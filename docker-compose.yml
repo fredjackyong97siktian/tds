@@ -1,0 +1,17 @@
+version: "3.9"
+
+services:
+  theft-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: theft-detection-api
+    restart: unless-stopped
+    ports:
+      - "8010:8010"
+    env_file:
+      - .env
+    volumes:
+      - ../Detect.py:/app/Detect.py:ro
+      - ../session:/app/session
+      - ./models:/app/tds/models

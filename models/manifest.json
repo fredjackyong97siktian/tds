@@ -1,0 +1,37 @@
+{
+  "required": [
+    {
+      "name": "entry_detection_model",
+      "path": "tds/models/yolo26s.pt",
+      "env": "MODEL_PATH"
+    },
+    {
+      "name": "tracker_config",
+      "path": "tds/models/custom_tracker.yaml",
+      "env": "TRACKER_PATH"
+    },
+    {
+      "name": "entry_segmentation_model",
+      "path": "tds/models/yoloe-11l-seg.pt",
+      "env": "REID_MASK_MODEL_PATH"
+    },
+    {
+      "name": "reid_model",
+      "path": "tds/models/reid/osnet_x1_0_msmt17.pt",
+      "env": "REID_WEIGHTS_PATH"
+    },
+    {
+      "name": "kiosk_pose_model",
+      "path": "tds/models/yolo26l-pose.pt",
+      "env": "KIOSK_POSE_MODEL_PATH"
+    }
+  ],
+  "optional": [
+    {
+      "name": "mobileclip_pt",
+      "path": "tds/models/mobileclip_blt.pt",
+      "env": "MOBILECLIP_PT_PATH",
+      "status": "not_present_locally"
+    }
+  ]
+}
