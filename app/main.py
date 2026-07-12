@@ -8,6 +8,7 @@ from .routers.sessions import router as sessions_router
 from .routers.triggers import router as triggers_router
 from .routers.vector import router as vector_router
 from .routers.videos import router as videos_router
+from .routers.whitelist import router as whitelist_router
 from .routers.workflows import router as workflows_router
 
 
@@ -20,6 +21,7 @@ app = FastAPI(
 app.include_router(health_router)
 app.include_router(cctv_router)
 app.include_router(locations_router)
+app.include_router(whitelist_router)
 app.include_router(triggers_router)
 app.include_router(sessions_router)
 app.include_router(videos_router)

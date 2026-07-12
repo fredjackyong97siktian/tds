@@ -37,6 +37,38 @@ class LocationOption(BaseModel):
     name: str
 
 
+class WhitelistEntryCreate(BaseModel):
+    method: str = Field(pattern="^(qrentry|entrylogs)$")
+    entry_id: str
+    status: str = Field(default="active", pattern="^(active|inactive)$")
+
+
+class WhitelistEntryResponse(BaseModel):
+    id: int
+    method: str
+    entry_id: str
+    status: str
+    resolved_value: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class WhitelistSourceOption(BaseModel):
+    value: str
+    label: str
+    secondary_label: str | None = None
+
+
+class PhoneNumberCreate(BaseModel):
+    phone_number: str
+
+
+class PhoneNumberResponse(BaseModel):
+    value: str
+    label: str
+    secondary_label: str | None = None
+
+
 class TriggerCreate(BaseModel):
     location_id: int
     aqara_event_id: str | None = None
@@ -149,7 +181,6 @@ class KioskRunRequest(BaseModel):
 
 
 class RetrievalRequest(BaseModel):
-    session_id: int
     start_time: datetime
     end_time: datetime
     location_id: int

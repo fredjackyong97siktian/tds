@@ -383,9 +383,28 @@ POST /api/v1/sessions/55/close?exit_trigger_id=202
 - stores the `exit_trigger_id` if supplied
 - in the latest business flow, closing the session is the handoff point to background kiosk processing
 
-## 9. Retrieve Kiosk Video Window
+## 9. Retrieve Entrance Video
 
-This is still a planning/helper endpoint, not the final Da Hua integration.
+Use this before session creation, after the trigger exists and before Entry detection confirms a real group.
+
+### Request
+
+```http
+POST /api/v1/workflows/triggers/101/retrieve-entrance-video
+Content-Type: application/json
+```
+
+```json
+{
+  "start_time": "2026-06-28T10:30:00+08:00",
+  "end_time": "2026-06-28T10:35:00+08:00",
+  "location_id": 1
+}
+```
+
+## 10. Retrieve Kiosk Video Window
+
+Use this only after the session already exists.
 
 ### Request
 
@@ -396,14 +415,13 @@ Content-Type: application/json
 
 ```json
 {
-  "session_id": 55,
   "start_time": "2026-06-28T10:31:00+08:00",
   "end_time": "2026-06-28T10:39:00+08:00",
   "location_id": 1
 }
 ```
 
-## 10. Run Kiosk Script
+## 11. Run Kiosk Script
 
 This triggers `DetectKiosk.py`.
 
@@ -428,7 +446,7 @@ Content-Type: application/json
 
 Use `POST /api/v1/videos/sessions/{session_id}` before this if you also want a persistent record of the kiosk video asset itself.
 
-## 11. Add Transaction Record
+## 12. Add Transaction Record
 
 Use this for real POS or receipt records that happened inside the session window.
 
@@ -451,7 +469,7 @@ Content-Type: application/json
 }
 ```
 
-## 12. Finalize Session Result
+## 13. Finalize Session Result
 
 This is the new endpoint that automatically sets the final session result to:
 

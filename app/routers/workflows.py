@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from ..db import get_transaction_db
@@ -51,14 +51,33 @@ def run_kiosk(
 
 
 @router.post("/sessions/{session_id}/retrieve-kiosk-video")
-def retrieve_kiosk_video(session_id: int, payload: RetrievalRequest) -> dict:
-    return {
-        "session_id": session_id,
-        **workflow_service.retrieve_kiosk_video_window(
+def retrieve_kiosk_video(session_id: int, payload: RetrievalRequest, db: Session = Depends(get_transaction_db)) -> dict:
+    try:
+        result = workflow_service.retrieve_kiosk_video_window(
+            db,
+            session_id=session_id,
+            location_id=payload.location_id,
             start_time=payload.start_time,
             end_time=payload.end_time,
-        ),
-    }
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return result.__dict__
+
+
+@router.post("/triggers/{trigger_id}/retrieve-entrance-video")
+def retrieve_entrance_video(trigger_id: int, payload: RetrievalRequest, db: Session = Depends(get_transaction_db)) -> dict:
+    try:
+        result = workflow_service.retrieve_entrance_video_window(
+            db,
+            trigger_id=trigger_id,
+            location_id=payload.location_id,
+            start_time=payload.start_time,
+            end_time=payload.end_time,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return result.__dict__
 
 
 @router.get("/triggers/{trigger_id}/video-ready-policy")

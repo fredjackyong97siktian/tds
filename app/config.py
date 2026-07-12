@@ -17,11 +17,26 @@ class Settings(BaseSettings):
     entry_script_path: Path = Path(__file__).resolve().parents[1] / "DetectEntry.py"
     kiosk_script_path: Path = Path(__file__).resolve().parents[1] / "DetectKiosk.py"
     python_bin: str = "python"
+    ffmpeg_bin: str = "ffmpeg"
     video_storage_dir: Path = Path(__file__).resolve().parents[2] / "session"
     transactional_table_prefix: str = "tds_"
     location_table_name: str = "location"
     location_id_column: str = "id"
     location_name_column: str = "name"
+    dahua_host: str | None = None
+    dahua_username: str | None = None
+    dahua_password: str | None = None
+    dahua_rtsp_port: int = 554
+    dahua_playback_subtype: int = 0
+    whitelist_qrentry_table_name: str = "phonenumber"
+    whitelist_qrentry_value_column: str = "participantId"
+    whitelist_qrentry_label_column: str = "participantId"
+    whitelist_qrentry_display_column: str = "phoneNumber"
+    whitelist_qrentry_create_column: str = "phoneNumber"
+    whitelist_entrylogs_table_name: str = "fingerprint"
+    whitelist_entrylogs_value_column: str = "fingerprint"
+    whitelist_entrylogs_label_column: str = "fingerprint"
+    whitelist_entrylogs_display_column: str = "fingerprint"
 
     model_config = SettingsConfigDict(
         env_prefix="THEFT_API_",

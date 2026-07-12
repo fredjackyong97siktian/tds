@@ -19,8 +19,20 @@ def media_root() -> Path:
     return root
 
 
+def tmp_media_root() -> Path:
+    root = settings.video_storage_dir / "tmp_video" / "locations"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
 def location_root(location_id: int) -> Path:
     root = media_root() / f"location_{location_id}"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def tmp_location_root(location_id: int) -> Path:
+    root = tmp_media_root() / f"location_{location_id}"
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -31,8 +43,20 @@ def trigger_root(location_id: int, trigger_id: int) -> Path:
     return root
 
 
+def tmp_trigger_root(location_id: int, trigger_id: int) -> Path:
+    root = tmp_location_root(location_id) / "triggers" / f"trigger_{trigger_id}"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
 def trigger_video_path(location_id: int, trigger_id: int, section: str, filename: str) -> Path:
     directory = trigger_root(location_id, trigger_id) / section / "raw"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / _safe_name(filename)
+
+
+def trigger_tmp_video_path(location_id: int, trigger_id: int, section: str, filename: str) -> Path:
+    directory = tmp_trigger_root(location_id, trigger_id) / section / "raw"
     directory.mkdir(parents=True, exist_ok=True)
     return directory / _safe_name(filename)
 
@@ -43,8 +67,20 @@ def session_root(location_id: int, session_id: int) -> Path:
     return root
 
 
+def tmp_session_root(location_id: int, session_id: int) -> Path:
+    root = tmp_location_root(location_id) / "sessions" / f"session_{session_id}"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
 def session_video_path(location_id: int, session_id: int, section: str, filename: str) -> Path:
     directory = session_root(location_id, session_id) / "videos" / section / "raw"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / _safe_name(filename)
+
+
+def session_tmp_video_path(location_id: int, session_id: int, section: str, filename: str) -> Path:
+    directory = tmp_session_root(location_id, session_id) / "videos" / section / "raw"
     directory.mkdir(parents=True, exist_ok=True)
     return directory / _safe_name(filename)
 

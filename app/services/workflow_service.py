@@ -5,12 +5,21 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from os.path import basename, splitext
 from pathlib import Path
+from urllib.parse import quote
 
 from sqlalchemy.orm import Session
 
 from ..config import settings
 from .. import repositories
-from ..storage import gallery_state_path as build_private_gallery_state_path, session_logs_root, session_root
+from ..storage import (
+    gallery_state_path as build_private_gallery_state_path,
+    session_logs_root,
+    session_root,
+    trigger_tmp_video_path,
+    trigger_video_path,
+    session_tmp_video_path,
+    session_video_path,
+)
 
 
 UTC = timezone.utc
@@ -22,6 +31,22 @@ class ScriptExecutionResult:
     model_name: str | None
     status: str
     command: list[str]
+    stdout: str
+    stderr: str
+
+
+@dataclass
+class VideoRetrievalResult:
+    session_id: int | None
+    trigger_id: int | None
+    location_id: int
+    section: str
+    requested_start_time: str
+    requested_end_time: str
+    output_path: str
+    rtsp_url: str
+    command: list[str]
+    status: str
     stdout: str
     stderr: str
 
@@ -136,13 +161,126 @@ def create_trigger_and_session(
     return {"trigger": trigger, "session": session, "message": "Trigger and session created."}
 
 
-def retrieve_kiosk_video_window(*, start_time: datetime, end_time: datetime) -> dict:
-    return {
-        "requested_start_time": start_time.isoformat(),
-        "requested_end_time": end_time.isoformat(),
-        "recommended_padding_seconds": 10,
-        "note": "Hook this into your Da Hua/NVR retrieval service.",
-    }
+def _format_dahua_playback_time(value: datetime) -> str:
+    return value.strftime("%Y_%m_%d_%H_%M_%S")
+
+
+def _build_dahua_rtsp_playback_url(*, channel: str, start_time: datetime, end_time: datetime) -> str:
+    if not settings.dahua_host or not settings.dahua_username or not settings.dahua_password:
+        raise ValueError("Dahua RTSP settings are incomplete. Set host, username, and password in the API environment.")
+
+    username = quote(settings.dahua_username, safe="")
+    password = quote(settings.dahua_password, safe="")
+    start = _format_dahua_playback_time(start_time)
+    end = _format_dahua_playback_time(end_time)
+    return (
+        f"rtsp://{username}:{password}@{settings.dahua_host}:{settings.dahua_rtsp_port}"
+        f"/cam/playback?channel={channel}&subtype={settings.dahua_playback_subtype}"
+        f"&starttime={start}&endtime={end}"
+    )
+
+
+def _retrieve_video_window(
+    db: Session,
+    *,
+    section: str,
+    location_id: int,
+    session_id: int | None,
+    trigger_id: int | None,
+    start_time: datetime,
+    end_time: datetime,
+) -> VideoRetrievalResult:
+    cctv = repositories.get_cctv_by_location_section(db, location_id=location_id, section=section)
+    channel = str(cctv.get("recorder_channel") or "").strip()
+    if not channel:
+        raise ValueError(f"{section.capitalize()} CCTV record does not have a recorder_channel.")
+
+    rtsp_url = _build_dahua_rtsp_playback_url(channel=channel, start_time=start_time, end_time=end_time)
+    filename = f"{section}_playback_{_format_dahua_playback_time(start_time)}_{_format_dahua_playback_time(end_time)}.mp4"
+    if session_id is not None:
+        output_path = session_tmp_video_path(location_id, session_id, section, filename)
+    elif trigger_id is not None:
+        output_path = trigger_tmp_video_path(location_id, trigger_id, section, filename)
+    else:
+        raise ValueError("Either session_id or trigger_id is required for video retrieval.")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    command = [
+        settings.ffmpeg_bin,
+        "-y",
+        "-rtsp_transport",
+        "tcp",
+        "-i",
+        rtsp_url,
+        "-c",
+        "copy",
+        str(output_path),
+    ]
+    completed = subprocess.run(command, capture_output=True, text=True)
+    status = "success" if completed.returncode == 0 else "failed"
+    repositories.create_script_run(
+        db,
+        session_id=session_id,
+        trigger_id=trigger_id,
+        script_name="retrieve_video",
+        model_name="dahua_rtsp_playback",
+        status=status,
+        command=" ".join(command),
+        stdout_log=completed.stdout,
+        stderr_log=completed.stderr,
+    )
+    return VideoRetrievalResult(
+        session_id=session_id,
+        trigger_id=trigger_id,
+        location_id=location_id,
+        section=section,
+        requested_start_time=start_time.isoformat(),
+        requested_end_time=end_time.isoformat(),
+        output_path=str(output_path),
+        rtsp_url=rtsp_url,
+        command=command,
+        status=status,
+        stdout=completed.stdout,
+        stderr=completed.stderr,
+    )
+
+
+def retrieve_entrance_video_window(
+    db: Session,
+    *,
+    trigger_id: int,
+    location_id: int,
+    start_time: datetime,
+    end_time: datetime,
+) -> VideoRetrievalResult:
+    return _retrieve_video_window(
+        db,
+        section="entrance",
+        location_id=location_id,
+        session_id=None,
+        trigger_id=trigger_id,
+        start_time=start_time,
+        end_time=end_time,
+    )
+
+
+def retrieve_kiosk_video_window(
+    db: Session,
+    *,
+    session_id: int,
+    location_id: int,
+    start_time: datetime,
+    end_time: datetime,
+) -> VideoRetrievalResult:
+    return _retrieve_video_window(
+        db,
+        section="kiosk",
+        location_id=location_id,
+        session_id=session_id,
+        trigger_id=None,
+        start_time=start_time,
+        end_time=end_time,
+    )
 
 
 def run_entry_for_trigger(

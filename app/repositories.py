@@ -23,6 +23,27 @@ def _fetch_all_dicts(result) -> list[dict[str, Any]]:
     return [dict(row) for row in result.mappings().all()]
 
 
+def _whitelist_source_config(method: str) -> dict[str, str]:
+    if method == "qrentry":
+        return {
+            "table_name": settings.whitelist_qrentry_table_name,
+            "value_column": settings.whitelist_qrentry_value_column,
+            "label_column": settings.whitelist_qrentry_label_column,
+            "display_column": settings.whitelist_qrentry_display_column,
+            "create_column": settings.whitelist_qrentry_create_column,
+        }
+
+    if method == "entrylogs":
+        return {
+            "table_name": settings.whitelist_entrylogs_table_name,
+            "value_column": settings.whitelist_entrylogs_value_column,
+            "label_column": settings.whitelist_entrylogs_label_column,
+            "display_column": settings.whitelist_entrylogs_display_column,
+        }
+
+    raise ValueError("Unsupported whitelist method.")
+
+
 def get_cctv(db: Session, cctv_id: int) -> dict[str, Any]:
     cctv_table = _table("cctv")
     result = db.execute(
@@ -34,6 +55,22 @@ def get_cctv(db: Session, cctv_id: int) -> dict[str, Any]:
             """
         ),
         {"cctv_id": cctv_id},
+    )
+    return _fetch_one_dict(result)
+
+
+def get_cctv_by_location_section(db: Session, *, location_id: int, section: str) -> dict[str, Any]:
+    cctv_table = _table("cctv")
+    result = db.execute(
+        text(
+            f"""
+            select id, location_id, section, stream_name, recorder_channel, delayed_seconds, created_at, updated_at
+            from {cctv_table}
+            where location_id = :location_id and section = :section
+            limit 1
+            """
+        ),
+        {"location_id": location_id, "section": section},
     )
     return _fetch_one_dict(result)
 
@@ -81,6 +118,133 @@ def list_locations(db: Session) -> list[dict[str, Any]]:
         )
     )
     return _fetch_all_dicts(result)
+
+
+def list_whitelist_entries(db: Session) -> list[dict[str, Any]]:
+    whitelist_table = _table("whitelist_entry")
+    qrentry = _whitelist_source_config("qrentry")
+    entrylogs = _whitelist_source_config("entrylogs")
+
+    result = db.execute(
+        text(
+            f"""
+            select w.id, w.method, w.entry_id, w.status, w.created_at, w.updated_at,
+                   case
+                       when w.method = 'qrentry' then (
+                           select cast(q.{qrentry["display_column"]} as char)
+                           from {qrentry["table_name"]} q
+                           where cast(q.{qrentry["value_column"]} as char) = w.entry_id
+                           limit 1
+                       )
+                       when w.method = 'entrylogs' then (
+                           select cast(e.{entrylogs["display_column"]} as char)
+                           from {entrylogs["table_name"]} e
+                           where cast(e.{entrylogs["value_column"]} as char) = w.entry_id
+                           limit 1
+                       )
+                       else null
+                   end as resolved_value
+            from {whitelist_table} w
+            order by w.created_at desc, w.id desc
+            """
+        )
+    )
+    return _fetch_all_dicts(result)
+
+
+def create_whitelist_entry(db: Session, payload: Mapping[str, Any]) -> dict[str, Any]:
+    whitelist_table = _table("whitelist_entry")
+    result = db.execute(
+        text(
+            f"""
+            insert into {whitelist_table} (
+                method, entry_id, status
+            )
+            values (
+                :method, :entry_id, :status
+            )
+            """
+        ),
+        payload,
+    )
+    db.commit()
+    whitelist_id = int(result.lastrowid)
+    rows = [row for row in list_whitelist_entries(db) if int(row["id"]) == whitelist_id]
+    if not rows:
+        raise ValueError("Whitelist entry not found after create.")
+    return rows[0]
+
+
+def delete_whitelist_entry(db: Session, whitelist_id: int) -> bool:
+    whitelist_table = _table("whitelist_entry")
+    result = db.execute(
+        text(
+            f"""
+            delete from {whitelist_table}
+            where id = :whitelist_id
+            """
+        ),
+        {"whitelist_id": whitelist_id},
+    )
+    db.commit()
+    return bool(result.rowcount)
+
+
+def list_whitelist_source_options(db: Session, method: str) -> list[dict[str, Any]]:
+    source = _whitelist_source_config(method)
+    result = db.execute(
+        text(
+            f"""
+            select cast({source["value_column"]} as char) as value,
+                   cast({source["label_column"]} as char) as label,
+                   case
+                       when {source["display_column"]} = {source["label_column"]} then null
+                       else cast({source["display_column"]} as char)
+                   end as secondary_label
+            from {source["table_name"]}
+            where {source["value_column"]} is not null
+            order by {source["label_column"]} asc
+            """
+        )
+    )
+    return _fetch_all_dicts(result)
+
+
+def create_phone_number_source(db: Session, phone_number: str) -> dict[str, Any]:
+    source = _whitelist_source_config("qrentry")
+    result = db.execute(
+        text(
+            f"""
+            insert into {source["table_name"]} (
+                {source["create_column"]}
+            )
+            values (
+                :phone_number
+            )
+            """
+        ),
+        {"phone_number": phone_number},
+    )
+    db.commit()
+
+    lastrowid = int(result.lastrowid)
+    created_result = db.execute(
+        text(
+            f"""
+            select cast({source["value_column"]} as char) as value,
+                   cast({source["label_column"]} as char) as label,
+                   case
+                       when {source["display_column"]} = {source["label_column"]} then null
+                       else cast({source["display_column"]} as char)
+                   end as secondary_label
+            from {source["table_name"]}
+            where {source["value_column"]} = :lastrowid
+            limit 1
+            """
+        ),
+        {"lastrowid": lastrowid},
+    )
+    return _fetch_one_dict(created_result)
 
 
 def get_trigger(db: Session, trigger_id: int) -> dict[str, Any]:
