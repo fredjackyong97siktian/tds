@@ -28,9 +28,12 @@ class Settings(BaseSettings):
     dahua_password: str | None = None
     dahua_rtsp_port: int = 554
     dahua_playback_subtype: int = 0
+    dahua_output_video_codec: str = "libx264"
+    dahua_output_preset: str = "veryfast"
+    dahua_output_crf: int = 23
     whitelist_qrentry_table_name: str = "phonenumber"
-    whitelist_qrentry_value_column: str = "participantId"
-    whitelist_qrentry_label_column: str = "participantId"
+    whitelist_qrentry_value_column: str = "phoneNumber"
+    whitelist_qrentry_label_column: str = "phoneNumber"
     whitelist_qrentry_display_column: str = "phoneNumber"
     whitelist_qrentry_create_column: str = "phoneNumber"
     whitelist_entrylogs_table_name: str = "fingerprint"

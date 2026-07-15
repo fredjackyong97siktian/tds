@@ -41,10 +41,12 @@ def delete_whitelist(whitelist_id: int, db: Session = Depends(get_transaction_db
 @router.get("/source-options", response_model=list[WhitelistSourceOption])
 def list_source_options(
     method: str = Query(pattern="^(qrentry|entrylogs)$"),
+    search: str | None = Query(default=None, max_length=255),
+    limit: int = Query(default=200, ge=1, le=500),
     db: Session = Depends(get_transaction_db),
 ) -> list[WhitelistSourceOption]:
     try:
-        rows = repositories.list_whitelist_source_options(db, method)
+        rows = repositories.list_whitelist_source_options(db, method, search=search, limit=limit)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return [WhitelistSourceOption(**row) for row in rows]

@@ -1,10 +1,11 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from ..db import get_transaction_db
 from ..schemas import (
     EntryRunRequest,
     KioskRunRequest,
+    RetrievalAcceptedResponse,
     RetrievalRequest,
     ScriptRunResponse,
 )
@@ -50,8 +51,13 @@ def run_kiosk(
     return ScriptRunResponse(**result.__dict__)
 
 
-@router.post("/sessions/{session_id}/retrieve-kiosk-video")
-def retrieve_kiosk_video(session_id: int, payload: RetrievalRequest, db: Session = Depends(get_transaction_db)) -> dict:
+@router.post("/sessions/{session_id}/retrieve-kiosk-video", response_model=RetrievalAcceptedResponse, status_code=status.HTTP_202_ACCEPTED)
+def retrieve_kiosk_video(
+    session_id: int,
+    payload: RetrievalRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_transaction_db),
+) -> RetrievalAcceptedResponse:
     try:
         result = workflow_service.retrieve_kiosk_video_window(
             db,
@@ -62,11 +68,29 @@ def retrieve_kiosk_video(session_id: int, payload: RetrievalRequest, db: Session
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return result.__dict__
+    background_tasks.add_task(workflow_service.start_video_retrieval_job, result)
+    return RetrievalAcceptedResponse(
+        message="Kiosk video retrieval queued.",
+        video_asset_id=result.video_asset_id,
+        trigger_id=result.trigger_id,
+        session_id=result.session_id,
+        location_id=result.location_id,
+        section=result.section,
+        status=result.status,
+        video_url=result.video_url,
+        file_path=result.output_path,
+        requested_start_time=result.requested_start_time,
+        requested_end_time=result.requested_end_time,
+    )
 
 
-@router.post("/triggers/{trigger_id}/retrieve-entrance-video")
-def retrieve_entrance_video(trigger_id: int, payload: RetrievalRequest, db: Session = Depends(get_transaction_db)) -> dict:
+@router.post("/triggers/{trigger_id}/retrieve-entrance-video", response_model=RetrievalAcceptedResponse, status_code=status.HTTP_202_ACCEPTED)
+def retrieve_entrance_video(
+    trigger_id: int,
+    payload: RetrievalRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_transaction_db),
+) -> RetrievalAcceptedResponse:
     try:
         result = workflow_service.retrieve_entrance_video_window(
             db,
@@ -77,7 +101,20 @@ def retrieve_entrance_video(trigger_id: int, payload: RetrievalRequest, db: Sess
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return result.__dict__
+    background_tasks.add_task(workflow_service.start_video_retrieval_job, result)
+    return RetrievalAcceptedResponse(
+        message="Entrance video retrieval queued.",
+        video_asset_id=result.video_asset_id,
+        trigger_id=result.trigger_id,
+        session_id=result.session_id,
+        location_id=result.location_id,
+        section=result.section,
+        status=result.status,
+        video_url=result.video_url,
+        file_path=result.output_path,
+        requested_start_time=result.requested_start_time,
+        requested_end_time=result.requested_end_time,
+    )
 
 
 @router.get("/triggers/{trigger_id}/video-ready-policy")

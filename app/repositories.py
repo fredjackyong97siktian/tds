@@ -44,6 +44,13 @@ def _whitelist_source_config(method: str) -> dict[str, str]:
     raise ValueError("Unsupported whitelist method.")
 
 
+def _validate_whitelist_method(method: str) -> str:
+    normalized = method.strip().lower()
+    if normalized not in {"qrentry", "entrylogs"}:
+        raise ValueError("Unsupported whitelist method.")
+    return normalized
+
+
 def get_cctv(db: Session, cctv_id: int) -> dict[str, Any]:
     cctv_table = _table("cctv")
     result = db.execute(
@@ -190,8 +197,16 @@ def delete_whitelist_entry(db: Session, whitelist_id: int) -> bool:
     return bool(result.rowcount)
 
 
-def list_whitelist_source_options(db: Session, method: str) -> list[dict[str, Any]]:
+def list_whitelist_source_options(
+    db: Session,
+    method: str,
+    *,
+    search: str | None = None,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    method = _validate_whitelist_method(method)
     source = _whitelist_source_config(method)
+    search_value = f"%{search.strip()}%" if search and search.strip() else None
     result = db.execute(
         text(
             f"""
@@ -200,19 +215,36 @@ def list_whitelist_source_options(db: Session, method: str) -> list[dict[str, An
                    case
                        when {source["display_column"]} = {source["label_column"]} then null
                        else cast({source["display_column"]} as char)
-                   end as secondary_label
+                   end as secondary_label,
+                   :method as method
             from {source["table_name"]}
             where {source["value_column"]} is not null
+              and (
+                  :search_value is null
+                  or cast({source["value_column"]} as char) like :search_value
+                  or cast({source["label_column"]} as char) like :search_value
+                  or cast({source["display_column"]} as char) like :search_value
+              )
             order by {source["label_column"]} asc
+            limit :limit_value
             """
-        )
+        ),
+        {
+            "method": method,
+            "search_value": search_value,
+            "limit_value": limit,
+        },
     )
     return _fetch_all_dicts(result)
 
 
 def create_phone_number_source(db: Session, phone_number: str) -> dict[str, Any]:
     source = _whitelist_source_config("qrentry")
-    result = db.execute(
+    normalized_phone_number = phone_number.strip()
+    if not normalized_phone_number:
+        raise ValueError("Phone number is required.")
+
+    db.execute(
         text(
             f"""
             insert into {source["table_name"]} (
@@ -223,11 +255,10 @@ def create_phone_number_source(db: Session, phone_number: str) -> dict[str, Any]
             )
             """
         ),
-        {"phone_number": phone_number},
+        {"phone_number": normalized_phone_number},
     )
     db.commit()
 
-    lastrowid = int(result.lastrowid)
     created_result = db.execute(
         text(
             f"""
@@ -236,13 +267,14 @@ def create_phone_number_source(db: Session, phone_number: str) -> dict[str, Any]
                    case
                        when {source["display_column"]} = {source["label_column"]} then null
                        else cast({source["display_column"]} as char)
-                   end as secondary_label
+                   end as secondary_label,
+                   'qrentry' as method
             from {source["table_name"]}
-            where {source["value_column"]} = :lastrowid
+            where cast({source["create_column"]} as char) = :phone_number
             limit 1
             """
         ),
-        {"lastrowid": lastrowid},
+        {"phone_number": normalized_phone_number},
     )
     return _fetch_one_dict(created_result)
 
@@ -558,6 +590,26 @@ def create_video_asset(db: Session, payload: Mapping[str, Any]) -> int:
     return int(result.lastrowid)
 
 
+def update_video_asset_status(db: Session, video_asset_id: int, status: str, metadata: Mapping[str, Any] | None = None) -> None:
+    video_asset_table = _table("video_asset")
+    db.execute(
+        text(
+            f"""
+            update {video_asset_table}
+            set status = :status,
+                metadata = coalesce(:metadata, metadata)
+            where id = :video_asset_id
+            """
+        ),
+        {
+            "video_asset_id": video_asset_id,
+            "status": status,
+            "metadata": json.dumps(metadata) if metadata is not None else None,
+        },
+    )
+    db.commit()
+
+
 def update_video_asset_url(db: Session, video_asset_id: int, video_url: str) -> None:
     video_asset_table = _table("video_asset")
     db.execute(
@@ -569,6 +621,31 @@ def update_video_asset_url(db: Session, video_asset_id: int, video_url: str) -> 
             """
         ),
         {"video_asset_id": video_asset_id, "video_url": video_url},
+    )
+    db.commit()
+
+
+def update_video_asset(db: Session, video_asset_id: int, payload: Mapping[str, Any]) -> None:
+    video_asset_table = _table("video_asset")
+    db.execute(
+        text(
+            f"""
+            update {video_asset_table}
+            set video_url = :video_url,
+                file_path = :file_path,
+                captured_start_time = :captured_start_time,
+                captured_end_time = :captured_end_time,
+                retention_until = :retention_until,
+                status = :status,
+                metadata = :metadata
+            where id = :video_asset_id
+            """
+        ),
+        {
+            "video_asset_id": video_asset_id,
+            **payload,
+            "metadata": json.dumps(payload.get("metadata")) if payload.get("metadata") is not None else None,
+        },
     )
     db.commit()
 

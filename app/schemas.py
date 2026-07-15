@@ -57,6 +57,7 @@ class WhitelistSourceOption(BaseModel):
     value: str
     label: str
     secondary_label: str | None = None
+    method: str | None = None
 
 
 class PhoneNumberCreate(BaseModel):
@@ -139,7 +140,7 @@ class VideoAssetCreate(BaseModel):
     captured_start_time: datetime | None = None
     captured_end_time: datetime | None = None
     retention_until: datetime | None = None
-    status: str = Field(default="not_retrieved", pattern="^(not_retrieved|ready|processing|processed|deleted|issue)$")
+    status: str = Field(default="not_retrieved", pattern="^(not_retrieved|retrieving|ready|processing|processed|deleted|issue)$")
     trigger_id: int | None = None
     link_section: str | None = Field(default=None, pattern="^(entrance|kiosk)$")
     link_sequence_no: int | None = None
@@ -184,6 +185,21 @@ class RetrievalRequest(BaseModel):
     start_time: datetime
     end_time: datetime
     location_id: int
+
+
+class RetrievalAcceptedResponse(BaseModel):
+    ok: bool = True
+    message: str
+    video_asset_id: int
+    trigger_id: int | None = None
+    session_id: int | None = None
+    location_id: int
+    section: str
+    status: str
+    video_url: str
+    file_path: str
+    requested_start_time: datetime
+    requested_end_time: datetime
 
 
 class SessionFinalizeRequest(BaseModel):

@@ -150,7 +150,7 @@ CREATE TABLE IF NOT EXISTS sesamedb.tds_video_asset (
     captured_start_time DATETIME,
     captured_end_time DATETIME,
     retention_until DATETIME COMMENT 'Delete the stored video file/object and this row after this timestamp; use 3-day retention by default.',
-    status VARCHAR(30) NOT NULL DEFAULT 'not_retrieved' COMMENT 'Video lifecycle: not_retrieved, ready, deleted, or issue.',
+    status VARCHAR(30) NOT NULL DEFAULT 'not_retrieved' COMMENT 'Video lifecycle: not_retrieved, retrieving, ready, deleted, or issue.',
     metadata JSON,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     KEY idx_video_asset_trigger_id (trigger_id),
@@ -161,7 +161,7 @@ CREATE TABLE IF NOT EXISTS sesamedb.tds_video_asset (
     CONSTRAINT chk_video_asset_section
         CHECK (section IN ('entrance', 'kiosk')),
     CONSTRAINT chk_video_asset_status
-        CHECK (status IN ('not_retrieved', 'ready', 'processing', 'processed', 'deleted', 'issue'))
+        CHECK (status IN ('not_retrieved', 'retrieving', 'ready', 'processing', 'processed', 'deleted', 'issue'))
 );
 
 CREATE TABLE IF NOT EXISTS sesamedb.tds_session_video_asset (
