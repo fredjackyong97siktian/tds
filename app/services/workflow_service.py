@@ -61,6 +61,9 @@ class VideoRetrievalQueued:
     section: str
     requested_start_time: datetime
     requested_end_time: datetime
+    delayed_seconds: int
+    adjusted_start_time: datetime
+    adjusted_end_time: datetime
     output_path: str
     rtsp_url: str
     status: str
@@ -316,6 +319,9 @@ def _prepare_video_retrieval(
         section=section,
         requested_start_time=start_time,
         requested_end_time=end_time,
+        delayed_seconds=delayed_seconds,
+        adjusted_start_time=adjusted_start_time,
+        adjusted_end_time=adjusted_end_time,
         output_path=str(output_path),
         rtsp_url=rtsp_url,
         status="retrieving",
@@ -332,6 +338,9 @@ def _run_video_retrieval_job(
     section: str,
     start_time: datetime,
     end_time: datetime,
+    delayed_seconds: int,
+    adjusted_start_time: datetime,
+    adjusted_end_time: datetime,
     output_path: str,
     rtsp_url: str,
 ) -> None:
@@ -354,16 +363,16 @@ def _run_video_retrieval_job(
                 "status": "ready" if status == "success" else "issue",
                 "metadata": {
                     "retrieval_source": "dahua_rtsp_playback",
-                "location_id": location_id,
-                "session_id": session_id,
-                "trigger_id": trigger_id,
-                "rtsp_url": rtsp_url,
-                "delayed_seconds": delayed_seconds,
-                "adjusted_start_time": adjusted_start_time.isoformat(),
-                "adjusted_end_time": adjusted_end_time.isoformat(),
-                "output_codec": settings.dahua_output_video_codec,
-                "ffmpeg_status": status,
-                "ffmpeg_stdout": completed.stdout,
+                    "location_id": location_id,
+                    "session_id": session_id,
+                    "trigger_id": trigger_id,
+                    "rtsp_url": rtsp_url,
+                    "delayed_seconds": delayed_seconds,
+                    "adjusted_start_time": adjusted_start_time.isoformat(),
+                    "adjusted_end_time": adjusted_end_time.isoformat(),
+                    "output_codec": settings.dahua_output_video_codec,
+                    "ffmpeg_status": status,
+                    "ffmpeg_stdout": completed.stdout,
                     "ffmpeg_stderr": completed.stderr,
                 },
             },
@@ -394,6 +403,9 @@ def start_video_retrieval_job(job: VideoRetrievalQueued) -> None:
             "section": job.section,
             "start_time": job.requested_start_time,
             "end_time": job.requested_end_time,
+            "delayed_seconds": job.delayed_seconds,
+            "adjusted_start_time": job.adjusted_start_time,
+            "adjusted_end_time": job.adjusted_end_time,
             "output_path": job.output_path,
             "rtsp_url": job.rtsp_url,
         },
