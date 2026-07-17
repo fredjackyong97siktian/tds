@@ -27,16 +27,33 @@ CREATE TABLE IF NOT EXISTS sesamedb.tds_whitelist_entry (
     UNIQUE KEY idx_whitelist_entry_method_entry_id (method, entry_id)
 );
 
-CREATE TABLE IF NOT EXISTS sesamedb.tds_cctv (
+CREATE TABLE IF NOT EXISTS sesamedb.tds_location_endpoint (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     location_id BIGINT NOT NULL,
+    dahua_host VARCHAR(255) NOT NULL,
+    dahua_username VARCHAR(255) NOT NULL,
+    dahua_password_encrypted TEXT NOT NULL,
+    rtsp_port INT NOT NULL DEFAULT 554,
+    notes TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_location_endpoint_location_id (location_id)
+);
+
+CREATE TABLE IF NOT EXISTS sesamedb.tds_cctv (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    location_endpoint_id BIGINT NOT NULL,
     section VARCHAR(50) NOT NULL,
     stream_name VARCHAR(255),
     recorder_channel VARCHAR(100),
     delayed_seconds INT NOT NULL DEFAULT 0,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    UNIQUE KEY idx_cctv_location_section (location_id, section)
+    UNIQUE KEY idx_cctv_location_endpoint_section (location_endpoint_id, section),
+    CONSTRAINT fk_cctv_location_endpoint
+        FOREIGN KEY (location_endpoint_id) REFERENCES tds_location_endpoint(id)
+        ON UPDATE CASCADE
+        ON DELETE RESTRICT
 );
 
 CREATE TABLE IF NOT EXISTS sesamedb.tds_trigger_event (

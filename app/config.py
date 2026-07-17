@@ -19,13 +19,11 @@ class Settings(BaseSettings):
     python_bin: str = "python"
     ffmpeg_bin: str = "ffmpeg"
     video_storage_dir: Path = Path(__file__).resolve().parents[2] / "session"
+    credential_secret: str = "change_me_please_use_a_long_random_secret"
     transactional_table_prefix: str = "tds_"
     location_table_name: str = "location"
     location_id_column: str = "id"
     location_name_column: str = "name"
-    dahua_host: str | None = None
-    dahua_username: str | None = None
-    dahua_password: str | None = None
     dahua_rtsp_port: int = 554
     dahua_playback_subtype: int = 0
     dahua_output_video_codec: str = "libx264"

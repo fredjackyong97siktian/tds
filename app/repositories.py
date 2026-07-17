@@ -53,12 +53,22 @@ def _validate_whitelist_method(method: str) -> str:
 
 def get_cctv(db: Session, cctv_id: int) -> dict[str, Any]:
     cctv_table = _table("cctv")
+    location_endpoint_table = _table("location_endpoint")
     result = db.execute(
         text(
             f"""
-            select id, location_id, section, stream_name, recorder_channel, delayed_seconds, created_at, updated_at
-            from {cctv_table}
-            where id = :cctv_id
+            select c.id,
+                   e.location_id as location_id,
+                   c.location_endpoint_id,
+                   c.section,
+                   c.stream_name,
+                   c.recorder_channel,
+                   c.delayed_seconds,
+                   c.created_at,
+                   c.updated_at
+            from {cctv_table} c
+            join {location_endpoint_table} e on e.id = c.location_endpoint_id
+            where c.id = :cctv_id
             """
         ),
         {"cctv_id": cctv_id},
@@ -68,12 +78,22 @@ def get_cctv(db: Session, cctv_id: int) -> dict[str, Any]:
 
 def get_cctv_by_location_section(db: Session, *, location_id: int, section: str) -> dict[str, Any]:
     cctv_table = _table("cctv")
+    location_endpoint_table = _table("location_endpoint")
     result = db.execute(
         text(
             f"""
-            select id, location_id, section, stream_name, recorder_channel, delayed_seconds, created_at, updated_at
-            from {cctv_table}
-            where location_id = :location_id and section = :section
+            select c.id,
+                   e.location_id as location_id,
+                   c.location_endpoint_id,
+                   c.section,
+                   c.stream_name,
+                   c.recorder_channel,
+                   c.delayed_seconds,
+                   c.created_at,
+                   c.updated_at
+            from {cctv_table} c
+            join {location_endpoint_table} e on e.id = c.location_endpoint_id
+            where e.location_id = :location_id and c.section = :section
             limit 1
             """
         ),
@@ -84,13 +104,23 @@ def get_cctv_by_location_section(db: Session, *, location_id: int, section: str)
 
 def list_cctv(db: Session, location_id: int | None = None) -> list[dict[str, Any]]:
     cctv_table = _table("cctv")
+    location_endpoint_table = _table("location_endpoint")
     if location_id is None:
         result = db.execute(
             text(
                 f"""
-                select id, location_id, section, stream_name, recorder_channel, delayed_seconds, created_at, updated_at
-                from {cctv_table}
-                order by location_id asc, section asc, id asc
+                select c.id,
+                       e.location_id as location_id,
+                       c.location_endpoint_id,
+                       c.section,
+                       c.stream_name,
+                       c.recorder_channel,
+                       c.delayed_seconds,
+                       c.created_at,
+                       c.updated_at
+                from {cctv_table} c
+                join {location_endpoint_table} e on e.id = c.location_endpoint_id
+                order by e.location_id asc, c.section asc, c.id asc
                 """
             )
         )
@@ -99,10 +129,19 @@ def list_cctv(db: Session, location_id: int | None = None) -> list[dict[str, Any
     result = db.execute(
         text(
             f"""
-            select id, location_id, section, stream_name, recorder_channel, delayed_seconds, created_at, updated_at
-            from {cctv_table}
-            where location_id = :location_id
-            order by section asc, id asc
+            select c.id,
+                   e.location_id as location_id,
+                   c.location_endpoint_id,
+                   c.section,
+                   c.stream_name,
+                   c.recorder_channel,
+                   c.delayed_seconds,
+                   c.created_at,
+                   c.updated_at
+            from {cctv_table} c
+            join {location_endpoint_table} e on e.id = c.location_endpoint_id
+            where e.location_id = :location_id
+            order by c.section asc, c.id asc
             """
         ),
         {"location_id": location_id},
@@ -114,17 +153,98 @@ def list_locations(db: Session) -> list[dict[str, Any]]:
     table_name = settings.location_table_name
     id_column = settings.location_id_column
     name_column = settings.location_name_column
+    location_endpoint_table = _table("location_endpoint")
 
     result = db.execute(
         text(
             f"""
-            select {id_column} as id, {name_column} as name
-            from {table_name}
+            select l.{id_column} as id,
+                   l.{name_column} as name,
+                   e.dahua_host,
+                   e.dahua_username,
+                   null as dahua_password,
+                   e.rtsp_port,
+                   e.notes,
+                   case when e.id is null then 0 else 1 end as has_endpoint_config,
+                   case when e.dahua_password_encrypted is null or e.dahua_password_encrypted = '' then 0 else 1 end as has_password_config
+            from {table_name} l
+            left join {location_endpoint_table} e on e.location_id = l.{id_column}
             order by {name_column} asc, {id_column} asc
             """
         )
     )
     return _fetch_all_dicts(result)
+
+
+def get_location_endpoint(db: Session, location_id: int) -> dict[str, Any]:
+    table_name = settings.location_table_name
+    id_column = settings.location_id_column
+    name_column = settings.location_name_column
+    location_endpoint_table = _table("location_endpoint")
+
+    result = db.execute(
+        text(
+            f"""
+            select l.{id_column} as id,
+                   l.{name_column} as name,
+                   e.dahua_host,
+                   e.dahua_username,
+                   null as dahua_password,
+                   e.dahua_password_encrypted,
+                   e.rtsp_port,
+                   e.notes,
+                   case when e.id is null then 0 else 1 end as has_endpoint_config,
+                   case when e.dahua_password_encrypted is null or e.dahua_password_encrypted = '' then 0 else 1 end as has_password_config
+            from {table_name} l
+            left join {location_endpoint_table} e on e.location_id = l.{id_column}
+            where l.{id_column} = :location_id
+            limit 1
+            """
+        ),
+        {"location_id": location_id},
+    )
+    return _fetch_one_dict(result)
+
+
+def upsert_location_endpoint(db: Session, location_id: int, payload: Mapping[str, Any]) -> dict[str, Any]:
+    location_endpoint_table = _table("location_endpoint")
+    db.execute(
+        text(
+            f"""
+            insert into {location_endpoint_table} (
+                location_id, dahua_host, dahua_username, dahua_password_encrypted, rtsp_port, notes
+            )
+            values (
+                :location_id, :dahua_host, :dahua_username, :dahua_password_encrypted, :rtsp_port, :notes
+            )
+            on duplicate key update
+                dahua_host = values(dahua_host),
+                dahua_username = values(dahua_username),
+                dahua_password_encrypted = coalesce(values(dahua_password_encrypted), dahua_password_encrypted),
+                rtsp_port = values(rtsp_port),
+                notes = values(notes)
+            """
+        ),
+        {"location_id": location_id, **payload},
+    )
+    db.commit()
+    return get_location_endpoint(db, location_id)
+
+
+def get_location_endpoint_by_location_id(db: Session, location_id: int) -> dict[str, Any]:
+    location_endpoint_table = _table("location_endpoint")
+    result = db.execute(
+        text(
+            f"""
+            select id, location_id, dahua_host, dahua_username, dahua_password_encrypted, rtsp_port, notes, created_at, updated_at
+            from {location_endpoint_table}
+            where location_id = :location_id
+            limit 1
+            """
+        ),
+        {"location_id": location_id},
+    )
+    return _fetch_one_dict(result)
 
 
 def list_whitelist_entries(db: Session) -> list[dict[str, Any]]:
@@ -437,18 +557,25 @@ def create_trigger(db: Session, payload: Mapping[str, Any]) -> dict[str, Any]:
 
 def create_cctv(db: Session, payload: Mapping[str, Any]) -> dict[str, Any]:
     cctv_table = _table("cctv")
+    location_endpoint = get_location_endpoint_by_location_id(db, int(payload["location_id"]))
     result = db.execute(
         text(
             f"""
             insert into {cctv_table} (
-                location_id, section, stream_name, recorder_channel, delayed_seconds
+                location_endpoint_id, section, stream_name, recorder_channel, delayed_seconds
             )
             values (
-                :location_id, :section, :stream_name, :recorder_channel, :delayed_seconds
+                :location_endpoint_id, :section, :stream_name, :recorder_channel, :delayed_seconds
             )
             """
         ),
-        payload,
+        {
+            "location_endpoint_id": int(location_endpoint["id"]),
+            "section": payload["section"],
+            "stream_name": payload.get("stream_name"),
+            "recorder_channel": payload.get("recorder_channel"),
+            "delayed_seconds": payload.get("delayed_seconds", 0),
+        },
     )
     db.commit()
     return get_cctv(db, int(result.lastrowid))
@@ -456,11 +583,12 @@ def create_cctv(db: Session, payload: Mapping[str, Any]) -> dict[str, Any]:
 
 def update_cctv(db: Session, cctv_id: int, payload: Mapping[str, Any]) -> dict[str, Any]:
     cctv_table = _table("cctv")
+    location_endpoint = get_location_endpoint_by_location_id(db, int(payload["location_id"]))
     result = db.execute(
         text(
             f"""
             update {cctv_table}
-            set location_id = :location_id,
+            set location_endpoint_id = :location_endpoint_id,
                 section = :section,
                 stream_name = :stream_name,
                 recorder_channel = :recorder_channel,
@@ -468,7 +596,14 @@ def update_cctv(db: Session, cctv_id: int, payload: Mapping[str, Any]) -> dict[s
             where id = :cctv_id
             """
         ),
-        {"cctv_id": cctv_id, **payload},
+        {
+            "cctv_id": cctv_id,
+            "location_endpoint_id": int(location_endpoint["id"]),
+            "section": payload["section"],
+            "stream_name": payload.get("stream_name"),
+            "recorder_channel": payload.get("recorder_channel"),
+            "delayed_seconds": payload.get("delayed_seconds", 0),
+        },
     )
     db.commit()
     if result.rowcount == 0:

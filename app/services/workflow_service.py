@@ -11,6 +11,7 @@ from urllib.parse import quote
 from sqlalchemy.orm import Session
 
 from ..config import settings
+from ..crypto import decrypt_secret
 from .. import repositories
 from ..db import TransactionalSessionLocal
 from ..storage import (
@@ -184,16 +185,25 @@ def _format_dahua_playback_time(value: datetime) -> str:
     return value.strftime("%Y_%m_%d_%H_%M_%S")
 
 
-def _build_dahua_rtsp_playback_url(*, channel: str, start_time: datetime, end_time: datetime) -> str:
-    if not settings.dahua_host or not settings.dahua_username or not settings.dahua_password:
-        raise ValueError("Dahua RTSP settings are incomplete. Set host, username, and password in the API environment.")
+def _build_dahua_rtsp_playback_url(
+    *,
+    host: str,
+    username: str,
+    password: str,
+    rtsp_port: int,
+    channel: str,
+    start_time: datetime,
+    end_time: datetime,
+) -> str:
+    if not host or not username or not password:
+        raise ValueError("Dahua RTSP settings are incomplete. Set location Dahua host, username, and password.")
 
-    username = quote(settings.dahua_username, safe="")
-    password = quote(settings.dahua_password, safe="")
+    encoded_username = quote(username, safe="")
+    encoded_password = quote(password, safe="")
     start = _format_dahua_playback_time(start_time)
     end = _format_dahua_playback_time(end_time)
     return (
-        f"rtsp://{username}:{password}@{settings.dahua_host}:{settings.dahua_rtsp_port}"
+        f"rtsp://{encoded_username}:{encoded_password}@{host}:{rtsp_port}"
         f"/cam/playback?channel={channel}&subtype={settings.dahua_playback_subtype}"
         f"&starttime={start}&endtime={end}"
     )
@@ -247,14 +257,26 @@ def _prepare_video_retrieval(
     end_time: datetime,
 ) -> VideoRetrievalQueued:
     cctv = repositories.get_cctv_by_location_section(db, location_id=location_id, section=section)
+    location = repositories.get_location_endpoint(db, location_id)
     channel = str(cctv.get("recorder_channel") or "").strip()
     if not channel:
         raise ValueError(f"{section.capitalize()} CCTV record does not have a recorder_channel.")
+    dahua_host = str(location.get("dahua_host") or "").strip()
+    dahua_username = str(location.get("dahua_username") or "").strip()
+    dahua_password_encrypted = str(location.get("dahua_password_encrypted") or "").strip()
+    if not dahua_host or not dahua_username or not dahua_password_encrypted:
+        raise ValueError(f"Location {location_id} does not have complete Dahua host credentials configured.")
+    dahua_password = decrypt_secret(dahua_password_encrypted)
+    rtsp_port = int(location.get("rtsp_port") or settings.dahua_rtsp_port)
     delayed_seconds = int(cctv.get("delayed_seconds") or 0)
     adjusted_start_time = start_time - timedelta(seconds=delayed_seconds)
     adjusted_end_time = end_time - timedelta(seconds=delayed_seconds)
 
     rtsp_url = _build_dahua_rtsp_playback_url(
+        host=dahua_host,
+        username=dahua_username,
+        password=dahua_password,
+        rtsp_port=rtsp_port,
         channel=channel,
         start_time=adjusted_start_time,
         end_time=adjusted_end_time,
@@ -285,6 +307,10 @@ def _prepare_video_retrieval(
                 "location_id": location_id,
                 "session_id": session_id,
                 "trigger_id": trigger_id,
+                "dahua_host": dahua_host,
+                "dahua_username": dahua_username,
+                "has_dahua_password": True,
+                "rtsp_port": rtsp_port,
                 "recorder_channel": channel,
                 "delayed_seconds": delayed_seconds,
                 "adjusted_start_time": adjusted_start_time.isoformat(),
@@ -366,6 +392,10 @@ def _run_video_retrieval_job(
                     "location_id": location_id,
                     "session_id": session_id,
                     "trigger_id": trigger_id,
+                    "dahua_host": dahua_host,
+                    "dahua_username": dahua_username,
+                    "has_dahua_password": True,
+                    "rtsp_port": rtsp_port,
                     "rtsp_url": rtsp_url,
                     "delayed_seconds": delayed_seconds,
                     "adjusted_start_time": adjusted_start_time.isoformat(),

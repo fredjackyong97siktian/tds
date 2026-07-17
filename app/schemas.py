@@ -35,6 +35,21 @@ class CctvResponse(CctvBase):
 class LocationOption(BaseModel):
     id: int
     name: str
+    dahua_host: str | None = None
+    dahua_username: str | None = None
+    dahua_password: str | None = None
+    rtsp_port: int | None = None
+    notes: str | None = None
+    has_endpoint_config: bool = False
+    has_password_config: bool = False
+
+
+class LocationEndpointUpsert(BaseModel):
+    dahua_host: str
+    dahua_username: str
+    dahua_password: str | None = None
+    rtsp_port: int = Field(default=554, ge=1, le=65535)
+    notes: str | None = None
 
 
 class WhitelistEntryCreate(BaseModel):
