@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from .. import repositories
@@ -44,5 +45,25 @@ def upsert_location_endpoint(
             },
         )
     except ValueError as exc:
-        raise HTTPException(status_code=404, detail="Location not found.") from exc
+        message = str(exc)
+        if message == "Location not found.":
+            raise HTTPException(status_code=404, detail=message) from exc
+        raise HTTPException(status_code=400, detail=message) from exc
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not save location endpoint: {exc}") from exc
     return LocationOption(**row)
+
+
+@router.delete("/{location_id}/endpoint")
+def delete_location_endpoint(location_id: int, db: Session = Depends(get_transaction_db)) -> dict[str, bool]:
+    try:
+        deleted = repositories.delete_location_endpoint(db, location_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not delete location endpoint: {exc}") from exc
+
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Location endpoint not found.")
+
+    return {"ok": True}

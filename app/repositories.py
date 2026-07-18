@@ -1,4 +1,5 @@
 import json
+import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -48,6 +49,19 @@ def _validate_whitelist_method(method: str) -> str:
     normalized = method.strip().lower()
     if normalized not in {"qrentry", "entrylogs"}:
         raise ValueError("Unsupported whitelist method.")
+    return normalized
+
+
+def _normalize_international_phone_number(value: str) -> str:
+    normalized = re.sub(r"[\s\-()]+", "", value.strip())
+    if not normalized:
+        raise ValueError("Phone number is required.")
+    if normalized.startswith("+"):
+        normalized = normalized[1:]
+    if not re.fullmatch(r"\d{8,15}", normalized):
+        raise ValueError("Phone number must include country code and contain only digits, for example 60123456789.")
+    if normalized.startswith("0"):
+        raise ValueError("Phone number must include country code and should not start with 0, for example 60123456789.")
     return normalized
 
 
@@ -208,25 +222,55 @@ def get_location_endpoint(db: Session, location_id: int) -> dict[str, Any]:
 
 def upsert_location_endpoint(db: Session, location_id: int, payload: Mapping[str, Any]) -> dict[str, Any]:
     location_endpoint_table = _table("location_endpoint")
-    db.execute(
+    existing = db.execute(
         text(
             f"""
-            insert into {location_endpoint_table} (
-                location_id, dahua_host, dahua_username, dahua_password_encrypted, rtsp_port, notes
-            )
-            values (
-                :location_id, :dahua_host, :dahua_username, :dahua_password_encrypted, :rtsp_port, :notes
-            )
-            on duplicate key update
-                dahua_host = values(dahua_host),
-                dahua_username = values(dahua_username),
-                dahua_password_encrypted = coalesce(values(dahua_password_encrypted), dahua_password_encrypted),
-                rtsp_port = values(rtsp_port),
-                notes = values(notes)
+            select id, dahua_password_encrypted
+            from {location_endpoint_table}
+            where location_id = :location_id
+            limit 1
             """
         ),
-        {"location_id": location_id, **payload},
-    )
+        {"location_id": location_id},
+    ).mappings().first()
+
+    if existing is None:
+        if payload.get("dahua_password_encrypted") is None:
+            raise ValueError("Password is required when creating a new location endpoint.")
+        db.execute(
+            text(
+                f"""
+                insert into {location_endpoint_table} (
+                    location_id, dahua_host, dahua_username, dahua_password_encrypted, rtsp_port, notes
+                )
+                values (
+                    :location_id, :dahua_host, :dahua_username, :dahua_password_encrypted, :rtsp_port, :notes
+                )
+                """
+            ),
+            {"location_id": location_id, **payload},
+        )
+    else:
+        update_sql = f"""
+            update {location_endpoint_table}
+            set dahua_host = :dahua_host,
+                dahua_username = :dahua_username,
+                rtsp_port = :rtsp_port,
+                notes = :notes
+        """
+        params = {
+            "location_id": location_id,
+            "dahua_host": payload["dahua_host"],
+            "dahua_username": payload["dahua_username"],
+            "rtsp_port": payload["rtsp_port"],
+            "notes": payload["notes"],
+        }
+        if payload.get("dahua_password_encrypted") is not None:
+            update_sql += ", dahua_password_encrypted = :dahua_password_encrypted"
+            params["dahua_password_encrypted"] = payload["dahua_password_encrypted"]
+        update_sql += " where location_id = :location_id"
+        db.execute(text(update_sql), params)
+
     db.commit()
     return get_location_endpoint(db, location_id)
 
@@ -245,6 +289,38 @@ def get_location_endpoint_by_location_id(db: Session, location_id: int) -> dict[
         {"location_id": location_id},
     )
     return _fetch_one_dict(result)
+
+
+def delete_location_endpoint(db: Session, location_id: int) -> bool:
+    location_endpoint_table = _table("location_endpoint")
+    cctv_table = _table("cctv")
+
+    linked_cctv_count = db.execute(
+        text(
+            f"""
+            select count(*) as total
+            from {cctv_table} c
+            join {location_endpoint_table} e on e.id = c.location_endpoint_id
+            where e.location_id = :location_id
+            """
+        ),
+        {"location_id": location_id},
+    ).scalar_one()
+
+    if int(linked_cctv_count or 0) > 0:
+        raise ValueError("Delete the CCTV rows for this location before deleting the NVR.")
+
+    result = db.execute(
+        text(
+            f"""
+            delete from {location_endpoint_table}
+            where location_id = :location_id
+            """
+        ),
+        {"location_id": location_id},
+    )
+    db.commit()
+    return bool(result.rowcount)
 
 
 def list_whitelist_entries(db: Session) -> list[dict[str, Any]]:
@@ -360,9 +436,28 @@ def list_whitelist_source_options(
 
 def create_phone_number_source(db: Session, phone_number: str) -> dict[str, Any]:
     source = _whitelist_source_config("qrentry")
-    normalized_phone_number = phone_number.strip()
-    if not normalized_phone_number:
-        raise ValueError("Phone number is required.")
+    normalized_phone_number = _normalize_international_phone_number(phone_number)
+
+    existing_result = db.execute(
+        text(
+            f"""
+            select cast({source["value_column"]} as char) as value,
+                   cast({source["label_column"]} as char) as label,
+                   case
+                       when {source["display_column"]} = {source["label_column"]} then null
+                       else cast({source["display_column"]} as char)
+                   end as secondary_label,
+                   'qrentry' as method
+            from {source["table_name"]}
+            where cast({source["create_column"]} as char) = :phone_number
+            limit 1
+            """
+        ),
+        {"phone_number": normalized_phone_number},
+    ).mappings().first()
+
+    if existing_result is not None:
+        raise ValueError("This phone number already exists.")
 
     db.execute(
         text(
