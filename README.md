@@ -155,7 +155,7 @@ If you use Nginx:
 
 The compose file mounts:
 
-- `../Detect.py` -> `/app/Detect.py`
+- `./Detect.py` -> `/app/tds/Detect.py`
 - `../session` -> `/app/session`
 - `./models` -> `/app/tds/models`
 
