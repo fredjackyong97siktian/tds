@@ -1,4 +1,5 @@
 import argparse
+import importlib.util
 import json
 import os
 import sys
@@ -13,7 +14,27 @@ from model_setup import configure_detect_model_env
 
 configure_detect_model_env()
 
-import Detect
+def _load_detect_module():
+    try:
+        import Detect as detect_module
+
+        return detect_module
+    except ModuleNotFoundError as exc:
+        detect_path = os.path.join(REPO_ROOT, "Detect.py")
+        if not os.path.exists(detect_path):
+            raise ModuleNotFoundError(
+                f"Detect.py was not found at {detect_path}. Make sure the file is mounted into the container."
+            ) from exc
+        spec = importlib.util.spec_from_file_location("Detect", detect_path)
+        if spec is None or spec.loader is None:
+            raise ModuleNotFoundError(f"Could not load Detect.py from {detect_path}.") from exc
+        detect_module = importlib.util.module_from_spec(spec)
+        sys.modules["Detect"] = detect_module
+        spec.loader.exec_module(detect_module)
+        return detect_module
+
+
+Detect = _load_detect_module()
 from detect_split_state import load_cross_state, save_cross_state
 
 
