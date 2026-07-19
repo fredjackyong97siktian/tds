@@ -616,7 +616,8 @@ def get_video_asset(db: Session, video_asset_id: int) -> dict[str, Any]:
         text(
             f"""
             select id, trigger_id, section, sequence_no, video_url, file_path,
-                   captured_start_time, captured_end_time, retention_until, status, metadata, created_at
+                   captured_start_time, captured_end_time, retrieved_at, analyzed_at,
+                   retention_until, status, metadata, created_at
             from {video_asset_table}
             where id = :video_asset_id
             """
@@ -632,7 +633,8 @@ def get_video_asset_by_file_path(db: Session, file_path: str) -> dict[str, Any]:
         text(
             f"""
             select id, trigger_id, section, sequence_no, video_url, file_path,
-                   captured_start_time, captured_end_time, retention_until, status, metadata, created_at
+                   captured_start_time, captured_end_time, retrieved_at, analyzed_at,
+                   retention_until, status, metadata, created_at
             from {video_asset_table}
             where file_path = :file_path
             order by id desc
@@ -658,6 +660,8 @@ def list_pending_video_asset_retrievals(db: Session, limit: int = 50) -> list[di
                    va.file_path,
                    va.captured_start_time,
                    va.captured_end_time,
+                   va.retrieved_at,
+                   va.analyzed_at,
                    va.created_at,
                    min(sva.session_id) as session_id,
                    coalesce(te.location_id, min(s.location_id)) as location_id
@@ -666,7 +670,7 @@ def list_pending_video_asset_retrievals(db: Session, limit: int = 50) -> list[di
             left join {session_video_asset_table} sva on sva.video_asset_id = va.id
             left join {session_table} s on s.id = sva.session_id
             where va.status = 'not_retrieved'
-            group by va.id, va.trigger_id, va.section, va.file_path, va.captured_start_time, va.captured_end_time, va.created_at, te.location_id
+            group by va.id, va.trigger_id, va.section, va.file_path, va.captured_start_time, va.captured_end_time, va.retrieved_at, va.analyzed_at, va.created_at, te.location_id
             order by va.created_at asc, va.id asc
             limit :limit
             """
@@ -690,6 +694,8 @@ def list_running_video_asset_retrievals(db: Session) -> list[dict[str, Any]]:
                    va.file_path,
                    va.captured_start_time,
                    va.captured_end_time,
+                   va.retrieved_at,
+                   va.analyzed_at,
                    min(sva.session_id) as session_id,
                    coalesce(te.location_id, min(s.location_id)) as location_id
             from {video_asset_table} va
@@ -697,7 +703,7 @@ def list_running_video_asset_retrievals(db: Session) -> list[dict[str, Any]]:
             left join {session_video_asset_table} sva on sva.video_asset_id = va.id
             left join {session_table} s on s.id = sva.session_id
             where va.status = 'retrieving'
-            group by va.id, va.trigger_id, va.section, va.file_path, va.captured_start_time, va.captured_end_time, te.location_id
+            group by va.id, va.trigger_id, va.section, va.file_path, va.captured_start_time, va.captured_end_time, va.retrieved_at, va.analyzed_at, te.location_id
             order by va.id asc
             """
         )
@@ -728,7 +734,7 @@ def list_video_assets(db: Session, limit: int = 50) -> list[dict[str, Any]]:
         text(
             f"""
             select va.id, va.trigger_id, va.section, va.sequence_no, va.video_url, va.file_path,
-                   va.captured_start_time, va.captured_end_time, va.retention_until, va.status,
+                   va.captured_start_time, va.captured_end_time, va.retrieved_at, va.analyzed_at, va.retention_until, va.status,
                    va.metadata, va.created_at,
                    count(distinct sva.id) as session_link_count,
                    min(sva.session_id) as primary_session_id,
@@ -736,7 +742,7 @@ def list_video_assets(db: Session, limit: int = 50) -> list[dict[str, Any]]:
             from {video_asset_table} va
             left join {session_video_asset_table} sva on sva.video_asset_id = va.id
             group by va.id, va.trigger_id, va.section, va.sequence_no, va.video_url, va.file_path,
-                     va.captured_start_time, va.captured_end_time, va.retention_until, va.status,
+                     va.captured_start_time, va.captured_end_time, va.retrieved_at, va.analyzed_at, va.retention_until, va.status,
                      va.metadata, va.created_at
             order by va.created_at desc, va.id desc
             limit :limit
@@ -981,11 +987,11 @@ def create_video_asset(db: Session, payload: Mapping[str, Any]) -> int:
             f"""
             insert into {video_asset_table} (
                 trigger_id, section, sequence_no, video_url, file_path, captured_start_time,
-                captured_end_time, retention_until, status, metadata
+                captured_end_time, retrieved_at, analyzed_at, retention_until, status, metadata
             )
             values (
                 :trigger_id, :section, :sequence_no, :video_url, :file_path, :captured_start_time,
-                :captured_end_time, :retention_until, :status, :metadata
+                :captured_end_time, :retrieved_at, :analyzed_at, :retention_until, :status, :metadata
             )
             """
         ),
@@ -1043,6 +1049,8 @@ def update_video_asset(db: Session, video_asset_id: int, payload: Mapping[str, A
                 file_path = :file_path,
                 captured_start_time = :captured_start_time,
                 captured_end_time = :captured_end_time,
+                retrieved_at = :retrieved_at,
+                analyzed_at = :analyzed_at,
                 retention_until = :retention_until,
                 status = :status,
                 metadata = :metadata
@@ -1051,7 +1059,14 @@ def update_video_asset(db: Session, video_asset_id: int, payload: Mapping[str, A
         ),
         {
             "video_asset_id": video_asset_id,
-            **payload,
+            "video_url": payload.get("video_url"),
+            "file_path": payload.get("file_path"),
+            "captured_start_time": payload.get("captured_start_time"),
+            "captured_end_time": payload.get("captured_end_time"),
+            "retrieved_at": payload.get("retrieved_at"),
+            "analyzed_at": payload.get("analyzed_at"),
+            "retention_until": payload.get("retention_until"),
+            "status": payload.get("status"),
             "metadata": json.dumps(payload.get("metadata")) if payload.get("metadata") is not None else None,
         },
     )

@@ -154,6 +154,8 @@ class VideoAssetCreate(BaseModel):
     sequence_no: int | None = None
     captured_start_time: datetime | None = None
     captured_end_time: datetime | None = None
+    retrieved_at: datetime | None = None
+    analyzed_at: datetime | None = None
     retention_until: datetime | None = None
     status: str = Field(default="not_retrieved", pattern="^(not_retrieved|retrieving|ready|processing|processed|deleted|issue)$")
     trigger_id: int | None = None
@@ -297,6 +299,8 @@ class VideoAssetListItem(BaseModel):
     file_path: str | None = None
     captured_start_time: datetime | None = None
     captured_end_time: datetime | None = None
+    retrieved_at: datetime | None = None
+    analyzed_at: datetime | None = None
     retention_until: datetime | None = None
     status: str
     metadata: dict[str, Any] | None = None

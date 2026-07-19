@@ -166,6 +166,8 @@ CREATE TABLE IF NOT EXISTS sesamedb.tds_video_asset (
     file_path TEXT,
     captured_start_time DATETIME,
     captured_end_time DATETIME,
+    retrieved_at DATETIME COMMENT 'When ffmpeg successfully finished retrieving the source clip.',
+    analyzed_at DATETIME COMMENT 'When the video finished successful analysis processing.',
     retention_until DATETIME COMMENT 'Delete the stored video file/object and this row after this timestamp; use 3-day retention by default.',
     status VARCHAR(30) NOT NULL DEFAULT 'not_retrieved' COMMENT 'Video lifecycle: not_retrieved, retrieving, ready, deleted, or issue.',
     metadata JSON,

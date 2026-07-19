@@ -1,6 +1,4 @@
 from __future__ import annotations
-
-import json
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -28,6 +26,7 @@ from ..storage import (
 
 
 UTC = timezone.utc
+SCRIPT_RUN_COMMAND_REDACTED = "[redacted]"
 
 
 @dataclass
@@ -174,6 +173,8 @@ def _upload_processed_video_for_asset(
             "file_path": f"spaces://{upload_result['object_key']}",
             "captured_start_time": video_asset_row.get("captured_start_time"),
             "captured_end_time": video_asset_row.get("captured_end_time"),
+            "retrieved_at": video_asset_row.get("retrieved_at"),
+            "analyzed_at": datetime.now(UTC),
             "retention_until": video_asset_row.get("retention_until"),
             "status": "processed",
             "metadata": None,
@@ -207,7 +208,7 @@ def run_script(
         script_name=script_name,
         model_name=model_name,
         status=status,
-        command=" ".join(command),
+        command=SCRIPT_RUN_COMMAND_REDACTED,
         stdout_log=completed.stdout,
         stderr_log=completed.stderr,
     )
@@ -385,6 +386,8 @@ def _prepare_video_retrieval(
             "file_path": str(output_path),
             "captured_start_time": start_time,
             "captured_end_time": end_time,
+            "retrieved_at": None,
+            "analyzed_at": None,
             "retention_until": retention_until,
             "status": "not_retrieved",
             "metadata": None,
@@ -540,6 +543,8 @@ def _run_video_retrieval_job(
                 "file_path": output_path,
                 "captured_start_time": start_time,
                 "captured_end_time": end_time,
+                "retrieved_at": datetime.now(UTC) if status == "success" else None,
+                "analyzed_at": None,
                 "retention_until": end_time + timedelta(days=3),
                 "status": "ready" if status == "success" else "issue",
                 "metadata": None,
@@ -552,7 +557,7 @@ def _run_video_retrieval_job(
             script_name="retrieve_video",
             model_name=f"dahua_rtsp_playback:{settings.dahua_output_video_codec}",
             status=status,
-            command=" ".join(command),
+            command=SCRIPT_RUN_COMMAND_REDACTED,
             stdout_log=completed.stdout,
             stderr_log=completed.stderr,
         )
@@ -565,6 +570,8 @@ def _run_video_retrieval_job(
                 "file_path": output_path,
                 "captured_start_time": start_time,
                 "captured_end_time": end_time,
+                "retrieved_at": None,
+                "analyzed_at": None,
                 "retention_until": end_time + timedelta(days=3),
                 "status": "issue",
                 "metadata": None,
@@ -577,7 +584,7 @@ def _run_video_retrieval_job(
             script_name="retrieve_video",
             model_name=f"dahua_rtsp_playback:{settings.dahua_output_video_codec}",
             status="failed",
-            command=" ".join(command),
+            command=SCRIPT_RUN_COMMAND_REDACTED,
             stdout_log="",
             stderr_log=str(exc),
         )
