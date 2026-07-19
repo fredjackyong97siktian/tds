@@ -386,7 +386,7 @@ def _prepare_video_retrieval(
             "captured_start_time": start_time,
             "captured_end_time": end_time,
             "retention_until": retention_until,
-            "status": "retrieving",
+            "status": "not_retrieved",
             "metadata": None,
         },
     )
@@ -424,8 +424,85 @@ def _prepare_video_retrieval(
         dahua_host=dahua_host,
         dahua_username=dahua_username,
         rtsp_port=rtsp_port,
-        status="retrieving",
+        status="not_retrieved",
         video_url=access_url,
+    )
+
+
+def build_retrieval_job_from_video_asset(db: Session, video_asset_id: int) -> VideoRetrievalQueued:
+    video_asset = repositories.get_video_asset(db, video_asset_id)
+    section = str(video_asset.get("section") or "").strip()
+    if not section:
+        raise ValueError(f"Video asset {video_asset_id} does not have a section.")
+
+    trigger_id = video_asset.get("trigger_id")
+    session_id = None
+    location_id = None
+
+    if trigger_id is not None:
+        trigger = repositories.get_trigger(db, int(trigger_id))
+        location_id = int(trigger["location_id"])
+    else:
+        candidates = repositories.list_pending_video_asset_retrievals(db, limit=500)
+        matched = next((row for row in candidates if int(row["id"]) == video_asset_id), None)
+        if matched is None:
+            matched = next((row for row in repositories.list_running_video_asset_retrievals(db) if int(row["id"]) == video_asset_id), None)
+        if matched is None:
+            raise ValueError(f"Could not resolve session/location for video asset {video_asset_id}.")
+        session_id = int(matched["session_id"]) if matched.get("session_id") is not None else None
+        location_id = int(matched["location_id"]) if matched.get("location_id") is not None else None
+
+    if location_id is None:
+        raise ValueError(f"Could not resolve location_id for video asset {video_asset_id}.")
+
+    start_time = video_asset.get("captured_start_time")
+    end_time = video_asset.get("captured_end_time")
+    if start_time is None or end_time is None:
+        raise ValueError(f"Video asset {video_asset_id} is missing capture timestamps.")
+
+    cctv = repositories.get_cctv_by_location_section(db, location_id=location_id, section=section)
+    location = repositories.get_location_endpoint(db, location_id)
+    channel = str(cctv.get("recorder_channel") or "").strip()
+    if not channel:
+        raise ValueError(f"{section.capitalize()} CCTV record does not have a recorder_channel.")
+    dahua_host = str(location.get("dahua_host") or "").strip()
+    dahua_username = str(location.get("dahua_username") or "").strip()
+    dahua_password_encrypted = str(location.get("dahua_password_encrypted") or "").strip()
+    if not dahua_host or not dahua_username or not dahua_password_encrypted:
+        raise ValueError(f"Location {location_id} does not have complete Dahua host credentials configured.")
+    dahua_password = decrypt_secret(dahua_password_encrypted)
+    rtsp_port = int(location.get("rtsp_port") or settings.dahua_rtsp_port)
+    delayed_seconds = int(cctv.get("delayed_seconds") or 0)
+    adjusted_start_time = start_time - timedelta(seconds=delayed_seconds)
+    adjusted_end_time = end_time - timedelta(seconds=delayed_seconds)
+    rtsp_url = _build_dahua_rtsp_playback_url(
+        host=dahua_host,
+        username=dahua_username,
+        password=dahua_password,
+        rtsp_port=rtsp_port,
+        channel=channel,
+        start_time=adjusted_start_time,
+        end_time=adjusted_end_time,
+    )
+
+    return VideoRetrievalQueued(
+        video_asset_id=video_asset_id,
+        session_id=session_id,
+        trigger_id=int(trigger_id) if trigger_id is not None else None,
+        location_id=location_id,
+        section=section,
+        requested_start_time=start_time,
+        requested_end_time=end_time,
+        delayed_seconds=delayed_seconds,
+        adjusted_start_time=adjusted_start_time,
+        adjusted_end_time=adjusted_end_time,
+        output_path=str(video_asset.get("file_path") or ""),
+        rtsp_url=rtsp_url,
+        dahua_host=dahua_host,
+        dahua_username=dahua_username,
+        rtsp_port=rtsp_port,
+        status=str(video_asset.get("status") or "retrieving"),
+        video_url=str(video_asset.get("video_url") or f"/api/v1/videos/assets/{video_asset_id}/content"),
     )
 
 

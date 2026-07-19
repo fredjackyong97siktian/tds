@@ -1,4 +1,4 @@
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from ..db import get_transaction_db
@@ -55,7 +55,6 @@ def run_kiosk(
 def retrieve_kiosk_video(
     session_id: int,
     payload: RetrievalRequest,
-    background_tasks: BackgroundTasks,
     db: Session = Depends(get_transaction_db),
 ) -> RetrievalAcceptedResponse:
     try:
@@ -68,9 +67,8 @@ def retrieve_kiosk_video(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    background_tasks.add_task(workflow_service.start_video_retrieval_job, result)
     return RetrievalAcceptedResponse(
-        message="Kiosk video retrieval queued.",
+        message="Kiosk video retrieval queued for worker pickup.",
         video_asset_id=result.video_asset_id,
         trigger_id=result.trigger_id,
         session_id=result.session_id,
@@ -88,7 +86,6 @@ def retrieve_kiosk_video(
 def retrieve_entrance_video(
     trigger_id: int,
     payload: RetrievalRequest,
-    background_tasks: BackgroundTasks,
     db: Session = Depends(get_transaction_db),
 ) -> RetrievalAcceptedResponse:
     try:
@@ -101,9 +98,8 @@ def retrieve_entrance_video(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    background_tasks.add_task(workflow_service.start_video_retrieval_job, result)
     return RetrievalAcceptedResponse(
-        message="Entrance video retrieval queued.",
+        message="Entrance video retrieval queued for worker pickup.",
         video_asset_id=result.video_asset_id,
         trigger_id=result.trigger_id,
         session_id=result.session_id,

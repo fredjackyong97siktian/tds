@@ -644,6 +644,83 @@ def get_video_asset_by_file_path(db: Session, file_path: str) -> dict[str, Any]:
     return _fetch_one_dict(result)
 
 
+def list_pending_video_asset_retrievals(db: Session, limit: int = 50) -> list[dict[str, Any]]:
+    video_asset_table = _table("video_asset")
+    trigger_table = _table("trigger_event")
+    session_video_asset_table = _table("session_video_asset")
+    session_table = _table("session")
+    result = db.execute(
+        text(
+            f"""
+            select va.id,
+                   va.trigger_id,
+                   va.section,
+                   va.file_path,
+                   va.captured_start_time,
+                   va.captured_end_time,
+                   va.created_at,
+                   min(sva.session_id) as session_id,
+                   coalesce(te.location_id, min(s.location_id)) as location_id
+            from {video_asset_table} va
+            left join {trigger_table} te on te.id = va.trigger_id
+            left join {session_video_asset_table} sva on sva.video_asset_id = va.id
+            left join {session_table} s on s.id = sva.session_id
+            where va.status = 'not_retrieved'
+            group by va.id, va.trigger_id, va.section, va.file_path, va.captured_start_time, va.captured_end_time, va.created_at, te.location_id
+            order by va.created_at asc, va.id asc
+            limit :limit
+            """
+        ),
+        {"limit": limit},
+    )
+    return _fetch_all_dicts(result)
+
+
+def list_running_video_asset_retrievals(db: Session) -> list[dict[str, Any]]:
+    video_asset_table = _table("video_asset")
+    trigger_table = _table("trigger_event")
+    session_video_asset_table = _table("session_video_asset")
+    session_table = _table("session")
+    result = db.execute(
+        text(
+            f"""
+            select va.id,
+                   va.trigger_id,
+                   va.section,
+                   va.file_path,
+                   va.captured_start_time,
+                   va.captured_end_time,
+                   min(sva.session_id) as session_id,
+                   coalesce(te.location_id, min(s.location_id)) as location_id
+            from {video_asset_table} va
+            left join {trigger_table} te on te.id = va.trigger_id
+            left join {session_video_asset_table} sva on sva.video_asset_id = va.id
+            left join {session_table} s on s.id = sva.session_id
+            where va.status = 'retrieving'
+            group by va.id, va.trigger_id, va.section, va.file_path, va.captured_start_time, va.captured_end_time, te.location_id
+            order by va.id asc
+            """
+        )
+    )
+    return _fetch_all_dicts(result)
+
+
+def claim_video_asset_for_retrieval(db: Session, video_asset_id: int) -> bool:
+    video_asset_table = _table("video_asset")
+    result = db.execute(
+        text(
+            f"""
+            update {video_asset_table}
+            set status = 'retrieving'
+            where id = :video_asset_id and status = 'not_retrieved'
+            """
+        ),
+        {"video_asset_id": video_asset_id},
+    )
+    db.commit()
+    return bool(result.rowcount)
+
+
 def list_video_assets(db: Session, limit: int = 50) -> list[dict[str, Any]]:
     video_asset_table = _table("video_asset")
     session_video_asset_table = _table("session_video_asset")

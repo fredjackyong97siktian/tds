@@ -15,3 +15,17 @@ services:
       - ../Detect.py:/app/Detect.py:ro
       - ../session:/app/session
       - ./models:/app/tds/models
+
+  theft-retrieval-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: theft-detection-worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    command: python -m app.workers.video_retrieval_worker
+    volumes:
+      - ../Detect.py:/app/Detect.py:ro
+      - ../session:/app/session
+      - ./models:/app/tds/models

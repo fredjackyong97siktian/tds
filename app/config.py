@@ -36,6 +36,9 @@ class Settings(BaseSettings):
     spaces_secret_key: str | None = None
     spaces_key_prefix: str = "tds"
     spaces_presign_ttl_seconds: int = 600
+    retrieval_poll_seconds: int = 10
+    retrieval_max_global_workers: int = 2
+    retrieval_max_per_location: int = 1
     whitelist_qrentry_table_name: str = "phonenumber"
     whitelist_qrentry_value_column: str = "participantId"
     whitelist_qrentry_label_column: str = "participantId"

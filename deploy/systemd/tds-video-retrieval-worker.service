@@ -1,0 +1,15 @@
+[Unit]
+Description=TDS Video Retrieval Worker
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/tds
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -m app.workers.video_retrieval_worker
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
