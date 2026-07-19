@@ -29,6 +29,13 @@ class Settings(BaseSettings):
     dahua_output_video_codec: str = "libx264"
     dahua_output_preset: str = "veryfast"
     dahua_output_crf: int = 23
+    spaces_endpoint_url: str | None = None
+    spaces_region: str = "sgp1"
+    spaces_bucket: str | None = None
+    spaces_access_key: str | None = None
+    spaces_secret_key: str | None = None
+    spaces_key_prefix: str = "tds"
+    spaces_presign_ttl_seconds: int = 600
     whitelist_qrentry_table_name: str = "phonenumber"
     whitelist_qrentry_value_column: str = "participantId"
     whitelist_qrentry_label_column: str = "participantId"
@@ -38,6 +45,9 @@ class Settings(BaseSettings):
     whitelist_entrylogs_value_column: str = "fingerprint"
     whitelist_entrylogs_label_column: str = "fingerprint"
     whitelist_entrylogs_display_column: str = "fingerprint"
+    theft_transaction_table_name: str = "transaction"
+    theft_transaction_status_column: str = "status"
+    theft_transaction_status_value: str = "theft"
 
     model_config = SettingsConfigDict(
         env_prefix="THEFT_API_",

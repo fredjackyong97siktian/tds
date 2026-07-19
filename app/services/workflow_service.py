@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import json
 import subprocess
-from threading import Thread
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from os.path import basename, splitext
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote
 
 from sqlalchemy.orm import Session
@@ -14,10 +15,14 @@ from ..config import settings
 from ..crypto import decrypt_secret
 from .. import repositories
 from ..db import TransactionalSessionLocal
+from ..spaces import upload_private_file
 from ..storage import (
+    guess_media_type,
     gallery_state_path as build_private_gallery_state_path,
+    processed_video_spaces_key,
     session_logs_root,
     session_root,
+    tmp_media_root,
     trigger_tmp_video_path,
     session_tmp_video_path,
 )
@@ -67,6 +72,9 @@ class VideoRetrievalQueued:
     adjusted_end_time: datetime
     output_path: str
     rtsp_url: str
+    dahua_host: str
+    dahua_username: str
+    rtsp_port: int
     status: str
     video_url: str
 
@@ -94,6 +102,128 @@ def default_video_output_dir(location_id: int, session_id: int, video_path: str)
     out_dir = build_logs_root(location_id, session_id) / stem
     out_dir.mkdir(parents=True, exist_ok=True)
     return out_dir
+
+
+def _coerce_metadata_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _safe_unlink(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        return
+
+
+def _is_under_tmp_media_root(path: Path) -> bool:
+    try:
+        resolved = path.resolve()
+        root = tmp_media_root().resolve()
+    except OSError:
+        return False
+    return resolved == root or root in resolved.parents
+
+
+def _expected_processed_video_path(video_path: str, output_dir: Path) -> Path:
+    return output_dir / f"{Path(video_path).stem}_output.mp4"
+
+
+def _lookup_video_asset_by_file_path(db: Session, video_path: str) -> dict[str, Any] | None:
+    try:
+        return repositories.get_video_asset_by_file_path(db, video_path)
+    except ValueError:
+        return None
+
+
+def _update_video_asset_status_with_merge(
+    db: Session,
+    *,
+    video_asset_row: dict[str, Any],
+    status: str,
+    metadata_updates: dict[str, Any],
+) -> None:
+    merged_metadata = {
+        **_coerce_metadata_dict(video_asset_row.get("metadata")),
+        **metadata_updates,
+    }
+    repositories.update_video_asset_status(db, int(video_asset_row["id"]), status, merged_metadata)
+
+
+def _upload_processed_video_for_asset(
+    db: Session,
+    *,
+    video_asset_row: dict[str, Any],
+    session_id: int | None,
+    trigger_id: int | None,
+    processed_video_path: Path,
+    source_video_path: str,
+    output_dir: Path,
+    script_name: str,
+    model_name: str | None,
+) -> None:
+    metadata = _coerce_metadata_dict(video_asset_row.get("metadata"))
+    location_id = int(metadata.get("location_id") or 0)
+    if location_id <= 0:
+        raise ValueError("Video asset metadata does not have a valid location_id for Spaces upload.")
+
+    object_key = processed_video_spaces_key(
+        location_id=location_id,
+        section=str(video_asset_row.get("section") or script_name),
+        filename=processed_video_path.name,
+        session_id=session_id,
+        trigger_id=trigger_id,
+    )
+    upload_result = upload_private_file(
+        processed_video_path,
+        object_key,
+        content_type=guess_media_type(str(processed_video_path)),
+    )
+
+    raw_input_path = Path(source_video_path)
+    raw_removed = False
+    if _is_under_tmp_media_root(raw_input_path):
+        _safe_unlink(raw_input_path)
+        raw_removed = not raw_input_path.exists()
+
+    processed_local_path = processed_video_path
+    _safe_unlink(processed_local_path)
+    processed_removed = not processed_local_path.exists()
+
+    repositories.update_video_asset(
+        db,
+        int(video_asset_row["id"]),
+        {
+            "video_url": f"/api/v1/videos/assets/{int(video_asset_row['id'])}/content",
+            "file_path": None,
+            "captured_start_time": video_asset_row.get("captured_start_time"),
+            "captured_end_time": video_asset_row.get("captured_end_time"),
+            "retention_until": video_asset_row.get("retention_until"),
+            "status": "processed",
+            "metadata": {
+                **metadata,
+                "analysis_script_name": script_name,
+                "analysis_model_name": model_name,
+                "analysis_output_dir": str(output_dir),
+                "analysis_processed_video_name": processed_video_path.name,
+                "analysis_processed_at": datetime.now(UTC).isoformat(),
+                "spaces_bucket": upload_result["bucket"],
+                "spaces_object_key": upload_result["object_key"],
+                "spaces_endpoint_url": upload_result["endpoint_url"],
+                "spaces_uploaded_at": datetime.now(UTC).isoformat(),
+                "source_video_path": source_video_path,
+                "raw_tmp_video_removed": raw_removed,
+                "processed_local_video_removed": processed_removed,
+            },
+        },
+    )
 
 
 def run_script(
@@ -350,6 +480,9 @@ def _prepare_video_retrieval(
         adjusted_end_time=adjusted_end_time,
         output_path=str(output_path),
         rtsp_url=rtsp_url,
+        dahua_host=dahua_host,
+        dahua_username=dahua_username,
+        rtsp_port=rtsp_port,
         status="retrieving",
         video_url=access_url,
     )
@@ -369,8 +502,12 @@ def _run_video_retrieval_job(
     adjusted_end_time: datetime,
     output_path: str,
     rtsp_url: str,
+    dahua_host: str,
+    dahua_username: str,
+    rtsp_port: int,
 ) -> None:
     db = TransactionalSessionLocal()
+    command: list[str] = []
     try:
         target_path = Path(output_path)
         target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -418,30 +555,70 @@ def _run_video_retrieval_job(
             stdout_log=completed.stdout,
             stderr_log=completed.stderr,
         )
+    except Exception as exc:
+        repositories.update_video_asset(
+            db,
+            video_asset_id,
+            {
+                "video_url": f"/api/v1/videos/assets/{video_asset_id}/content",
+                "file_path": output_path,
+                "captured_start_time": start_time,
+                "captured_end_time": end_time,
+                "retention_until": end_time + timedelta(days=3),
+                "status": "issue",
+                "metadata": {
+                    "retrieval_source": "dahua_rtsp_playback",
+                    "location_id": location_id,
+                    "session_id": session_id,
+                    "trigger_id": trigger_id,
+                    "dahua_host": dahua_host,
+                    "dahua_username": dahua_username,
+                    "has_dahua_password": True,
+                    "rtsp_port": rtsp_port,
+                    "rtsp_url": rtsp_url,
+                    "delayed_seconds": delayed_seconds,
+                    "adjusted_start_time": adjusted_start_time.isoformat(),
+                    "adjusted_end_time": adjusted_end_time.isoformat(),
+                    "output_codec": settings.dahua_output_video_codec,
+                    "ffmpeg_status": "exception",
+                    "ffmpeg_stdout": "",
+                    "ffmpeg_stderr": str(exc),
+                },
+            },
+        )
+        repositories.create_script_run(
+            db,
+            session_id=session_id,
+            trigger_id=trigger_id,
+            script_name="retrieve_video",
+            model_name=f"dahua_rtsp_playback:{settings.dahua_output_video_codec}",
+            status="failed",
+            command=" ".join(command),
+            stdout_log="",
+            stderr_log=str(exc),
+        )
     finally:
         db.close()
 
 
 def start_video_retrieval_job(job: VideoRetrievalQueued) -> None:
-    worker = Thread(
-        target=_run_video_retrieval_job,
-        kwargs={
-            "video_asset_id": job.video_asset_id,
-            "session_id": job.session_id,
-            "trigger_id": job.trigger_id,
-            "location_id": job.location_id,
-            "section": job.section,
-            "start_time": job.requested_start_time,
-            "end_time": job.requested_end_time,
-            "delayed_seconds": job.delayed_seconds,
-            "adjusted_start_time": job.adjusted_start_time,
-            "adjusted_end_time": job.adjusted_end_time,
-            "output_path": job.output_path,
-            "rtsp_url": job.rtsp_url,
-        },
-        daemon=True,
+    _run_video_retrieval_job(
+        video_asset_id=job.video_asset_id,
+        session_id=job.session_id,
+        trigger_id=job.trigger_id,
+        location_id=job.location_id,
+        section=job.section,
+        start_time=job.requested_start_time,
+        end_time=job.requested_end_time,
+        delayed_seconds=job.delayed_seconds,
+        adjusted_start_time=job.adjusted_start_time,
+        adjusted_end_time=job.adjusted_end_time,
+        output_path=job.output_path,
+        rtsp_url=job.rtsp_url,
+        dahua_host=job.dahua_host,
+        dahua_username=job.dahua_username,
+        rtsp_port=job.rtsp_port,
     )
-    worker.start()
 
 
 def retrieve_entrance_video_window(
@@ -497,7 +674,19 @@ def run_entry_for_trigger(
     workdir = build_session_workdir(location_id, session_id)
     resolved_output_dir = Path(output_dir) if output_dir else default_video_output_dir(location_id, session_id, video_path)
     resolved_gallery_state = Path(gallery_state_path) if gallery_state_path else build_private_gallery_state_path(location_id, session_id)
-    return run_script(
+    video_asset_row = _lookup_video_asset_by_file_path(db, video_path)
+    if video_asset_row is not None:
+        _update_video_asset_status_with_merge(
+            db,
+            video_asset_row=video_asset_row,
+            status="processing",
+            metadata_updates={
+                "analysis_script_name": "entry",
+                "analysis_started_at": datetime.now(UTC).isoformat(),
+            },
+        )
+
+    result = run_script(
         db,
         script_name="entry",
         model_name=model_name,
@@ -514,6 +703,74 @@ def run_entry_for_trigger(
         trigger_id=trigger_id,
         cwd=workdir,
     )
+    if video_asset_row is None:
+        return result
+    if result.status != "success":
+        _update_video_asset_status_with_merge(
+            db,
+            video_asset_row=video_asset_row,
+            status="issue",
+            metadata_updates={
+                "analysis_script_name": "entry",
+                "analysis_failed_at": datetime.now(UTC).isoformat(),
+                "analysis_failure_reason": "entry_script_failed",
+            },
+        )
+        return result
+
+    processed_video_path = _expected_processed_video_path(video_path, resolved_output_dir)
+    if not processed_video_path.exists():
+        _update_video_asset_status_with_merge(
+            db,
+            video_asset_row=video_asset_row,
+            status="issue",
+            metadata_updates={
+                "analysis_script_name": "entry",
+                "analysis_failed_at": datetime.now(UTC).isoformat(),
+                "analysis_failure_reason": f"processed_video_missing:{processed_video_path}",
+            },
+        )
+        return ScriptExecutionResult(
+            script_name=result.script_name,
+            model_name=result.model_name,
+            status="failed",
+            command=result.command,
+            stdout=result.stdout,
+            stderr=f"{result.stderr}\nProcessed video not found at {processed_video_path}".strip(),
+        )
+
+    try:
+        _upload_processed_video_for_asset(
+            db,
+            video_asset_row=video_asset_row,
+            session_id=session_id,
+            trigger_id=trigger_id,
+            processed_video_path=processed_video_path,
+            source_video_path=video_path,
+            output_dir=resolved_output_dir,
+            script_name="entry",
+            model_name=model_name,
+        )
+    except Exception as exc:
+        _update_video_asset_status_with_merge(
+            db,
+            video_asset_row=video_asset_row,
+            status="issue",
+            metadata_updates={
+                "analysis_script_name": "entry",
+                "analysis_failed_at": datetime.now(UTC).isoformat(),
+                "analysis_failure_reason": f"spaces_upload_failed:{exc}",
+            },
+        )
+        return ScriptExecutionResult(
+            script_name=result.script_name,
+            model_name=result.model_name,
+            status="failed",
+            command=result.command,
+            stdout=result.stdout,
+            stderr=f"{result.stderr}\nDigitalOcean Spaces upload failed: {exc}".strip(),
+        )
+    return result
 
 
 def run_kiosk_for_session(
@@ -530,7 +787,19 @@ def run_kiosk_for_session(
     workdir = build_session_workdir(location_id, session_id)
     resolved_output_dir = Path(output_dir) if output_dir else default_video_output_dir(location_id, session_id, video_path)
     resolved_gallery_state = Path(gallery_state_path) if gallery_state_path else build_private_gallery_state_path(location_id, session_id)
-    return run_script(
+    video_asset_row = _lookup_video_asset_by_file_path(db, video_path)
+    if video_asset_row is not None:
+        _update_video_asset_status_with_merge(
+            db,
+            video_asset_row=video_asset_row,
+            status="processing",
+            metadata_updates={
+                "analysis_script_name": "kiosk",
+                "analysis_started_at": datetime.now(UTC).isoformat(),
+            },
+        )
+
+    result = run_script(
         db,
         script_name="kiosk",
         model_name=model_name,
@@ -547,6 +816,74 @@ def run_kiosk_for_session(
         trigger_id=None,
         cwd=workdir,
     )
+    if video_asset_row is None:
+        return result
+    if result.status != "success":
+        _update_video_asset_status_with_merge(
+            db,
+            video_asset_row=video_asset_row,
+            status="issue",
+            metadata_updates={
+                "analysis_script_name": "kiosk",
+                "analysis_failed_at": datetime.now(UTC).isoformat(),
+                "analysis_failure_reason": "kiosk_script_failed",
+            },
+        )
+        return result
+
+    processed_video_path = _expected_processed_video_path(video_path, resolved_output_dir)
+    if not processed_video_path.exists():
+        _update_video_asset_status_with_merge(
+            db,
+            video_asset_row=video_asset_row,
+            status="issue",
+            metadata_updates={
+                "analysis_script_name": "kiosk",
+                "analysis_failed_at": datetime.now(UTC).isoformat(),
+                "analysis_failure_reason": f"processed_video_missing:{processed_video_path}",
+            },
+        )
+        return ScriptExecutionResult(
+            script_name=result.script_name,
+            model_name=result.model_name,
+            status="failed",
+            command=result.command,
+            stdout=result.stdout,
+            stderr=f"{result.stderr}\nProcessed video not found at {processed_video_path}".strip(),
+        )
+
+    try:
+        _upload_processed_video_for_asset(
+            db,
+            video_asset_row=video_asset_row,
+            session_id=session_id,
+            trigger_id=None,
+            processed_video_path=processed_video_path,
+            source_video_path=video_path,
+            output_dir=resolved_output_dir,
+            script_name="kiosk",
+            model_name=model_name,
+        )
+    except Exception as exc:
+        _update_video_asset_status_with_merge(
+            db,
+            video_asset_row=video_asset_row,
+            status="issue",
+            metadata_updates={
+                "analysis_script_name": "kiosk",
+                "analysis_failed_at": datetime.now(UTC).isoformat(),
+                "analysis_failure_reason": f"spaces_upload_failed:{exc}",
+            },
+        )
+        return ScriptExecutionResult(
+            script_name=result.script_name,
+            model_name=result.model_name,
+            status="failed",
+            command=result.command,
+            stdout=result.stdout,
+            stderr=f"{result.stderr}\nDigitalOcean Spaces upload failed: {exc}".strip(),
+        )
+    return result
 
 
 def check_video_ready_policy(created_time: datetime, retries_used: int) -> dict:

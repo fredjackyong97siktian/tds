@@ -13,6 +13,10 @@ def _table(name: str) -> str:
     return f"{settings.transactional_table_prefix}{name}"
 
 
+def _quote_identifier(name: str) -> str:
+    return f"`{name.replace('`', '``')}`"
+
+
 def _fetch_one_dict(result) -> dict[str, Any]:
     row = result.mappings().first()
     if row is None:
@@ -22,6 +26,13 @@ def _fetch_one_dict(result) -> dict[str, Any]:
 
 def _fetch_all_dicts(result) -> list[dict[str, Any]]:
     return [dict(row) for row in result.mappings().all()]
+
+
+def _pick_first(row: Mapping[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in row and row[key] is not None:
+            return row[key]
+    return None
 
 
 def _whitelist_source_config(method: str) -> dict[str, str]:
@@ -161,6 +172,78 @@ def list_cctv(db: Session, location_id: int | None = None) -> list[dict[str, Any
         {"location_id": location_id},
     )
     return _fetch_all_dicts(result)
+
+
+def list_theft_transactions(db: Session, limit: int = 50) -> list[dict[str, Any]]:
+    table_name = _quote_identifier(settings.theft_transaction_table_name)
+    status_column = _quote_identifier(settings.theft_transaction_status_column)
+
+    result = db.execute(
+        text(
+            f"""
+            select *
+            from {table_name}
+            where {status_column} = :status_value
+            limit :limit
+            """
+        ),
+        {
+            "status_value": settings.theft_transaction_status_value,
+            "limit": limit,
+        },
+    )
+    rows = _fetch_all_dicts(result)
+
+    def sort_key(row: Mapping[str, Any]) -> Any:
+        return _pick_first(row, "created_at", "createdAt", "transaction_time", "transactionTime", "updated_at", "updatedAt")
+
+    sorted_rows = sorted(rows, key=lambda row: sort_key(row) or 0, reverse=True)
+
+    payload: list[dict[str, Any]] = []
+    for row in sorted_rows:
+        item_id = _pick_first(row, "id", "ID", "transaction_id", "transactionId", "receipt_number", "receiptNumber")
+        payload.append(
+            {
+                "id": str(item_id) if item_id is not None else "-",
+                "reference": (
+                    str(
+                        _pick_first(
+                            row,
+                            "receipt_number",
+                            "receiptNumber",
+                            "reference",
+                            "reference_no",
+                            "referenceNo",
+                            "transaction_id",
+                            "transactionId",
+                        )
+                    )
+                    if _pick_first(
+                        row,
+                        "receipt_number",
+                        "receiptNumber",
+                        "reference",
+                        "reference_no",
+                        "referenceNo",
+                        "transaction_id",
+                        "transactionId",
+                    )
+                    is not None
+                    else None
+                ),
+                "location_id": (
+                    str(_pick_first(row, "location_id", "locationId", "store_id", "storeId"))
+                    if _pick_first(row, "location_id", "locationId", "store_id", "storeId") is not None
+                    else None
+                ),
+                "status": str(_pick_first(row, settings.theft_transaction_status_column) or settings.theft_transaction_status_value),
+                "total_amount": _pick_first(row, "total_amount", "totalAmount", "amount", "grand_total", "grandTotal"),
+                "created_at": _pick_first(row, "created_at", "createdAt", "transaction_time", "transactionTime", "updated_at", "updatedAt"),
+                "metadata": {key: value for key, value in row.items()},
+            }
+        )
+
+    return payload
 
 
 def list_locations(db: Session) -> list[dict[str, Any]]:
@@ -539,6 +622,24 @@ def get_video_asset(db: Session, video_asset_id: int) -> dict[str, Any]:
             """
         ),
         {"video_asset_id": video_asset_id},
+    )
+    return _fetch_one_dict(result)
+
+
+def get_video_asset_by_file_path(db: Session, file_path: str) -> dict[str, Any]:
+    video_asset_table = _table("video_asset")
+    result = db.execute(
+        text(
+            f"""
+            select id, trigger_id, section, sequence_no, video_url, file_path,
+                   captured_start_time, captured_end_time, retention_until, status, metadata, created_at
+            from {video_asset_table}
+            where file_path = :file_path
+            order by id desc
+            limit 1
+            """
+        ),
+        {"file_path": file_path},
     )
     return _fetch_one_dict(result)
 

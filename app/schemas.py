@@ -15,7 +15,7 @@ class CctvBase(BaseModel):
     section: str
     stream_name: str | None = None
     recorder_channel: str | None = None
-    delayed_seconds: int = Field(default=0, ge=0)
+    delayed_seconds: int = 0
 
 
 class CctvCreate(CctvBase):
@@ -258,6 +258,16 @@ class CustomerGalleryResponse(BaseModel):
 
 class ActiveGalleryUpsert(BaseModel):
     session_id: int | None = None
+
+
+class TheftListItem(BaseModel):
+    id: str
+    reference: str | None = None
+    location_id: str | None = None
+    status: str
+    total_amount: float | None = None
+    created_at: datetime | None = None
+    metadata: dict[str, Any] | None = None
     session_customer_id: int
     person_id: int | None = None
     state_kind: str = "active_gallery"

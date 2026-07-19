@@ -114,6 +114,35 @@ def session_customer_reid_path(
     return directory / _safe_name(filename)
 
 
+def build_spaces_object_key(*parts: str) -> str:
+    segments: list[str] = []
+    prefix = str(settings.spaces_key_prefix or "").strip().strip("/")
+    if prefix:
+        segments.append(_safe_name(prefix))
+    for part in parts:
+        cleaned = _safe_name(str(part))
+        if cleaned:
+            segments.append(cleaned)
+    return "/".join(segments)
+
+
+def processed_video_spaces_key(
+    *,
+    location_id: int,
+    section: str,
+    filename: str,
+    session_id: int | None = None,
+    trigger_id: int | None = None,
+) -> str:
+    segments = ["locations", f"location_{location_id}"]
+    if session_id is not None:
+        segments.extend(["sessions", f"session_{session_id}"])
+    if trigger_id is not None:
+        segments.extend(["triggers", f"trigger_{trigger_id}"])
+    segments.extend(["videos", section, "processed", filename])
+    return build_spaces_object_key(*segments)
+
+
 def infer_filename(source: str | None, fallback_stem: str, default_extension: str) -> str:
     if source:
         parsed = urlparse(source)
