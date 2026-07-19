@@ -6,6 +6,7 @@ ENV PYTHONUNBUFFERED=1
 WORKDIR /app/tds
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    g++ \
     ffmpeg \
     git \
     libglib2.0-0 \
