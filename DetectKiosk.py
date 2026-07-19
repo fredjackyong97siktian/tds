@@ -20,10 +20,16 @@ def _load_detect_module():
 
         return detect_module
     except ModuleNotFoundError as exc:
-        detect_path = os.path.join(REPO_ROOT, "Detect.py")
-        if not os.path.exists(detect_path):
+        detect_override = os.environ.get("DETECT_MODULE_PATH")
+        candidate_paths = [
+            detect_override,
+            os.path.join(THIS_DIR, "Detect.py"),
+            os.path.join(REPO_ROOT, "Detect.py"),
+        ]
+        detect_path = next((path for path in candidate_paths if path and os.path.isfile(path)), None)
+        if detect_path is None:
             raise ModuleNotFoundError(
-                f"Detect.py was not found at {detect_path}. Make sure the file is mounted into the container."
+                f"Detect.py was not found in any expected location: {candidate_paths}. Make sure the file is mounted into the container."
             ) from exc
         spec = importlib.util.spec_from_file_location("Detect", detect_path)
         if spec is None or spec.loader is None:
