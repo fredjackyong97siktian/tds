@@ -727,6 +727,135 @@ def claim_video_asset_for_retrieval(db: Session, video_asset_id: int) -> bool:
     return bool(result.rowcount)
 
 
+def list_pending_video_asset_analyses(db: Session, limit: int = 50) -> list[dict[str, Any]]:
+    video_asset_table = _table("video_asset")
+    trigger_table = _table("trigger_event")
+    result = db.execute(
+        text(
+            f"""
+            select va.id,
+                   va.trigger_id,
+                   va.section,
+                   va.file_path,
+                   va.video_url,
+                   va.captured_start_time,
+                   va.captured_end_time,
+                   va.retrieved_at,
+                   va.analyzed_at,
+                   va.created_at,
+                   te.location_id
+            from {video_asset_table} va
+            inner join {trigger_table} te on te.id = va.trigger_id
+            where va.section = 'entrance'
+              and va.status = 'ready'
+              and not exists (
+                  select 1
+                  from {video_asset_table} prev
+                  inner join {trigger_table} prev_te on prev_te.id = prev.trigger_id
+                  where prev.section = 'entrance'
+                    and prev_te.location_id = te.location_id
+                    and (
+                        coalesce(prev.captured_start_time, prev.created_at) < coalesce(va.captured_start_time, va.created_at)
+                        or (
+                            coalesce(prev.captured_start_time, prev.created_at) = coalesce(va.captured_start_time, va.created_at)
+                            and prev.id < va.id
+                        )
+                    )
+                    and prev.status in ('not_retrieved', 'retrieving', 'ready', 'processing', 'issue')
+              )
+            order by coalesce(va.captured_start_time, va.created_at) asc, va.id asc
+            limit :limit
+            """
+        ),
+        {"limit": limit},
+    )
+    return _fetch_all_dicts(result)
+
+
+def list_running_video_asset_analyses(db: Session) -> list[dict[str, Any]]:
+    video_asset_table = _table("video_asset")
+    trigger_table = _table("trigger_event")
+    result = db.execute(
+        text(
+            f"""
+            select va.id,
+                   va.trigger_id,
+                   va.section,
+                   va.file_path,
+                   va.video_url,
+                   va.captured_start_time,
+                   va.captured_end_time,
+                   va.retrieved_at,
+                   va.analyzed_at,
+                   va.created_at,
+                   te.location_id
+            from {video_asset_table} va
+            inner join {trigger_table} te on te.id = va.trigger_id
+            where va.section = 'entrance'
+              and va.status = 'processing'
+            order by va.id asc
+            """
+        )
+    )
+    return _fetch_all_dicts(result)
+
+
+def claim_video_asset_for_analysis(db: Session, video_asset_id: int) -> bool:
+    video_asset_table = _table("video_asset")
+    result = db.execute(
+        text(
+            f"""
+            update {video_asset_table}
+            set status = 'processing'
+            where id = :video_asset_id
+              and section = 'entrance'
+              and status = 'ready'
+            """
+        ),
+        {"video_asset_id": video_asset_id},
+    )
+    db.commit()
+    return bool(result.rowcount)
+
+
+def list_location_analysis_heads(db: Session) -> list[dict[str, Any]]:
+    video_asset_table = _table("video_asset")
+    trigger_table = _table("trigger_event")
+    result = db.execute(
+        text(
+            f"""
+            select head.id,
+                   head.trigger_id,
+                   head.status,
+                   head.captured_start_time,
+                   head.created_at,
+                   te.location_id
+            from {video_asset_table} head
+            inner join {trigger_table} te on te.id = head.trigger_id
+            where head.section = 'entrance'
+              and head.status in ('not_retrieved', 'retrieving', 'ready', 'processing', 'issue')
+              and not exists (
+                  select 1
+                  from {video_asset_table} prev
+                  inner join {trigger_table} prev_te on prev_te.id = prev.trigger_id
+                  where prev.section = 'entrance'
+                    and prev.status in ('not_retrieved', 'retrieving', 'ready', 'processing', 'issue')
+                    and prev_te.location_id = te.location_id
+                    and (
+                        coalesce(prev.captured_start_time, prev.created_at) < coalesce(head.captured_start_time, head.created_at)
+                        or (
+                            coalesce(prev.captured_start_time, prev.created_at) = coalesce(head.captured_start_time, head.created_at)
+                            and prev.id < head.id
+                        )
+                    )
+              )
+            order by te.location_id asc
+            """
+        )
+    )
+    return _fetch_all_dicts(result)
+
+
 def list_video_assets(db: Session, limit: int = 50) -> list[dict[str, Any]]:
     video_asset_table = _table("video_asset")
     session_video_asset_table = _table("session_video_asset")
@@ -770,6 +899,24 @@ def get_session(db: Session, session_id: int) -> dict[str, Any]:
             """
         ),
         {"session_id": session_id},
+    )
+    return _fetch_one_dict(result)
+
+
+def get_session_by_entry_trigger_id(db: Session, entry_trigger_id: int) -> dict[str, Any]:
+    session_table = _table("session")
+    result = db.execute(
+        text(
+            f"""
+            select id, entry_trigger_id, exit_trigger_id, location_id, status, start_time, end_time,
+                   total_item_brought, actual_items_brought, transaction_total_items, total_customer
+            from {session_table}
+            where entry_trigger_id = :entry_trigger_id
+            order by id asc
+            limit 1
+            """
+        ),
+        {"entry_trigger_id": entry_trigger_id},
     )
     return _fetch_one_dict(result)
 

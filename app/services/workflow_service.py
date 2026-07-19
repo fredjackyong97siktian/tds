@@ -77,6 +77,16 @@ class VideoRetrievalQueued:
     video_url: str
 
 
+@dataclass
+class EntranceAnalysisQueued:
+    video_asset_id: int
+    trigger_id: int
+    session_id: int
+    location_id: int
+    video_path: str
+    model_name: str | None = None
+
+
 def build_session_workdir(location_id: int, session_id: int) -> Path:
     workdir = session_root(location_id, session_id)
     workdir.mkdir(parents=True, exist_ok=True)
@@ -509,6 +519,28 @@ def build_retrieval_job_from_video_asset(db: Session, video_asset_id: int) -> Vi
     )
 
 
+def build_entrance_analysis_job_from_video_asset(db: Session, video_asset_id: int) -> EntranceAnalysisQueued:
+    video_asset = repositories.get_video_asset(db, video_asset_id)
+    trigger_id = video_asset.get("trigger_id")
+    if trigger_id is None:
+        raise ValueError(f"Video asset {video_asset_id} does not have a related trigger.")
+    if str(video_asset.get("section") or "") != "entrance":
+        raise ValueError(f"Video asset {video_asset_id} is not an entrance video.")
+    video_path = str(video_asset.get("file_path") or "").strip()
+    if not video_path:
+        raise ValueError(f"Video asset {video_asset_id} does not have a file path.")
+    trigger = repositories.get_trigger(db, int(trigger_id))
+    session = repositories.get_session_by_entry_trigger_id(db, int(trigger_id))
+    return EntranceAnalysisQueued(
+        video_asset_id=video_asset_id,
+        trigger_id=int(trigger_id),
+        session_id=int(session["id"]),
+        location_id=int(trigger["location_id"]),
+        video_path=video_path,
+        model_name=None,
+    )
+
+
 def _run_video_retrieval_job(
     *,
     video_asset_id: int,
@@ -610,6 +642,36 @@ def start_video_retrieval_job(job: VideoRetrievalQueued) -> None:
         dahua_username=job.dahua_username,
         rtsp_port=job.rtsp_port,
     )
+
+
+def start_entrance_analysis_job(job: EntranceAnalysisQueued) -> None:
+    db = TransactionalSessionLocal()
+    try:
+        result = run_entry_for_trigger(
+            db,
+            trigger_id=job.trigger_id,
+            session_id=job.session_id,
+            video_path=job.video_path,
+            model_name=job.model_name,
+        )
+        if result.status != "success":
+            repositories.update_video_asset_status(db, job.video_asset_id, "issue")
+    except Exception as exc:
+        repositories.update_video_asset_status(db, job.video_asset_id, "issue")
+        repositories.create_script_run(
+            db,
+            session_id=job.session_id,
+            trigger_id=job.trigger_id,
+            script_name="entry",
+            model_name=job.model_name or "analysis_worker",
+            status="failed",
+            command=SCRIPT_RUN_COMMAND_REDACTED,
+            stdout_log="",
+            stderr_log=str(exc),
+        )
+        raise
+    finally:
+        db.close()
 
 
 def retrieve_entrance_video_window(
