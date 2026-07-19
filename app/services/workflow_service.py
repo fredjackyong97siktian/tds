@@ -530,7 +530,19 @@ def build_entrance_analysis_job_from_video_asset(db: Session, video_asset_id: in
     if not video_path:
         raise ValueError(f"Video asset {video_asset_id} does not have a file path.")
     trigger = repositories.get_trigger(db, int(trigger_id))
-    session = repositories.get_session_by_entry_trigger_id(db, int(trigger_id))
+    try:
+        session = repositories.get_session_by_entry_trigger_id(db, int(trigger_id))
+    except ValueError:
+        session = repositories.create_session(
+            db,
+            {
+                "entry_trigger_id": int(trigger_id),
+                "exit_trigger_id": None,
+                "location_id": int(trigger["location_id"]),
+                "start_time": trigger.get("trigger_time"),
+            },
+        )
+        repositories.update_trigger_status(db, int(trigger_id), "video_pending")
     return EntranceAnalysisQueued(
         video_asset_id=video_asset_id,
         trigger_id=int(trigger_id),

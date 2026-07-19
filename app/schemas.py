@@ -107,6 +107,14 @@ class TriggerListItem(TriggerResponse):
     entry_match_status: str
     whitelist_hit: bool = False
     issue_reason: str | None = None
+    latest_script_name: str | None = None
+    latest_script_status: str | None = None
+    latest_script_finished_at: datetime | None = None
+    latest_error_log: str | None = None
+    latest_video_asset_id: int | None = None
+    latest_video_status: str | None = None
+    can_retry: bool = False
+    retry_to_status: str | None = None
     created_at: datetime
     updated_at: datetime
 
