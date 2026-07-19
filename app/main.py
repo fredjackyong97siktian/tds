@@ -10,6 +10,7 @@ from .routers.triggers import router as triggers_router
 from .routers.vector import router as vector_router
 from .routers.videos import router as videos_router
 from .routers.whitelist import router as whitelist_router
+from .routers.workers import router as workers_router
 from .routers.workflows import router as workflows_router
 
 
@@ -28,6 +29,7 @@ app.include_router(sessions_router)
 app.include_router(theft_router)
 app.include_router(videos_router)
 app.include_router(vector_router)
+app.include_router(workers_router)
 app.include_router(workflows_router)
 
 
