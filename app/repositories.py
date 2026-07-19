@@ -987,6 +987,14 @@ def create_session_customer(db: Session, session_id: int, payload: Mapping[str, 
 
 def create_video_asset(db: Session, payload: Mapping[str, Any]) -> int:
     video_asset_table = _table("video_asset")
+    file_path = payload.get("file_path")
+    if isinstance(file_path, str) and file_path.strip():
+        try:
+            existing_row = get_video_asset_by_file_path(db, file_path.strip())
+        except ValueError:
+            existing_row = None
+        if existing_row is not None:
+            return int(existing_row["id"])
     result = db.execute(
         text(
             f"""
