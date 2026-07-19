@@ -17,5 +17,6 @@ transformers==5.8.1
 timm==1.0.27
 torchreid==0.2.5
 fashion-clip==0.2.2
+gdown==5.2.0
 clip @ git+https://github.com/ultralytics/CLIP.git@81ff68ed7ffcac3b40484c914f104f816757308d
 mobileclip @ git+https://github.com/ultralytics/mobileclip.git@6183bdd2dab5d0bad1e1195c35338e831f47bbca

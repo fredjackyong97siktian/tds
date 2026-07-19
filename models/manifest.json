@@ -2,17 +2,17 @@
   "required": [
     {
       "name": "entry_detection_model",
-      "path": "tds/models/yolo26s.pt",
+      "path": "tds/models/detection/yolo26s.pt",
       "env": "MODEL_PATH"
     },
     {
       "name": "tracker_config",
-      "path": "tds/models/custom_tracker.yaml",
+      "path": "tds/models/tracker/custom_tracker.yaml",
       "env": "TRACKER_PATH"
     },
     {
       "name": "entry_segmentation_model",
-      "path": "tds/models/yoloe-11l-seg.pt",
+      "path": "tds/models/segmentation/yoloe-11l-seg.pt",
       "env": "REID_MASK_MODEL_PATH"
     },
     {
@@ -22,14 +22,25 @@
     },
     {
       "name": "kiosk_pose_model",
-      "path": "tds/models/yolo26l-pose.pt",
+      "path": "tds/models/pose/yolo26l-pose.pt",
       "env": "KIOSK_POSE_MODEL_PATH"
+    },
+    {
+      "name": "kiosk_tracker_config",
+      "path": "tds/models/tracker/custom_tracker.yaml",
+      "env": "KIOSK_TRACKER_PATH"
     }
   ],
   "optional": [
     {
+      "name": "kiosk_product_model",
+      "path": "tds/models/detection/yolo26s.pt",
+      "env": "KIOSK_PRODUCT_MODEL_PATH",
+      "status": "defaults_to_entry_detection_model"
+    },
+    {
       "name": "mobileclip_pt",
-      "path": "tds/models/mobileclip_blt.pt",
+      "path": "tds/models/text/mobileclip_blt.pt",
       "env": "MOBILECLIP_PT_PATH",
       "status": "not_present_locally"
     }
