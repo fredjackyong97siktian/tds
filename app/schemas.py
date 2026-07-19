@@ -317,3 +317,9 @@ class VideoAssetListItem(BaseModel):
     session_link_count: int = 0
     primary_session_id: int | None = None
     session_ids: str | None = None
+    latest_script_name: str | None = None
+    latest_script_status: str | None = None
+    latest_script_finished_at: datetime | None = None
+    latest_error_log: str | None = None
+    can_retry: bool = False
+    retry_to_status: str | None = None

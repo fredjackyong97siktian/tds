@@ -1052,6 +1052,7 @@ def list_video_assets(db: Session, limit: int = 50) -> list[dict[str, Any]]:
     session_video_asset_table = _table("session_video_asset")
     trigger_table = _table("trigger_event")
     session_table = _table("session")
+    script_run_table = _table("script_run")
     result = db.execute(
         text(
             f"""
@@ -1061,7 +1062,49 @@ def list_video_assets(db: Session, limit: int = 50) -> list[dict[str, Any]]:
                    coalesce(te.location_id, min(s.location_id)) as location_id,
                    count(distinct sva.id) as session_link_count,
                    min(sva.session_id) as primary_session_id,
-                   group_concat(distinct sva.session_id order by sva.session_id separator ',') as session_ids
+                   group_concat(distinct sva.session_id order by sva.session_id separator ',') as session_ids,
+                   (
+                       select sr.script_name
+                       from {script_run_table} sr
+                       where sr.trigger_id = va.trigger_id
+                       order by sr.id desc
+                       limit 1
+                   ) as latest_script_name,
+                   (
+                       select sr.status
+                       from {script_run_table} sr
+                       where sr.trigger_id = va.trigger_id
+                       order by sr.id desc
+                       limit 1
+                   ) as latest_script_status,
+                   (
+                       select sr.finished_at
+                       from {script_run_table} sr
+                       where sr.trigger_id = va.trigger_id
+                       order by sr.id desc
+                       limit 1
+                   ) as latest_script_finished_at,
+                   (
+                       select nullif(trim(sr.stderr_log), '')
+                       from {script_run_table} sr
+                       where sr.trigger_id = va.trigger_id
+                         and sr.status = 'failed'
+                       order by sr.id desc
+                       limit 1
+                   ) as latest_error_log,
+                   case when va.status = 'issue' then true else false end as can_retry,
+                   case
+                       when va.status <> 'issue' then null
+                       when (
+                           select sr.script_name
+                           from {script_run_table} sr
+                           where sr.trigger_id = va.trigger_id
+                             and sr.status = 'failed'
+                           order by sr.id desc
+                           limit 1
+                       ) = 'entry' then 'ready'
+                       else 'not_retrieved'
+                   end as retry_to_status
             from {video_asset_table} va
             left join {trigger_table} te on te.id = va.trigger_id
             left join {session_video_asset_table} sva on sva.video_asset_id = va.id
@@ -1076,6 +1119,51 @@ def list_video_assets(db: Session, limit: int = 50) -> list[dict[str, Any]]:
         {"limit": limit},
     )
     return _fetch_all_dicts(result)
+
+
+def retry_video_asset_issue(db: Session, video_asset_id: int) -> dict[str, Any]:
+    video_asset = get_video_asset(db, video_asset_id)
+    if str(video_asset.get("status") or "") != "issue":
+        raise ValueError("This video asset is not in issue state.")
+    trigger_id = video_asset.get("trigger_id")
+    if trigger_id is None:
+        raise ValueError("This video asset is not linked to a trigger.")
+    script_run_table = _table("script_run")
+    latest_failed_script = db.execute(
+        text(
+            f"""
+            select script_name
+            from {script_run_table}
+            where trigger_id = :trigger_id
+              and status = 'failed'
+            order by id desc
+            limit 1
+            """
+        ),
+        {"trigger_id": trigger_id},
+    ).mappings().first()
+    retry_to_status = "ready" if latest_failed_script and latest_failed_script["script_name"] == "entry" else "not_retrieved"
+    update_video_asset(
+        db,
+        video_asset_id,
+        {
+            "video_url": video_asset.get("video_url"),
+            "file_path": video_asset.get("file_path"),
+            "captured_start_time": video_asset.get("captured_start_time"),
+            "captured_end_time": video_asset.get("captured_end_time"),
+            "retrieved_at": None if retry_to_status == "not_retrieved" else video_asset.get("retrieved_at"),
+            "analyzed_at": None,
+            "retention_until": video_asset.get("retention_until"),
+            "status": retry_to_status,
+            "metadata": video_asset.get("metadata"),
+        },
+    )
+    return {
+        "ok": True,
+        "video_asset_id": video_asset_id,
+        "trigger_id": int(trigger_id),
+        "new_status": retry_to_status,
+    }
 
 
 def get_session(db: Session, session_id: int) -> dict[str, Any]:

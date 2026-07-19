@@ -25,6 +25,14 @@ def list_video_assets(limit: int = 50, db: Session = Depends(get_transaction_db)
     return [VideoAssetListItem(**row) for row in rows]
 
 
+@router.post("/assets/{video_asset_id}/retry-issue")
+def retry_video_asset_issue(video_asset_id: int, db: Session = Depends(get_transaction_db)) -> dict:
+    try:
+        return repositories.retry_video_asset_issue(db, video_asset_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.post("/triggers/{trigger_id}")
 def create_trigger_video_asset(trigger_id: int, payload: VideoAssetCreate, db: Session = Depends(get_transaction_db)) -> dict:
     trigger = repositories.get_trigger(db, trigger_id)
