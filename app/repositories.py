@@ -730,20 +730,25 @@ def claim_video_asset_for_retrieval(db: Session, video_asset_id: int) -> bool:
 def list_video_assets(db: Session, limit: int = 50) -> list[dict[str, Any]]:
     video_asset_table = _table("video_asset")
     session_video_asset_table = _table("session_video_asset")
+    trigger_table = _table("trigger_event")
+    session_table = _table("session")
     result = db.execute(
         text(
             f"""
             select va.id, va.trigger_id, va.section, va.sequence_no, va.video_url, va.file_path,
                    va.captured_start_time, va.captured_end_time, va.retrieved_at, va.analyzed_at, va.retention_until, va.status,
                    va.metadata, va.created_at,
+                   coalesce(te.location_id, min(s.location_id)) as location_id,
                    count(distinct sva.id) as session_link_count,
                    min(sva.session_id) as primary_session_id,
                    group_concat(distinct sva.session_id order by sva.session_id separator ',') as session_ids
             from {video_asset_table} va
+            left join {trigger_table} te on te.id = va.trigger_id
             left join {session_video_asset_table} sva on sva.video_asset_id = va.id
+            left join {session_table} s on s.id = sva.session_id
             group by va.id, va.trigger_id, va.section, va.sequence_no, va.video_url, va.file_path,
                      va.captured_start_time, va.captured_end_time, va.retrieved_at, va.analyzed_at, va.retention_until, va.status,
-                     va.metadata, va.created_at
+                     va.metadata, va.created_at, te.location_id
             order by va.created_at desc, va.id desc
             limit :limit
             """

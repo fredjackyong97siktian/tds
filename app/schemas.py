@@ -293,6 +293,7 @@ class ActiveGalleryResponse(BaseModel):
 class VideoAssetListItem(BaseModel):
     id: int
     trigger_id: int | None = None
+    location_id: int | None = None
     section: str
     sequence_no: int | None = None
     video_url: str
