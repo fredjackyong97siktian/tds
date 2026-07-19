@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from ..config import settings
@@ -7,6 +8,10 @@ from .. import repositories
 
 
 router = APIRouter(prefix="/api/v1/workers", tags=["workers"])
+
+
+class WorkerControlRequest(BaseModel):
+    paused: bool
 
 
 @router.get("/retrieval-status")
@@ -66,6 +71,7 @@ def get_retrieval_status(db: Session = Depends(get_transaction_db)) -> dict:
         "max_per_location": settings.retrieval_max_per_location,
         "queued_count": len(pending_rows),
         "running_count": len(running_rows),
+        "paused": repositories.is_worker_paused(db, "retrieval"),
         "locations": locations,
     }
 
@@ -162,5 +168,24 @@ def get_analysis_status(db: Session = Depends(get_transaction_db)) -> dict:
         "max_per_location": settings.analysis_max_per_location,
         "queued_count": len(pending_rows),
         "running_count": len(running_rows),
+        "paused": repositories.is_worker_paused(db, "analysis"),
         "locations": locations,
+    }
+
+
+@router.post("/retrieval-control")
+def update_retrieval_control(payload: WorkerControlRequest, db: Session = Depends(get_transaction_db)) -> dict:
+    state = repositories.set_worker_paused(db, "retrieval", payload.paused)
+    return {
+        "ok": True,
+        **state,
+    }
+
+
+@router.post("/analysis-control")
+def update_analysis_control(payload: WorkerControlRequest, db: Session = Depends(get_transaction_db)) -> dict:
+    state = repositories.set_worker_paused(db, "analysis", payload.paused)
+    return {
+        "ok": True,
+        **state,
     }

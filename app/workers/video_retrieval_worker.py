@@ -76,6 +76,8 @@ class VideoRetrievalWorker:
 
         db = TransactionalSessionLocal()
         try:
+            if repositories.is_worker_paused(db, "retrieval"):
+                return
             # Include already-running rows from DB so a restarted worker does not double-book a location.
             for row in repositories.list_running_video_asset_retrievals(db):
                 location_id = row.get("location_id")

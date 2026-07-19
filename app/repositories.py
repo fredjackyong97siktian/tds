@@ -592,6 +592,66 @@ def get_trigger(db: Session, trigger_id: int) -> dict[str, Any]:
     return _fetch_one_dict(result)
 
 
+def get_worker_control(db: Session, worker_name: str) -> dict[str, Any]:
+    worker_control_table = _table("worker_control")
+    result = db.execute(
+        text(
+            f"""
+            select worker_name, paused, paused_at, resumed_at, created_at, updated_at
+            from {worker_control_table}
+            where worker_name = :worker_name
+            limit 1
+            """
+        ),
+        {"worker_name": worker_name},
+    )
+    row = result.mappings().first()
+    if row is None:
+        return {
+            "worker_name": worker_name,
+            "paused": False,
+            "paused_at": None,
+            "resumed_at": None,
+            "created_at": None,
+            "updated_at": None,
+        }
+    return dict(row)
+
+
+def is_worker_paused(db: Session, worker_name: str) -> bool:
+    row = get_worker_control(db, worker_name)
+    return bool(row.get("paused", False))
+
+
+def set_worker_paused(db: Session, worker_name: str, paused: bool) -> dict[str, Any]:
+    worker_control_table = _table("worker_control")
+    db.execute(
+        text(
+            f"""
+            insert into {worker_control_table} (
+                worker_name, paused, paused_at, resumed_at
+            )
+            values (
+                :worker_name,
+                :paused,
+                case when :paused = 1 then now() else null end,
+                case when :paused = 0 then now() else null end
+            )
+            on duplicate key update
+                paused = values(paused),
+                paused_at = case when values(paused) = 1 then now() else paused_at end,
+                resumed_at = case when values(paused) = 0 then now() else resumed_at end
+            """
+        ),
+        {
+            "worker_name": worker_name,
+            "paused": 1 if paused else 0,
+        },
+    )
+    db.commit()
+    return get_worker_control(db, worker_name)
+
+
 def list_triggers(db: Session, limit: int = 50) -> list[dict[str, Any]]:
     trigger_table = _table("trigger_event")
     result = db.execute(

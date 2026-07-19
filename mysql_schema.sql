@@ -183,6 +183,21 @@ CREATE TABLE IF NOT EXISTS sesamedb.tds_video_asset (
         CHECK (status IN ('not_retrieved', 'retrieving', 'ready', 'processing', 'processed', 'deleted', 'issue'))
 );
 
+CREATE TABLE IF NOT EXISTS sesamedb.tds_worker_control (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    worker_name VARCHAR(50) NOT NULL,
+    paused TINYINT(1) NOT NULL DEFAULT 0,
+    paused_at DATETIME,
+    resumed_at DATETIME,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_worker_control_worker_name (worker_name),
+    CONSTRAINT chk_worker_control_name
+        CHECK (worker_name IN ('retrieval', 'analysis')),
+    CONSTRAINT chk_worker_control_paused
+        CHECK (paused IN (0, 1))
+);
+
 CREATE TABLE IF NOT EXISTS sesamedb.tds_session_video_asset (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     session_id BIGINT NOT NULL,

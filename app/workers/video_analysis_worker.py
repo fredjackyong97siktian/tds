@@ -76,6 +76,8 @@ class VideoAnalysisWorker:
 
         db = TransactionalSessionLocal()
         try:
+            if repositories.is_worker_paused(db, "analysis"):
+                return
             for row in repositories.list_running_video_asset_analyses(db):
                 location_id = row.get("location_id")
                 if location_id is None:
