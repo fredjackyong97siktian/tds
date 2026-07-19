@@ -7,6 +7,7 @@ WORKDIR /app/tds
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    git \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
