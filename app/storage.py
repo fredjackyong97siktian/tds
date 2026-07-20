@@ -61,6 +61,12 @@ def trigger_tmp_video_path(location_id: int, trigger_id: int, section: str, file
     return directory / _safe_name(filename)
 
 
+def trigger_processed_root(location_id: int, trigger_id: int, section: str) -> Path:
+    root = tmp_trigger_root(location_id, trigger_id) / section / "processed"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
 def session_root(location_id: int, session_id: int) -> Path:
     root = location_root(location_id) / "sessions" / f"session_{session_id}"
     root.mkdir(parents=True, exist_ok=True)

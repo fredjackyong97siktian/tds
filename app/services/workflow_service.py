@@ -23,6 +23,7 @@ from ..storage import (
     session_logs_root,
     session_root,
     tmp_media_root,
+    trigger_processed_root,
     trigger_tmp_video_path,
     session_tmp_video_path,
 )
@@ -113,6 +114,10 @@ def default_video_output_dir(location_id: int, session_id: int, video_path: str)
     out_dir = build_logs_root(location_id, session_id) / stem
     out_dir.mkdir(parents=True, exist_ok=True)
     return out_dir
+
+
+def default_trigger_output_dir(location_id: int, trigger_id: int) -> Path:
+    return trigger_processed_root(location_id, trigger_id, "entrance")
 
 
 def _safe_unlink(path: Path) -> None:
@@ -971,7 +976,11 @@ def run_entry_for_trigger(
     session = repositories.get_session(db, session_id)
     location_id = int(session["location_id"])
     workdir = build_session_workdir(location_id, session_id)
-    resolved_output_dir = Path(output_dir) if output_dir else default_video_output_dir(location_id, session_id, video_path)
+    resolved_output_dir = (
+        Path(output_dir)
+        if output_dir
+        else default_trigger_output_dir(location_id, trigger_id)
+    )
     resolved_gallery_state = Path(gallery_state_path) if gallery_state_path else build_private_gallery_state_path(location_id, session_id)
     video_asset_row = _lookup_video_asset_by_file_path(db, video_path)
     if video_asset_row is not None:
