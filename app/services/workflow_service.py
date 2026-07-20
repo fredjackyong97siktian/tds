@@ -35,6 +35,7 @@ SCRIPT_RUN_COMMAND_REDACTED = "[redacted]"
 
 @dataclass
 class ScriptExecutionResult:
+    script_run_id: int
     script_name: str
     model_name: str | None
     status: str
@@ -400,6 +401,7 @@ def _upload_processed_video_for_asset(
 def _record_followup_failure(
     db: Session,
     *,
+    script_run_id: int,
     session_id: int,
     trigger_id: int | None,
     script_name: str,
@@ -407,14 +409,10 @@ def _record_followup_failure(
     stdout: str,
     stderr: str,
 ) -> None:
-    repositories.create_script_run(
+    repositories.revise_script_run(
         db,
-        session_id=session_id,
-        trigger_id=trigger_id,
-        script_name=script_name,
-        model_name=model_name,
+        script_run_id,
         status="failed",
-        command=SCRIPT_RUN_COMMAND_REDACTED,
         stdout_log=stdout,
         stderr_log=stderr,
     )
@@ -456,6 +454,7 @@ def run_script(
         stderr_log=completed.stderr,
     )
     return ScriptExecutionResult(
+        script_run_id=script_run_id,
         script_name=script_name,
         model_name=model_name,
         status=status,
@@ -1015,6 +1014,7 @@ def run_entry_for_trigger(
         stderr = f"{result.stderr}\nProcessed video not found at {processed_video_path}".strip()
         _record_followup_failure(
             db,
+            script_run_id=result.script_run_id,
             session_id=session_id,
             trigger_id=trigger_id,
             script_name="entry",
@@ -1023,6 +1023,7 @@ def run_entry_for_trigger(
             stderr=stderr,
         )
         return ScriptExecutionResult(
+            script_run_id=result.script_run_id,
             script_name=result.script_name,
             model_name=result.model_name,
             status="failed",
@@ -1046,6 +1047,7 @@ def run_entry_for_trigger(
         stderr = f"{result.stderr}\nGallery persistence failed: {exc}".strip()
         _record_followup_failure(
             db,
+            script_run_id=result.script_run_id,
             session_id=session_id,
             trigger_id=trigger_id,
             script_name="entry",
@@ -1054,6 +1056,7 @@ def run_entry_for_trigger(
             stderr=stderr,
         )
         return ScriptExecutionResult(
+            script_run_id=result.script_run_id,
             script_name=result.script_name,
             model_name=result.model_name,
             status="failed",
@@ -1080,6 +1083,7 @@ def run_entry_for_trigger(
         stderr = f"{result.stderr}\nDigitalOcean Spaces upload failed: {exc}".strip()
         _record_followup_failure(
             db,
+            script_run_id=result.script_run_id,
             session_id=session_id,
             trigger_id=trigger_id,
             script_name="entry",
@@ -1088,6 +1092,7 @@ def run_entry_for_trigger(
             stderr=stderr,
         )
         return ScriptExecutionResult(
+            script_run_id=result.script_run_id,
             script_name=result.script_name,
             model_name=result.model_name,
             status="failed",
@@ -1142,13 +1147,22 @@ def run_kiosk_for_session(
     processed_video_path = _expected_processed_video_path(video_path, resolved_output_dir)
     if not processed_video_path.exists():
         repositories.update_video_asset_status(db, int(video_asset_row["id"]), "issue")
+        stderr = f"{result.stderr}\nProcessed video not found at {processed_video_path}".strip()
+        repositories.revise_script_run(
+            db,
+            result.script_run_id,
+            status="failed",
+            stdout_log=result.stdout,
+            stderr_log=stderr,
+        )
         return ScriptExecutionResult(
+            script_run_id=result.script_run_id,
             script_name=result.script_name,
             model_name=result.model_name,
             status="failed",
             command=result.command,
             stdout=result.stdout,
-            stderr=f"{result.stderr}\nProcessed video not found at {processed_video_path}".strip(),
+            stderr=stderr,
         )
 
     try:
@@ -1166,13 +1180,22 @@ def run_kiosk_for_session(
         )
     except Exception as exc:
         repositories.update_video_asset_status(db, int(video_asset_row["id"]), "issue")
+        stderr = f"{result.stderr}\nDigitalOcean Spaces upload failed: {exc}".strip()
+        repositories.revise_script_run(
+            db,
+            result.script_run_id,
+            status="failed",
+            stdout_log=result.stdout,
+            stderr_log=stderr,
+        )
         return ScriptExecutionResult(
+            script_run_id=result.script_run_id,
             script_name=result.script_name,
             model_name=result.model_name,
             status="failed",
             command=result.command,
             stdout=result.stdout,
-            stderr=f"{result.stderr}\nDigitalOcean Spaces upload failed: {exc}".strip(),
+            stderr=stderr,
         )
     return result
 

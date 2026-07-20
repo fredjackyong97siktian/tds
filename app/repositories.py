@@ -1654,6 +1654,36 @@ def finish_script_run(
     db.commit()
 
 
+def revise_script_run(
+    db: Session,
+    script_run_id: int,
+    *,
+    status: str,
+    stdout_log: str,
+    stderr_log: str,
+) -> None:
+    script_run_table = _table("script_run")
+    db.execute(
+        text(
+            f"""
+            update {script_run_table}
+            set status = :status,
+                stdout_log = :stdout_log,
+                stderr_log = :stderr_log,
+                finished_at = now()
+            where id = :script_run_id
+            """
+        ),
+        {
+            "script_run_id": script_run_id,
+            "status": status,
+            "stdout_log": stdout_log,
+            "stderr_log": stderr_log,
+        },
+    )
+    db.commit()
+
+
 def create_script_run(
     db: Session,
     *,
