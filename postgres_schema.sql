@@ -34,16 +34,16 @@ create table if not exists tds_customer_gallery (
 );
 
 create index if not exists idx_customer_gallery_session_person
-    on customer_gallery(session_id, person_id);
+    on tds_customer_gallery(session_id, person_id);
 
 create index if not exists idx_customer_gallery_location_person
-    on customer_gallery(location_id, person_id);
+    on tds_customer_gallery(location_id, person_id);
 
 create index if not exists idx_customer_gallery_session_customer
-    on customer_gallery(session_customer_id);
+    on tds_customer_gallery(session_customer_id);
 
 create index if not exists idx_customer_gallery_image_kind
-    on customer_gallery(image_kind);
+    on tds_customer_gallery(image_kind);
 
 create table if not exists tds_active_gallery (
     id bigserial primary key,
@@ -51,38 +51,40 @@ create table if not exists tds_active_gallery (
     session_id bigint,
     session_customer_id bigint not null,
     person_id integer,
+    state_kind varchar(50) not null default 'active_gallery',
+    state_payload jsonb,
+    metadata jsonb,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now(),
-    unique (location_id, session_customer_id)
+    unique (location_id, state_kind, session_customer_id)
 );
 
 create index if not exists idx_active_gallery_location_id
-    on active_gallery(location_id);
+    on tds_active_gallery(location_id);
 
 create index if not exists idx_active_gallery_session_id
-    on active_gallery(session_id);
+    on tds_active_gallery(session_id);
 
 create index if not exists idx_active_gallery_session_customer_id
-    on active_gallery(session_customer_id);
+    on tds_active_gallery(session_customer_id);
 
 create index if not exists idx_active_gallery_payload_gin
-    on active_gallery using gin (state_payload);
+    on tds_active_gallery using gin (state_payload);
 
-comment on column customer_gallery.location_id is
+comment on column tds_customer_gallery.location_id is
     'Store/location partition key copied from MySQL so embeddings can be isolated by location.';
 
-comment on column customer_gallery.session_customer_id is
+comment on column tds_customer_gallery.session_customer_id is
     'Value-copied MySQL session_customer.id for the exact detected person row that produced this gallery entry.';
 
-comment on column active_gallery.location_id is
+comment on column tds_active_gallery.location_id is
     'Store/location partition key for the active gallery currently used in comparisons.';
 
-comment on column active_gallery.session_customer_id is
+comment on column tds_active_gallery.session_customer_id is
     'Value-copied MySQL session_customer.id for the active customer represented by this runtime-state row.';
 
-comment on column active_gallery.state_kind is
+comment on column tds_active_gallery.state_kind is
     'active_gallery keeps only currently active customer_gallery references for one customer at one location.';
 
-comment on column active_gallery.state_payload is
+comment on column tds_active_gallery.state_payload is
     'Recommended shape: {"customer_gallery_ids":[5001,5002],"primary_gallery_entry_id":5001,"is_active":true} so the app can fetch embeddings from customer_gallery by id for this active customer.';
-

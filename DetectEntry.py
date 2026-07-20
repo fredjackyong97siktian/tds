@@ -3,6 +3,8 @@ import importlib.util
 import json
 import os
 import sys
+import time
+from datetime import datetime
 
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -44,7 +46,16 @@ Detect = _load_detect_module()
 from detect_split_state import load_cross_state, save_cross_state
 
 
+def _ts() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _log(message: str) -> None:
+    print(f"[{_ts()}] [DetectEntry] {message}")
+
+
 def main():
+    runner_started = time.time()
     parser = argparse.ArgumentParser(description="Run Detect.py Entry logic only.")
     parser.add_argument("--video", required=True, help="Path to the entry/exit video.")
     parser.add_argument("--output-dir", required=True, help="Directory for entry logs and outputs.")
@@ -71,10 +82,23 @@ def main():
     Detect.IntegratedEntry.REID_FASHION_DEBUG_DIR = reid_fashion_views_dir
     Detect.REID_FASHION_DEBUG_DIR = reid_fashion_views_dir
 
+    _log(f"start video={video_path}")
+
+    stage_started = time.time()
     cross_state = load_cross_state(gallery_state_path)
+    _log(f"load_cross_state done elapsed={time.time() - stage_started:.2f}s")
+
+    stage_started = time.time()
     Detect.ensure_integrated_fashionclip_model()
+    _log(f"ensure_integrated_fashionclip_model done elapsed={time.time() - stage_started:.2f}s")
+
+    stage_started = time.time()
     events = Detect.IntegratedEntry.process_video(video_path, output_dir, cross_state)
+    _log(f"process_video done elapsed={time.time() - stage_started:.2f}s event_count={len(events or [])}")
+
+    stage_started = time.time()
     save_cross_state(gallery_state_path, cross_state)
+    _log(f"save_cross_state done elapsed={time.time() - stage_started:.2f}s")
 
     summary_path = os.path.join(
         output_dir,
@@ -95,7 +119,9 @@ def main():
             indent=2,
         )
 
-    print(f"[DetectEntry] done video={video_path} output={output_dir}")
+    _log(
+        f"done video={video_path} output={output_dir} total_elapsed={time.time() - runner_started:.2f}s"
+    )
 
 
 if __name__ == "__main__":

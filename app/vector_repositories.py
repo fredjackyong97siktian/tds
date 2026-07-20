@@ -31,7 +31,7 @@ def upsert_active_gallery(
     db.execute(
         text(
             """
-            insert into active_gallery (
+            insert into tds_active_gallery (
                 location_id, session_id, session_customer_id, person_id, state_kind, state_payload, metadata
             )
             values (
@@ -74,7 +74,7 @@ def create_customer_gallery_record(
     result = db.execute(
         text(
             """
-            insert into customer_gallery (
+            insert into tds_customer_gallery (
                 location_id, session_id, session_customer_id, person_id, image_url, image_kind,
                 embedding_osnet, embedding_fashion, metadata
             )
@@ -108,7 +108,7 @@ def get_customer_gallery_record(db: Session, gallery_id: int) -> dict[str, Any]:
             """
             select id, location_id, session_id, session_customer_id, person_id, image_url, image_kind,
                    embedding_osnet, embedding_fashion, metadata, created_at
-            from customer_gallery
+            from tds_customer_gallery
             where id = :gallery_id
             """
         ),
@@ -128,7 +128,7 @@ def get_active_gallery(
         text(
             """
             select id, location_id, session_id, session_customer_id, person_id, state_kind, state_payload, metadata, created_at, updated_at
-            from active_gallery
+            from tds_active_gallery
             where location_id = :location_id and session_customer_id = :session_customer_id and state_kind = :state_kind
             """
         ),
@@ -176,7 +176,7 @@ def list_customer_gallery_records(
             """
             select id, location_id, session_id, session_customer_id, person_id, image_url, image_kind,
                    embedding_osnet, embedding_fashion, metadata, created_at
-            from customer_gallery
+            from tds_customer_gallery
             where session_id = :session_id
             order by id asc
             """
@@ -184,6 +184,43 @@ def list_customer_gallery_records(
         {"session_id": session_id},
     )
     return _fetch_all_dicts(result)
+
+
+def list_customer_gallery_records_for_session_customer(
+    db: Session,
+    *,
+    session_customer_id: int,
+) -> list[dict[str, Any]]:
+    result = db.execute(
+        text(
+            """
+            select id, location_id, session_id, session_customer_id, person_id, image_url, image_kind,
+                   embedding_osnet, embedding_fashion, metadata, created_at
+            from tds_customer_gallery
+            where session_customer_id = :session_customer_id
+            order by id asc
+            """
+        ),
+        {"session_customer_id": session_customer_id},
+    )
+    return _fetch_all_dicts(result)
+
+
+def delete_customer_gallery_records_for_session_customer(
+    db: Session,
+    *,
+    session_customer_id: int,
+) -> None:
+    db.execute(
+        text(
+            """
+            delete from tds_customer_gallery
+            where session_customer_id = :session_customer_id
+            """
+        ),
+        {"session_customer_id": session_customer_id},
+    )
+    db.commit()
 
 
 def list_active_gallery_records(
@@ -198,7 +235,7 @@ def list_active_gallery_records(
                 """
                 select id, location_id, session_id, session_customer_id, person_id, state_kind,
                        state_payload, metadata, created_at, updated_at
-                from active_gallery
+                from tds_active_gallery
                 order by updated_at desc, id desc
                 limit :limit
                 """
@@ -212,7 +249,7 @@ def list_active_gallery_records(
             """
             select id, location_id, session_id, session_customer_id, person_id, state_kind,
                    state_payload, metadata, created_at, updated_at
-            from active_gallery
+            from tds_active_gallery
             where location_id = :location_id
             order by updated_at desc, id desc
             limit :limit
@@ -221,3 +258,39 @@ def list_active_gallery_records(
         {"location_id": location_id, "limit": limit},
     )
     return _fetch_all_dicts(result)
+
+
+def delete_active_gallery(
+    db: Session,
+    *,
+    location_id: int,
+    session_customer_id: int,
+    state_kind: str | None = None,
+) -> None:
+    if state_kind is None:
+        db.execute(
+            text(
+                """
+                delete from tds_active_gallery
+                where location_id = :location_id and session_customer_id = :session_customer_id
+                """
+            ),
+            {"location_id": location_id, "session_customer_id": session_customer_id},
+        )
+    else:
+        db.execute(
+            text(
+                """
+                delete from tds_active_gallery
+                where location_id = :location_id
+                  and session_customer_id = :session_customer_id
+                  and state_kind = :state_kind
+                """
+            ),
+            {
+                "location_id": location_id,
+                "session_customer_id": session_customer_id,
+                "state_kind": state_kind,
+            },
+        )
+    db.commit()

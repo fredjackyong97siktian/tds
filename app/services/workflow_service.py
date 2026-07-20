@@ -1,9 +1,11 @@
 from __future__ import annotations
+import json
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from os.path import basename, splitext
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote
 
 from sqlalchemy.orm import Session
@@ -11,8 +13,9 @@ from sqlalchemy.orm import Session
 from ..config import settings
 from ..crypto import decrypt_secret
 from .. import repositories
-from ..db import TransactionalSessionLocal
+from ..db import TransactionalSessionLocal, VectorSessionLocal
 from ..spaces import upload_private_file
+from .. import vector_repositories
 from ..storage import (
     guess_media_type,
     gallery_state_path as build_private_gallery_state_path,
@@ -132,6 +135,203 @@ def _expected_processed_video_path(video_path: str, output_dir: Path) -> Path:
     return output_dir / f"{Path(video_path).stem}_output.mp4"
 
 
+def _tracking_summary_path(video_path: str, output_dir: Path) -> Path:
+    return output_dir / f"{Path(video_path).stem}_tracking_summary.json"
+
+
+def _load_tracking_summary(video_path: str, output_dir: Path) -> dict[str, Any]:
+    summary_path = _tracking_summary_path(video_path, output_dir)
+    if not summary_path.exists():
+        raise FileNotFoundError(f"Tracking summary not found at {summary_path}")
+    return json.loads(summary_path.read_text())
+
+
+def _load_cross_state_pickle(gallery_state_path: Path) -> dict[str, Any]:
+    import pickle
+
+    if not gallery_state_path.exists():
+        return {"next_gid": 1, "persistent_gallery": {}, "persistent_gallery_view_paths": {}}
+    with gallery_state_path.open("rb") as handle:
+        data = pickle.load(handle)
+    if not isinstance(data, dict):
+        return {"next_gid": 1, "persistent_gallery": {}, "persistent_gallery_view_paths": {}}
+    data.setdefault("persistent_gallery", {})
+    data.setdefault("persistent_gallery_view_paths", {})
+    return data
+
+
+def _tensor_like_to_float_list(value: Any) -> list[float] | None:
+    if value is None:
+        return None
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    if hasattr(value, "numpy"):
+        value = value.numpy()
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if isinstance(value, (list, tuple)):
+        return [float(item) for item in value]
+    return None
+
+
+def _combine_fashion_embedding(upper: Any, lower: Any) -> list[float] | None:
+    upper_list = _tensor_like_to_float_list(upper)
+    lower_list = _tensor_like_to_float_list(lower)
+    if upper_list and lower_list:
+        return upper_list + lower_list
+    return upper_list or lower_list
+
+
+def _candidate_gallery_image_paths(
+    *,
+    cross_state: dict[str, Any],
+    output_dir: Path,
+    person_id: int,
+) -> list[str]:
+    image_paths = cross_state.get("persistent_gallery_view_paths", {}).get(person_id) or []
+    if image_paths:
+        return sorted(str(path) for path in image_paths)
+    reid_dir = output_dir.parent / "reid_views" / f"ID{person_id}"
+    if not reid_dir.exists():
+        return []
+    return sorted(str(path) for path in reid_dir.glob("*.jpg"))
+
+
+def _sync_gallery_state_after_entry(
+    *,
+    location_id: int,
+    session_id: int,
+    video_path: str,
+    output_dir: Path,
+    gallery_state_path: Path,
+    enter_time: datetime | None,
+    leave_time: datetime | None,
+) -> None:
+    tracking_summary = _load_tracking_summary(video_path, output_dir)
+    cross_state = _load_cross_state_pickle(gallery_state_path)
+    persistent_gallery = cross_state.get("persistent_gallery", {})
+
+    transactional_db = TransactionalSessionLocal()
+    vector_db = VectorSessionLocal()
+    try:
+        for customer in tracking_summary.get("customers", []):
+            person_id = int(customer["person_id"])
+            repositories.create_session_customer(
+                transactional_db,
+                session_id,
+                {
+                    "person_id": person_id,
+                    "enter_time": enter_time,
+                    "kiosk_start_time": None,
+                    "leave_time": leave_time if bool(customer.get("exited")) else None,
+                    "match_status": "resolved" if bool(customer.get("exited")) else "tracked",
+                },
+            )
+            session_customer = repositories.get_session_customer_by_session_person(
+                transactional_db,
+                session_id,
+                person_id,
+            )
+
+            vector_repositories.delete_customer_gallery_records_for_session_customer(
+                vector_db,
+                session_customer_id=int(session_customer["id"]),
+            )
+
+            gallery_entry = persistent_gallery.get(person_id) or {}
+            osnet_views = gallery_entry.get("views") or []
+            fashion_embedding = _combine_fashion_embedding(
+                gallery_entry.get("fashion_upper_init"),
+                gallery_entry.get("fashion_lower_init"),
+            )
+            image_paths = _candidate_gallery_image_paths(
+                cross_state=cross_state,
+                output_dir=output_dir,
+                person_id=person_id,
+            )
+
+            created_gallery_ids: list[int] = []
+            for index, osnet_view in enumerate(osnet_views):
+                image_url = image_paths[index] if index < len(image_paths) else (image_paths[0] if image_paths else None)
+                row = vector_repositories.create_customer_gallery_record(
+                    vector_db,
+                    location_id=location_id,
+                    session_id=session_id,
+                    session_customer_id=int(session_customer["id"]),
+                    person_id=person_id,
+                    image_url=image_url,
+                    image_kind="reid_view",
+                    embedding_osnet=_tensor_like_to_float_list(osnet_view),
+                    embedding_fashion=fashion_embedding,
+                    metadata={
+                        "source": "entry_analysis",
+                        "exited": bool(customer.get("exited")),
+                        "group_id": customer.get("group_id"),
+                        "view_index": index,
+                    },
+                )
+                created_gallery_ids.append(int(row["id"]))
+
+            if not created_gallery_ids and fashion_embedding is not None:
+                row = vector_repositories.create_customer_gallery_record(
+                    vector_db,
+                    location_id=location_id,
+                    session_id=session_id,
+                    session_customer_id=int(session_customer["id"]),
+                    person_id=person_id,
+                    image_url=image_paths[0] if image_paths else None,
+                    image_kind="fashion_view",
+                    embedding_osnet=None,
+                    embedding_fashion=fashion_embedding,
+                    metadata={
+                        "source": "entry_analysis",
+                        "exited": bool(customer.get("exited")),
+                        "group_id": customer.get("group_id"),
+                    },
+                )
+                created_gallery_ids.append(int(row["id"]))
+
+            if bool(customer.get("exited")):
+                vector_repositories.delete_active_gallery(
+                    vector_db,
+                    location_id=location_id,
+                    session_customer_id=int(session_customer["id"]),
+                )
+                continue
+
+            if created_gallery_ids:
+                vector_repositories.upsert_active_gallery(
+                    vector_db,
+                    location_id=location_id,
+                    session_id=session_id,
+                    session_customer_id=int(session_customer["id"]),
+                    person_id=person_id,
+                    state_kind="active_gallery",
+                    state_payload={
+                        "customer_gallery_ids": created_gallery_ids,
+                        "primary_gallery_entry_id": created_gallery_ids[0],
+                        "is_active": True,
+                    },
+                    metadata={
+                        "source": "entry_analysis",
+                        "group_id": customer.get("group_id"),
+                        "entered": bool(customer.get("entered")),
+                        "exited": False,
+                    },
+                )
+            else:
+                vector_repositories.delete_active_gallery(
+                    vector_db,
+                    location_id=location_id,
+                    session_customer_id=int(session_customer["id"]),
+                )
+    finally:
+        vector_db.close()
+        transactional_db.close()
+
+
 def _lookup_video_asset_by_file_path(db: Session, video_path: str) -> dict[str, Any] | None:
     try:
         return repositories.get_video_asset_by_file_path(db, video_path)
@@ -204,6 +404,15 @@ def run_script(
     cwd: Path | None = None,
 ) -> ScriptExecutionResult:
     command = [settings.python_bin, str(script_path), *args]
+    script_run_id = repositories.create_script_run_started(
+        db,
+        session_id=session_id,
+        trigger_id=trigger_id,
+        script_name=script_name,
+        model_name=model_name,
+        status="running",
+        command=SCRIPT_RUN_COMMAND_REDACTED,
+    )
     completed = subprocess.run(
         command,
         cwd=str(cwd) if cwd else None,
@@ -211,14 +420,10 @@ def run_script(
         text=True,
     )
     status = "success" if completed.returncode == 0 else "failed"
-    repositories.create_script_run(
+    repositories.finish_script_run(
         db,
-        session_id=session_id,
-        trigger_id=trigger_id,
-        script_name=script_name,
-        model_name=model_name,
+        script_run_id,
         status=status,
-        command=SCRIPT_RUN_COMMAND_REDACTED,
         stdout_log=completed.stdout,
         stderr_log=completed.stderr,
     )
@@ -573,6 +778,15 @@ def _run_video_retrieval_job(
 ) -> None:
     db = TransactionalSessionLocal()
     command: list[str] = []
+    script_run_id = repositories.create_script_run_started(
+        db,
+        session_id=session_id,
+        trigger_id=trigger_id,
+        script_name="retrieve_video",
+        model_name=f"dahua_rtsp_playback:{settings.dahua_output_video_codec}",
+        status="running",
+        command=SCRIPT_RUN_COMMAND_REDACTED,
+    )
     try:
         target_path = Path(output_path)
         target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -594,14 +808,10 @@ def _run_video_retrieval_job(
                 "metadata": None,
             },
         )
-        repositories.create_script_run(
+        repositories.finish_script_run(
             db,
-            session_id=session_id,
-            trigger_id=trigger_id,
-            script_name="retrieve_video",
-            model_name=f"dahua_rtsp_playback:{settings.dahua_output_video_codec}",
+            script_run_id,
             status=status,
-            command=SCRIPT_RUN_COMMAND_REDACTED,
             stdout_log=completed.stdout,
             stderr_log=completed.stderr,
         )
@@ -621,14 +831,10 @@ def _run_video_retrieval_job(
                 "metadata": None,
             },
         )
-        repositories.create_script_run(
+        repositories.finish_script_run(
             db,
-            session_id=session_id,
-            trigger_id=trigger_id,
-            script_name="retrieve_video",
-            model_name=f"dahua_rtsp_playback:{settings.dahua_output_video_codec}",
+            script_run_id,
             status="failed",
-            command=SCRIPT_RUN_COMMAND_REDACTED,
             stdout_log="",
             stderr_log=str(exc),
         )
@@ -670,14 +876,18 @@ def start_entrance_analysis_job(job: EntranceAnalysisQueued) -> None:
             repositories.update_video_asset_status(db, job.video_asset_id, "issue")
     except Exception as exc:
         repositories.update_video_asset_status(db, job.video_asset_id, "issue")
-        repositories.create_script_run(
+        script_run_id = repositories.create_script_run_started(
             db,
             session_id=job.session_id,
             trigger_id=job.trigger_id,
             script_name="entry",
             model_name=job.model_name or "analysis_worker",
-            status="failed",
             command=SCRIPT_RUN_COMMAND_REDACTED,
+        )
+        repositories.finish_script_run(
+            db,
+            script_run_id,
+            status="failed",
             stdout_log="",
             stderr_log=str(exc),
         )
@@ -776,6 +986,27 @@ def run_entry_for_trigger(
             command=result.command,
             stdout=result.stdout,
             stderr=f"{result.stderr}\nProcessed video not found at {processed_video_path}".strip(),
+        )
+
+    try:
+        _sync_gallery_state_after_entry(
+            location_id=location_id,
+            session_id=session_id,
+            video_path=video_path,
+            output_dir=resolved_output_dir,
+            gallery_state_path=resolved_gallery_state,
+            enter_time=session.get("start_time"),
+            leave_time=video_asset_row.get("captured_end_time"),
+        )
+    except Exception as exc:
+        repositories.update_video_asset_status(db, int(video_asset_row["id"]), "issue")
+        return ScriptExecutionResult(
+            script_name=result.script_name,
+            model_name=result.model_name,
+            status="failed",
+            command=result.command,
+            stdout=result.stdout,
+            stderr=f"{result.stderr}\nGallery persistence failed: {exc}".strip(),
         )
 
     try:

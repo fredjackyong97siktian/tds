@@ -9,6 +9,7 @@ import mimetypes
 import re
 import urllib.request
 import urllib.error
+from datetime import datetime
 from types import SimpleNamespace
 
 import cv2
@@ -4185,7 +4186,7 @@ def process_kiosk_video(video_path, output_dir, cross_state):
 
     def vlog(msg):
         msg_str = str(msg)
-        prefix = f"[{vname}] "
+        prefix = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [{vname}] "
         log_msg = "\n".join(prefix + line if line else line for line in msg_str.splitlines())
         print(log_msg)
         with open(out_log, "a") as lf:

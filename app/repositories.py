@@ -1411,6 +1411,23 @@ def create_session_customer(db: Session, session_id: int, payload: Mapping[str, 
     db.commit()
 
 
+def get_session_customer_by_session_person(db: Session, session_id: int, person_id: int) -> dict[str, Any]:
+    session_customer_table = _table("session_customer")
+    result = db.execute(
+        text(
+            f"""
+            select id, session_id, person_id, merged_into_session_customer_id, enter_time,
+                   kiosk_start_time, leave_time, match_status, merge_reason, merged_at,
+                   created_at, updated_at
+            from {session_customer_table}
+            where session_id = :session_id and person_id = :person_id
+            """
+        ),
+        {"session_id": session_id, "person_id": person_id},
+    )
+    return _fetch_one_dict(result)
+
+
 def create_video_asset(db: Session, payload: Mapping[str, Any]) -> int:
     video_asset_table = _table("video_asset")
     file_path = payload.get("file_path")
@@ -1568,27 +1585,27 @@ def create_transaction(db: Session, session_id: int, payload: Mapping[str, Any])
     db.commit()
 
 
-def create_script_run(
+def create_script_run_started(
     db: Session,
     *,
     session_id: int | None,
     trigger_id: int | None,
     script_name: str,
     model_name: str | None,
-    status: str,
+    status: str = "running",
     command: str,
-    stdout_log: str,
-    stderr_log: str,
-) -> None:
+    stdout_log: str = "",
+    stderr_log: str = "",
+) -> int:
     script_run_table = _table("script_run")
-    db.execute(
+    result = db.execute(
         text(
             f"""
             insert into {script_run_table} (
-                session_id, trigger_id, script_name, model_name, status, command, stdout_log, stderr_log, finished_at
+                session_id, trigger_id, script_name, model_name, status, command, stdout_log, stderr_log
             )
             values (
-                :session_id, :trigger_id, :script_name, :model_name, :status, :command, :stdout_log, :stderr_log, now()
+                :session_id, :trigger_id, :script_name, :model_name, :status, :command, :stdout_log, :stderr_log
             )
             """
         ),
@@ -1599,6 +1616,37 @@ def create_script_run(
             "model_name": model_name,
             "status": status,
             "command": command,
+            "stdout_log": stdout_log,
+            "stderr_log": stderr_log,
+        },
+    )
+    db.commit()
+    return int(result.lastrowid)
+
+
+def finish_script_run(
+    db: Session,
+    script_run_id: int,
+    *,
+    status: str,
+    stdout_log: str,
+    stderr_log: str,
+) -> None:
+    script_run_table = _table("script_run")
+    db.execute(
+        text(
+            f"""
+            update {script_run_table}
+            set status = :status,
+                stdout_log = :stdout_log,
+                stderr_log = :stderr_log,
+                finished_at = now()
+            where id = :script_run_id
+            """
+        ),
+        {
+            "script_run_id": script_run_id,
+            "status": status,
             "stdout_log": stdout_log,
             "stderr_log": stderr_log,
         },
