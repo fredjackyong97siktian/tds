@@ -10,6 +10,7 @@ from .. import repositories
 from ..config import settings
 from ..db import TransactionalSessionLocal
 from ..services import workflow_service
+from ..services.workflow_service import ScriptExecutionResult
 
 
 logger = logging.getLogger("tds.video_analysis_worker")
@@ -17,7 +18,7 @@ logger = logging.getLogger("tds.video_analysis_worker")
 
 @dataclass
 class RunningJob:
-    future: Future[None]
+    future: Future[ScriptExecutionResult]
     location_id: int
     video_asset_id: int
 
@@ -52,8 +53,20 @@ class VideoAnalysisWorker:
             if not job.future.done():
                 continue
             try:
-                job.future.result()
-                logger.info("Analysis job completed for video_asset_id=%s location_id=%s", job.video_asset_id, job.location_id)
+                result = job.future.result()
+                if result.status == "success":
+                    logger.info(
+                        "Analysis job completed successfully for video_asset_id=%s location_id=%s",
+                        job.video_asset_id,
+                        job.location_id,
+                    )
+                else:
+                    logger.warning(
+                        "Analysis job completed with issue for video_asset_id=%s location_id=%s stderr=%s",
+                        job.video_asset_id,
+                        job.location_id,
+                        (result.stderr or "")[:500],
+                    )
             except Exception:
                 logger.exception("Analysis job crashed for video_asset_id=%s", job.video_asset_id)
             finished_ids.append(video_asset_id)

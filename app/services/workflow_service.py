@@ -392,6 +392,29 @@ def _upload_processed_video_for_asset(
     )
 
 
+def _record_followup_failure(
+    db: Session,
+    *,
+    session_id: int,
+    trigger_id: int | None,
+    script_name: str,
+    model_name: str | None,
+    stdout: str,
+    stderr: str,
+) -> None:
+    repositories.create_script_run(
+        db,
+        session_id=session_id,
+        trigger_id=trigger_id,
+        script_name=script_name,
+        model_name=model_name,
+        status="failed",
+        command=SCRIPT_RUN_COMMAND_REDACTED,
+        stdout_log=stdout,
+        stderr_log=stderr,
+    )
+
+
 def run_script(
     db: Session,
     *,
@@ -862,7 +885,7 @@ def start_video_retrieval_job(job: VideoRetrievalQueued) -> None:
     )
 
 
-def start_entrance_analysis_job(job: EntranceAnalysisQueued) -> None:
+def start_entrance_analysis_job(job: EntranceAnalysisQueued) -> ScriptExecutionResult:
     db = TransactionalSessionLocal()
     try:
         result = run_entry_for_trigger(
@@ -874,6 +897,7 @@ def start_entrance_analysis_job(job: EntranceAnalysisQueued) -> None:
         )
         if result.status != "success":
             repositories.update_video_asset_status(db, job.video_asset_id, "issue")
+        return result
     except Exception as exc:
         repositories.update_video_asset_status(db, job.video_asset_id, "issue")
         script_run_id = repositories.create_script_run_started(
@@ -979,13 +1003,23 @@ def run_entry_for_trigger(
     processed_video_path = _expected_processed_video_path(video_path, resolved_output_dir)
     if not processed_video_path.exists():
         repositories.update_video_asset_status(db, int(video_asset_row["id"]), "issue")
+        stderr = f"{result.stderr}\nProcessed video not found at {processed_video_path}".strip()
+        _record_followup_failure(
+            db,
+            session_id=session_id,
+            trigger_id=trigger_id,
+            script_name="entry",
+            model_name=model_name or "postprocess_processed_video_missing",
+            stdout=result.stdout,
+            stderr=stderr,
+        )
         return ScriptExecutionResult(
             script_name=result.script_name,
             model_name=result.model_name,
             status="failed",
             command=result.command,
             stdout=result.stdout,
-            stderr=f"{result.stderr}\nProcessed video not found at {processed_video_path}".strip(),
+            stderr=stderr,
         )
 
     try:
@@ -1000,13 +1034,23 @@ def run_entry_for_trigger(
         )
     except Exception as exc:
         repositories.update_video_asset_status(db, int(video_asset_row["id"]), "issue")
+        stderr = f"{result.stderr}\nGallery persistence failed: {exc}".strip()
+        _record_followup_failure(
+            db,
+            session_id=session_id,
+            trigger_id=trigger_id,
+            script_name="entry",
+            model_name=model_name or "postprocess_gallery_persistence",
+            stdout=result.stdout,
+            stderr=stderr,
+        )
         return ScriptExecutionResult(
             script_name=result.script_name,
             model_name=result.model_name,
             status="failed",
             command=result.command,
             stdout=result.stdout,
-            stderr=f"{result.stderr}\nGallery persistence failed: {exc}".strip(),
+            stderr=stderr,
         )
 
     try:
@@ -1024,13 +1068,23 @@ def run_entry_for_trigger(
         )
     except Exception as exc:
         repositories.update_video_asset_status(db, int(video_asset_row["id"]), "issue")
+        stderr = f"{result.stderr}\nDigitalOcean Spaces upload failed: {exc}".strip()
+        _record_followup_failure(
+            db,
+            session_id=session_id,
+            trigger_id=trigger_id,
+            script_name="entry",
+            model_name=model_name or "postprocess_spaces_upload",
+            stdout=result.stdout,
+            stderr=stderr,
+        )
         return ScriptExecutionResult(
             script_name=result.script_name,
             model_name=result.model_name,
             status="failed",
             command=result.command,
             stdout=result.stdout,
-            stderr=f"{result.stderr}\nDigitalOcean Spaces upload failed: {exc}".strip(),
+            stderr=stderr,
         )
     return result
 

@@ -1654,6 +1654,37 @@ def finish_script_run(
     db.commit()
 
 
+def create_script_run(
+    db: Session,
+    *,
+    session_id: int | None,
+    trigger_id: int | None,
+    script_name: str,
+    model_name: str | None,
+    status: str,
+    command: str,
+    stdout_log: str,
+    stderr_log: str,
+) -> int:
+    script_run_id = create_script_run_started(
+        db,
+        session_id=session_id,
+        trigger_id=trigger_id,
+        script_name=script_name,
+        model_name=model_name,
+        status="running",
+        command=command,
+    )
+    finish_script_run(
+        db,
+        script_run_id,
+        status=status,
+        stdout_log=stdout_log,
+        stderr_log=stderr_log,
+    )
+    return script_run_id
+
+
 def finalize_session_result(
     db: Session,
     *,
