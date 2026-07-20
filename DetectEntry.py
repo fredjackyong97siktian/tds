@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import time
+from collections import defaultdict
 from datetime import datetime
 
 
@@ -55,6 +56,144 @@ def _log(message: str) -> None:
     print(f"[{_ts()}] [DetectEntry] {message}")
 
 
+def _tracking_summary_path(video_path: str, output_dir: str) -> str:
+    stem = os.path.splitext(os.path.basename(video_path))[0]
+    return os.path.join(output_dir, f"{stem}_tracking_summary.json")
+
+
+def _event_person_id(event: object) -> int | None:
+    if not isinstance(event, dict):
+        return None
+    for key in ("person_id", "gid", "id"):
+        value = event.get(key)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _event_type(event: object) -> str:
+    if not isinstance(event, dict):
+        return ""
+    value = event.get("type") or event.get("event") or event.get("label")
+    return str(value or "").strip().lower()
+
+
+def _build_fallback_tracking_summary(video_path: str, events: object, cross_state: dict) -> dict:
+    customers: dict[int, dict] = {}
+    first_frames: dict[int, int | None] = {}
+    last_frames: dict[int, int | None] = {}
+    current_sources: dict[int, str] = {}
+    group_ids: defaultdict[int, int] = defaultdict(int)
+
+    if isinstance(events, list):
+        for event in events:
+            person_id = _event_person_id(event)
+            if person_id is None:
+                continue
+            event_type = _event_type(event)
+            frame_value = event.get("frame") if isinstance(event, dict) else None
+            frame_no: int | None = None
+            try:
+                frame_no = int(frame_value) if frame_value is not None else None
+            except (TypeError, ValueError):
+                frame_no = None
+
+            if person_id not in customers:
+                customers[person_id] = {
+                    "person_id": person_id,
+                    "source": "fallback_events",
+                    "entered": False,
+                    "exited": False,
+                    "entry_frame": None,
+                    "exit_frame": None,
+                    "last_seen_frame": frame_no,
+                    "group_id": person_id,
+                }
+            customer = customers[person_id]
+
+            if frame_no is not None:
+                if first_frames[person_id] is None if person_id in first_frames else True:
+                    first_frames[person_id] = frame_no
+                else:
+                    first_frames[person_id] = min(first_frames[person_id], frame_no)  # type: ignore[arg-type]
+                if last_frames[person_id] is None if person_id in last_frames else True:
+                    last_frames[person_id] = frame_no
+                else:
+                    last_frames[person_id] = max(last_frames[person_id], frame_no)  # type: ignore[arg-type]
+                customer["last_seen_frame"] = last_frames[person_id]
+
+            if "enter" in event_type:
+                customer["entered"] = True
+                if customer["entry_frame"] is None:
+                    customer["entry_frame"] = frame_no
+            if "exit" in event_type or "quit" in event_type:
+                customer["exited"] = True
+                customer["exit_frame"] = frame_no
+
+            source_value = event.get("source") if isinstance(event, dict) else None
+            if source_value:
+                current_sources[person_id] = str(source_value)
+                customer["source"] = current_sources[person_id]
+
+            group_value = event.get("group_id") if isinstance(event, dict) else None
+            try:
+                if group_value is not None:
+                    group_ids[person_id] = int(group_value)
+                    customer["group_id"] = group_ids[person_id]
+            except (TypeError, ValueError):
+                pass
+
+    persistent_gallery = cross_state.get("persistent_gallery", {})
+    for raw_person_id in persistent_gallery.keys():
+        try:
+            person_id = int(raw_person_id)
+        except (TypeError, ValueError):
+            continue
+        customers.setdefault(
+            person_id,
+            {
+                "person_id": person_id,
+                "source": "fallback_gallery",
+                "entered": True,
+                "exited": False,
+                "entry_frame": None,
+                "exit_frame": None,
+                "last_seen_frame": last_frames.get(person_id),
+                "group_id": person_id,
+            },
+        )
+
+    for customer in customers.values():
+        if not customer["entered"] and not customer["exited"]:
+            customer["entered"] = True
+
+    return {
+        "video": os.path.splitext(os.path.basename(video_path))[0],
+        "persistent_gallery_ids": sorted(
+            int(gid)
+            for gid in persistent_gallery.keys()
+            if str(gid).strip()
+        ),
+        "customers": sorted(customers.values(), key=lambda row: int(row["person_id"])),
+    }
+
+
+def _ensure_tracking_summary(video_path: str, output_dir: str, events: object, cross_state: dict) -> str:
+    summary_path = _tracking_summary_path(video_path, output_dir)
+    if os.path.exists(summary_path):
+        return summary_path
+
+    fallback_summary = _build_fallback_tracking_summary(video_path, events, cross_state)
+    with open(summary_path, "w") as f:
+        json.dump(fallback_summary, f, indent=2)
+    _log(f"fallback tracking summary created path={summary_path}")
+    return summary_path
+
+
 def main():
     runner_started = time.time()
     parser = argparse.ArgumentParser(description="Run Detect.py Entry logic only.")
@@ -96,6 +235,10 @@ def main():
     stage_started = time.time()
     events = Detect.IntegratedEntry.process_video(video_path, output_dir, cross_state)
     _log(f"process_video done elapsed={time.time() - stage_started:.2f}s event_count={len(events or [])}")
+
+    stage_started = time.time()
+    tracking_summary_path = _ensure_tracking_summary(video_path, output_dir, events, cross_state)
+    _log(f"ensure_tracking_summary done elapsed={time.time() - stage_started:.2f}s path={tracking_summary_path}")
 
     stage_started = time.time()
     save_cross_state(gallery_state_path, cross_state)
