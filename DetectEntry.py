@@ -17,29 +17,30 @@ from model_setup import configure_detect_model_env
 configure_detect_model_env()
 
 def _load_detect_module():
+    detect_override = os.environ.get("DETECT_MODULE_PATH")
+    candidate_paths = [
+        detect_override,
+        os.path.join(THIS_DIR, "Detect.py"),
+        os.path.join(REPO_ROOT, "Detect.py"),
+    ]
+    detect_path = next((path for path in candidate_paths if path and os.path.isfile(path)), None)
+    if detect_path is not None:
+        spec = importlib.util.spec_from_file_location("Detect", detect_path)
+        if spec is None or spec.loader is None:
+            raise ModuleNotFoundError(f"Could not load Detect.py from {detect_path}.")
+        detect_module = importlib.util.module_from_spec(spec)
+        sys.modules["Detect"] = detect_module
+        spec.loader.exec_module(detect_module)
+        return detect_module
+
     try:
         import Detect as detect_module
 
         return detect_module
     except ModuleNotFoundError as exc:
-        detect_override = os.environ.get("DETECT_MODULE_PATH")
-        candidate_paths = [
-            detect_override,
-            os.path.join(THIS_DIR, "Detect.py"),
-            os.path.join(REPO_ROOT, "Detect.py"),
-        ]
-        detect_path = next((path for path in candidate_paths if path and os.path.isfile(path)), None)
-        if detect_path is None:
-            raise ModuleNotFoundError(
-                f"Detect.py was not found in any expected location: {candidate_paths}. Make sure the file is mounted into the container."
-            ) from exc
-        spec = importlib.util.spec_from_file_location("Detect", detect_path)
-        if spec is None or spec.loader is None:
-            raise ModuleNotFoundError(f"Could not load Detect.py from {detect_path}.") from exc
-        detect_module = importlib.util.module_from_spec(spec)
-        sys.modules["Detect"] = detect_module
-        spec.loader.exec_module(detect_module)
-        return detect_module
+        raise ModuleNotFoundError(
+            f"Detect.py was not found in any expected location: {candidate_paths}. Make sure the file is mounted into the container."
+        ) from exc
 
 
 Detect = _load_detect_module()
