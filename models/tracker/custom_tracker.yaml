@@ -1,1 +1,26 @@
-../../custom_tracker.yaml
+# Static CCTV camera: disable camera motion compensation to reduce drift.
+gmc_method: none
+
+
+tracker_type: botsort
+
+# ===== Core tracking =====
+track_high_thresh: 0.5
+track_low_thresh: 0.1
+new_track_thresh: 0.6
+fuse_score: true
+
+# ===== Matching =====
+match_thresh: 0.6              # 🔥 lower = more tolerant
+proximity_thresh: 0.5          # 🔥 was too strict before
+
+# ===== ReID =====
+with_reid: True
+appearance_thresh: 0.2         # 🔥 more tolerant
+model: auto
+
+# ===== Motion =====
+cmc_method: none               # 🔥 disable for fixed camera
+
+# ===== Buffer =====
+track_buffer: 200               # keep tracks longer
