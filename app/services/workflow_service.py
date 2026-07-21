@@ -138,7 +138,10 @@ def _is_under_tmp_media_root(path: Path) -> bool:
 
 
 def _expected_processed_video_path(video_path: str, output_dir: Path) -> Path:
-    return output_dir / f"{Path(video_path).stem}_output.mp4"
+    stem = Path(video_path).stem
+    if stem.endswith("_output"):
+        return output_dir / f"{stem}.mp4"
+    return output_dir / f"{stem}_output.mp4"
 
 
 def _tracking_summary_path(video_path: str, output_dir: Path) -> Path:
