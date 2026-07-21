@@ -36,6 +36,8 @@ class Settings(BaseSettings):
     spaces_secret_key: str | None = None
     spaces_key_prefix: str = "tds"
     spaces_presign_ttl_seconds: int = 600
+    spaces_public_read: bool = False
+    spaces_public_base_url: str | None = None
     retrieval_poll_seconds: int = 10
     retrieval_max_global_workers: int = 2
     retrieval_max_per_location: int = 1

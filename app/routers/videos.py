@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 
 from ..db import get_transaction_db
 from .. import repositories
-from ..spaces import generate_presigned_download_url
+from ..spaces import generate_presigned_download_url, generate_public_object_url, is_spaces_public_read_enabled
 from ..schemas import VideoAssetCreate, VideoAssetListItem
 from ..storage import (
     guess_media_type,
@@ -28,7 +28,11 @@ def list_video_assets(limit: int = 50, db: Session = Depends(get_transaction_db)
             spaces_object_key = file_path.removeprefix("spaces://").lstrip("/")
             if spaces_object_key:
                 try:
-                    row["video_url"] = generate_presigned_download_url(spaces_object_key)
+                    row["video_url"] = (
+                        generate_public_object_url(spaces_object_key)
+                        if is_spaces_public_read_enabled()
+                        else generate_presigned_download_url(spaces_object_key)
+                    )
                 except RuntimeError:
                     row["video_url"] = row.get("video_url") or ""
     return [VideoAssetListItem(**row) for row in rows]
@@ -103,10 +107,14 @@ def get_video_asset_content(video_asset_id: int, db: Session = Depends(get_trans
         if not spaces_object_key:
             raise HTTPException(status_code=404, detail="Spaces object key is missing for this video asset.")
         try:
-            presigned_url = generate_presigned_download_url(spaces_object_key)
+            resolved_url = (
+                generate_public_object_url(spaces_object_key)
+                if is_spaces_public_read_enabled()
+                else generate_presigned_download_url(spaces_object_key)
+            )
         except RuntimeError as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
-        return RedirectResponse(url=presigned_url, status_code=307)
+        return RedirectResponse(url=resolved_url, status_code=307)
 
     if file_path:
         try:

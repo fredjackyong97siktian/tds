@@ -549,7 +549,7 @@ def _upload_processed_video_for_asset(
         db,
         int(video_asset_row["id"]),
         {
-            "video_url": f"/api/v1/videos/assets/{int(video_asset_row['id'])}/content",
+            "video_url": str(upload_result.get("public_url") or f"/api/v1/videos/assets/{int(video_asset_row['id'])}/content"),
             "file_path": f"spaces://{upload_result['object_key']}",
             "captured_start_time": video_asset_row.get("captured_start_time"),
             "captured_end_time": video_asset_row.get("captured_end_time"),
