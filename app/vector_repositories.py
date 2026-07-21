@@ -206,6 +206,28 @@ def list_customer_gallery_records_for_session_customer(
     return _fetch_all_dicts(result)
 
 
+def list_customer_gallery_records_by_ids(
+    db: Session,
+    *,
+    gallery_ids: list[int],
+) -> list[dict[str, Any]]:
+    if not gallery_ids:
+        return []
+    result = db.execute(
+        text(
+            """
+            select id, location_id, session_id, session_customer_id, person_id, image_url, image_kind,
+                   embedding_osnet, embedding_fashion, metadata, created_at
+            from tds_customer_gallery
+            where id = any(:gallery_ids)
+            order by id asc
+            """
+        ),
+        {"gallery_ids": gallery_ids},
+    )
+    return _fetch_all_dicts(result)
+
+
 def delete_customer_gallery_records_for_session_customer(
     db: Session,
     *,
