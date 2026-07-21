@@ -174,10 +174,21 @@ def _tracking_summary_path(video_path: str, output_dir: Path) -> Path:
     return output_dir / f"{Path(video_path).stem}_tracking_summary.json"
 
 
+def _reid_views_summary_path(video_path: str, output_dir: Path) -> Path:
+    return output_dir / f"{Path(video_path).stem}_reid_views_summary.json"
+
+
 def _load_tracking_summary(video_path: str, output_dir: Path) -> dict[str, Any]:
     summary_path = _tracking_summary_path(video_path, output_dir)
     if not summary_path.exists():
         raise FileNotFoundError(f"Tracking summary not found at {summary_path}")
+    return json.loads(summary_path.read_text())
+
+
+def _load_reid_views_summary(video_path: str, output_dir: Path) -> dict[str, Any]:
+    summary_path = _reid_views_summary_path(video_path, output_dir)
+    if not summary_path.exists():
+        return {"customers": []}
     return json.loads(summary_path.read_text())
 
 
@@ -335,8 +346,20 @@ def _sync_gallery_state_after_entry(
     leave_time: datetime | None,
 ) -> None:
     tracking_summary = _load_tracking_summary(video_path, output_dir)
+    reid_views_summary = _load_reid_views_summary(video_path, output_dir)
     cross_state = _load_cross_state_pickle(gallery_state_path)
     persistent_gallery = cross_state.get("persistent_gallery", {})
+    reid_views_by_person: dict[int, list[dict[str, Any]]] = {}
+    for customer_views in reid_views_summary.get("customers", []):
+        try:
+            summary_person_id = int(customer_views["person_id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        raw_views = customer_views.get("views") or []
+        if isinstance(raw_views, list):
+            reid_views_by_person[summary_person_id] = [
+                view for view in raw_views if isinstance(view, dict)
+            ]
 
     transactional_db = TransactionalSessionLocal()
     vector_db = VectorSessionLocal()
@@ -376,28 +399,44 @@ def _sync_gallery_state_after_entry(
                 output_dir=output_dir,
                 person_id=person_id,
             )
-            canonical_image_url = image_paths[0] if image_paths else None
+            view_rows = reid_views_by_person.get(person_id) or []
+            canonical_view = view_rows[0] if view_rows else None
+            canonical_image_url = (
+                canonical_view.get("image_url")
+                if canonical_view and canonical_view.get("image_url")
+                else (image_paths[0] if image_paths else None)
+            )
+            canonical_osnet = (
+                canonical_view.get("embedding_osnet")
+                if canonical_view
+                else (_tensor_like_to_float_list(osnet_views[0]) if osnet_views else None)
+            )
+            canonical_fashion = (
+                canonical_view.get("embedding_fashion")
+                if canonical_view
+                else fashion_embedding
+            )
             if (
-                (_tensor_like_to_float_list(osnet_views[0]) if osnet_views else None) is not None
-                or fashion_embedding is not None
+                canonical_osnet is not None
+                or canonical_fashion is not None
                 or canonical_image_url is not None
             ):
-                row = vector_repositories.create_customer_gallery_record(
+                vector_repositories.create_customer_gallery_record(
                     vector_db,
                     location_id=location_id,
                     session_id=session_id,
                     session_customer_id=int(session_customer["id"]),
                     person_id=person_id,
                     image_url=canonical_image_url,
-                    image_kind="reid_view" if osnet_views else "fashion_view",
-                    embedding_osnet=_tensor_like_to_float_list(osnet_views[0]) if osnet_views else None,
-                    embedding_fashion=fashion_embedding,
+                    image_kind="reid_view" if canonical_osnet is not None else "fashion_view",
+                    embedding_osnet=canonical_osnet,
+                    embedding_fashion=canonical_fashion,
                     metadata={
                         "source": "entry_analysis",
                         "exited": bool(customer.get("exited")),
                         "group_id": customer.get("group_id"),
-                        "active_view_count": len(osnet_views),
-                        "active_image_count": len(image_paths),
+                        "active_view_count": len(view_rows) if view_rows else len(osnet_views),
+                        "active_image_count": len(view_rows) if view_rows else len(image_paths),
                     },
                 )
             if bool(customer.get("exited")):
@@ -408,7 +447,7 @@ def _sync_gallery_state_after_entry(
                 )
                 continue
 
-            if osnet_views or fashion_embedding is not None or image_paths:
+            if view_rows or osnet_views or fashion_embedding is not None or image_paths:
                 vector_repositories.delete_active_gallery(
                     vector_db,
                     location_id=location_id,
@@ -420,7 +459,21 @@ def _sync_gallery_state_after_entry(
                     "entered": bool(customer.get("entered")),
                     "exited": False,
                 }
-                if osnet_views:
+                if view_rows:
+                    for index, view_row in enumerate(view_rows):
+                        vector_repositories.create_active_gallery_record(
+                            vector_db,
+                            location_id=location_id,
+                            session_id=session_id,
+                            session_customer_id=int(session_customer["id"]),
+                            person_id=person_id,
+                            image_url=view_row.get("image_url"),
+                            image_kind=str(view_row.get("image_kind") or "reid_view"),
+                            embedding_osnet=view_row.get("embedding_osnet"),
+                            embedding_fashion=view_row.get("embedding_fashion"),
+                            metadata={**active_metadata, "view_index": index},
+                        )
+                elif osnet_views:
                     for index, osnet_view in enumerate(osnet_views):
                         image_url = image_paths[index] if index < len(image_paths) else (image_paths[0] if image_paths else None)
                         vector_repositories.create_active_gallery_record(

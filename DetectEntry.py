@@ -1,4 +1,5 @@
 import argparse
+import cv2
 import importlib.util
 import json
 import os
@@ -59,6 +60,100 @@ def _log(message: str) -> None:
 def _tracking_summary_path(video_path: str, output_dir: str) -> str:
     stem = os.path.splitext(os.path.basename(video_path))[0]
     return os.path.join(output_dir, f"{stem}_tracking_summary.json")
+
+
+def _reid_views_summary_path(video_path: str, output_dir: str) -> str:
+    stem = os.path.splitext(os.path.basename(video_path))[0]
+    return os.path.join(output_dir, f"{stem}_reid_views_summary.json")
+
+
+def _tensor_like_to_float_list(value):
+    if value is None:
+        return None
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    if hasattr(value, "numpy"):
+        value = value.numpy()
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if isinstance(value, (list, tuple)):
+        return [float(item) for item in value]
+    return None
+
+
+def _combine_fashion_embedding(upper, lower):
+    upper_list = _tensor_like_to_float_list(upper)
+    lower_list = _tensor_like_to_float_list(lower)
+    if upper_list and lower_list:
+        return upper_list + lower_list
+    return upper_list or lower_list
+
+
+def _build_reid_views_summary(video_path: str, output_dir: str) -> str:
+    reid_views_dir = os.path.join(os.path.dirname(output_dir), "reid_views")
+    summary = {
+        "video": os.path.splitext(os.path.basename(video_path))[0],
+        "customers": [],
+    }
+    customers = []
+
+    if not os.path.isdir(reid_views_dir):
+        summary_path = _reid_views_summary_path(video_path, output_dir)
+        with open(summary_path, "w") as f:
+            json.dump(summary, f, indent=2)
+        return summary_path
+
+    for name in sorted(os.listdir(reid_views_dir)):
+        if not name.startswith("ID"):
+            continue
+        person_id_raw = name[2:]
+        if not person_id_raw.isdigit():
+            continue
+        person_id = int(person_id_raw)
+        gid_dir = os.path.join(reid_views_dir, name)
+        if not os.path.isdir(gid_dir):
+            continue
+
+        view_rows = []
+        for image_name in sorted(os.listdir(gid_dir)):
+            if not image_name.lower().endswith(".jpg"):
+                continue
+            image_path = os.path.join(gid_dir, image_name)
+            img = cv2.imread(image_path)
+            if img is None or img.size == 0:
+                continue
+            h, w = img.shape[:2]
+            box = [0, 0, w, h]
+            embedding_osnet = _tensor_like_to_float_list(
+                Detect.IntegratedEntry.extract_embedding(img, box)
+            )
+            fashion_upper, fashion_lower = Detect.IntegratedEntry.extract_fashion_pair(img, box)
+            embedding_fashion = _combine_fashion_embedding(fashion_upper, fashion_lower)
+            if embedding_osnet is None and embedding_fashion is None:
+                continue
+            view_rows.append(
+                {
+                    "image_url": image_path,
+                    "image_kind": "reid_view",
+                    "embedding_osnet": embedding_osnet,
+                    "embedding_fashion": embedding_fashion,
+                }
+            )
+
+        customers.append(
+            {
+                "person_id": person_id,
+                "views": view_rows,
+            }
+        )
+
+    summary["customers"] = customers
+    summary_path = _reid_views_summary_path(video_path, output_dir)
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    return summary_path
 
 
 def _event_person_id(event: object) -> int | None:
@@ -241,6 +336,10 @@ def main():
     _log(f"ensure_tracking_summary done elapsed={time.time() - stage_started:.2f}s path={tracking_summary_path}")
 
     stage_started = time.time()
+    reid_views_summary_path = _build_reid_views_summary(video_path, output_dir)
+    _log(f"build_reid_views_summary done elapsed={time.time() - stage_started:.2f}s path={reid_views_summary_path}")
+
+    stage_started = time.time()
     save_cross_state(gallery_state_path, cross_state)
     _log(f"save_cross_state done elapsed={time.time() - stage_started:.2f}s")
 
@@ -255,6 +354,7 @@ def main():
                 "output_dir": output_dir,
                 "gallery_state": gallery_state_path,
                 "event_count": len(events or []),
+                "reid_views_summary": reid_views_summary_path,
                 "persistent_gallery_ids": sorted(
                     int(gid) for gid in cross_state.get("persistent_gallery", {}).keys()
                 ),
