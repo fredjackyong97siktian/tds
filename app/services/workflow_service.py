@@ -144,6 +144,32 @@ def _expected_processed_video_path(video_path: str, output_dir: Path) -> Path:
     return output_dir / f"{stem}_output.mp4"
 
 
+def _resolve_processed_video_path(video_path: str, output_dir: Path) -> Path | None:
+    expected_path = _expected_processed_video_path(video_path, output_dir)
+    if expected_path.exists():
+        return expected_path
+
+    stem = Path(video_path).stem
+    candidate_names = [
+        f"{stem}_output.mp4",
+        f"{stem}.mp4",
+    ]
+    for candidate_name in candidate_names:
+        candidate_path = output_dir / candidate_name
+        if candidate_path.exists():
+            return candidate_path
+
+    candidates = sorted(
+        path
+        for path in output_dir.glob(f"{stem}*.mp4")
+        if path.is_file()
+    )
+    if candidates:
+        return candidates[0]
+
+    return None
+
+
 def _tracking_summary_path(video_path: str, output_dir: Path) -> Path:
     return output_dir / f"{Path(video_path).stem}_tracking_summary.json"
 
@@ -465,16 +491,6 @@ def _upload_processed_video_for_asset(
         object_key,
         content_type=guess_media_type(str(processed_video_path)),
     )
-
-    raw_input_path = Path(source_video_path)
-    raw_removed = False
-    if _is_under_tmp_media_root(raw_input_path):
-        _safe_unlink(raw_input_path)
-        raw_removed = not raw_input_path.exists()
-
-    processed_local_path = processed_video_path
-    _safe_unlink(processed_local_path)
-    processed_removed = not processed_local_path.exists()
 
     repositories.update_video_asset(
         db,
@@ -1104,10 +1120,11 @@ def run_entry_for_trigger(
         repositories.update_video_asset_status(db, int(video_asset_row["id"]), "issue")
         return result
 
-    processed_video_path = _expected_processed_video_path(video_path, resolved_output_dir)
-    if not processed_video_path.exists():
+    processed_video_path = _resolve_processed_video_path(video_path, resolved_output_dir)
+    if processed_video_path is None:
+        expected_processed_video_path = _expected_processed_video_path(video_path, resolved_output_dir)
         repositories.update_video_asset_status(db, int(video_asset_row["id"]), "issue")
-        stderr = f"{result.stderr}\nProcessed video not found at {processed_video_path}".strip()
+        stderr = f"{result.stderr}\nProcessed video not found at {expected_processed_video_path}".strip()
         _record_followup_failure(
             db,
             script_run_id=result.script_run_id,
@@ -1241,10 +1258,11 @@ def run_kiosk_for_session(
         repositories.update_video_asset_status(db, int(video_asset_row["id"]), "issue")
         return result
 
-    processed_video_path = _expected_processed_video_path(video_path, resolved_output_dir)
-    if not processed_video_path.exists():
+    processed_video_path = _resolve_processed_video_path(video_path, resolved_output_dir)
+    if processed_video_path is None:
+        expected_processed_video_path = _expected_processed_video_path(video_path, resolved_output_dir)
         repositories.update_video_asset_status(db, int(video_asset_row["id"]), "issue")
-        stderr = f"{result.stderr}\nProcessed video not found at {processed_video_path}".strip()
+        stderr = f"{result.stderr}\nProcessed video not found at {expected_processed_video_path}".strip()
         repositories.revise_script_run(
             db,
             result.script_run_id,
