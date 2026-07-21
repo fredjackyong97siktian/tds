@@ -43,38 +43,40 @@ def list_customer_gallery(session_id: int, db: Session = Depends(get_vector_db))
     return [CustomerGalleryResponse(**row) for row in rows]
 
 
-@router.put("/locations/{location_id}/active-gallery/{session_customer_id}", response_model=ActiveGalleryResponse)
-def upsert_active_gallery(
+@router.post("/locations/{location_id}/active-gallery/{session_customer_id}", response_model=ActiveGalleryResponse)
+def create_active_gallery(
     location_id: int,
     session_customer_id: int,
     payload: ActiveGalleryUpsert,
     db: Session = Depends(get_vector_db),
 ) -> ActiveGalleryResponse:
-    row = vector_repositories.upsert_and_get_active_gallery(
+    row = vector_repositories.create_active_gallery_record(
         db,
         location_id=location_id,
         session_id=payload.session_id,
         session_customer_id=session_customer_id,
         person_id=payload.person_id,
-        state_kind=payload.state_kind,
-        state_payload=payload.state_payload,
+        image_url=payload.image_url,
+        image_kind=payload.image_kind,
+        embedding_osnet=payload.embedding_osnet,
+        embedding_fashion=payload.embedding_fashion,
         metadata=payload.metadata,
     )
     return ActiveGalleryResponse(**row)
 
 
-@router.get("/locations/{location_id}/active-gallery/{session_customer_id}/{state_kind}", response_model=ActiveGalleryResponse)
+@router.get("/locations/{location_id}/active-gallery/{session_customer_id}/{active_gallery_id}", response_model=ActiveGalleryResponse)
 def get_active_gallery(
     location_id: int,
     session_customer_id: int,
-    state_kind: str,
+    active_gallery_id: int,
     db: Session = Depends(get_vector_db),
 ) -> ActiveGalleryResponse:
     row = vector_repositories.get_active_gallery(
         db,
         location_id=location_id,
         session_customer_id=session_customer_id,
-        state_kind=state_kind,
+        active_gallery_id=active_gallery_id,
     )
     return ActiveGalleryResponse(**row)
 

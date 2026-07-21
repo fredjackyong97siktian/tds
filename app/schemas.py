@@ -268,6 +268,12 @@ class CustomerGalleryResponse(BaseModel):
 
 class ActiveGalleryUpsert(BaseModel):
     session_id: int | None = None
+    person_id: int | None = None
+    image_url: str | None = None
+    image_kind: str = "reid_view"
+    embedding_osnet: list[float] | None = None
+    embedding_fashion: list[float] | None = None
+    metadata: dict[str, Any] | None = None
 
 
 class TheftListItem(BaseModel):
@@ -280,9 +286,6 @@ class TheftListItem(BaseModel):
     metadata: dict[str, Any] | None = None
     session_customer_id: int
     person_id: int | None = None
-    state_kind: str = "active_gallery"
-    state_payload: dict[str, Any]
-    metadata: dict[str, Any] | None = None
 
 
 class ActiveGalleryResponse(BaseModel):
@@ -291,8 +294,10 @@ class ActiveGalleryResponse(BaseModel):
     session_id: int | None = None
     session_customer_id: int
     person_id: int | None = None
-    state_kind: str
-    state_payload: dict[str, Any]
+    image_url: str | None = None
+    image_kind: str
+    embedding_osnet: Any | None = None
+    embedding_fashion: Any | None = None
     metadata: dict[str, Any] | None = None
     created_at: datetime
     updated_at: datetime

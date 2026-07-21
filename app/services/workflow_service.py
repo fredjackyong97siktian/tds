@@ -245,8 +245,7 @@ def _build_cross_state_from_active_gallery(location_id: int) -> dict[str, Any]:
         next_gid = 1
 
         for row in active_rows:
-            payload = row.get("state_payload") or {}
-            person_id_value = row.get("person_id", payload.get("person_id"))
+            person_id_value = row.get("person_id")
             try:
                 person_id = int(person_id_value)
             except (TypeError, ValueError):
@@ -254,66 +253,33 @@ def _build_cross_state_from_active_gallery(location_id: int) -> dict[str, Any]:
 
             next_gid = max(next_gid, person_id + 1)
 
-            image_paths = [
-                str(path)
-                for path in (payload.get("image_urls") or [])
-                if str(path).strip()
-            ]
-            if not image_paths and payload.get("image_url"):
-                image_paths = [str(payload["image_url"])]
+            image_paths = [str(row["image_url"])] if row.get("image_url") else []
+            osnet_views = []
+            osnet_tensor = _float_list_to_tensor(row.get("embedding_osnet"))
+            if osnet_tensor is not None:
+                osnet_views.append(osnet_tensor)
 
-            osnet_views = [
-                tensor
-                for tensor in (_float_list_to_tensor(view) for view in (payload.get("embedding_osnet_views") or []))
-                if tensor is not None
-            ]
-
-            fashion_upper = _tensor_like_to_float_list(payload.get("fashion_upper_embedding"))
-            fashion_lower = _tensor_like_to_float_list(payload.get("fashion_lower_embedding"))
-            if fashion_upper is None and fashion_lower is None:
-                fashion_upper, fashion_lower = _split_fashion_embedding(payload.get("embedding_fashion"))
-
-            if not osnet_views and payload.get("customer_gallery_ids"):
-                gallery_records = vector_repositories.list_customer_gallery_records_by_ids(
-                    vector_db,
-                    gallery_ids=[int(gallery_id) for gallery_id in payload.get("customer_gallery_ids") or []],
-                )
-                if not image_paths:
-                    image_paths = [
-                        str(record["image_url"])
-                        for record in gallery_records
-                        if record.get("image_url")
-                    ]
-                osnet_views = [
-                    tensor
-                    for tensor in (
-                        _float_list_to_tensor(record.get("embedding_osnet"))
-                        for record in gallery_records
-                    )
-                    if tensor is not None
-                ]
-                if fashion_upper is None and fashion_lower is None:
-                    for record in gallery_records:
-                        fashion_upper, fashion_lower = _split_fashion_embedding(record.get("embedding_fashion"))
-                        if fashion_upper is not None or fashion_lower is not None:
-                            break
+            fashion_upper, fashion_lower = _split_fashion_embedding(row.get("embedding_fashion"))
 
             if not osnet_views and fashion_upper is None and fashion_lower is None and not image_paths:
                 continue
 
-            gallery_entry: dict[str, Any] = {"views": osnet_views}
+            gallery_entry = persistent_gallery.setdefault(person_id, {"views": []})
+            gallery_entry["views"].extend(osnet_views)
             if fashion_upper is not None:
                 fashion_upper_tensor = _float_list_to_tensor(fashion_upper)
-                if fashion_upper_tensor is not None:
+                if fashion_upper_tensor is not None and "fashion_upper_init" not in gallery_entry:
                     gallery_entry["fashion_upper_init"] = fashion_upper_tensor
             if fashion_lower is not None:
                 fashion_lower_tensor = _float_list_to_tensor(fashion_lower)
-                if fashion_lower_tensor is not None:
+                if fashion_lower_tensor is not None and "fashion_lower_init" not in gallery_entry:
                     gallery_entry["fashion_lower_init"] = fashion_lower_tensor
 
-            persistent_gallery[person_id] = gallery_entry
             if image_paths:
-                persistent_gallery_view_paths[person_id] = image_paths
+                existing_paths = persistent_gallery_view_paths.setdefault(person_id, [])
+                for image_path in image_paths:
+                    if image_path not in existing_paths:
+                        existing_paths.append(image_path)
 
         return {
             "next_gid": next_gid,
@@ -381,13 +347,12 @@ def _sync_gallery_state_after_entry(
                 output_dir=output_dir,
                 person_id=person_id,
             )
-            fashion_upper_embedding = _tensor_like_to_float_list(gallery_entry.get("fashion_upper_init"))
-            fashion_lower_embedding = _tensor_like_to_float_list(gallery_entry.get("fashion_lower_init"))
-            canonical_osnet_embedding = _tensor_like_to_float_list(osnet_views[0]) if osnet_views else None
             canonical_image_url = image_paths[0] if image_paths else None
-
-            created_gallery_id: int | None = None
-            if canonical_osnet_embedding is not None or fashion_embedding is not None or canonical_image_url is not None:
+            if (
+                (_tensor_like_to_float_list(osnet_views[0]) if osnet_views else None) is not None
+                or fashion_embedding is not None
+                or canonical_image_url is not None
+            ):
                 row = vector_repositories.create_customer_gallery_record(
                     vector_db,
                     location_id=location_id,
@@ -395,8 +360,8 @@ def _sync_gallery_state_after_entry(
                     session_customer_id=int(session_customer["id"]),
                     person_id=person_id,
                     image_url=canonical_image_url,
-                    image_kind="reid_view" if canonical_osnet_embedding is not None else "fashion_view",
-                    embedding_osnet=canonical_osnet_embedding,
+                    image_kind="reid_view" if osnet_views else "fashion_view",
+                    embedding_osnet=_tensor_like_to_float_list(osnet_views[0]) if osnet_views else None,
                     embedding_fashion=fashion_embedding,
                     metadata={
                         "source": "entry_analysis",
@@ -406,8 +371,6 @@ def _sync_gallery_state_after_entry(
                         "active_image_count": len(image_paths),
                     },
                 )
-                created_gallery_id = int(row["id"])
-
             if bool(customer.get("exited")):
                 vector_repositories.delete_active_gallery(
                     vector_db,
@@ -417,38 +380,45 @@ def _sync_gallery_state_after_entry(
                 continue
 
             if osnet_views or fashion_embedding is not None or image_paths:
-                vector_repositories.upsert_active_gallery(
+                vector_repositories.delete_active_gallery(
                     vector_db,
                     location_id=location_id,
-                    session_id=session_id,
                     session_customer_id=int(session_customer["id"]),
-                    person_id=person_id,
-                    state_kind="active_gallery",
-                    state_payload={
-                        "person_id": person_id,
-                        "image_url": canonical_image_url,
-                        "image_urls": image_paths,
-                        "embedding_osnet_views": [
-                            embedding
-                            for embedding in (
-                                _tensor_like_to_float_list(osnet_view)
-                                for osnet_view in osnet_views
-                            )
-                            if embedding is not None
-                        ],
-                        "fashion_upper_embedding": fashion_upper_embedding,
-                        "fashion_lower_embedding": fashion_lower_embedding,
-                        "embedding_fashion": fashion_embedding,
-                        "primary_customer_gallery_id": created_gallery_id,
-                        "is_active": True,
-                    },
-                    metadata={
-                        "source": "entry_analysis",
-                        "group_id": customer.get("group_id"),
-                        "entered": bool(customer.get("entered")),
-                        "exited": False,
-                    },
                 )
+                active_metadata = {
+                    "source": "entry_analysis",
+                    "group_id": customer.get("group_id"),
+                    "entered": bool(customer.get("entered")),
+                    "exited": False,
+                }
+                if osnet_views:
+                    for index, osnet_view in enumerate(osnet_views):
+                        image_url = image_paths[index] if index < len(image_paths) else (image_paths[0] if image_paths else None)
+                        vector_repositories.create_active_gallery_record(
+                            vector_db,
+                            location_id=location_id,
+                            session_id=session_id,
+                            session_customer_id=int(session_customer["id"]),
+                            person_id=person_id,
+                            image_url=image_url,
+                            image_kind="reid_view",
+                            embedding_osnet=_tensor_like_to_float_list(osnet_view),
+                            embedding_fashion=fashion_embedding,
+                            metadata={**active_metadata, "view_index": index},
+                        )
+                elif fashion_embedding is not None or canonical_image_url is not None:
+                    vector_repositories.create_active_gallery_record(
+                        vector_db,
+                        location_id=location_id,
+                        session_id=session_id,
+                        session_customer_id=int(session_customer["id"]),
+                        person_id=person_id,
+                        image_url=canonical_image_url,
+                        image_kind="fashion_view",
+                        embedding_osnet=None,
+                        embedding_fashion=fashion_embedding,
+                        metadata=active_metadata,
+                    )
             else:
                 vector_repositories.delete_active_gallery(
                     vector_db,

@@ -51,12 +51,13 @@ create table if not exists tds_active_gallery (
     session_id bigint,
     session_customer_id bigint not null,
     person_id integer,
-    state_kind varchar(50) not null default 'active_gallery',
-    state_payload jsonb,
+    image_url text,
+    image_kind varchar(50) not null default 'reid_view',
+    embedding_osnet jsonb,
+    embedding_fashion jsonb,
     metadata jsonb,
     created_at timestamptz not null default now(),
-    updated_at timestamptz not null default now(),
-    unique (location_id, state_kind, session_customer_id)
+    updated_at timestamptz not null default now()
 );
 
 create index if not exists idx_active_gallery_location_id
@@ -68,8 +69,11 @@ create index if not exists idx_active_gallery_session_id
 create index if not exists idx_active_gallery_session_customer_id
     on tds_active_gallery(session_customer_id);
 
-create index if not exists idx_active_gallery_payload_gin
-    on tds_active_gallery using gin (state_payload);
+create index if not exists idx_active_gallery_person_id
+    on tds_active_gallery(person_id);
+
+create index if not exists idx_active_gallery_image_kind
+    on tds_active_gallery(image_kind);
 
 comment on column tds_customer_gallery.location_id is
     'Store/location partition key copied from MySQL so embeddings can be isolated by location.';
@@ -83,8 +87,8 @@ comment on column tds_active_gallery.location_id is
 comment on column tds_active_gallery.session_customer_id is
     'Value-copied MySQL session_customer.id for the active customer represented by this runtime-state row.';
 
-comment on column tds_active_gallery.state_kind is
-    'active_gallery keeps only currently active customer_gallery references for one customer at one location.';
+comment on column tds_active_gallery.embedding_osnet is
+    'OSNet embedding for one active ReID view that should be compared against the next video.';
 
-comment on column tds_active_gallery.state_payload is
-    'Recommended shape: {"customer_gallery_ids":[5001,5002],"primary_gallery_entry_id":5001,"is_active":true} so the app can fetch embeddings from customer_gallery by id for this active customer.';
+comment on column tds_active_gallery.embedding_fashion is
+    'Fashion embedding for one active ReID view that should be compared against the next video.';
