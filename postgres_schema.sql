@@ -60,6 +60,9 @@ create table if not exists tds_active_gallery (
     updated_at timestamptz not null default now()
 );
 
+alter table tds_active_gallery
+    drop constraint if exists active_gallery_location_id_session_customer_id_key;
+
 create index if not exists idx_active_gallery_location_id
     on tds_active_gallery(location_id);
 
