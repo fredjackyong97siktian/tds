@@ -40,6 +40,9 @@ def create_active_gallery_record(
             values (
                 :location_id, :session_id, :session_customer_id, :person_id, :image_url, :image_kind,
                 cast(:embedding_osnet as jsonb), cast(:embedding_fashion as jsonb), cast(:metadata as jsonb)
+            )
+            returning id, location_id, session_id, session_customer_id, person_id, image_url, image_kind,
+                      embedding_osnet, embedding_fashion, metadata, created_at, updated_at
             """
         ),
         {
@@ -55,7 +58,7 @@ def create_active_gallery_record(
         },
     )
     db.commit()
-    return get_active_gallery_record(db, int(result.lastrowid))
+    return _fetch_one_dict(result)
 
 
 def create_customer_gallery_record(
