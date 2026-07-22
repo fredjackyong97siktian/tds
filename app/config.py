@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     analysis_poll_seconds: int = 10
     analysis_max_global_workers: int = 1
     analysis_max_per_location: int = 1
+    analysis_post_job_sleep_seconds: int = 10
     whitelist_qrentry_table_name: str = "phonenumber"
     whitelist_qrentry_value_column: str = "participantId"
     whitelist_qrentry_label_column: str = "participantId"

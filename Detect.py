@@ -118,6 +118,34 @@ _ENTRY_SOURCE = _ENTRY_SOURCE.replace('os.path.join(BASE_DIR, "yolo26s.pt")', 'o
 _ENTRY_SOURCE = _ENTRY_SOURCE.replace('os.path.join(BASE_DIR, "custom_tracker.yaml")', 'os.path.join(BASE_DIR, "models", "tracker", "custom_tracker.yaml")')
 _ENTRY_SOURCE = _ENTRY_SOURCE.replace('os.path.join(BASE_DIR, "yoloe-11l-seg.pt")', 'os.path.join(BASE_DIR, "models", "segmentation", "yoloe-11l-seg.pt")')
 _ENTRY_SOURCE = _ENTRY_SOURCE.replace('os.path.join(BASE_DIR, "models", "osnet_x1_0_msmt17.pt")', 'os.path.join(BASE_DIR, "models", "reid", "osnet_x1_0_msmt17.pt")')
+_ENTRY_SOURCE = _ENTRY_SOURCE.replace(
+    '"views": [init_emb] if init_emb is not None else [],\n'
+    '                        "fashion_upper_init": f_u_init,\n',
+    '"views": [init_emb] if init_emb is not None else [],\n'
+    '                        "session_id": globals().get("CURRENT_SESSION_ID"),\n'
+    '                        "session_customer_id": None,\n'
+    '                        "matched_person_id": None,\n'
+    '                        "fashion_upper_init": f_u_init,\n',
+)
+_ENTRY_SOURCE = _ENTRY_SOURCE.replace(
+    '"views": seeded_views,\n'
+    '            "fashion_upper_init": persistent_gallery[best_gid].get("fashion_upper_init"),\n',
+    '"views": seeded_views,\n'
+    '            "session_id": persistent_gallery[best_gid].get("session_id", globals().get("CURRENT_SESSION_ID")),\n'
+    '            "session_customer_id": persistent_gallery[best_gid].get("session_customer_id", best_gid),\n'
+    '            "matched_person_id": persistent_gallery[best_gid].get("person_id"),\n'
+    '            "fashion_upper_init": persistent_gallery[best_gid].get("fashion_upper_init"),\n',
+)
+_ENTRY_SOURCE = _ENTRY_SOURCE.replace(
+    'label = f"ID {gid} [{n_views}v]"\n'
+    '                if gid in event_display:\n',
+    'session_label = mem.get("session_id") or globals().get("CURRENT_SESSION_ID")\n'
+    '                label = f"ID {gid}"\n'
+    '                if session_label not in (None, ""):\n'
+    '                    label += f" | S{session_label}"\n'
+    '                label += f" [{n_views}v]"\n'
+    '                if gid in event_display:\n',
+)
 _ENTRY_NS = {"__file__": __file__, "__name__": "_integrated_entry"}
 exec(_ENTRY_SOURCE, _ENTRY_NS)
 IntegratedEntry = _IntegratedModuleProxy(_ENTRY_NS)
@@ -4627,6 +4655,9 @@ def process_kiosk_video(video_path, output_dir, cross_state):
                         "missing": 0,
                         "seen": 1,
                         "views": seeded_views,
+                        "session_id": persistent_gallery[best_gid].get("session_id", globals().get("CURRENT_SESSION_ID")),
+                        "session_customer_id": persistent_gallery[best_gid].get("session_customer_id", best_gid),
+                        "matched_person_id": persistent_gallery[best_gid].get("person_id"),
                         "fashion_upper_init": persistent_gallery[best_gid].get("fashion_upper_init"),
                         "fashion_lower_init": persistent_gallery[best_gid].get("fashion_lower_init"),
                         "source": "entry_gallery",
@@ -4669,6 +4700,9 @@ def process_kiosk_video(video_path, output_dir, cross_state):
             "missing": 0,
             "seen": 1,
             "views": seeded_views,
+            "session_id": persistent_gallery[best_gid].get("session_id", globals().get("CURRENT_SESSION_ID")),
+            "session_customer_id": persistent_gallery[best_gid].get("session_customer_id", best_gid),
+            "matched_person_id": persistent_gallery[best_gid].get("person_id"),
             "fashion_upper_init": persistent_gallery[best_gid].get("fashion_upper_init"),
             "fashion_lower_init": persistent_gallery[best_gid].get("fashion_lower_init"),
             "source": "entry_gallery",

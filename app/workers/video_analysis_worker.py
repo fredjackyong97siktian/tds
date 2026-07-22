@@ -47,6 +47,7 @@ class VideoAnalysisWorker:
 
     def _reap_finished_jobs(self) -> None:
         finished_ids: list[int] = []
+        finished_count = 0
         with self._lock:
             items = list(self._running.items())
         for video_asset_id, job in items:
@@ -70,11 +71,20 @@ class VideoAnalysisWorker:
             except Exception:
                 logger.exception("Analysis job crashed for video_asset_id=%s", job.video_asset_id)
             finished_ids.append(video_asset_id)
+            finished_count += 1
         if not finished_ids:
             return
         with self._lock:
             for video_asset_id in finished_ids:
                 self._running.pop(video_asset_id, None)
+        cooldown_seconds = max(0, settings.analysis_post_job_sleep_seconds)
+        if finished_count > 0 and cooldown_seconds > 0:
+            logger.info(
+                "Analysis worker cooldown started for %ss after %s finished job(s)",
+                cooldown_seconds,
+                finished_count,
+            )
+            time.sleep(cooldown_seconds)
 
     def _fill_available_slots(self) -> None:
         with self._lock:

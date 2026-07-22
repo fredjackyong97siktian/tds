@@ -258,19 +258,43 @@ def _split_fashion_embedding(value: Any) -> tuple[list[float] | None, list[float
     return combined[:midpoint], combined[midpoint:]
 
 
+def _coerce_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _candidate_gallery_image_paths(
     *,
     cross_state: dict[str, Any],
     output_dir: Path,
-    person_id: int,
+    gallery_id: int,
 ) -> list[str]:
-    image_paths = cross_state.get("persistent_gallery_view_paths", {}).get(person_id) or []
+    image_paths = cross_state.get("persistent_gallery_view_paths", {}).get(gallery_id) or []
     if image_paths:
         return sorted(str(path) for path in image_paths)
-    reid_dir = output_dir.parent / "reid_views" / f"ID{person_id}"
+    reid_dir = output_dir.parent / "reid_views" / f"ID{gallery_id}"
     if not reid_dir.exists():
         return []
     return sorted(str(path) for path in reid_dir.glob("*.jpg"))
+
+
+def _resolve_runtime_gallery_entry(
+    *,
+    persistent_gallery: dict[int, dict[str, Any]],
+    runtime_person_id: int,
+) -> dict[str, Any]:
+    gallery_entry = persistent_gallery.get(runtime_person_id) or {}
+    if gallery_entry:
+        return gallery_entry
+
+    # Backward-compatible fallback for older cross-state layouts that may have
+    # stored the same runtime person under a nested person_id field.
+    for entry in persistent_gallery.values():
+        if _coerce_int(entry.get("person_id")) == runtime_person_id:
+            return entry
+    return {}
 
 
 def _build_cross_state_from_active_gallery(location_id: int) -> dict[str, Any]:
@@ -286,13 +310,11 @@ def _build_cross_state_from_active_gallery(location_id: int) -> dict[str, Any]:
         next_gid = 1
 
         for row in active_rows:
-            person_id_value = row.get("person_id")
-            try:
-                person_id = int(person_id_value)
-            except (TypeError, ValueError):
+            gallery_id = _coerce_int(row.get("session_customer_id"))
+            if gallery_id is None:
                 continue
 
-            next_gid = max(next_gid, person_id + 1)
+            next_gid = max(next_gid, gallery_id + 1)
 
             image_paths = [str(row["image_url"])] if row.get("image_url") else []
             osnet_views = []
@@ -305,7 +327,17 @@ def _build_cross_state_from_active_gallery(location_id: int) -> dict[str, Any]:
             if not osnet_views and fashion_upper is None and fashion_lower is None and not image_paths:
                 continue
 
-            gallery_entry = persistent_gallery.setdefault(person_id, {"views": []})
+            gallery_entry = persistent_gallery.setdefault(
+                gallery_id,
+                {
+                    "views": [],
+                    "session_id": _coerce_int(row.get("session_id")),
+                    "session_customer_id": gallery_id,
+                    "person_id": _coerce_int(row.get("person_id")),
+                    "location_id": _coerce_int(row.get("location_id")),
+                    "source": "postgresql_active_gallery",
+                },
+            )
             gallery_entry["views"].extend(osnet_views)
             if fashion_upper is not None:
                 fashion_upper_tensor = _float_list_to_tensor(fashion_upper)
@@ -317,7 +349,7 @@ def _build_cross_state_from_active_gallery(location_id: int) -> dict[str, Any]:
                     gallery_entry["fashion_lower_init"] = fashion_lower_tensor
 
             if image_paths:
-                existing_paths = persistent_gallery_view_paths.setdefault(person_id, [])
+                existing_paths = persistent_gallery_view_paths.setdefault(gallery_id, [])
                 for image_path in image_paths:
                     if image_path not in existing_paths:
                         existing_paths.append(image_path)
@@ -389,7 +421,16 @@ def _sync_gallery_state_after_entry(
                 session_customer_id=int(session_customer["id"]),
             )
 
-            gallery_entry = persistent_gallery.get(person_id) or {}
+            gallery_entry = _resolve_runtime_gallery_entry(
+                persistent_gallery=persistent_gallery,
+                runtime_person_id=person_id,
+            )
+            source_session_id = _coerce_int(gallery_entry.get("session_id"))
+            source_session_customer_id = _coerce_int(gallery_entry.get("session_customer_id"))
+            source_person_id = _coerce_int(gallery_entry.get("person_id"))
+            active_session_id = source_session_id or session_id
+            active_session_customer_id = source_session_customer_id or int(session_customer["id"])
+            active_person_id = source_person_id or person_id
             osnet_views = gallery_entry.get("views") or []
             fashion_embedding = _combine_fashion_embedding(
                 gallery_entry.get("fashion_upper_init"),
@@ -398,7 +439,7 @@ def _sync_gallery_state_after_entry(
             image_paths = _candidate_gallery_image_paths(
                 cross_state=cross_state,
                 output_dir=output_dir,
-                person_id=person_id,
+                gallery_id=person_id,
             )
             view_rows = reid_views_by_person.get(person_id) or []
             canonical_view = view_rows[0] if view_rows else None
@@ -444,7 +485,7 @@ def _sync_gallery_state_after_entry(
                 vector_repositories.delete_active_gallery(
                     vector_db,
                     location_id=location_id,
-                    session_customer_id=int(session_customer["id"]),
+                    session_customer_id=active_session_customer_id,
                 )
                 continue
 
@@ -452,7 +493,7 @@ def _sync_gallery_state_after_entry(
                 vector_repositories.delete_active_gallery(
                     vector_db,
                     location_id=location_id,
-                    session_customer_id=int(session_customer["id"]),
+                    session_customer_id=active_session_customer_id,
                 )
                 active_metadata = {
                     "source": "entry_analysis",
@@ -465,9 +506,9 @@ def _sync_gallery_state_after_entry(
                         vector_repositories.create_active_gallery_record(
                             vector_db,
                             location_id=location_id,
-                            session_id=session_id,
-                            session_customer_id=int(session_customer["id"]),
-                            person_id=person_id,
+                            session_id=active_session_id,
+                            session_customer_id=active_session_customer_id,
+                            person_id=active_person_id,
                             image_url=view_row.get("image_url"),
                             image_kind=str(view_row.get("image_kind") or "reid_view"),
                             embedding_osnet=view_row.get("embedding_osnet"),
@@ -480,9 +521,9 @@ def _sync_gallery_state_after_entry(
                         vector_repositories.create_active_gallery_record(
                             vector_db,
                             location_id=location_id,
-                            session_id=session_id,
-                            session_customer_id=int(session_customer["id"]),
-                            person_id=person_id,
+                            session_id=active_session_id,
+                            session_customer_id=active_session_customer_id,
+                            person_id=active_person_id,
                             image_url=image_url,
                             image_kind="reid_view",
                             embedding_osnet=_tensor_like_to_float_list(osnet_view),
@@ -493,9 +534,9 @@ def _sync_gallery_state_after_entry(
                     vector_repositories.create_active_gallery_record(
                         vector_db,
                         location_id=location_id,
-                        session_id=session_id,
-                        session_customer_id=int(session_customer["id"]),
-                        person_id=person_id,
+                        session_id=active_session_id,
+                        session_customer_id=active_session_customer_id,
+                        person_id=active_person_id,
                         image_url=canonical_image_url,
                         image_kind="fashion_view",
                         embedding_osnet=None,
@@ -506,7 +547,7 @@ def _sync_gallery_state_after_entry(
                 vector_repositories.delete_active_gallery(
                     vector_db,
                     location_id=location_id,
-                    session_customer_id=int(session_customer["id"]),
+                    session_customer_id=active_session_customer_id,
                 )
     finally:
         vector_db.close()
@@ -1161,6 +1202,8 @@ def run_entry_for_trigger(
             str(video_path),
             "--output-dir",
             str(resolved_output_dir),
+            "--session-id",
+            str(session_id),
             "--gallery-state",
             str(resolved_gallery_state),
         ],

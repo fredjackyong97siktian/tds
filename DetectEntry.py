@@ -295,6 +295,12 @@ def main():
     parser.add_argument("--video", required=True, help="Path to the entry/exit video.")
     parser.add_argument("--output-dir", required=True, help="Directory for entry logs and outputs.")
     parser.add_argument(
+        "--session-id",
+        type=int,
+        default=None,
+        help="Current transactional session id for overlay labels and gallery ownership.",
+    )
+    parser.add_argument(
         "--gallery-state",
         required=True,
         help="Pickle file that stores the shared persistent gallery between Entry and Kiosk.",
@@ -316,6 +322,9 @@ def main():
     Detect.IntegratedEntry.REID_DEBUG_DIR = reid_views_dir
     Detect.IntegratedEntry.REID_FASHION_DEBUG_DIR = reid_fashion_views_dir
     Detect.REID_FASHION_DEBUG_DIR = reid_fashion_views_dir
+    Detect.CURRENT_SESSION_ID = args.session_id
+    if args.session_id is not None:
+        os.environ["DETECT_CURRENT_SESSION_ID"] = str(args.session_id)
 
     _log(f"start video={video_path}")
 
