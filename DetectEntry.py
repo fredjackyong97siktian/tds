@@ -221,7 +221,7 @@ def _build_fallback_tracking_summary(video_path: str, events: object, cross_stat
                     last_frames[person_id] = max(last_frames[person_id], frame_no)  # type: ignore[arg-type]
                 customer["last_seen_frame"] = last_frames[person_id]
 
-            if "enter" in event_type:
+            if event_type in {"entry", "enter"} or "enter" in event_type or "entry" in event_type:
                 customer["entered"] = True
                 if customer["entry_frame"] is None:
                     customer["entry_frame"] = frame_no

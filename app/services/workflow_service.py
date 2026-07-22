@@ -19,6 +19,7 @@ from .. import vector_repositories
 from ..storage import (
     guess_media_type,
     gallery_state_path as build_private_gallery_state_path,
+    location_gallery_state_path as build_location_gallery_state_path,
     processed_video_spaces_key,
     session_logs_root,
     session_root,
@@ -1144,7 +1145,7 @@ def run_entry_for_trigger(
         if output_dir
         else default_trigger_output_dir(location_id, trigger_id)
     )
-    resolved_gallery_state = Path(gallery_state_path) if gallery_state_path else build_private_gallery_state_path(location_id, session_id)
+    resolved_gallery_state = Path(gallery_state_path) if gallery_state_path else build_location_gallery_state_path(location_id)
     _hydrate_gallery_state_from_active_gallery(location_id, resolved_gallery_state)
     video_asset_row = _lookup_video_asset_by_file_path(db, video_path)
     if video_asset_row is not None:
@@ -1282,7 +1283,7 @@ def run_kiosk_for_session(
     location_id = int(session["location_id"])
     workdir = build_session_workdir(location_id, session_id)
     resolved_output_dir = Path(output_dir) if output_dir else default_video_output_dir(location_id, session_id, video_path)
-    resolved_gallery_state = Path(gallery_state_path) if gallery_state_path else build_private_gallery_state_path(location_id, session_id)
+    resolved_gallery_state = Path(gallery_state_path) if gallery_state_path else build_location_gallery_state_path(location_id)
     _hydrate_gallery_state_from_active_gallery(location_id, resolved_gallery_state)
     video_asset_row = _lookup_video_asset_by_file_path(db, video_path)
     if video_asset_row is not None:

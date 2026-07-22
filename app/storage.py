@@ -38,13 +38,13 @@ def tmp_location_root(location_id: int) -> Path:
 
 
 def trigger_root(location_id: int, trigger_id: int) -> Path:
-    root = location_root(location_id) / "triggers" / f"trigger_{trigger_id}"
+    root = location_root(location_id) / f"trigger_{trigger_id}"
     root.mkdir(parents=True, exist_ok=True)
     return root
 
 
 def tmp_trigger_root(location_id: int, trigger_id: int) -> Path:
-    root = tmp_location_root(location_id) / "triggers" / f"trigger_{trigger_id}"
+    root = tmp_location_root(location_id) / f"trigger_{trigger_id}"
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -68,25 +68,25 @@ def trigger_processed_root(location_id: int, trigger_id: int, section: str) -> P
 
 
 def session_root(location_id: int, session_id: int) -> Path:
-    root = location_root(location_id) / "sessions" / f"session_{session_id}"
+    root = location_root(location_id) / f"session_{session_id}"
     root.mkdir(parents=True, exist_ok=True)
     return root
 
 
 def tmp_session_root(location_id: int, session_id: int) -> Path:
-    root = tmp_location_root(location_id) / "sessions" / f"session_{session_id}"
+    root = tmp_location_root(location_id) / f"session_{session_id}"
     root.mkdir(parents=True, exist_ok=True)
     return root
 
 
 def session_video_path(location_id: int, session_id: int, section: str, filename: str) -> Path:
-    directory = session_root(location_id, session_id) / "videos" / section / "raw"
+    directory = session_root(location_id, session_id) / section / "raw"
     directory.mkdir(parents=True, exist_ok=True)
     return directory / _safe_name(filename)
 
 
 def session_tmp_video_path(location_id: int, session_id: int, section: str, filename: str) -> Path:
-    directory = tmp_session_root(location_id, session_id) / "videos" / section / "raw"
+    directory = tmp_session_root(location_id, session_id) / section / "raw"
     directory.mkdir(parents=True, exist_ok=True)
     return directory / _safe_name(filename)
 
@@ -101,6 +101,17 @@ def session_logs_root(location_id: int, session_id: int) -> Path:
     root = session_scripts_root(location_id, session_id) / "logs"
     root.mkdir(parents=True, exist_ok=True)
     return root
+
+
+def location_scripts_root(location_id: int) -> Path:
+    root = location_root(location_id) / "scripts"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def location_gallery_state_path(location_id: int) -> Path:
+    root = location_scripts_root(location_id)
+    return root / "active_gallery_state.pkl"
 
 
 def gallery_state_path(location_id: int, session_id: int) -> Path:
@@ -140,12 +151,12 @@ def processed_video_spaces_key(
     session_id: int | None = None,
     trigger_id: int | None = None,
 ) -> str:
-    segments = ["locations", f"location_{location_id}"]
+    segments = [f"location_{location_id}"]
     if session_id is not None:
-        segments.extend(["sessions", f"session_{session_id}"])
+        segments.append(f"session_{session_id}")
     if trigger_id is not None:
-        segments.extend(["triggers", f"trigger_{trigger_id}"])
-    segments.extend(["videos", section, "processed", filename])
+        segments.append(f"trigger_{trigger_id}")
+    segments.extend([section, "processed", filename])
     return build_spaces_object_key(*segments)
 
 
