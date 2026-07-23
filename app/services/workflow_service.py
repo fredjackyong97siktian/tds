@@ -1,5 +1,6 @@
 from __future__ import annotations
 import json
+import re
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -574,10 +575,54 @@ def _upload_processed_video_for_asset(
     script_name: str,
     model_name: str | None,
 ) -> None:
+    source_stem = processed_video_path.stem
+    if source_stem.endswith("_output"):
+        source_stem = source_stem[: -len("_output")]
+
+    shortened_stem = source_stem
+    section_name = str(video_asset_row.get("section") or script_name or "video").strip().lower()
+    section_prefix = f"{section_name}_playback_"
+    if shortened_stem.startswith(section_prefix):
+        shortened_stem = shortened_stem[len(section_prefix) :]
+
+    timestamp_match = re.fullmatch(
+        r"(\d{4})_(\d{2})_(\d{2})_(\d{2})_(\d{2})_(\d{2})_(\d{4})_(\d{2})_(\d{2})_(\d{2})_(\d{2})_(\d{2})",
+        shortened_stem,
+    )
+    if timestamp_match:
+        (
+            start_year,
+            start_month,
+            start_day,
+            start_hour,
+            start_minute,
+            start_second,
+            end_year,
+            end_month,
+            end_day,
+            end_hour,
+            end_minute,
+            end_second,
+        ) = timestamp_match.groups()
+        shortened_stem = (
+            f"{start_day}_{start_month}_{start_year[-2:]}"
+            f"_{start_hour}{start_minute}{start_second}"
+            f"_{end_day}_{end_month}_{end_year[-2:]}"
+            f"_{end_hour}{end_minute}{end_second}"
+        )
+
+    upload_filename = f"{section_name[:1] or 'v'}_{shortened_stem}{processed_video_path.suffix}"
+    if session_id is not None and trigger_id is not None:
+        upload_filename = f"s{session_id}_t{trigger_id}_{upload_filename}"
+    elif session_id is not None:
+        upload_filename = f"s{session_id}_{upload_filename}"
+    elif trigger_id is not None:
+        upload_filename = f"t{trigger_id}_{upload_filename}"
+
     object_key = processed_video_spaces_key(
         location_id=location_id,
         section=str(video_asset_row.get("section") or script_name),
-        filename=processed_video_path.name,
+        filename=upload_filename,
         session_id=session_id,
         trigger_id=trigger_id,
     )

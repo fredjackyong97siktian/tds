@@ -152,11 +152,13 @@ def processed_video_spaces_key(
     trigger_id: int | None = None,
 ) -> str:
     segments = [f"location_{location_id}"]
-    if session_id is not None:
+    if session_id is not None and trigger_id is not None:
+        segments.append(f"session_{session_id}_trigger_{trigger_id}")
+    elif session_id is not None:
         segments.append(f"session_{session_id}")
-    if trigger_id is not None:
+    elif trigger_id is not None:
         segments.append(f"trigger_{trigger_id}")
-    segments.extend([section, "processed", filename])
+    segments.extend([section, filename])
     return build_spaces_object_key(*segments)
 
 
