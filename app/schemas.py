@@ -184,12 +184,15 @@ class TransactionCreate(BaseModel):
 
 
 class ScriptRunResponse(BaseModel):
+    script_run_id: int | None = None
+    runner_job_id: str | None = None
     script_name: str
     model_name: str | None = None
     status: str
     command: list[str]
     stdout: str
     stderr: str
+    message: str | None = None
 
 
 class EntryRunRequest(BaseModel):

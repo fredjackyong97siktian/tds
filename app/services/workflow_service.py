@@ -53,6 +53,8 @@ class ScriptExecutionResult:
     command: list[str]
     stdout: str
     stderr: str
+    runner_job_id: str | None = None
+    message: str | None = None
 
 
 @dataclass
@@ -114,6 +116,11 @@ class RemoteRunnerResult:
     reid_views_summary: dict[str, Any] | None = None
 
 
+@dataclass
+class RunpodEnqueueResult:
+    job_id: str
+
+
 def build_session_workdir(location_id: int, session_id: int) -> Path:
     workdir = session_root(location_id, session_id)
     workdir.mkdir(parents=True, exist_ok=True)
@@ -152,7 +159,15 @@ def _http_runner_enabled() -> bool:
 
 
 def _runpod_runner_enabled() -> bool:
-    return bool(str(settings.runpod_endpoint_id or "").strip() and str(settings.runpod_api_key or "").strip())
+    has_endpoint = any(
+        str(value or "").strip()
+        for value in (
+            settings.runpod_endpoint_id,
+            settings.runpod_entry_endpoint_id,
+            settings.runpod_kiosk_endpoint_id,
+        )
+    )
+    return bool(has_endpoint and str(settings.runpod_api_key or "").strip())
 
 
 def _spaces_download_url_for_object_key(object_key: str) -> str:
@@ -320,6 +335,281 @@ def _write_remote_entry_summaries(
     )
 
 
+def _remote_runner_result_from_runpod_body(body: dict[str, Any]) -> tuple[str, RemoteRunnerResult]:
+    status = str(body.get("status") or "").upper()
+    output = body.get("output")
+    if status == "COMPLETED":
+        if not isinstance(output, dict):
+            raise RuntimeError(f"Runpod completed without structured output: {body}")
+        return (
+            status,
+            RemoteRunnerResult(
+                status=str(output.get("status") or "success"),
+                stdout=str(output.get("stdout") or ""),
+                stderr=str(output.get("stderr") or ""),
+                processed_video_object_key=output.get("processed_video_object_key"),
+                processed_video_url=output.get("processed_video_url"),
+                tracking_summary=output.get("tracking_summary"),
+                reid_views_summary=output.get("reid_views_summary"),
+            ),
+        )
+
+    error_detail = body.get("error") or body.get("message") or body
+    if isinstance(output, dict):
+        return (
+            status,
+            RemoteRunnerResult(
+                status="failed",
+                stdout=str(output.get("stdout") or ""),
+                stderr=str(output.get("stderr") or error_detail),
+                processed_video_object_key=output.get("processed_video_object_key"),
+                processed_video_url=output.get("processed_video_url"),
+                tracking_summary=output.get("tracking_summary"),
+                reid_views_summary=output.get("reid_views_summary"),
+            ),
+        )
+    return (
+        status,
+        RemoteRunnerResult(
+            status="failed",
+            stdout="",
+            stderr=str(error_detail),
+            processed_video_object_key=None,
+            processed_video_url=None,
+        ),
+    )
+
+
+def _finalize_remote_entry_script_run(
+    db: Session,
+    *,
+    script_run: dict[str, Any],
+    remote_result: RemoteRunnerResult,
+) -> ScriptExecutionResult:
+    runner_payload = dict(script_run.get("runner_payload") or {})
+    script_run_id = int(script_run["id"])
+    session_id = int(script_run["session_id"])
+    trigger_id = int(script_run["trigger_id"]) if script_run.get("trigger_id") is not None else None
+    location_id = int(runner_payload["location_id"])
+    video_path = str(runner_payload["video_path"])
+    output_dir = Path(str(runner_payload["output_dir"]))
+    gallery_state_path = Path(str(runner_payload["gallery_state_path"]))
+    video_asset_id = int(runner_payload["video_asset_id"])
+    processed_video_url = str(runner_payload.get("processed_video_url") or "")
+    video_asset_row = repositories.get_video_asset(db, video_asset_id)
+    session = repositories.get_session(db, session_id)
+
+    remote_status = "success" if remote_result.status == "success" else "failed"
+    repositories.finish_script_run(
+        db,
+        script_run_id,
+        status=remote_status,
+        stdout_log=remote_result.stdout,
+        stderr_log=remote_result.stderr,
+    )
+    result = ScriptExecutionResult(
+        script_run_id=script_run_id,
+        runner_job_id=str(script_run.get("runner_job_id") or ""),
+        script_name="entry",
+        model_name=script_run.get("model_name"),
+        status=remote_status,
+        command=["runpod_serverless", "entry"],
+        stdout=remote_result.stdout,
+        stderr=remote_result.stderr,
+    )
+    if result.status != "success":
+        repositories.update_video_asset_status(db, video_asset_id, "issue")
+        return result
+    if not remote_result.tracking_summary:
+        repositories.update_video_asset_status(db, video_asset_id, "issue")
+        stderr = f"{result.stderr}\nRemote runner did not return tracking_summary.".strip()
+        _record_followup_failure(
+            db,
+            script_run_id=result.script_run_id,
+            session_id=session_id,
+            trigger_id=trigger_id,
+            script_name="entry",
+            model_name=str(script_run.get("model_name") or "remote_runner_tracking_summary_missing"),
+            stdout=result.stdout,
+            stderr=stderr,
+        )
+        return ScriptExecutionResult(
+            script_run_id=result.script_run_id,
+            runner_job_id=result.runner_job_id,
+            script_name=result.script_name,
+            model_name=result.model_name,
+            status="failed",
+            command=result.command,
+            stdout=result.stdout,
+            stderr=stderr,
+        )
+    _write_remote_entry_summaries(
+        video_path=video_path,
+        output_dir=output_dir,
+        tracking_summary=remote_result.tracking_summary,
+        reid_views_summary=remote_result.reid_views_summary,
+    )
+    try:
+        _sync_gallery_state_after_entry(
+            location_id=location_id,
+            session_id=session_id,
+            video_path=video_path,
+            output_dir=output_dir,
+            gallery_state_path=gallery_state_path,
+            enter_time=session.get("start_time"),
+            leave_time=video_asset_row.get("captured_end_time"),
+        )
+    except Exception as exc:
+        repositories.update_video_asset_status(db, video_asset_id, "issue")
+        stderr = f"{result.stderr}\nGallery persistence failed: {exc}".strip()
+        _record_followup_failure(
+            db,
+            script_run_id=result.script_run_id,
+            session_id=session_id,
+            trigger_id=trigger_id,
+            script_name="entry",
+            model_name=str(script_run.get("model_name") or "remote_runner_gallery_persistence"),
+            stdout=result.stdout,
+            stderr=stderr,
+        )
+        return ScriptExecutionResult(
+            script_run_id=result.script_run_id,
+            runner_job_id=result.runner_job_id,
+            script_name=result.script_name,
+            model_name=result.model_name,
+            status="failed",
+            command=result.command,
+            stdout=result.stdout,
+            stderr=stderr,
+        )
+    if not remote_result.processed_video_object_key:
+        repositories.update_video_asset_status(db, video_asset_id, "issue")
+        stderr = f"{result.stderr}\nRemote runner did not return processed video object key.".strip()
+        _record_followup_failure(
+            db,
+            script_run_id=result.script_run_id,
+            session_id=session_id,
+            trigger_id=trigger_id,
+            script_name="entry",
+            model_name=str(script_run.get("model_name") or "remote_runner_processed_video_missing"),
+            stdout=result.stdout,
+            stderr=stderr,
+        )
+        return ScriptExecutionResult(
+            script_run_id=result.script_run_id,
+            runner_job_id=result.runner_job_id,
+            script_name=result.script_name,
+            model_name=result.model_name,
+            status="failed",
+            command=result.command,
+            stdout=result.stdout,
+            stderr=stderr,
+        )
+    _apply_processed_video_upload_result(
+        db,
+        video_asset_row=video_asset_row,
+        object_key=remote_result.processed_video_object_key,
+        video_url=processed_video_url,
+    )
+    return result
+
+
+def _finalize_remote_kiosk_script_run(
+    db: Session,
+    *,
+    script_run: dict[str, Any],
+    remote_result: RemoteRunnerResult,
+) -> ScriptExecutionResult:
+    runner_payload = dict(script_run.get("runner_payload") or {})
+    script_run_id = int(script_run["id"])
+    video_asset_id = int(runner_payload["video_asset_id"])
+    processed_video_url = str(runner_payload.get("processed_video_url") or "")
+    video_asset_row = repositories.get_video_asset(db, video_asset_id)
+
+    remote_status = "success" if remote_result.status == "success" else "failed"
+    repositories.finish_script_run(
+        db,
+        script_run_id,
+        status=remote_status,
+        stdout_log=remote_result.stdout,
+        stderr_log=remote_result.stderr,
+    )
+    result = ScriptExecutionResult(
+        script_run_id=script_run_id,
+        runner_job_id=str(script_run.get("runner_job_id") or ""),
+        script_name="kiosk",
+        model_name=script_run.get("model_name"),
+        status=remote_status,
+        command=["runpod_serverless", "kiosk"],
+        stdout=remote_result.stdout,
+        stderr=remote_result.stderr,
+    )
+    if result.status != "success":
+        repositories.update_video_asset_status(db, video_asset_id, "issue")
+        return result
+    if not remote_result.processed_video_object_key:
+        repositories.update_video_asset_status(db, video_asset_id, "issue")
+        stderr = f"{result.stderr}\nRemote runner did not return processed video object key.".strip()
+        repositories.revise_script_run(
+            db,
+            result.script_run_id,
+            status="failed",
+            stdout_log=result.stdout,
+            stderr_log=stderr,
+        )
+        return ScriptExecutionResult(
+            script_run_id=result.script_run_id,
+            runner_job_id=result.runner_job_id,
+            script_name=result.script_name,
+            model_name=result.model_name,
+            status="failed",
+            command=result.command,
+            stdout=result.stdout,
+            stderr=stderr,
+        )
+    _apply_processed_video_upload_result(
+        db,
+        video_asset_row=video_asset_row,
+        object_key=remote_result.processed_video_object_key,
+        video_url=processed_video_url,
+    )
+    return result
+
+
+def process_runpod_webhook(
+    db: Session,
+    *,
+    kind: str,
+    body: dict[str, Any],
+    token: str | None = None,
+) -> dict[str, Any]:
+    secret = str(settings.runpod_webhook_secret or "").strip()
+    if secret and token != secret:
+        raise PermissionError("Invalid Runpod webhook token.")
+
+    job_id = str(body.get("id") or body.get("jobId") or "").strip()
+    if not job_id:
+        raise ValueError("Runpod webhook payload is missing job id.")
+
+    script_run = repositories.get_script_run_by_runner_job_id(db, job_id)
+    runpod_status, remote_result = _remote_runner_result_from_runpod_body(body)
+    normalized_kind = str(kind or "").strip().lower()
+    if normalized_kind == "entry":
+        result = _finalize_remote_entry_script_run(db, script_run=script_run, remote_result=remote_result)
+    elif normalized_kind == "kiosk":
+        result = _finalize_remote_kiosk_script_run(db, script_run=script_run, remote_result=remote_result)
+    else:
+        raise ValueError("Unsupported Runpod webhook kind.")
+
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "runpod_status": runpod_status,
+        "script_run_id": result.script_run_id,
+        "status": result.status,
+    }
+
+
 def _post_remote_runner_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
     request = Request(
         url,
@@ -362,10 +652,22 @@ def _invoke_remote_runner(
     )
 
 
-def _runpod_endpoint_url(path: str) -> str:
-    endpoint_id = str(settings.runpod_endpoint_id or "").strip()
+def _runpod_endpoint_id(kind: str | None = None) -> str:
+    normalized_kind = str(kind or "").strip().lower()
+    endpoint_id = ""
+    if normalized_kind == "entry":
+        endpoint_id = str(settings.runpod_entry_endpoint_id or "").strip()
+    elif normalized_kind == "kiosk":
+        endpoint_id = str(settings.runpod_kiosk_endpoint_id or "").strip()
+    if not endpoint_id:
+        endpoint_id = str(settings.runpod_endpoint_id or "").strip()
     if not endpoint_id:
         raise RuntimeError("Runpod endpoint id is not configured.")
+    return endpoint_id
+
+
+def _runpod_endpoint_url(path: str, *, kind: str | None = None) -> str:
+    endpoint_id = _runpod_endpoint_id(kind)
     normalized_path = path if path.startswith("/") else f"/{path}"
     return f"https://api.runpod.ai/v2/{quote(endpoint_id)}{normalized_path}"
 
@@ -375,13 +677,14 @@ def _runpod_request(
     method: str,
     path: str,
     payload: dict[str, Any] | None = None,
+    kind: str | None = None,
 ) -> dict[str, Any]:
     api_key = str(settings.runpod_api_key or "").strip()
     if not api_key:
         raise RuntimeError("Runpod API key is not configured.")
     body = None if payload is None else json.dumps(payload).encode("utf-8")
     request = Request(
-        _runpod_endpoint_url(path),
+        _runpod_endpoint_url(path, kind=kind),
         data=body,
         headers={
             "Content-Type": "application/json",
@@ -403,65 +706,35 @@ def _runpod_request(
         raise RuntimeError(f"Runpod returned invalid JSON: {response_text[:1000]}") from exc
 
 
-def _invoke_runpod_runner(
+def _build_runpod_webhook_url(kind: str) -> str:
+    base_url = str(settings.runpod_webhook_base_url or "").strip().rstrip("/")
+    if not base_url:
+        raise RuntimeError("Runpod webhook base URL is not configured.")
+    webhook_url = f"{base_url}/api/v1/runpod/webhooks/{quote(kind)}"
+    secret = str(settings.runpod_webhook_secret or "").strip()
+    if secret:
+        webhook_url = f"{webhook_url}?token={quote(secret, safe='')}"
+    return webhook_url
+
+
+def _enqueue_runpod_runner(
     *,
+    kind: str,
     payload: dict[str, Any],
-) -> RemoteRunnerResult:
+) -> RunpodEnqueueResult:
     enqueue_body = _runpod_request(
         method="POST",
         path="/run",
-        payload={"input": payload},
+        payload={
+            "input": payload,
+            "webhook": _build_runpod_webhook_url(kind),
+        },
+        kind=kind,
     )
     job_id = str(enqueue_body.get("id") or "").strip()
     if not job_id:
         raise RuntimeError(f"Runpod did not return a job id: {enqueue_body}")
-
-    poll_seconds = max(1, int(settings.runpod_status_poll_seconds))
-    deadline = time.monotonic() + max(30, int(settings.runner_timeout_seconds))
-    last_body = enqueue_body
-    while True:
-        status_body = _runpod_request(
-            method="GET",
-            path=f"/status/{quote(job_id)}",
-        )
-        last_body = status_body
-        status = str(status_body.get("status") or "").upper()
-        if status == "COMPLETED":
-            output = status_body.get("output")
-            if not isinstance(output, dict):
-                raise RuntimeError(f"Runpod completed without structured output: {status_body}")
-            return RemoteRunnerResult(
-                status=str(output.get("status") or "success"),
-                stdout=str(output.get("stdout") or ""),
-                stderr=str(output.get("stderr") or ""),
-                processed_video_object_key=output.get("processed_video_object_key"),
-                processed_video_url=output.get("processed_video_url"),
-                tracking_summary=output.get("tracking_summary"),
-                reid_views_summary=output.get("reid_views_summary"),
-            )
-        if status in {"FAILED", "CANCELLED", "TIMED_OUT"}:
-            output = status_body.get("output")
-            error_detail = status_body.get("error") or status_body.get("message") or status_body
-            if isinstance(output, dict):
-                return RemoteRunnerResult(
-                    status="failed",
-                    stdout=str(output.get("stdout") or ""),
-                    stderr=str(output.get("stderr") or error_detail),
-                    processed_video_object_key=output.get("processed_video_object_key"),
-                    processed_video_url=output.get("processed_video_url"),
-                    tracking_summary=output.get("tracking_summary"),
-                    reid_views_summary=output.get("reid_views_summary"),
-                )
-            return RemoteRunnerResult(
-                status="failed",
-                stdout="",
-                stderr=str(error_detail),
-                processed_video_object_key=None,
-                processed_video_url=None,
-            )
-        if time.monotonic() >= deadline:
-            raise RuntimeError(f"Runpod job timed out after waiting for status: {last_body}")
-        time.sleep(poll_seconds)
+    return RunpodEnqueueResult(job_id=job_id)
 
 
 def _safe_unlink(path: Path) -> None:
@@ -1572,19 +1845,44 @@ def run_entry_for_trigger(
             "session_id": session_id,
             "model_name": model_name,
         }
-        remote_result = (
-            _invoke_runpod_runner(payload=remote_payload)
-            if _runpod_runner_enabled()
-            else _invoke_remote_runner(
-                endpoint="/api/v1/runner/jobs/entry",
-                payload={
-                    "video_url": source_video_url,
-                    "gallery_state_url": gallery_state_url,
-                    "processed_video_object_key": upload_target["object_key"],
+        if _runpod_runner_enabled():
+            enqueue_result = _enqueue_runpod_runner(kind="entry", payload=remote_payload)
+            repositories.assign_script_run_runner_job(
+                db,
+                script_run_id,
+                runner_job_id=enqueue_result.job_id,
+                runner_payload={
+                    "video_asset_id": int(video_asset_row["id"]),
+                    "location_id": location_id,
                     "session_id": session_id,
-                    "model_name": model_name,
+                    "trigger_id": trigger_id,
+                    "video_path": video_path,
+                    "output_dir": str(resolved_output_dir),
+                    "gallery_state_path": str(resolved_gallery_state),
+                    "processed_video_url": upload_target["video_url"],
                 },
             )
+            return ScriptExecutionResult(
+                script_run_id=script_run_id,
+                runner_job_id=enqueue_result.job_id,
+                script_name="entry",
+                model_name=model_name,
+                status="running",
+                command=["runpod_serverless", "entry"],
+                stdout="",
+                stderr="",
+                message="Runpod entry job queued. FastAPI will update MySQL when the webhook completes.",
+            )
+
+        remote_result = _invoke_remote_runner(
+            endpoint="/api/v1/runner/jobs/entry",
+            payload={
+                "video_url": source_video_url,
+                "gallery_state_url": gallery_state_url,
+                "processed_video_object_key": upload_target["object_key"],
+                "session_id": session_id,
+                "model_name": model_name,
+            },
         )
         remote_status = "success" if remote_result.status == "success" else "failed"
         repositories.finish_script_run(
@@ -1599,11 +1897,7 @@ def run_entry_for_trigger(
             script_name="entry",
             model_name=model_name,
             status=remote_status,
-            command=(
-                ["runpod_serverless", "entry"]
-                if _runpod_runner_enabled()
-                else ["remote_runner", "/api/v1/runner/jobs/entry"]
-            ),
+            command=["remote_runner", "/api/v1/runner/jobs/entry"],
             stdout=remote_result.stdout,
             stderr=remote_result.stderr,
         )
@@ -1885,18 +2179,43 @@ def run_kiosk_for_session(
             "processed_video_object_key": upload_target["object_key"],
             "model_name": model_name,
         }
-        remote_result = (
-            _invoke_runpod_runner(payload=remote_payload)
-            if _runpod_runner_enabled()
-            else _invoke_remote_runner(
-                endpoint="/api/v1/runner/jobs/kiosk",
-                payload={
-                    "video_url": source_video_url,
-                    "gallery_state_url": gallery_state_url,
-                    "processed_video_object_key": upload_target["object_key"],
-                    "model_name": model_name,
+        if _runpod_runner_enabled():
+            enqueue_result = _enqueue_runpod_runner(kind="kiosk", payload=remote_payload)
+            repositories.assign_script_run_runner_job(
+                db,
+                script_run_id,
+                runner_job_id=enqueue_result.job_id,
+                runner_payload={
+                    "video_asset_id": int(video_asset_row["id"]),
+                    "location_id": location_id,
+                    "session_id": session_id,
+                    "trigger_id": None,
+                    "video_path": video_path,
+                    "output_dir": str(resolved_output_dir),
+                    "gallery_state_path": str(resolved_gallery_state),
+                    "processed_video_url": upload_target["video_url"],
                 },
             )
+            return ScriptExecutionResult(
+                script_run_id=script_run_id,
+                runner_job_id=enqueue_result.job_id,
+                script_name="kiosk",
+                model_name=model_name,
+                status="running",
+                command=["runpod_serverless", "kiosk"],
+                stdout="",
+                stderr="",
+                message="Runpod kiosk job queued. FastAPI will update MySQL when the webhook completes.",
+            )
+
+        remote_result = _invoke_remote_runner(
+            endpoint="/api/v1/runner/jobs/kiosk",
+            payload={
+                "video_url": source_video_url,
+                "gallery_state_url": gallery_state_url,
+                "processed_video_object_key": upload_target["object_key"],
+                "model_name": model_name,
+            },
         )
         remote_status = "success" if remote_result.status == "success" else "failed"
         repositories.finish_script_run(
@@ -1911,11 +2230,7 @@ def run_kiosk_for_session(
             script_name="kiosk",
             model_name=model_name,
             status=remote_status,
-            command=(
-                ["runpod_serverless", "kiosk"]
-                if _runpod_runner_enabled()
-                else ["remote_runner", "/api/v1/runner/jobs/kiosk"]
-            ),
+            command=["remote_runner", "/api/v1/runner/jobs/kiosk"],
             stdout=remote_result.stdout,
             stderr=remote_result.stderr,
         )

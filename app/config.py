@@ -42,8 +42,11 @@ class Settings(BaseSettings):
     runner_timeout_seconds: int = 7200
     runner_input_key_prefix: str = "runner_inputs"
     runpod_endpoint_id: str | None = None
+    runpod_entry_endpoint_id: str | None = None
+    runpod_kiosk_endpoint_id: str | None = None
     runpod_api_key: str | None = None
-    runpod_status_poll_seconds: int = 5
+    runpod_webhook_base_url: str | None = None
+    runpod_webhook_secret: str | None = None
     retrieval_poll_seconds: int = 10
     retrieval_max_global_workers: int = 2
     retrieval_max_per_location: int = 1

@@ -1592,6 +1592,8 @@ def create_script_run_started(
     trigger_id: int | None,
     script_name: str,
     model_name: str | None,
+    runner_job_id: str | None = None,
+    runner_payload: Mapping[str, Any] | None = None,
     status: str = "running",
     command: str,
     stdout_log: str = "",
@@ -1602,10 +1604,10 @@ def create_script_run_started(
         text(
             f"""
             insert into {script_run_table} (
-                session_id, trigger_id, script_name, model_name, status, command, stdout_log, stderr_log
+                session_id, trigger_id, script_name, model_name, runner_job_id, runner_payload, status, command, stdout_log, stderr_log
             )
             values (
-                :session_id, :trigger_id, :script_name, :model_name, :status, :command, :stdout_log, :stderr_log
+                :session_id, :trigger_id, :script_name, :model_name, :runner_job_id, :runner_payload, :status, :command, :stdout_log, :stderr_log
             )
             """
         ),
@@ -1614,6 +1616,8 @@ def create_script_run_started(
             "trigger_id": trigger_id,
             "script_name": script_name,
             "model_name": model_name,
+            "runner_job_id": runner_job_id,
+            "runner_payload": json.dumps(runner_payload) if runner_payload is not None else None,
             "status": status,
             "command": command,
             "stdout_log": stdout_log,
@@ -1682,6 +1686,78 @@ def revise_script_run(
         },
     )
     db.commit()
+
+
+def assign_script_run_runner_job(
+    db: Session,
+    script_run_id: int,
+    *,
+    runner_job_id: str,
+    runner_payload: Mapping[str, Any] | None = None,
+) -> None:
+    script_run_table = _table("script_run")
+    db.execute(
+        text(
+            f"""
+            update {script_run_table}
+            set runner_job_id = :runner_job_id,
+                runner_payload = coalesce(:runner_payload, runner_payload)
+            where id = :script_run_id
+            """
+        ),
+        {
+            "script_run_id": script_run_id,
+            "runner_job_id": runner_job_id,
+            "runner_payload": json.dumps(runner_payload) if runner_payload is not None else None,
+        },
+    )
+    db.commit()
+
+
+def get_script_run(db: Session, script_run_id: int) -> dict[str, Any]:
+    script_run_table = _table("script_run")
+    result = db.execute(
+        text(
+            f"""
+            select id, session_id, trigger_id, script_name, model_name, runner_job_id, runner_payload,
+                   status, command, stdout_log, stderr_log, started_at, finished_at
+            from {script_run_table}
+            where id = :script_run_id
+            limit 1
+            """
+        ),
+        {"script_run_id": script_run_id},
+    )
+    row = _fetch_one_dict(result)
+    if isinstance(row.get("runner_payload"), str):
+        try:
+            row["runner_payload"] = json.loads(row["runner_payload"])
+        except json.JSONDecodeError:
+            pass
+    return row
+
+
+def get_script_run_by_runner_job_id(db: Session, runner_job_id: str) -> dict[str, Any]:
+    script_run_table = _table("script_run")
+    result = db.execute(
+        text(
+            f"""
+            select id, session_id, trigger_id, script_name, model_name, runner_job_id, runner_payload,
+                   status, command, stdout_log, stderr_log, started_at, finished_at
+            from {script_run_table}
+            where runner_job_id = :runner_job_id
+            limit 1
+            """
+        ),
+        {"runner_job_id": runner_job_id},
+    )
+    row = _fetch_one_dict(result)
+    if isinstance(row.get("runner_payload"), str):
+        try:
+            row["runner_payload"] = json.loads(row["runner_payload"])
+        except json.JSONDecodeError:
+            pass
+    return row
 
 
 def create_script_run(
