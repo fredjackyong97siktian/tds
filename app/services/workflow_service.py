@@ -150,6 +150,10 @@ def default_trigger_output_dir(location_id: int, trigger_id: int) -> Path:
     return trigger_processed_root(location_id, trigger_id, "entrance")
 
 
+def _runpod_dispatch_busy(db: Session) -> bool:
+    return repositories.has_active_remote_analysis_script_run(db)
+
+
 def _runner_enabled() -> bool:
     return _http_runner_enabled() or _runpod_runner_enabled()
 
@@ -1800,12 +1804,25 @@ def run_entry_for_trigger(
     )
     _hydrate_gallery_state_from_active_gallery(location_id, resolved_gallery_state)
     video_asset_row = _lookup_video_asset_by_file_path(db, video_path)
-    if video_asset_row is not None:
+    if video_asset_row is not None and not (_runpod_runner_enabled() and _runner_enabled()):
         repositories.update_video_asset_status(db, int(video_asset_row["id"]), "processing")
 
     if _runner_enabled():
         if video_asset_row is None:
             raise RuntimeError("Remote runner requires a matching video_asset row for the source video.")
+        if _runpod_runner_enabled() and _runpod_dispatch_busy(db):
+            return ScriptExecutionResult(
+                script_run_id=None,
+                runner_job_id=None,
+                script_name="entry",
+                model_name=model_name,
+                status="pending",
+                command=["runpod_serverless", "entry"],
+                stdout="",
+                stderr="",
+                message="Runpod analysis worker is busy. Entry job was not enqueued yet; retry after the current analysis finishes.",
+            )
+        repositories.update_video_asset_status(db, int(video_asset_row["id"]), "processing")
         source_video_url = _upload_runner_input_file(
             Path(video_path),
             kind="source_video",
@@ -2135,12 +2152,25 @@ def run_kiosk_for_session(
     )
     _hydrate_gallery_state_from_active_gallery(location_id, resolved_gallery_state)
     video_asset_row = _lookup_video_asset_by_file_path(db, video_path)
-    if video_asset_row is not None:
+    if video_asset_row is not None and not (_runpod_runner_enabled() and _runner_enabled()):
         repositories.update_video_asset_status(db, int(video_asset_row["id"]), "processing")
 
     if _runner_enabled():
         if video_asset_row is None:
             raise RuntimeError("Remote runner requires a matching video_asset row for the source video.")
+        if _runpod_runner_enabled() and _runpod_dispatch_busy(db):
+            return ScriptExecutionResult(
+                script_run_id=None,
+                runner_job_id=None,
+                script_name="kiosk",
+                model_name=model_name,
+                status="pending",
+                command=["runpod_serverless", "kiosk"],
+                stdout="",
+                stderr="",
+                message="Runpod analysis worker is busy. Kiosk job was not enqueued yet; retry after the current analysis finishes.",
+            )
+        repositories.update_video_asset_status(db, int(video_asset_row["id"]), "processing")
         source_video_url = _upload_runner_input_file(
             Path(video_path),
             kind="source_video",

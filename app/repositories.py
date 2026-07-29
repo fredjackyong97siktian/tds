@@ -1760,6 +1760,23 @@ def get_script_run_by_runner_job_id(db: Session, runner_job_id: str) -> dict[str
     return row
 
 
+def has_active_remote_analysis_script_run(db: Session) -> bool:
+    script_run_table = _table("script_run")
+    result = db.execute(
+        text(
+            f"""
+            select 1
+            from {script_run_table}
+            where script_name in ('entry', 'kiosk')
+              and status = 'running'
+              and runner_job_id is not null
+            limit 1
+            """
+        )
+    )
+    return result.first() is not None
+
+
 def create_script_run(
     db: Session,
     *,
