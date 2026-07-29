@@ -12,7 +12,6 @@ services:
     env_file:
       - .env
     volumes:
-      - ./Detect.py:/app/tds/Detect.py:ro
       - ../session:/app/session
       - ./models:/app/tds/models
 
@@ -26,6 +25,5 @@ services:
       - .env
     command: python -m app.workers.video_retrieval_worker
     volumes:
-      - ./Detect.py:/app/tds/Detect.py:ro
       - ../session:/app/session
       - ./models:/app/tds/models

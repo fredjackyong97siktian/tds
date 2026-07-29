@@ -1,7 +1,6 @@
 from __future__ import annotations
 import json
 import re
-import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -1263,52 +1262,6 @@ def _record_followup_failure(
     )
 
 
-def run_script(
-    db: Session,
-    *,
-    script_name: str,
-    model_name: str | None,
-    script_path: Path,
-    args: list[str],
-    session_id: int | None = None,
-    trigger_id: int | None = None,
-    cwd: Path | None = None,
-) -> ScriptExecutionResult:
-    command = [settings.python_bin, str(script_path), *args]
-    script_run_id = repositories.create_script_run_started(
-        db,
-        session_id=session_id,
-        trigger_id=trigger_id,
-        script_name=script_name,
-        model_name=model_name,
-        status="running",
-        command=SCRIPT_RUN_COMMAND_REDACTED,
-    )
-    completed = subprocess.run(
-        command,
-        cwd=str(cwd) if cwd else None,
-        capture_output=True,
-        text=True,
-    )
-    status = "success" if completed.returncode == 0 else "failed"
-    repositories.finish_script_run(
-        db,
-        script_run_id,
-        status=status,
-        stdout_log=completed.stdout,
-        stderr_log=completed.stderr,
-    )
-    return ScriptExecutionResult(
-        script_run_id=script_run_id,
-        script_name=script_name,
-        model_name=model_name,
-        status=status,
-        command=command,
-        stdout=completed.stdout,
-        stderr=completed.stderr,
-    )
-
-
 def create_trigger_and_session(
     db: Session,
     *,
@@ -1934,126 +1887,6 @@ def run_entry_for_trigger(
         stderr="",
         message="Runpod entry job queued. FastAPI will update MySQL when the webhook completes.",
     )
-
-    result = run_script(
-        db,
-        script_name="entry",
-        model_name=model_name,
-        script_path=settings.entry_script_path,
-        args=[
-            "--video",
-            str(video_path),
-            "--output-dir",
-            str(resolved_output_dir),
-            "--session-id",
-            str(session_id),
-            "--gallery-state",
-            str(resolved_gallery_state),
-        ],
-        session_id=session_id,
-        trigger_id=trigger_id,
-        cwd=workdir,
-    )
-    if video_asset_row is None:
-        return result
-    if result.status != "success":
-        repositories.update_video_asset_status(db, int(video_asset_row["id"]), "issue")
-        return result
-
-    processed_video_path = _resolve_processed_video_path(video_path, resolved_output_dir)
-    if processed_video_path is None:
-        expected_processed_video_path = _expected_processed_video_path(video_path, resolved_output_dir)
-        repositories.update_video_asset_status(db, int(video_asset_row["id"]), "issue")
-        stderr = f"{result.stderr}\nProcessed video not found at {expected_processed_video_path}".strip()
-        _record_followup_failure(
-            db,
-            script_run_id=result.script_run_id,
-            session_id=session_id,
-            trigger_id=trigger_id,
-            script_name="entry",
-            model_name=model_name or "postprocess_processed_video_missing",
-            stdout=result.stdout,
-            stderr=stderr,
-        )
-        return ScriptExecutionResult(
-            script_run_id=result.script_run_id,
-            script_name=result.script_name,
-            model_name=result.model_name,
-            status="failed",
-            command=result.command,
-            stdout=result.stdout,
-            stderr=stderr,
-        )
-
-    try:
-        _sync_gallery_state_after_entry(
-            location_id=location_id,
-            session_id=session_id,
-            video_path=video_path,
-            output_dir=resolved_output_dir,
-            gallery_state_path=resolved_gallery_state,
-            enter_time=session.get("start_time"),
-            leave_time=video_asset_row.get("captured_end_time"),
-        )
-    except Exception as exc:
-        repositories.update_video_asset_status(db, int(video_asset_row["id"]), "issue")
-        stderr = f"{result.stderr}\nGallery persistence failed: {exc}".strip()
-        _record_followup_failure(
-            db,
-            script_run_id=result.script_run_id,
-            session_id=session_id,
-            trigger_id=trigger_id,
-            script_name="entry",
-            model_name=model_name or "postprocess_gallery_persistence",
-            stdout=result.stdout,
-            stderr=stderr,
-        )
-        return ScriptExecutionResult(
-            script_run_id=result.script_run_id,
-            script_name=result.script_name,
-            model_name=result.model_name,
-            status="failed",
-            command=result.command,
-            stdout=result.stdout,
-            stderr=stderr,
-        )
-
-    try:
-        _upload_processed_video_for_asset(
-            db,
-            video_asset_row=video_asset_row,
-            location_id=location_id,
-            session_id=session_id,
-            trigger_id=trigger_id,
-            processed_video_path=processed_video_path,
-            source_video_path=video_path,
-            output_dir=resolved_output_dir,
-            script_name="entry",
-            model_name=model_name,
-        )
-    except Exception as exc:
-        repositories.update_video_asset_status(db, int(video_asset_row["id"]), "issue")
-        stderr = f"{result.stderr}\nDigitalOcean Spaces upload failed: {exc}".strip()
-        _record_followup_failure(
-            db,
-            script_run_id=result.script_run_id,
-            session_id=session_id,
-            trigger_id=trigger_id,
-            script_name="entry",
-            model_name=model_name or "postprocess_spaces_upload",
-            stdout=result.stdout,
-            stderr=stderr,
-        )
-        return ScriptExecutionResult(
-            script_run_id=result.script_run_id,
-            script_name=result.script_name,
-            model_name=result.model_name,
-            status="failed",
-            command=result.command,
-            stdout=result.stdout,
-            stderr=stderr,
-        )
-    return result
 
 
 def run_kiosk_for_session(

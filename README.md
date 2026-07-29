@@ -1,6 +1,6 @@
 # Theft Detection API
 
-This folder contains the FastAPI server, SQL schema, API docs, model manifest, and script runners for the theft-detection system.
+This folder contains the FastAPI server, SQL schema, API docs, and retrieval/workflow orchestration for the theft-detection system.
 
 Current recommended split:
 
@@ -12,8 +12,8 @@ It is designed to be the GitHub-ready service layer that:
 
 1. receives Aqara / automation triggers
 2. creates theft-detection sessions
-3. runs Entry logic
-4. runs Kiosk logic
+3. retrieves CCTV videos
+4. dispatches analysis jobs to `tds_runner`
 5. stores results into your existing database
 
 ## Project Layout
@@ -24,24 +24,18 @@ It is designed to be the GitHub-ready service layer that:
 - [postgres_schema.sql](/Users/fredjackyong/Documents/kebunapp/theft_detection/tds/postgres_schema.sql): PostgreSQL vector/gallery tables
 - [API_DOCS.md](/Users/fredjackyong/Documents/kebunapp/theft_detection/tds/API_DOCS.md): endpoint docs
 - [theft_detection_flow.md](/Users/fredjackyong/Documents/kebunapp/theft_detection/tds/theft_detection_flow.md): business flow summary
-- [DetectEntry.py](/Users/fredjackyong/Documents/kebunapp/theft_detection/tds/DetectEntry.py): Entry runner
-- [DetectKiosk.py](/Users/fredjackyong/Documents/kebunapp/theft_detection/tds/DetectKiosk.py): Kiosk runner
-- [model_setup.py](/Users/fredjackyong/Documents/kebunapp/theft_detection/tds/model_setup.py): model env setup
 - [models/manifest.json](/Users/fredjackyong/Documents/kebunapp/theft_detection/tds/models/manifest.json): required model inventory
 - [Dockerfile](/Users/fredjackyong/Documents/kebunapp/theft_detection/tds/Dockerfile): container image
 - [docker-compose.yml](/Users/fredjackyong/Documents/kebunapp/theft_detection/tds/docker-compose.yml): server startup
 
 ## Important Architecture Note
 
-Local mode:
+Runpod runner mode:
 
-- `tds` can still run `DetectEntry.py` / `DetectKiosk.py` directly.
+- `tds` does not run local entry or kiosk analysis anymore.
+- `tds` uploads runner input artifacts to Spaces and enqueues analysis jobs to `tds_runner` / Runpod.
 
-Remote runner mode:
-
-- if `THEFT_API_RUNNER_BASE_URL` is set, `tds` uploads source artifacts to Spaces and calls `tds_runner` over HTTP for entry/kiosk execution.
-
-The detection runtime is now expected to live with `tds_runner`, while `tds` keeps orchestration, retrieval, DB writes, and workflow control only.
+The detection runtime lives in `tds_runner`, while `tds` keeps orchestration, retrieval, DB writes, webhook handling, and workflow control only.
 
 ## Database Roles
 
@@ -57,22 +51,11 @@ Apply:
 
 ## Required Models
 
-Expected model files:
+Expected retrieval-side files:
 
-- `tds/models/yolo26s.pt`
-- `tds/models/yolo26l-pose.pt`
-- `tds/models/yoloe-11l-seg.pt`
-- `tds/models/custom_tracker.yaml`
-- `tds/models/reid/osnet_x1_0_msmt17.pt`
+- any files needed only by `tds_runner` should live in the `tds_runner` deployment, not in `tds`
 
-Optional:
-
-- `tds/models/mobileclip_blt.pt`
-
-See:
-
-- [models/README.md](/Users/fredjackyong/Documents/kebunapp/theft_detection/tds/models/README.md)
-- [models/manifest.json](/Users/fredjackyong/Documents/kebunapp/theft_detection/tds/models/manifest.json)
+See [models/manifest.json](/Users/fredjackyong/Documents/kebunapp/theft_detection/tds/models/manifest.json) only if you still keep a reference inventory here.
 
 ## Docker Deployment
 
@@ -88,7 +71,6 @@ Recommended structure:
 
 ```text
 /opt/theft-detection/
-  Detect.py
   session/
   tds/
     Dockerfile
@@ -158,7 +140,6 @@ If you use Nginx:
 
 The compose file mounts:
 
-- `./Detect.py` -> `/app/tds/Detect.py`
 - `../session` -> `/app/session`
 - `./models` -> `/app/tds/models`
 
@@ -167,7 +148,6 @@ That way:
 - FastAPI lives inside the container
 - output files persist on the host
 - models stay on the host
-- `Detect.py` stays available to the runners
 
 ## Database Setup
 

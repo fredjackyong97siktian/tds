@@ -44,28 +44,20 @@ http://127.0.0.1:8010/docs
 
 Right now:
 
-- `run-entry` waits until the Entry script finishes
-- `run-kiosk` waits until the Kiosk script finishes
-- both are synchronous API calls
-
-That means the HTTP request stays open while the Python script is running.
+- `tds` does not execute local entry or kiosk analysis
+- `tds` dispatches analysis to `tds_runner` / Runpod
+- completion comes back through the Runpod webhook flow
 
 ## How Entry and Kiosk Are Run
 
-The API does not call the old standalone `Entry.py` and `Kiosk.py` files directly.
+`tds` prepares the job and enqueues it to `tds_runner` / Runpod.
 
-Instead it calls:
+`tds_runner`:
 
-- [DetectEntry.py](/Users/fredjackyong/Documents/kebunapp/theft_detection/tds/DetectEntry.py)
-- [DetectKiosk.py](/Users/fredjackyong/Documents/kebunapp/theft_detection/tds/DetectKiosk.py)
-
-Those runners:
-
-1. configure model paths from `tds/models`
-2. load shared gallery state from `shared_gallery_state.pkl`
-3. import [Detect.py](/Users/fredjackyong/Documents/kebunapp/theft_detection/Detect.py)
-4. run only the Entry logic or only the Kiosk logic
-5. save updated shared state back to disk
+1. downloads the source video and gallery-state input
+2. runs entry or kiosk analysis on the GPU worker
+3. uploads the processed video output
+4. returns results through the webhook payload so `tds` can update MySQL and PostgreSQL
 
 ## Recommended Flow
 
@@ -323,9 +315,9 @@ GET /api/v1/videos/assets/{video_asset_id}/content
 
 This streams the private local video file through FastAPI instead of exposing a public object URL.
 
-## 7. Run Entry Script
+## 7. Run Entry Analysis
 
-This triggers `DetectEntry.py`.
+This enqueues entry analysis to `tds_runner` / Runpod.
 
 ### Request
 
@@ -360,9 +352,9 @@ Content-Type: application/json
 ### Behavior
 
 1. FastAPI builds the session output paths
-2. FastAPI runs `DetectEntry.py`
-3. stdout and stderr are stored in `script_run`
-4. the API returns only after the script finishes
+2. FastAPI uploads runner inputs and enqueues the Runpod job
+3. `runner_job_id` is stored in `script_run`
+4. FastAPI returns after queueing, and final updates arrive through the webhook
 
 In the latest target flow, this endpoint is called by the Theft Detection System worker after it claims a `ready` entrance video for a location.
 
@@ -421,9 +413,9 @@ Content-Type: application/json
 }
 ```
 
-## 11. Run Kiosk Script
+## 11. Run Kiosk Analysis
 
-This triggers `DetectKiosk.py`.
+This enqueues kiosk analysis to `tds_runner` / Runpod.
 
 ### Request
 
@@ -608,7 +600,5 @@ This returns the PostgreSQL `active_gallery` row for the given `location_id`, `s
 
 ## Current Limitations
 
-1. Entry and Kiosk runs are synchronous
-2. Da Hua retrieval is not implemented yet
-3. `tds` still depends on [Detect.py](/Users/fredjackyong/Documents/kebunapp/theft_detection/Detect.py)
-4. `DetectEntry.py` and `DetectKiosk.py` still use a local pickle file for shared state unless your integration explicitly calls the vector endpoints
+1. Runpod endpoint availability controls analysis throughput
+2. Da Hua retrieval depends on your network path and NVR availability

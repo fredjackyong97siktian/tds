@@ -41,7 +41,7 @@ This folder is the model home for the FastAPI + runner layer in `tds/`.
 ## Why this exists
 
 The API server should have a stable place to look for model files.
-`tds/DetectEntry.py` and `tds/DetectKiosk.py` set environment variables from this folder before importing `Detect.py`.
+Local analysis wrappers were removed from `tds`. If these models are still used for runtime analysis, they should now be managed by `tds_runner` instead of the FastAPI server.
 
 ## Important GitHub note
 

@@ -14,9 +14,6 @@ class Settings(BaseSettings):
 
     base_dir: Path = Path(__file__).resolve().parents[1]
     repo_root: Path = Path(__file__).resolve().parents[2]
-    entry_script_path: Path = Path(__file__).resolve().parents[1] / "DetectEntry.py"
-    kiosk_script_path: Path = Path(__file__).resolve().parents[1] / "DetectKiosk.py"
-    python_bin: str = "python"
     ffmpeg_bin: str = "ffmpeg"
     video_storage_dir: Path = Path(__file__).resolve().parents[2] / "session"
     credential_secret: str = "change_me_please_use_a_long_random_secret"
