@@ -2,12 +2,15 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from os.path import basename, splitext
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote
+from urllib.request import Request, urlopen
 
 from sqlalchemy.orm import Session
 
@@ -15,12 +18,18 @@ from ..config import settings
 from ..crypto import decrypt_secret
 from .. import repositories
 from ..db import TransactionalSessionLocal, VectorSessionLocal
-from ..spaces import upload_private_file
+from ..spaces import (
+    generate_presigned_download_url,
+    generate_public_object_url,
+    is_spaces_configured,
+    is_spaces_public_read_enabled,
+    upload_private_file,
+)
 from .. import vector_repositories
 from ..storage import (
+    build_spaces_object_key,
     guess_media_type,
     gallery_state_path as build_private_gallery_state_path,
-    location_gallery_state_path as build_location_gallery_state_path,
     processed_video_spaces_key,
     session_logs_root,
     session_root,
@@ -94,6 +103,17 @@ class EntranceAnalysisQueued:
     model_name: str | None = None
 
 
+@dataclass
+class RemoteRunnerResult:
+    status: str
+    stdout: str
+    stderr: str
+    processed_video_object_key: str | None
+    processed_video_url: str | None
+    tracking_summary: dict[str, Any] | None = None
+    reid_views_summary: dict[str, Any] | None = None
+
+
 def build_session_workdir(location_id: int, session_id: int) -> Path:
     workdir = session_root(location_id, session_id)
     workdir.mkdir(parents=True, exist_ok=True)
@@ -121,6 +141,327 @@ def default_video_output_dir(location_id: int, session_id: int, video_path: str)
 
 def default_trigger_output_dir(location_id: int, trigger_id: int) -> Path:
     return trigger_processed_root(location_id, trigger_id, "entrance")
+
+
+def _runner_enabled() -> bool:
+    return _http_runner_enabled() or _runpod_runner_enabled()
+
+
+def _http_runner_enabled() -> bool:
+    return bool(str(settings.runner_base_url or "").strip())
+
+
+def _runpod_runner_enabled() -> bool:
+    return bool(str(settings.runpod_endpoint_id or "").strip() and str(settings.runpod_api_key or "").strip())
+
+
+def _spaces_download_url_for_object_key(object_key: str) -> str:
+    if is_spaces_public_read_enabled():
+        return generate_public_object_url(object_key)
+    return generate_presigned_download_url(object_key, expires_seconds=settings.runner_timeout_seconds)
+
+
+def _runner_input_object_key(
+    *,
+    kind: str,
+    location_id: int,
+    session_id: int | None,
+    trigger_id: int | None,
+    filename: str,
+) -> str:
+    segments = [
+        str(settings.runner_input_key_prefix or "runner_inputs"),
+        f"location_{location_id}",
+    ]
+    if session_id is not None:
+        segments.append(f"session_{session_id}")
+    if trigger_id is not None:
+        segments.append(f"trigger_{trigger_id}")
+    segments.append(kind)
+    segments.append(filename)
+    return build_spaces_object_key(*segments)
+
+
+def _upload_runner_input_file(
+    local_path: Path,
+    *,
+    kind: str,
+    location_id: int,
+    session_id: int | None,
+    trigger_id: int | None,
+) -> tuple[str, str]:
+    if not is_spaces_configured():
+        raise RuntimeError(
+            "Remote runner execution requires DigitalOcean Spaces. Configure Spaces in `tds/.env`."
+        )
+    object_key = _runner_input_object_key(
+        kind=kind,
+        location_id=location_id,
+        session_id=session_id,
+        trigger_id=trigger_id,
+        filename=local_path.name,
+    )
+    upload_private_file(local_path, object_key, content_type=guess_media_type(str(local_path)))
+    return object_key, _spaces_download_url_for_object_key(object_key)
+
+
+def _build_processed_video_upload_target(
+    *,
+    video_asset_row: dict[str, Any],
+    location_id: int,
+    session_id: int | None,
+    trigger_id: int | None,
+    script_name: str,
+    processed_video_path: Path | None = None,
+    source_video_path: str | None = None,
+) -> dict[str, str]:
+    if processed_video_path is not None:
+        source_stem = processed_video_path.stem
+        suffix = processed_video_path.suffix
+    else:
+        source_stem = Path(source_video_path or "video").stem
+        suffix = ".mp4"
+    if source_stem.endswith("_output"):
+        source_stem = source_stem[: -len("_output")]
+
+    shortened_stem = source_stem
+    section_name = str(video_asset_row.get("section") or script_name or "video").strip().lower()
+    section_prefix = f"{section_name}_playback_"
+    if shortened_stem.startswith(section_prefix):
+        shortened_stem = shortened_stem[len(section_prefix) :]
+
+    timestamp_match = re.fullmatch(
+        r"(\d{4})_(\d{2})_(\d{2})_(\d{2})_(\d{2})_(\d{2})_(\d{4})_(\d{2})_(\d{2})_(\d{2})_(\d{2})_(\d{2})",
+        shortened_stem,
+    )
+    if timestamp_match:
+        (
+            start_year,
+            start_month,
+            start_day,
+            start_hour,
+            start_minute,
+            start_second,
+            end_year,
+            end_month,
+            end_day,
+            end_hour,
+            end_minute,
+            end_second,
+        ) = timestamp_match.groups()
+        shortened_stem = (
+            f"{start_day}_{start_month}_{start_year[-2:]}"
+            f"_{start_hour}{start_minute}{start_second}"
+            f"_{end_day}_{end_month}_{end_year[-2:]}"
+            f"_{end_hour}{end_minute}{end_second}"
+        )
+
+    upload_filename = f"{section_name[:1] or 'v'}_{shortened_stem}{suffix}"
+    if session_id is not None and trigger_id is not None:
+        upload_filename = f"s{session_id}_t{trigger_id}_{upload_filename}"
+    elif session_id is not None:
+        upload_filename = f"s{session_id}_{upload_filename}"
+    elif trigger_id is not None:
+        upload_filename = f"t{trigger_id}_{upload_filename}"
+
+    object_key = processed_video_spaces_key(
+        location_id=location_id,
+        section=str(video_asset_row.get("section") or script_name),
+        filename=upload_filename,
+        session_id=session_id,
+        trigger_id=trigger_id,
+    )
+    return {
+        "object_key": object_key,
+        "video_url": (
+            generate_public_object_url(object_key)
+            if is_spaces_public_read_enabled()
+            else f"/api/v1/videos/assets/{int(video_asset_row['id'])}/content"
+        ),
+        "file_path": f"spaces://{object_key}",
+    }
+
+
+def _apply_processed_video_upload_result(
+    db: Session,
+    *,
+    video_asset_row: dict[str, Any],
+    object_key: str,
+    video_url: str | None,
+) -> None:
+    repositories.update_video_asset(
+        db,
+        int(video_asset_row["id"]),
+        {
+            "video_url": str(video_url or f"/api/v1/videos/assets/{int(video_asset_row['id'])}/content"),
+            "file_path": f"spaces://{object_key}",
+            "captured_start_time": video_asset_row.get("captured_start_time"),
+            "captured_end_time": video_asset_row.get("captured_end_time"),
+            "retrieved_at": video_asset_row.get("retrieved_at"),
+            "analyzed_at": datetime.now(UTC),
+            "retention_until": video_asset_row.get("retention_until"),
+            "status": "processed",
+            "metadata": None,
+        },
+    )
+
+
+def _write_remote_entry_summaries(
+    *,
+    video_path: str,
+    output_dir: Path,
+    tracking_summary: dict[str, Any],
+    reid_views_summary: dict[str, Any] | None,
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _tracking_summary_path(video_path, output_dir).write_text(json.dumps(tracking_summary, indent=2))
+    _reid_views_summary_path(video_path, output_dir).write_text(
+        json.dumps(reid_views_summary or {"customers": []}, indent=2)
+    )
+
+
+def _post_remote_runner_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
+    request = Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=settings.runner_timeout_seconds) as response:
+            response_text = response.read().decode("utf-8")
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Runner request failed with HTTP {exc.code}: {detail}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"Runner request failed: {exc}") from exc
+
+    try:
+        return json.loads(response_text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Runner returned invalid JSON: {response_text[:1000]}") from exc
+
+
+def _invoke_remote_runner(
+    *,
+    endpoint: str,
+    payload: dict[str, Any],
+) -> RemoteRunnerResult:
+    base_url = str(settings.runner_base_url or "").strip().rstrip("/")
+    if not base_url:
+        raise RuntimeError("Remote runner base URL is not configured.")
+    body = _post_remote_runner_json(f"{base_url}{endpoint}", payload)
+    return RemoteRunnerResult(
+        status=str(body.get("status") or "failed"),
+        stdout=str(body.get("stdout") or ""),
+        stderr=str(body.get("stderr") or ""),
+        processed_video_object_key=body.get("processed_video_object_key"),
+        processed_video_url=body.get("processed_video_url"),
+        tracking_summary=body.get("tracking_summary"),
+        reid_views_summary=body.get("reid_views_summary"),
+    )
+
+
+def _runpod_endpoint_url(path: str) -> str:
+    endpoint_id = str(settings.runpod_endpoint_id or "").strip()
+    if not endpoint_id:
+        raise RuntimeError("Runpod endpoint id is not configured.")
+    normalized_path = path if path.startswith("/") else f"/{path}"
+    return f"https://api.runpod.ai/v2/{quote(endpoint_id)}{normalized_path}"
+
+
+def _runpod_request(
+    *,
+    method: str,
+    path: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    api_key = str(settings.runpod_api_key or "").strip()
+    if not api_key:
+        raise RuntimeError("Runpod API key is not configured.")
+    body = None if payload is None else json.dumps(payload).encode("utf-8")
+    request = Request(
+        _runpod_endpoint_url(path),
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method=method,
+    )
+    try:
+        with urlopen(request, timeout=settings.runner_timeout_seconds) as response:
+            response_text = response.read().decode("utf-8")
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Runpod request failed with HTTP {exc.code}: {detail}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"Runpod request failed: {exc}") from exc
+    try:
+        return json.loads(response_text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Runpod returned invalid JSON: {response_text[:1000]}") from exc
+
+
+def _invoke_runpod_runner(
+    *,
+    payload: dict[str, Any],
+) -> RemoteRunnerResult:
+    enqueue_body = _runpod_request(
+        method="POST",
+        path="/run",
+        payload={"input": payload},
+    )
+    job_id = str(enqueue_body.get("id") or "").strip()
+    if not job_id:
+        raise RuntimeError(f"Runpod did not return a job id: {enqueue_body}")
+
+    poll_seconds = max(1, int(settings.runpod_status_poll_seconds))
+    deadline = time.monotonic() + max(30, int(settings.runner_timeout_seconds))
+    last_body = enqueue_body
+    while True:
+        status_body = _runpod_request(
+            method="GET",
+            path=f"/status/{quote(job_id)}",
+        )
+        last_body = status_body
+        status = str(status_body.get("status") or "").upper()
+        if status == "COMPLETED":
+            output = status_body.get("output")
+            if not isinstance(output, dict):
+                raise RuntimeError(f"Runpod completed without structured output: {status_body}")
+            return RemoteRunnerResult(
+                status=str(output.get("status") or "success"),
+                stdout=str(output.get("stdout") or ""),
+                stderr=str(output.get("stderr") or ""),
+                processed_video_object_key=output.get("processed_video_object_key"),
+                processed_video_url=output.get("processed_video_url"),
+                tracking_summary=output.get("tracking_summary"),
+                reid_views_summary=output.get("reid_views_summary"),
+            )
+        if status in {"FAILED", "CANCELLED", "TIMED_OUT"}:
+            output = status_body.get("output")
+            error_detail = status_body.get("error") or status_body.get("message") or status_body
+            if isinstance(output, dict):
+                return RemoteRunnerResult(
+                    status="failed",
+                    stdout=str(output.get("stdout") or ""),
+                    stderr=str(output.get("stderr") or error_detail),
+                    processed_video_object_key=output.get("processed_video_object_key"),
+                    processed_video_url=output.get("processed_video_url"),
+                    tracking_summary=output.get("tracking_summary"),
+                    reid_views_summary=output.get("reid_views_summary"),
+                )
+            return RemoteRunnerResult(
+                status="failed",
+                stdout="",
+                stderr=str(error_detail),
+                processed_video_object_key=None,
+                processed_video_url=None,
+            )
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"Runpod job timed out after waiting for status: {last_body}")
+        time.sleep(poll_seconds)
 
 
 def _safe_unlink(path: Path) -> None:
@@ -575,77 +916,25 @@ def _upload_processed_video_for_asset(
     script_name: str,
     model_name: str | None,
 ) -> None:
-    source_stem = processed_video_path.stem
-    if source_stem.endswith("_output"):
-        source_stem = source_stem[: -len("_output")]
-
-    shortened_stem = source_stem
-    section_name = str(video_asset_row.get("section") or script_name or "video").strip().lower()
-    section_prefix = f"{section_name}_playback_"
-    if shortened_stem.startswith(section_prefix):
-        shortened_stem = shortened_stem[len(section_prefix) :]
-
-    timestamp_match = re.fullmatch(
-        r"(\d{4})_(\d{2})_(\d{2})_(\d{2})_(\d{2})_(\d{2})_(\d{4})_(\d{2})_(\d{2})_(\d{2})_(\d{2})_(\d{2})",
-        shortened_stem,
-    )
-    if timestamp_match:
-        (
-            start_year,
-            start_month,
-            start_day,
-            start_hour,
-            start_minute,
-            start_second,
-            end_year,
-            end_month,
-            end_day,
-            end_hour,
-            end_minute,
-            end_second,
-        ) = timestamp_match.groups()
-        shortened_stem = (
-            f"{start_day}_{start_month}_{start_year[-2:]}"
-            f"_{start_hour}{start_minute}{start_second}"
-            f"_{end_day}_{end_month}_{end_year[-2:]}"
-            f"_{end_hour}{end_minute}{end_second}"
-        )
-
-    upload_filename = f"{section_name[:1] or 'v'}_{shortened_stem}{processed_video_path.suffix}"
-    if session_id is not None and trigger_id is not None:
-        upload_filename = f"s{session_id}_t{trigger_id}_{upload_filename}"
-    elif session_id is not None:
-        upload_filename = f"s{session_id}_{upload_filename}"
-    elif trigger_id is not None:
-        upload_filename = f"t{trigger_id}_{upload_filename}"
-
-    object_key = processed_video_spaces_key(
+    target = _build_processed_video_upload_target(
+        video_asset_row=video_asset_row,
         location_id=location_id,
-        section=str(video_asset_row.get("section") or script_name),
-        filename=upload_filename,
         session_id=session_id,
         trigger_id=trigger_id,
+        script_name=script_name,
+        processed_video_path=processed_video_path,
+        source_video_path=source_video_path,
     )
     upload_result = upload_private_file(
         processed_video_path,
-        object_key,
+        target["object_key"],
         content_type=guess_media_type(str(processed_video_path)),
     )
-
-    repositories.update_video_asset(
+    _apply_processed_video_upload_result(
         db,
-        int(video_asset_row["id"]),
-        {
-            "video_url": str(upload_result.get("public_url") or f"/api/v1/videos/assets/{int(video_asset_row['id'])}/content"),
-            "file_path": f"spaces://{upload_result['object_key']}",
-            "captured_start_time": video_asset_row.get("captured_start_time"),
-            "captured_end_time": video_asset_row.get("captured_end_time"),
-            "retrieved_at": video_asset_row.get("retrieved_at"),
-            "analyzed_at": datetime.now(UTC),
-            "retention_until": video_asset_row.get("retention_until"),
-            "status": "processed",
-            "metadata": None,
-        },
+        video_asset_row=video_asset_row,
+        object_key=upload_result["object_key"],
+        video_url=str(upload_result.get("public_url") or target["video_url"]),
     )
 
 
@@ -1231,11 +1520,185 @@ def run_entry_for_trigger(
         if output_dir
         else default_trigger_output_dir(location_id, trigger_id)
     )
-    resolved_gallery_state = Path(gallery_state_path) if gallery_state_path else build_location_gallery_state_path(location_id)
+    resolved_gallery_state = (
+        Path(gallery_state_path)
+        if gallery_state_path
+        else build_private_gallery_state_path(location_id, session_id)
+    )
     _hydrate_gallery_state_from_active_gallery(location_id, resolved_gallery_state)
     video_asset_row = _lookup_video_asset_by_file_path(db, video_path)
     if video_asset_row is not None:
         repositories.update_video_asset_status(db, int(video_asset_row["id"]), "processing")
+
+    if _runner_enabled():
+        if video_asset_row is None:
+            raise RuntimeError("Remote runner requires a matching video_asset row for the source video.")
+        source_video_url = _upload_runner_input_file(
+            Path(video_path),
+            kind="source_video",
+            location_id=location_id,
+            session_id=session_id,
+            trigger_id=trigger_id,
+        )[1]
+        gallery_state_url = _upload_runner_input_file(
+            resolved_gallery_state,
+            kind="gallery_state",
+            location_id=location_id,
+            session_id=session_id,
+            trigger_id=trigger_id,
+        )[1]
+        upload_target = _build_processed_video_upload_target(
+            video_asset_row=video_asset_row,
+            location_id=location_id,
+            session_id=session_id,
+            trigger_id=trigger_id,
+            script_name="entry",
+            source_video_path=video_path,
+        )
+        script_run_id = repositories.create_script_run_started(
+            db,
+            session_id=session_id,
+            trigger_id=trigger_id,
+            script_name="entry",
+            model_name=model_name or "remote_runner",
+            status="running",
+            command=SCRIPT_RUN_COMMAND_REDACTED,
+        )
+        remote_payload = {
+            "kind": "entry",
+            "video_url": source_video_url,
+            "gallery_state_url": gallery_state_url,
+            "processed_video_object_key": upload_target["object_key"],
+            "session_id": session_id,
+            "model_name": model_name,
+        }
+        remote_result = (
+            _invoke_runpod_runner(payload=remote_payload)
+            if _runpod_runner_enabled()
+            else _invoke_remote_runner(
+                endpoint="/api/v1/runner/jobs/entry",
+                payload={
+                    "video_url": source_video_url,
+                    "gallery_state_url": gallery_state_url,
+                    "processed_video_object_key": upload_target["object_key"],
+                    "session_id": session_id,
+                    "model_name": model_name,
+                },
+            )
+        )
+        remote_status = "success" if remote_result.status == "success" else "failed"
+        repositories.finish_script_run(
+            db,
+            script_run_id,
+            status=remote_status,
+            stdout_log=remote_result.stdout,
+            stderr_log=remote_result.stderr,
+        )
+        result = ScriptExecutionResult(
+            script_run_id=script_run_id,
+            script_name="entry",
+            model_name=model_name,
+            status=remote_status,
+            command=(
+                ["runpod_serverless", "entry"]
+                if _runpod_runner_enabled()
+                else ["remote_runner", "/api/v1/runner/jobs/entry"]
+            ),
+            stdout=remote_result.stdout,
+            stderr=remote_result.stderr,
+        )
+        if result.status != "success":
+            repositories.update_video_asset_status(db, int(video_asset_row["id"]), "issue")
+            return result
+        if not remote_result.tracking_summary:
+            repositories.update_video_asset_status(db, int(video_asset_row["id"]), "issue")
+            stderr = f"{result.stderr}\nRemote runner did not return tracking_summary.".strip()
+            _record_followup_failure(
+                db,
+                script_run_id=result.script_run_id,
+                session_id=session_id,
+                trigger_id=trigger_id,
+                script_name="entry",
+                model_name=model_name or "remote_runner_tracking_summary_missing",
+                stdout=result.stdout,
+                stderr=stderr,
+            )
+            return ScriptExecutionResult(
+                script_run_id=result.script_run_id,
+                script_name=result.script_name,
+                model_name=result.model_name,
+                status="failed",
+                command=result.command,
+                stdout=result.stdout,
+                stderr=stderr,
+            )
+        _write_remote_entry_summaries(
+            video_path=video_path,
+            output_dir=resolved_output_dir,
+            tracking_summary=remote_result.tracking_summary,
+            reid_views_summary=remote_result.reid_views_summary,
+        )
+        try:
+            _sync_gallery_state_after_entry(
+                location_id=location_id,
+                session_id=session_id,
+                video_path=video_path,
+                output_dir=resolved_output_dir,
+                gallery_state_path=resolved_gallery_state,
+                enter_time=session.get("start_time"),
+                leave_time=video_asset_row.get("captured_end_time"),
+            )
+        except Exception as exc:
+            repositories.update_video_asset_status(db, int(video_asset_row["id"]), "issue")
+            stderr = f"{result.stderr}\nGallery persistence failed: {exc}".strip()
+            _record_followup_failure(
+                db,
+                script_run_id=result.script_run_id,
+                session_id=session_id,
+                trigger_id=trigger_id,
+                script_name="entry",
+                model_name=model_name or "remote_runner_gallery_persistence",
+                stdout=result.stdout,
+                stderr=stderr,
+            )
+            return ScriptExecutionResult(
+                script_run_id=result.script_run_id,
+                script_name=result.script_name,
+                model_name=result.model_name,
+                status="failed",
+                command=result.command,
+                stdout=result.stdout,
+                stderr=stderr,
+            )
+        if not remote_result.processed_video_object_key:
+            repositories.update_video_asset_status(db, int(video_asset_row["id"]), "issue")
+            stderr = f"{result.stderr}\nRemote runner did not return processed video object key.".strip()
+            _record_followup_failure(
+                db,
+                script_run_id=result.script_run_id,
+                session_id=session_id,
+                trigger_id=trigger_id,
+                script_name="entry",
+                model_name=model_name or "remote_runner_processed_video_missing",
+                stdout=result.stdout,
+                stderr=stderr,
+            )
+            return ScriptExecutionResult(
+                script_run_id=result.script_run_id,
+                script_name=result.script_name,
+                model_name=result.model_name,
+                status="failed",
+                command=result.command,
+                stdout=result.stdout,
+                stderr=stderr,
+            )
+        _apply_processed_video_upload_result(
+            db,
+            video_asset_row=video_asset_row,
+            object_key=remote_result.processed_video_object_key,
+            video_url=upload_target["video_url"],
+        )
+        return result
 
     result = run_script(
         db,
@@ -1371,11 +1834,120 @@ def run_kiosk_for_session(
     location_id = int(session["location_id"])
     workdir = build_session_workdir(location_id, session_id)
     resolved_output_dir = Path(output_dir) if output_dir else default_video_output_dir(location_id, session_id, video_path)
-    resolved_gallery_state = Path(gallery_state_path) if gallery_state_path else build_location_gallery_state_path(location_id)
+    resolved_gallery_state = (
+        Path(gallery_state_path)
+        if gallery_state_path
+        else build_private_gallery_state_path(location_id, session_id)
+    )
     _hydrate_gallery_state_from_active_gallery(location_id, resolved_gallery_state)
     video_asset_row = _lookup_video_asset_by_file_path(db, video_path)
     if video_asset_row is not None:
         repositories.update_video_asset_status(db, int(video_asset_row["id"]), "processing")
+
+    if _runner_enabled():
+        if video_asset_row is None:
+            raise RuntimeError("Remote runner requires a matching video_asset row for the source video.")
+        source_video_url = _upload_runner_input_file(
+            Path(video_path),
+            kind="source_video",
+            location_id=location_id,
+            session_id=session_id,
+            trigger_id=None,
+        )[1]
+        gallery_state_url = _upload_runner_input_file(
+            resolved_gallery_state,
+            kind="gallery_state",
+            location_id=location_id,
+            session_id=session_id,
+            trigger_id=None,
+        )[1]
+        upload_target = _build_processed_video_upload_target(
+            video_asset_row=video_asset_row,
+            location_id=location_id,
+            session_id=session_id,
+            trigger_id=None,
+            script_name="kiosk",
+            source_video_path=video_path,
+        )
+        script_run_id = repositories.create_script_run_started(
+            db,
+            session_id=session_id,
+            trigger_id=None,
+            script_name="kiosk",
+            model_name=model_name or "remote_runner",
+            status="running",
+            command=SCRIPT_RUN_COMMAND_REDACTED,
+        )
+        remote_payload = {
+            "kind": "kiosk",
+            "video_url": source_video_url,
+            "gallery_state_url": gallery_state_url,
+            "processed_video_object_key": upload_target["object_key"],
+            "model_name": model_name,
+        }
+        remote_result = (
+            _invoke_runpod_runner(payload=remote_payload)
+            if _runpod_runner_enabled()
+            else _invoke_remote_runner(
+                endpoint="/api/v1/runner/jobs/kiosk",
+                payload={
+                    "video_url": source_video_url,
+                    "gallery_state_url": gallery_state_url,
+                    "processed_video_object_key": upload_target["object_key"],
+                    "model_name": model_name,
+                },
+            )
+        )
+        remote_status = "success" if remote_result.status == "success" else "failed"
+        repositories.finish_script_run(
+            db,
+            script_run_id,
+            status=remote_status,
+            stdout_log=remote_result.stdout,
+            stderr_log=remote_result.stderr,
+        )
+        result = ScriptExecutionResult(
+            script_run_id=script_run_id,
+            script_name="kiosk",
+            model_name=model_name,
+            status=remote_status,
+            command=(
+                ["runpod_serverless", "kiosk"]
+                if _runpod_runner_enabled()
+                else ["remote_runner", "/api/v1/runner/jobs/kiosk"]
+            ),
+            stdout=remote_result.stdout,
+            stderr=remote_result.stderr,
+        )
+        if result.status != "success":
+            repositories.update_video_asset_status(db, int(video_asset_row["id"]), "issue")
+            return result
+        if not remote_result.processed_video_object_key:
+            repositories.update_video_asset_status(db, int(video_asset_row["id"]), "issue")
+            stderr = f"{result.stderr}\nRemote runner did not return processed video object key.".strip()
+            repositories.revise_script_run(
+                db,
+                result.script_run_id,
+                status="failed",
+                stdout_log=result.stdout,
+                stderr_log=stderr,
+            )
+            return ScriptExecutionResult(
+                script_run_id=result.script_run_id,
+                script_name=result.script_name,
+                model_name=result.model_name,
+                status="failed",
+                command=result.command,
+                stdout=result.stdout,
+                stderr=stderr,
+            )
+        _apply_processed_video_upload_result(
+            db,
+            video_asset_row=video_asset_row,
+            object_key=remote_result.processed_video_object_key,
+            video_url=upload_target["video_url"],
+        )
+        return result
 
     result = run_script(
         db,

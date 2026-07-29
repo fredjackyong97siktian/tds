@@ -2,6 +2,12 @@
 
 This folder contains the FastAPI server, SQL schema, API docs, model manifest, and script runners for the theft-detection system.
 
+Current recommended split:
+
+1. `tds` = orchestration FastAPI, DB writes, retrieval, workflow control
+2. `tds_vision` = frontend/platform
+3. `tds_runner` = GPU-heavy entry/kiosk runner service for Runpod or other burst GPU hosts
+
 It is designed to be the GitHub-ready service layer that:
 
 1. receives Aqara / automation triggers
@@ -27,18 +33,15 @@ It is designed to be the GitHub-ready service layer that:
 
 ## Important Architecture Note
 
-Right now, the API runners in `tds/` still import the heavy detection engine from:
+Local mode:
 
-- `/app/Detect.py`
+- `tds` can still run `DetectEntry.py` / `DetectKiosk.py` directly.
 
-So for Docker/server deployment, you need:
+Remote runner mode:
 
-1. this `tds/` folder
-2. `Detect.py`
-3. the required model files
-4. output/session storage
+- if `THEFT_API_RUNNER_BASE_URL` is set, `tds` uploads source artifacts to Spaces and calls `tds_runner` over HTTP for entry/kiosk execution.
 
-This repo already has the service layer in `tds/`, but the detection engine is not yet fully extracted into `tds/detection/`.
+The detection runtime is now expected to live with `tds_runner`, while `tds` keeps orchestration, retrieval, DB writes, and workflow control only.
 
 ## Database Roles
 
@@ -205,16 +208,15 @@ Main ones:
 
 ## Current Limitations
 
-1. Entry and Kiosk script runs are synchronous
+1. Entry and Kiosk script runs are synchronous from the API caller point of view
 2. Da Hua retrieval is not implemented yet
-3. `tds/` still depends on root `Detect.py`
-4. models are expected to be available on disk before startup
+3. models are expected to be available on disk before startup
 
 ## Recommended Next Steps
 
 Best next steps for production:
 
-1. move detection engine code from `Detect.py` into `tds/detection/`
+1. keep `tds_runner` as the only detection runtime owner
 2. add background job execution for Entry/Kiosk
 3. add one full workflow endpoint for n8n
 4. add retrieval service integration for Da Hua / NVR

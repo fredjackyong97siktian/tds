@@ -18,6 +18,11 @@ from model_setup import configure_detect_model_env
 
 configure_detect_model_env()
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(line_buffering=True)
+
 def _load_detect_module():
     detect_override = os.environ.get("DETECT_MODULE_PATH")
     candidate_paths = [
@@ -54,7 +59,7 @@ def _ts() -> str:
 
 
 def _log(message: str) -> None:
-    print(f"[{_ts()}] [DetectEntry] {message}")
+    print(f"[{_ts()}] [DetectEntry] {message}", flush=True)
 
 
 def _tracking_summary_path(video_path: str, output_dir: str) -> str:
