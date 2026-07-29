@@ -156,11 +156,11 @@ def _runpod_dispatch_busy(db: Session) -> bool:
 
 
 def _runner_enabled() -> bool:
-    return _http_runner_enabled() or _runpod_runner_enabled()
+    return _runpod_runner_enabled()
 
 
 def _http_runner_enabled() -> bool:
-    return bool(str(settings.runner_base_url or "").strip())
+    return False
 
 
 def _runpod_runner_enabled() -> bool:
@@ -1848,210 +1848,92 @@ def run_entry_for_trigger(
         if gallery_state_path
         else build_private_gallery_state_path(location_id, session_id)
     )
+    if not _runpod_runner_enabled():
+        raise RuntimeError(
+            "Runpod entry analysis is not configured. Set THEFT_API_RUNPOD_ENTRY_ENDPOINT_ID "
+            "and THEFT_API_RUNPOD_API_KEY in the API environment."
+        )
     _hydrate_gallery_state_from_active_gallery(location_id, resolved_gallery_state)
     video_asset_row = _lookup_video_asset_by_file_path(db, video_path)
-    if video_asset_row is not None and not (_runpod_runner_enabled() and _runner_enabled()):
-        repositories.update_video_asset_status(db, int(video_asset_row["id"]), "processing")
-
-    if _runner_enabled():
-        if video_asset_row is None:
-            raise RuntimeError("Remote runner requires a matching video_asset row for the source video.")
-        if _runpod_runner_enabled() and _runpod_dispatch_busy(db):
-            return ScriptExecutionResult(
-                script_run_id=None,
-                runner_job_id=None,
-                script_name="entry",
-                model_name=model_name,
-                status="pending",
-                command=["runpod_serverless", "entry"],
-                stdout="",
-                stderr="",
-                message="Runpod analysis worker is busy. Entry job was not enqueued yet; retry after the current analysis finishes.",
-            )
-        repositories.update_video_asset_status(db, int(video_asset_row["id"]), "processing")
-        source_video_url = str(video_asset_row.get("video_url") or "").strip()
-        if not source_video_url:
-            raise RuntimeError("Remote runner requires a Spaces-backed source video URL on the video_asset row.")
-        gallery_state_url = _upload_runner_input_file(
-            resolved_gallery_state,
-            kind="gallery_state",
-            location_id=location_id,
-            session_id=session_id,
-            trigger_id=trigger_id,
-        )[1]
-        upload_target = _build_processed_video_upload_target(
-            video_asset_row=video_asset_row,
-            location_id=location_id,
-            session_id=session_id,
-            trigger_id=trigger_id,
+    if video_asset_row is None:
+        raise RuntimeError("Runpod entry analysis requires a matching video_asset row for the source video.")
+    if _runpod_dispatch_busy(db):
+        return ScriptExecutionResult(
+            script_run_id=None,
+            runner_job_id=None,
             script_name="entry",
-            source_video_path=video_path,
+            model_name=model_name,
+            status="pending",
+            command=["runpod_serverless", "entry"],
+            stdout="",
+            stderr="",
+            message="Runpod analysis worker is busy. Entry job was not enqueued yet; retry after the current analysis finishes.",
         )
-        script_run_id = repositories.create_script_run_started(
-            db,
-            session_id=session_id,
-            trigger_id=trigger_id,
-            script_name="entry",
-            model_name=model_name or "remote_runner",
-            status="running",
-            command=SCRIPT_RUN_COMMAND_REDACTED,
-        )
-        remote_payload = {
+    repositories.update_video_asset_status(db, int(video_asset_row["id"]), "processing")
+    source_video_url = str(video_asset_row.get("video_url") or "").strip()
+    if not source_video_url:
+        raise RuntimeError("Runpod entry analysis requires a Spaces-backed source video URL on the video_asset row.")
+    gallery_state_url = _upload_runner_input_file(
+        resolved_gallery_state,
+        kind="gallery_state",
+        location_id=location_id,
+        session_id=session_id,
+        trigger_id=trigger_id,
+    )[1]
+    upload_target = _build_processed_video_upload_target(
+        video_asset_row=video_asset_row,
+        location_id=location_id,
+        session_id=session_id,
+        trigger_id=trigger_id,
+        script_name="entry",
+        source_video_path=video_path,
+    )
+    script_run_id = repositories.create_script_run_started(
+        db,
+        session_id=session_id,
+        trigger_id=trigger_id,
+        script_name="entry",
+        model_name=model_name or "runpod_runner",
+        status="running",
+        command=SCRIPT_RUN_COMMAND_REDACTED,
+    )
+    enqueue_result = _enqueue_runpod_runner(
+        kind="entry",
+        payload={
             "kind": "entry",
             "video_url": source_video_url,
             "gallery_state_url": gallery_state_url,
             "processed_video_object_key": upload_target["object_key"],
             "session_id": session_id,
             "model_name": model_name,
-        }
-        if _runpod_runner_enabled():
-            enqueue_result = _enqueue_runpod_runner(kind="entry", payload=remote_payload)
-            repositories.assign_script_run_runner_job(
-                db,
-                script_run_id,
-                runner_job_id=enqueue_result.job_id,
-                runner_payload={
-                    "video_asset_id": int(video_asset_row["id"]),
-                    "location_id": location_id,
-                    "session_id": session_id,
-                    "trigger_id": trigger_id,
-                    "video_path": video_path,
-                    "output_dir": str(resolved_output_dir),
-                    "gallery_state_path": str(resolved_gallery_state),
-                    "processed_video_url": upload_target["video_url"],
-                },
-            )
-            return ScriptExecutionResult(
-                script_run_id=script_run_id,
-                runner_job_id=enqueue_result.job_id,
-                script_name="entry",
-                model_name=model_name,
-                status="running",
-                command=["runpod_serverless", "entry"],
-                stdout="",
-                stderr="",
-                message="Runpod entry job queued. FastAPI will update MySQL when the webhook completes.",
-            )
-
-        remote_result = _invoke_remote_runner(
-            endpoint="/api/v1/runner/jobs/entry",
-            payload={
-                "video_url": source_video_url,
-                "gallery_state_url": gallery_state_url,
-                "processed_video_object_key": upload_target["object_key"],
-                "session_id": session_id,
-                "model_name": model_name,
-            },
-        )
-        remote_status = "success" if remote_result.status == "success" else "failed"
-        repositories.finish_script_run(
-            db,
-            script_run_id,
-            status=remote_status,
-            stdout_log=remote_result.stdout,
-            stderr_log=remote_result.stderr,
-        )
-        result = ScriptExecutionResult(
-            script_run_id=script_run_id,
-            script_name="entry",
-            model_name=model_name,
-            status=remote_status,
-            command=["remote_runner", "/api/v1/runner/jobs/entry"],
-            stdout=remote_result.stdout,
-            stderr=remote_result.stderr,
-        )
-        if result.status != "success":
-            repositories.update_video_asset_status(db, int(video_asset_row["id"]), "issue")
-            return result
-        if not remote_result.tracking_summary:
-            repositories.update_video_asset_status(db, int(video_asset_row["id"]), "issue")
-            stderr = f"{result.stderr}\nRemote runner did not return tracking_summary.".strip()
-            _record_followup_failure(
-                db,
-                script_run_id=result.script_run_id,
-                session_id=session_id,
-                trigger_id=trigger_id,
-                script_name="entry",
-                model_name=model_name or "remote_runner_tracking_summary_missing",
-                stdout=result.stdout,
-                stderr=stderr,
-            )
-            return ScriptExecutionResult(
-                script_run_id=result.script_run_id,
-                script_name=result.script_name,
-                model_name=result.model_name,
-                status="failed",
-                command=result.command,
-                stdout=result.stdout,
-                stderr=stderr,
-            )
-        _write_remote_entry_summaries(
-            video_path=video_path,
-            output_dir=resolved_output_dir,
-            tracking_summary=remote_result.tracking_summary,
-            reid_views_summary=remote_result.reid_views_summary,
-        )
-        try:
-            _sync_gallery_state_after_entry(
-                location_id=location_id,
-                session_id=session_id,
-                video_path=video_path,
-                output_dir=resolved_output_dir,
-                gallery_state_path=resolved_gallery_state,
-                enter_time=session.get("start_time"),
-                leave_time=video_asset_row.get("captured_end_time"),
-            )
-        except Exception as exc:
-            repositories.update_video_asset_status(db, int(video_asset_row["id"]), "issue")
-            stderr = f"{result.stderr}\nGallery persistence failed: {exc}".strip()
-            _record_followup_failure(
-                db,
-                script_run_id=result.script_run_id,
-                session_id=session_id,
-                trigger_id=trigger_id,
-                script_name="entry",
-                model_name=model_name or "remote_runner_gallery_persistence",
-                stdout=result.stdout,
-                stderr=stderr,
-            )
-            return ScriptExecutionResult(
-                script_run_id=result.script_run_id,
-                script_name=result.script_name,
-                model_name=result.model_name,
-                status="failed",
-                command=result.command,
-                stdout=result.stdout,
-                stderr=stderr,
-            )
-        if not remote_result.processed_video_object_key:
-            repositories.update_video_asset_status(db, int(video_asset_row["id"]), "issue")
-            stderr = f"{result.stderr}\nRemote runner did not return processed video object key.".strip()
-            _record_followup_failure(
-                db,
-                script_run_id=result.script_run_id,
-                session_id=session_id,
-                trigger_id=trigger_id,
-                script_name="entry",
-                model_name=model_name or "remote_runner_processed_video_missing",
-                stdout=result.stdout,
-                stderr=stderr,
-            )
-            return ScriptExecutionResult(
-                script_run_id=result.script_run_id,
-                script_name=result.script_name,
-                model_name=result.model_name,
-                status="failed",
-                command=result.command,
-                stdout=result.stdout,
-                stderr=stderr,
-            )
-        _apply_processed_video_upload_result(
-            db,
-            video_asset_row=video_asset_row,
-            object_key=remote_result.processed_video_object_key,
-            video_url=upload_target["video_url"],
-        )
-        return result
+        },
+    )
+    repositories.assign_script_run_runner_job(
+        db,
+        script_run_id,
+        runner_job_id=enqueue_result.job_id,
+        runner_payload={
+            "video_asset_id": int(video_asset_row["id"]),
+            "location_id": location_id,
+            "session_id": session_id,
+            "trigger_id": trigger_id,
+            "video_path": video_path,
+            "output_dir": str(resolved_output_dir),
+            "gallery_state_path": str(resolved_gallery_state),
+            "processed_video_url": upload_target["video_url"],
+        },
+    )
+    return ScriptExecutionResult(
+        script_run_id=script_run_id,
+        runner_job_id=enqueue_result.job_id,
+        script_name="entry",
+        model_name=model_name,
+        status="running",
+        command=["runpod_serverless", "entry"],
+        stdout="",
+        stderr="",
+        message="Runpod entry job queued. FastAPI will update MySQL when the webhook completes.",
+    )
 
     result = run_script(
         db,
@@ -2192,224 +2074,91 @@ def run_kiosk_for_session(
         if gallery_state_path
         else build_private_gallery_state_path(location_id, session_id)
     )
+    if not _runpod_runner_enabled():
+        raise RuntimeError(
+            "Runpod kiosk analysis is not configured. Set THEFT_API_RUNPOD_KIOSK_ENDPOINT_ID "
+            "and THEFT_API_RUNPOD_API_KEY in the API environment."
+        )
     _hydrate_gallery_state_from_active_gallery(location_id, resolved_gallery_state)
     video_asset_row = _lookup_video_asset_by_file_path(db, video_path)
-    if video_asset_row is not None and not (_runpod_runner_enabled() and _runner_enabled()):
-        repositories.update_video_asset_status(db, int(video_asset_row["id"]), "processing")
-
-    if _runner_enabled():
-        if video_asset_row is None:
-            raise RuntimeError("Remote runner requires a matching video_asset row for the source video.")
-        if _runpod_runner_enabled() and _runpod_dispatch_busy(db):
-            return ScriptExecutionResult(
-                script_run_id=None,
-                runner_job_id=None,
-                script_name="kiosk",
-                model_name=model_name,
-                status="pending",
-                command=["runpod_serverless", "kiosk"],
-                stdout="",
-                stderr="",
-                message="Runpod analysis worker is busy. Kiosk job was not enqueued yet; retry after the current analysis finishes.",
-            )
-        repositories.update_video_asset_status(db, int(video_asset_row["id"]), "processing")
-        source_video_url = str(video_asset_row.get("video_url") or "").strip()
-        if not source_video_url:
-            raise RuntimeError("Remote runner requires a Spaces-backed source video URL on the video_asset row.")
-        gallery_state_url = _upload_runner_input_file(
-            resolved_gallery_state,
-            kind="gallery_state",
-            location_id=location_id,
-            session_id=session_id,
-            trigger_id=None,
-        )[1]
-        upload_target = _build_processed_video_upload_target(
-            video_asset_row=video_asset_row,
-            location_id=location_id,
-            session_id=session_id,
-            trigger_id=None,
+    if video_asset_row is None:
+        raise RuntimeError("Runpod kiosk analysis requires a matching video_asset row for the source video.")
+    if _runpod_dispatch_busy(db):
+        return ScriptExecutionResult(
+            script_run_id=None,
+            runner_job_id=None,
             script_name="kiosk",
-            source_video_path=video_path,
+            model_name=model_name,
+            status="pending",
+            command=["runpod_serverless", "kiosk"],
+            stdout="",
+            stderr="",
+            message="Runpod analysis worker is busy. Kiosk job was not enqueued yet; retry after the current analysis finishes.",
         )
-        script_run_id = repositories.create_script_run_started(
-            db,
-            session_id=session_id,
-            trigger_id=None,
-            script_name="kiosk",
-            model_name=model_name or "remote_runner",
-            status="running",
-            command=SCRIPT_RUN_COMMAND_REDACTED,
-        )
-        remote_payload = {
+    repositories.update_video_asset_status(db, int(video_asset_row["id"]), "processing")
+    source_video_url = str(video_asset_row.get("video_url") or "").strip()
+    if not source_video_url:
+        raise RuntimeError("Runpod kiosk analysis requires a Spaces-backed source video URL on the video_asset row.")
+    gallery_state_url = _upload_runner_input_file(
+        resolved_gallery_state,
+        kind="gallery_state",
+        location_id=location_id,
+        session_id=session_id,
+        trigger_id=None,
+    )[1]
+    upload_target = _build_processed_video_upload_target(
+        video_asset_row=video_asset_row,
+        location_id=location_id,
+        session_id=session_id,
+        trigger_id=None,
+        script_name="kiosk",
+        source_video_path=video_path,
+    )
+    script_run_id = repositories.create_script_run_started(
+        db,
+        session_id=session_id,
+        trigger_id=None,
+        script_name="kiosk",
+        model_name=model_name or "runpod_runner",
+        status="running",
+        command=SCRIPT_RUN_COMMAND_REDACTED,
+    )
+    enqueue_result = _enqueue_runpod_runner(
+        kind="kiosk",
+        payload={
             "kind": "kiosk",
             "video_url": source_video_url,
             "gallery_state_url": gallery_state_url,
             "processed_video_object_key": upload_target["object_key"],
             "model_name": model_name,
-        }
-        if _runpod_runner_enabled():
-            enqueue_result = _enqueue_runpod_runner(kind="kiosk", payload=remote_payload)
-            repositories.assign_script_run_runner_job(
-                db,
-                script_run_id,
-                runner_job_id=enqueue_result.job_id,
-                runner_payload={
-                    "video_asset_id": int(video_asset_row["id"]),
-                    "location_id": location_id,
-                    "session_id": session_id,
-                    "trigger_id": None,
-                    "video_path": video_path,
-                    "output_dir": str(resolved_output_dir),
-                    "gallery_state_path": str(resolved_gallery_state),
-                    "processed_video_url": upload_target["video_url"],
-                },
-            )
-            return ScriptExecutionResult(
-                script_run_id=script_run_id,
-                runner_job_id=enqueue_result.job_id,
-                script_name="kiosk",
-                model_name=model_name,
-                status="running",
-                command=["runpod_serverless", "kiosk"],
-                stdout="",
-                stderr="",
-                message="Runpod kiosk job queued. FastAPI will update MySQL when the webhook completes.",
-            )
-
-        remote_result = _invoke_remote_runner(
-            endpoint="/api/v1/runner/jobs/kiosk",
-            payload={
-                "video_url": source_video_url,
-                "gallery_state_url": gallery_state_url,
-                "processed_video_object_key": upload_target["object_key"],
-                "model_name": model_name,
-            },
-        )
-        remote_status = "success" if remote_result.status == "success" else "failed"
-        repositories.finish_script_run(
-            db,
-            script_run_id,
-            status=remote_status,
-            stdout_log=remote_result.stdout,
-            stderr_log=remote_result.stderr,
-        )
-        result = ScriptExecutionResult(
-            script_run_id=script_run_id,
-            script_name="kiosk",
-            model_name=model_name,
-            status=remote_status,
-            command=["remote_runner", "/api/v1/runner/jobs/kiosk"],
-            stdout=remote_result.stdout,
-            stderr=remote_result.stderr,
-        )
-        if result.status != "success":
-            repositories.update_video_asset_status(db, int(video_asset_row["id"]), "issue")
-            return result
-        if not remote_result.processed_video_object_key:
-            repositories.update_video_asset_status(db, int(video_asset_row["id"]), "issue")
-            stderr = f"{result.stderr}\nRemote runner did not return processed video object key.".strip()
-            repositories.revise_script_run(
-                db,
-                result.script_run_id,
-                status="failed",
-                stdout_log=result.stdout,
-                stderr_log=stderr,
-            )
-            return ScriptExecutionResult(
-                script_run_id=result.script_run_id,
-                script_name=result.script_name,
-                model_name=result.model_name,
-                status="failed",
-                command=result.command,
-                stdout=result.stdout,
-                stderr=stderr,
-            )
-        _apply_processed_video_upload_result(
-            db,
-            video_asset_row=video_asset_row,
-            object_key=remote_result.processed_video_object_key,
-            video_url=upload_target["video_url"],
-        )
-        return result
-
-    result = run_script(
+        },
+    )
+    repositories.assign_script_run_runner_job(
         db,
+        script_run_id,
+        runner_job_id=enqueue_result.job_id,
+        runner_payload={
+            "video_asset_id": int(video_asset_row["id"]),
+            "location_id": location_id,
+            "session_id": session_id,
+            "trigger_id": None,
+            "video_path": video_path,
+            "output_dir": str(resolved_output_dir),
+            "gallery_state_path": str(resolved_gallery_state),
+            "processed_video_url": upload_target["video_url"],
+        },
+    )
+    return ScriptExecutionResult(
+        script_run_id=script_run_id,
+        runner_job_id=enqueue_result.job_id,
         script_name="kiosk",
         model_name=model_name,
-        script_path=settings.kiosk_script_path,
-        args=[
-            "--video",
-            str(video_path),
-            "--output-dir",
-            str(resolved_output_dir),
-            "--gallery-state",
-            str(resolved_gallery_state),
-        ],
-        session_id=session_id,
-        trigger_id=None,
-        cwd=workdir,
+        status="running",
+        command=["runpod_serverless", "kiosk"],
+        stdout="",
+        stderr="",
+        message="Runpod kiosk job queued. FastAPI will update MySQL when the webhook completes.",
     )
-    if video_asset_row is None:
-        return result
-    if result.status != "success":
-        repositories.update_video_asset_status(db, int(video_asset_row["id"]), "issue")
-        return result
-
-    processed_video_path = _resolve_processed_video_path(video_path, resolved_output_dir)
-    if processed_video_path is None:
-        expected_processed_video_path = _expected_processed_video_path(video_path, resolved_output_dir)
-        repositories.update_video_asset_status(db, int(video_asset_row["id"]), "issue")
-        stderr = f"{result.stderr}\nProcessed video not found at {expected_processed_video_path}".strip()
-        repositories.revise_script_run(
-            db,
-            result.script_run_id,
-            status="failed",
-            stdout_log=result.stdout,
-            stderr_log=stderr,
-        )
-        return ScriptExecutionResult(
-            script_run_id=result.script_run_id,
-            script_name=result.script_name,
-            model_name=result.model_name,
-            status="failed",
-            command=result.command,
-            stdout=result.stdout,
-            stderr=stderr,
-        )
-
-    try:
-        _upload_processed_video_for_asset(
-            db,
-            video_asset_row=video_asset_row,
-            location_id=location_id,
-            session_id=session_id,
-            trigger_id=None,
-            processed_video_path=processed_video_path,
-            source_video_path=video_path,
-            output_dir=resolved_output_dir,
-            script_name="kiosk",
-            model_name=model_name,
-        )
-    except Exception as exc:
-        repositories.update_video_asset_status(db, int(video_asset_row["id"]), "issue")
-        stderr = f"{result.stderr}\nDigitalOcean Spaces upload failed: {exc}".strip()
-        repositories.revise_script_run(
-            db,
-            result.script_run_id,
-            status="failed",
-            stdout_log=result.stdout,
-            stderr_log=stderr,
-        )
-        return ScriptExecutionResult(
-            script_run_id=result.script_run_id,
-            script_name=result.script_name,
-            model_name=result.model_name,
-            status="failed",
-            command=result.command,
-            stdout=result.stdout,
-            stderr=stderr,
-        )
-    return result
 
 
 def check_video_ready_policy(created_time: datetime, retries_used: int) -> dict:
