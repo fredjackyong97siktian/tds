@@ -31,6 +31,7 @@ from ..storage import (
     guess_media_type,
     gallery_state_path as build_private_gallery_state_path,
     processed_video_spaces_key,
+    source_video_spaces_key,
     session_logs_root,
     session_root,
     tmp_media_root,
@@ -323,6 +324,33 @@ def _apply_processed_video_upload_result(
             "metadata": None,
         },
     )
+
+
+def _build_source_video_upload_target(
+    *,
+    video_asset_row: dict[str, Any],
+    location_id: int,
+    session_id: int | None,
+    trigger_id: int | None,
+    source_video_path: str,
+) -> dict[str, str]:
+    source_filename = Path(source_video_path).name or f"video_asset_{int(video_asset_row['id'])}.mp4"
+    object_key = source_video_spaces_key(
+        location_id=location_id,
+        section=str(video_asset_row.get("section") or "video"),
+        filename=source_filename,
+        session_id=session_id,
+        trigger_id=trigger_id,
+    )
+    return {
+        "object_key": object_key,
+        "video_url": (
+            generate_public_object_url(object_key)
+            if is_spaces_public_read_enabled()
+            else _spaces_download_url_for_object_key(object_key)
+        ),
+        "file_path": f"spaces://{object_key}",
+    }
 
 
 def _write_remote_entry_summaries(
@@ -1637,12 +1665,30 @@ def _run_video_retrieval_job(
         command = _build_retrieval_command(rtsp_url, target_path)
         completed = subprocess.run(command, capture_output=True, text=True)
         status = "success" if completed.returncode == 0 else "failed"
+        source_upload_url = f"/api/v1/videos/assets/{video_asset_id}/content"
+        source_file_path = output_path
+        if status == "success":
+            video_asset_row = repositories.get_video_asset(db, video_asset_id)
+            upload_target = _build_source_video_upload_target(
+                video_asset_row=video_asset_row,
+                location_id=location_id,
+                session_id=session_id,
+                trigger_id=trigger_id,
+                source_video_path=output_path,
+            )
+            upload_result = upload_private_file(
+                target_path,
+                upload_target["object_key"],
+                content_type=guess_media_type(str(target_path)),
+            )
+            source_upload_url = str(upload_result.get("public_url") or upload_target["video_url"])
+            source_file_path = f"spaces://{upload_target['object_key']}"
         repositories.update_video_asset(
             db,
             video_asset_id,
             {
-                "video_url": f"/api/v1/videos/assets/{video_asset_id}/content",
-                "file_path": output_path,
+                "video_url": source_upload_url,
+                "file_path": source_file_path,
                 "captured_start_time": start_time,
                 "captured_end_time": end_time,
                 "retrieved_at": datetime.now(UTC) if status == "success" else None,
@@ -1823,13 +1869,9 @@ def run_entry_for_trigger(
                 message="Runpod analysis worker is busy. Entry job was not enqueued yet; retry after the current analysis finishes.",
             )
         repositories.update_video_asset_status(db, int(video_asset_row["id"]), "processing")
-        source_video_url = _upload_runner_input_file(
-            Path(video_path),
-            kind="source_video",
-            location_id=location_id,
-            session_id=session_id,
-            trigger_id=trigger_id,
-        )[1]
+        source_video_url = str(video_asset_row.get("video_url") or "").strip()
+        if not source_video_url:
+            raise RuntimeError("Remote runner requires a Spaces-backed source video URL on the video_asset row.")
         gallery_state_url = _upload_runner_input_file(
             resolved_gallery_state,
             kind="gallery_state",
@@ -2171,13 +2213,9 @@ def run_kiosk_for_session(
                 message="Runpod analysis worker is busy. Kiosk job was not enqueued yet; retry after the current analysis finishes.",
             )
         repositories.update_video_asset_status(db, int(video_asset_row["id"]), "processing")
-        source_video_url = _upload_runner_input_file(
-            Path(video_path),
-            kind="source_video",
-            location_id=location_id,
-            session_id=session_id,
-            trigger_id=None,
-        )[1]
+        source_video_url = str(video_asset_row.get("video_url") or "").strip()
+        if not source_video_url:
+            raise RuntimeError("Remote runner requires a Spaces-backed source video URL on the video_asset row.")
         gallery_state_url = _upload_runner_input_file(
             resolved_gallery_state,
             kind="gallery_state",

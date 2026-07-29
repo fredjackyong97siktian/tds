@@ -162,6 +162,25 @@ def processed_video_spaces_key(
     return build_spaces_object_key(*segments)
 
 
+def source_video_spaces_key(
+    *,
+    location_id: int,
+    section: str,
+    filename: str,
+    session_id: int | None = None,
+    trigger_id: int | None = None,
+) -> str:
+    segments = [f"location_{location_id}"]
+    if session_id is not None and trigger_id is not None:
+        segments.append(f"session_{session_id}_trigger_{trigger_id}")
+    elif session_id is not None:
+        segments.append(f"session_{session_id}")
+    elif trigger_id is not None:
+        segments.append(f"trigger_{trigger_id}")
+    segments.extend([section, "source", filename])
+    return build_spaces_object_key(*segments)
+
+
 def infer_filename(source: str | None, fallback_stem: str, default_extension: str) -> str:
     if source:
         parsed = urlparse(source)
