@@ -1715,8 +1715,10 @@ def start_entrance_analysis_job(job: EntranceAnalysisQueued) -> ScriptExecutionR
             video_path=job.video_path,
             model_name=job.model_name,
         )
-        if result.status != "success":
+        if result.status == "failed":
             repositories.update_video_asset_status(db, job.video_asset_id, "issue")
+        elif result.status == "pending":
+            repositories.update_video_asset_status(db, job.video_asset_id, "ready")
         return result
     except Exception as exc:
         repositories.update_video_asset_status(db, job.video_asset_id, "issue")
