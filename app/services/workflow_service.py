@@ -34,6 +34,7 @@ from ..storage import (
     session_logs_root,
     session_root,
     tmp_media_root,
+    trigger_gallery_state_path,
     trigger_processed_root,
     trigger_tmp_video_path,
     session_tmp_video_path,
@@ -186,16 +187,16 @@ def _runner_input_object_key(
     location_id: int,
     session_id: int | None,
     trigger_id: int | None,
+    section: str | None,
     filename: str,
 ) -> str:
-    segments = [
-        str(settings.runner_input_key_prefix or "runner_inputs"),
-        f"location_{location_id}",
-    ]
-    if session_id is not None:
-        segments.append(f"session_{session_id}")
+    segments = [f"location_{location_id}"]
     if trigger_id is not None:
         segments.append(f"trigger_{trigger_id}")
+    elif session_id is not None:
+        segments.append(f"session_{session_id}")
+    if section:
+        segments.append(section)
     segments.append(kind)
     segments.append(filename)
     return build_spaces_object_key(*segments)
@@ -208,6 +209,7 @@ def _upload_runner_input_file(
     location_id: int,
     session_id: int | None,
     trigger_id: int | None,
+    section: str | None = None,
 ) -> tuple[str, str]:
     if not is_spaces_configured():
         raise RuntimeError(
@@ -218,6 +220,7 @@ def _upload_runner_input_file(
         location_id=location_id,
         session_id=session_id,
         trigger_id=trigger_id,
+        section=section,
         filename=local_path.name,
     )
     upload_private_file(local_path, object_key, content_type=guess_media_type(str(local_path)))
@@ -1825,7 +1828,7 @@ def run_entry_for_trigger(
     resolved_gallery_state = (
         Path(gallery_state_path)
         if gallery_state_path
-        else build_private_gallery_state_path(location_id, session_id)
+        else trigger_gallery_state_path(location_id, trigger_id, "entrance")
     )
     if not _runpod_runner_enabled():
         raise RuntimeError(
@@ -1858,6 +1861,7 @@ def run_entry_for_trigger(
         location_id=location_id,
         session_id=session_id,
         trigger_id=trigger_id,
+        section="entrance",
     )[1]
     upload_target = _build_processed_video_upload_target(
         video_asset_row=video_asset_row,
@@ -1965,6 +1969,7 @@ def run_kiosk_for_session(
         location_id=location_id,
         session_id=session_id,
         trigger_id=None,
+        section=str(video_asset_row.get("section") or "kiosk"),
     )[1]
     upload_target = _build_processed_video_upload_target(
         video_asset_row=video_asset_row,
