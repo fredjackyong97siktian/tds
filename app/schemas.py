@@ -149,6 +149,7 @@ class SessionListItem(SessionResponse):
 
 class SessionCustomerCreate(BaseModel):
     person_id: int
+    display_code: str | None = None
     enter_time: datetime | None = None
     kiosk_start_time: datetime | None = None
     leave_time: datetime | None = None
@@ -248,6 +249,7 @@ class CustomerGalleryCreate(BaseModel):
     location_id: int
     person_id: int
     session_customer_id: int | None = None
+    display_code: str | None = None
     image_url: str | None = None
     image_kind: str = "reid_view"
     embedding_osnet: list[float] | None = None
@@ -261,6 +263,7 @@ class CustomerGalleryResponse(BaseModel):
     session_id: int
     session_customer_id: int | None = None
     person_id: int
+    display_code: str | None = None
     image_url: str | None = None
     image_kind: str
     embedding_osnet: Any | None = None
@@ -272,6 +275,7 @@ class CustomerGalleryResponse(BaseModel):
 class ActiveGalleryUpsert(BaseModel):
     session_id: int | None = None
     person_id: int | None = None
+    display_code: str | None = None
     image_url: str | None = None
     image_kind: str = "reid_view"
     embedding_osnet: list[float] | None = None
@@ -297,6 +301,7 @@ class ActiveGalleryResponse(BaseModel):
     session_id: int | None = None
     session_customer_id: int
     person_id: int | None = None
+    display_code: str | None = None
     image_url: str | None = None
     image_kind: str
     embedding_osnet: Any | None = None

@@ -124,6 +124,7 @@ CREATE TABLE IF NOT EXISTS sesamedb.tds_session_customer (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     session_id BIGINT NOT NULL,
     person_id INT NOT NULL,
+    display_code VARCHAR(50),
     merged_into_session_customer_id BIGINT COMMENT 'If this row is a duplicate ReID/person track within the same session, point to the canonical session_customer row.',
     enter_time DATETIME,
     kiosk_start_time DATETIME,
@@ -134,6 +135,7 @@ CREATE TABLE IF NOT EXISTS sesamedb.tds_session_customer (
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     UNIQUE KEY uq_session_customer (session_id, person_id),
+    KEY idx_session_customer_display_code (display_code),
     KEY idx_session_customer_merged_into (merged_into_session_customer_id),
     CONSTRAINT fk_session_customer_session
         FOREIGN KEY (session_id) REFERENCES tds_session(id) ON DELETE CASCADE,

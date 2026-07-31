@@ -24,6 +24,7 @@ def create_active_gallery_record(
     session_id: int | None,
     session_customer_id: int,
     person_id: int | None,
+    display_code: str | None = None,
     image_url: str | None = None,
     image_kind: str = "reid_view",
     embedding_osnet: list[float] | None = None,
@@ -34,14 +35,14 @@ def create_active_gallery_record(
         text(
             """
             insert into tds_active_gallery (
-                location_id, session_id, session_customer_id, person_id, image_url, image_kind,
+                location_id, session_id, session_customer_id, person_id, display_code, image_url, image_kind,
                 embedding_osnet, embedding_fashion, metadata
             )
             values (
-                :location_id, :session_id, :session_customer_id, :person_id, :image_url, :image_kind,
+                :location_id, :session_id, :session_customer_id, :person_id, :display_code, :image_url, :image_kind,
                 cast(:embedding_osnet as jsonb), cast(:embedding_fashion as jsonb), cast(:metadata as jsonb)
             )
-            returning id, location_id, session_id, session_customer_id, person_id, image_url, image_kind,
+            returning id, location_id, session_id, session_customer_id, person_id, display_code, image_url, image_kind,
                       embedding_osnet, embedding_fashion, metadata, created_at, updated_at
             """
         ),
@@ -50,6 +51,7 @@ def create_active_gallery_record(
             "session_id": session_id,
             "session_customer_id": session_customer_id,
             "person_id": person_id,
+            "display_code": display_code,
             "image_url": image_url,
             "image_kind": image_kind,
             "embedding_osnet": json.dumps(embedding_osnet) if embedding_osnet is not None else None,
@@ -68,6 +70,7 @@ def create_customer_gallery_record(
     session_id: int,
     person_id: int,
     session_customer_id: int | None = None,
+    display_code: str | None = None,
     image_url: str | None = None,
     image_kind: str = "reid_view",
     embedding_osnet: list[float] | None = None,
@@ -78,14 +81,14 @@ def create_customer_gallery_record(
         text(
             """
             insert into tds_customer_gallery (
-                location_id, session_id, session_customer_id, person_id, image_url, image_kind,
+                location_id, session_id, session_customer_id, person_id, display_code, image_url, image_kind,
                 embedding_osnet, embedding_fashion, metadata
             )
             values (
-                :location_id, :session_id, :session_customer_id, :person_id, :image_url, :image_kind,
+                :location_id, :session_id, :session_customer_id, :person_id, :display_code, :image_url, :image_kind,
                 cast(:embedding_osnet as jsonb), cast(:embedding_fashion as jsonb), cast(:metadata as jsonb)
             )
-            returning id, location_id, session_id, session_customer_id, person_id, image_url, image_kind,
+            returning id, location_id, session_id, session_customer_id, person_id, display_code, image_url, image_kind,
                       embedding_osnet, embedding_fashion, metadata, created_at
             """
         ),
@@ -94,6 +97,7 @@ def create_customer_gallery_record(
             "session_id": session_id,
             "session_customer_id": session_customer_id,
             "person_id": person_id,
+            "display_code": display_code,
             "image_url": image_url,
             "image_kind": image_kind,
             "embedding_osnet": json.dumps(embedding_osnet) if embedding_osnet is not None else None,
@@ -109,7 +113,7 @@ def get_customer_gallery_record(db: Session, gallery_id: int) -> dict[str, Any]:
     result = db.execute(
         text(
             """
-            select id, location_id, session_id, session_customer_id, person_id, image_url, image_kind,
+            select id, location_id, session_id, session_customer_id, person_id, display_code, image_url, image_kind,
                    embedding_osnet, embedding_fashion, metadata, created_at
             from tds_customer_gallery
             where id = :gallery_id
@@ -130,7 +134,7 @@ def get_active_gallery(
     result = db.execute(
         text(
             """
-            select id, location_id, session_id, session_customer_id, person_id, image_url, image_kind,
+            select id, location_id, session_id, session_customer_id, person_id, display_code, image_url, image_kind,
                    embedding_osnet, embedding_fashion, metadata, created_at, updated_at
             from tds_active_gallery
             where location_id = :location_id and session_customer_id = :session_customer_id and id = :active_gallery_id
@@ -145,7 +149,7 @@ def get_active_gallery_record(db: Session, gallery_id: int) -> dict[str, Any]:
     result = db.execute(
         text(
             """
-            select id, location_id, session_id, session_customer_id, person_id, image_url, image_kind,
+            select id, location_id, session_id, session_customer_id, person_id, display_code, image_url, image_kind,
                    embedding_osnet, embedding_fashion, metadata, created_at, updated_at
             from tds_active_gallery
             where id = :gallery_id
@@ -164,7 +168,7 @@ def list_customer_gallery_records(
     result = db.execute(
         text(
             """
-            select id, location_id, session_id, session_customer_id, person_id, image_url, image_kind,
+            select id, location_id, session_id, session_customer_id, person_id, display_code, image_url, image_kind,
                    embedding_osnet, embedding_fashion, metadata, created_at
             from tds_customer_gallery
             where session_id = :session_id
@@ -184,7 +188,7 @@ def list_customer_gallery_records_for_session_customer(
     result = db.execute(
         text(
             """
-            select id, location_id, session_id, session_customer_id, person_id, image_url, image_kind,
+            select id, location_id, session_id, session_customer_id, person_id, display_code, image_url, image_kind,
                    embedding_osnet, embedding_fashion, metadata, created_at
             from tds_customer_gallery
             where session_customer_id = :session_customer_id
@@ -206,7 +210,7 @@ def list_customer_gallery_records_by_ids(
     result = db.execute(
         text(
             """
-            select id, location_id, session_id, session_customer_id, person_id, image_url, image_kind,
+            select id, location_id, session_id, session_customer_id, person_id, display_code, image_url, image_kind,
                    embedding_osnet, embedding_fashion, metadata, created_at
             from tds_customer_gallery
             where id = any(:gallery_ids)
@@ -245,7 +249,7 @@ def list_active_gallery_records(
         result = db.execute(
             text(
                 """
-                select id, location_id, session_id, session_customer_id, person_id, image_url, image_kind,
+                select id, location_id, session_id, session_customer_id, person_id, display_code, image_url, image_kind,
                        embedding_osnet, embedding_fashion, metadata, created_at, updated_at
                 from tds_active_gallery
                 order by updated_at desc, id desc
@@ -259,7 +263,7 @@ def list_active_gallery_records(
     result = db.execute(
         text(
             """
-            select id, location_id, session_id, session_customer_id, person_id, image_url, image_kind,
+            select id, location_id, session_id, session_customer_id, person_id, display_code, image_url, image_kind,
                    embedding_osnet, embedding_fashion, metadata, created_at, updated_at
             from tds_active_gallery
             where location_id = :location_id

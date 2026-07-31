@@ -25,6 +25,7 @@ create table if not exists tds_customer_gallery (
     session_id bigint not null,
     session_customer_id bigint,
     person_id integer not null,
+    display_code varchar(50),
     image_url text,
     image_kind varchar(50) not null default 'reid_view',
     embedding_osnet jsonb,
@@ -42,6 +43,9 @@ create index if not exists idx_customer_gallery_location_person
 create index if not exists idx_customer_gallery_session_customer
     on tds_customer_gallery(session_customer_id);
 
+create index if not exists idx_customer_gallery_display_code
+    on tds_customer_gallery(display_code);
+
 create index if not exists idx_customer_gallery_image_kind
     on tds_customer_gallery(image_kind);
 
@@ -51,6 +55,7 @@ create table if not exists tds_active_gallery (
     session_id bigint,
     session_customer_id bigint not null,
     person_id integer,
+    display_code varchar(50),
     image_url text,
     image_kind varchar(50) not null default 'reid_view',
     embedding_osnet jsonb,
@@ -74,6 +79,9 @@ create index if not exists idx_active_gallery_session_customer_id
 
 create index if not exists idx_active_gallery_person_id
     on tds_active_gallery(person_id);
+
+create index if not exists idx_active_gallery_display_code
+    on tds_active_gallery(display_code);
 
 create index if not exists idx_active_gallery_image_kind
     on tds_active_gallery(image_kind);
