@@ -658,8 +658,24 @@ def process_runpod_webhook(
             raise ValueError("Runpod webhook payload has invalid script_run_id.") from exc
     else:
         raise ValueError("Runpod webhook payload is missing job id.")
+    if script_run is None:
+        raise ValueError("Runpod webhook does not match any script_run.")
 
-    runpod_status, remote_result = _remote_runner_result_from_runpod_body(body)
+    effective_body = body
+    if not isinstance(body.get("output"), dict):
+        runner_job_id = str(script_run.get("runner_job_id") or job_id or "").strip()
+        if not runner_job_id:
+            raise ValueError("Runpod webhook is missing runner job id for status fetch.")
+        script_name = str(script_run.get("script_name") or kind or "").strip().lower()
+        if script_name not in {"entry", "kiosk"}:
+            raise ValueError("Unsupported Runpod webhook kind.")
+        effective_body = _runpod_request(
+            method="GET",
+            path=f"/status/{quote(runner_job_id)}",
+            kind=script_name,
+        )
+
+    runpod_status, remote_result = _remote_runner_result_from_runpod_body(effective_body)
     normalized_kind = str(kind or "").strip().lower()
     if normalized_kind == "entry":
         result = _finalize_remote_entry_script_run(db, script_run=script_run, remote_result=remote_result)
