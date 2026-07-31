@@ -1299,6 +1299,8 @@ def _sync_gallery_state_after_entry(
             active_session_id = source_session_id or session_id
             active_session_customer_id = source_session_customer_id or int(session_customer["id"])
             active_person_id = source_person_id or person_id
+            delete_session_customer_ids = [active_session_customer_id, int(session_customer["id"])]
+            delete_person_ids = [person_id, active_person_id, source_person_id]
             osnet_views = gallery_entry.get("views") or []
             fashion_embedding = _combine_fashion_embedding(
                 gallery_entry.get("fashion_upper_init"),
@@ -1350,18 +1352,20 @@ def _sync_gallery_state_after_entry(
                     },
                 )
             if bool(customer.get("exited")):
-                vector_repositories.delete_active_gallery(
+                vector_repositories.delete_active_gallery_by_aliases(
                     vector_db,
                     location_id=location_id,
-                    session_customer_id=active_session_customer_id,
+                    session_customer_ids=delete_session_customer_ids,
+                    person_ids=delete_person_ids,
                 )
                 continue
 
             if view_rows or osnet_views or fashion_embedding is not None or image_paths:
-                vector_repositories.delete_active_gallery(
+                vector_repositories.delete_active_gallery_by_aliases(
                     vector_db,
                     location_id=location_id,
-                    session_customer_id=active_session_customer_id,
+                    session_customer_ids=delete_session_customer_ids,
+                    person_ids=delete_person_ids,
                 )
                 active_metadata = {
                     "source": "entry_analysis",
@@ -1412,10 +1416,11 @@ def _sync_gallery_state_after_entry(
                         metadata=active_metadata,
                     )
             else:
-                vector_repositories.delete_active_gallery(
+                vector_repositories.delete_active_gallery_by_aliases(
                     vector_db,
                     location_id=location_id,
-                    session_customer_id=active_session_customer_id,
+                    session_customer_ids=delete_session_customer_ids,
+                    person_ids=delete_person_ids,
                 )
     finally:
         vector_db.close()

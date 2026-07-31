@@ -288,3 +288,41 @@ def delete_active_gallery(
         {"location_id": location_id, "session_customer_id": session_customer_id},
     )
     db.commit()
+
+
+def delete_active_gallery_by_aliases(
+    db: Session,
+    *,
+    location_id: int,
+    session_customer_ids: list[int] | None = None,
+    person_ids: list[int] | None = None,
+) -> None:
+    normalized_session_customer_ids = sorted(
+        {int(value) for value in (session_customer_ids or []) if value is not None}
+    )
+    normalized_person_ids = sorted(
+        {int(value) for value in (person_ids or []) if value is not None}
+    )
+    if not normalized_session_customer_ids and not normalized_person_ids:
+        return
+
+    clauses = []
+    params: dict[str, Any] = {"location_id": location_id}
+    if normalized_session_customer_ids:
+        clauses.append("session_customer_id = any(:session_customer_ids)")
+        params["session_customer_ids"] = normalized_session_customer_ids
+    if normalized_person_ids:
+        clauses.append("person_id = any(:person_ids)")
+        params["person_ids"] = normalized_person_ids
+
+    db.execute(
+        text(
+            f"""
+            delete from tds_active_gallery
+            where location_id = :location_id
+              and ({' or '.join(clauses)})
+            """
+        ),
+        params,
+    )
+    db.commit()
