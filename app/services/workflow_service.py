@@ -647,10 +647,18 @@ def process_runpod_webhook(
         raise PermissionError("Invalid Runpod webhook token.")
 
     job_id = str(body.get("id") or body.get("jobId") or "").strip()
-    if not job_id:
+    script_run_id_value = body.get("script_run_id")
+    script_run = None
+    if job_id:
+        script_run = repositories.get_script_run_by_runner_job_id(db, job_id)
+    elif script_run_id_value is not None:
+        try:
+            script_run = repositories.get_script_run(db, int(script_run_id_value))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Runpod webhook payload has invalid script_run_id.") from exc
+    else:
         raise ValueError("Runpod webhook payload is missing job id.")
 
-    script_run = repositories.get_script_run_by_runner_job_id(db, job_id)
     runpod_status, remote_result = _remote_runner_result_from_runpod_body(body)
     normalized_kind = str(kind or "").strip().lower()
     if normalized_kind == "entry":
@@ -663,8 +671,8 @@ def process_runpod_webhook(
     return {
         "ok": True,
         "job_id": job_id,
-        "runpod_status": runpod_status,
         "script_run_id": result.script_run_id,
+        "runpod_status": runpod_status,
         "status": result.status,
     }
 
@@ -1889,6 +1897,7 @@ def run_entry_for_trigger(
             "gallery_state_url": gallery_state_url,
             "processed_video_object_key": upload_target["object_key"],
             "callback_url": _build_runpod_webhook_url("entry"),
+            "script_run_id": script_run_id,
             "session_id": session_id,
             "model_name": model_name,
         },
@@ -1997,6 +2006,7 @@ def run_kiosk_for_session(
             "gallery_state_url": gallery_state_url,
             "processed_video_object_key": upload_target["object_key"],
             "callback_url": _build_runpod_webhook_url("kiosk"),
+            "script_run_id": script_run_id,
             "model_name": model_name,
         },
     )
