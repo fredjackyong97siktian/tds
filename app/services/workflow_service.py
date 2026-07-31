@@ -1161,7 +1161,7 @@ def _build_cross_state_from_active_gallery(location_id: int) -> dict[str, Any]:
         next_gid = 1
 
         for row in active_rows:
-            gallery_id = _coerce_int(row.get("session_customer_id"))
+            gallery_id = _coerce_int(row.get("person_id"))
             if gallery_id is None:
                 continue
 
@@ -1183,8 +1183,8 @@ def _build_cross_state_from_active_gallery(location_id: int) -> dict[str, Any]:
                 {
                     "views": [],
                     "session_id": _coerce_int(row.get("session_id")),
-                    "session_customer_id": gallery_id,
-                    "person_id": _coerce_int(row.get("person_id")),
+                    "session_customer_id": _coerce_int(row.get("session_customer_id")),
+                    "person_id": gallery_id,
                     "location_id": _coerce_int(row.get("location_id")),
                     "source": "postgresql_active_gallery",
                 },
