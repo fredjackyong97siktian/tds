@@ -1,5 +1,6 @@
 from __future__ import annotations
 import json
+import logging
 import re
 import subprocess
 import time
@@ -44,6 +45,7 @@ from ..storage import (
 
 UTC = timezone.utc
 SCRIPT_RUN_COMMAND_REDACTED = "[redacted]"
+logger = logging.getLogger("tds.workflow_service")
 
 
 @dataclass
@@ -662,21 +664,38 @@ def process_runpod_webhook(
         raise ValueError("Runpod webhook does not match any script_run.")
 
     effective_body = body
+    runner_job_id = str(script_run.get("runner_job_id") or job_id or "").strip()
+    normalized_kind = str(kind or "").strip().lower()
     if not isinstance(body.get("output"), dict):
-        runner_job_id = str(script_run.get("runner_job_id") or job_id or "").strip()
         if not runner_job_id:
             raise ValueError("Runpod webhook is missing runner job id for status fetch.")
-        script_name = str(script_run.get("script_name") or kind or "").strip().lower()
+        script_name = str(script_run.get("script_name") or normalized_kind or "").strip().lower()
         if script_name not in {"entry", "kiosk"}:
             raise ValueError("Unsupported Runpod webhook kind.")
-        effective_body = _runpod_request(
-            method="GET",
-            path=f"/status/{quote(runner_job_id)}",
-            kind=script_name,
+        effective_body = _fetch_runpod_status_with_retries(
+            runner_job_id=runner_job_id,
+            script_name=script_name,
+            attempts=3,
+            sleep_seconds=2.0,
         )
 
     runpod_status, remote_result = _remote_runner_result_from_runpod_body(effective_body)
-    normalized_kind = str(kind or "").strip().lower()
+    if not _is_runpod_terminal_status(runpod_status):
+        logger.info(
+            "Runpod webhook received before terminal state for job_id=%s script_run_id=%s kind=%s status=%s",
+            runner_job_id or job_id,
+            script_run.get("id"),
+            normalized_kind,
+            runpod_status or "UNKNOWN",
+        )
+        return {
+            "ok": True,
+            "job_id": runner_job_id or job_id,
+            "script_run_id": int(script_run["id"]),
+            "runpod_status": runpod_status,
+            "status": str(script_run.get("status") or "running"),
+            "message": "Runpod job is not terminal yet; reconciliation worker will retry.",
+        }
     if normalized_kind == "entry":
         result = _finalize_remote_entry_script_run(db, script_run=script_run, remote_result=remote_result)
     elif normalized_kind == "kiosk":
@@ -696,6 +715,48 @@ def process_runpod_webhook(
 def _is_runpod_terminal_status(status: str) -> bool:
     normalized = str(status or "").strip().upper()
     return normalized in {"COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT", "ABORTED"}
+
+
+def _fetch_runpod_status_with_retries(
+    *,
+    runner_job_id: str,
+    script_name: str,
+    attempts: int = 3,
+    sleep_seconds: float = 2.0,
+) -> dict[str, Any]:
+    last_body: dict[str, Any] | None = None
+    total_attempts = max(1, attempts)
+    for attempt in range(1, total_attempts + 1):
+        body = _runpod_request(
+            method="GET",
+            path=f"/status/{quote(runner_job_id)}",
+            kind=script_name,
+        )
+        last_body = body
+        runpod_status = str(body.get("status") or "").strip().upper()
+        if _is_runpod_terminal_status(runpod_status):
+            if attempt > 1:
+                logger.info(
+                    "Runpod status reached terminal state on retry %s for job_id=%s script=%s status=%s",
+                    attempt,
+                    runner_job_id,
+                    script_name,
+                    runpod_status,
+                )
+            return body
+        if attempt < total_attempts:
+            logger.info(
+                "Runpod status still pending for job_id=%s script=%s attempt=%s/%s status=%s; retrying in %.1fs",
+                runner_job_id,
+                script_name,
+                attempt,
+                total_attempts,
+                runpod_status or "UNKNOWN",
+                sleep_seconds,
+            )
+            time.sleep(max(0.0, sleep_seconds))
+    assert last_body is not None
+    return last_body
 
 
 def reconcile_running_remote_analysis_script_runs(db: Session) -> list[dict[str, Any]]:
