@@ -1116,10 +1116,6 @@ def _coerce_int(value: Any) -> int | None:
         return None
 
 
-def _build_display_code(location_id: int, person_id: int) -> str:
-    return f"L{int(location_id)}-C{int(person_id):04d}"
-
-
 def _candidate_gallery_image_paths(
     *,
     cross_state: dict[str, Any],
@@ -1271,13 +1267,11 @@ def _sync_gallery_state_after_entry(
     try:
         for customer in summary_customers:
             person_id = int(customer["person_id"])
-            display_code = _build_display_code(location_id, person_id)
             repositories.create_session_customer(
                 transactional_db,
                 session_id,
                 {
                     "person_id": person_id,
-                    "display_code": display_code,
                     "enter_time": enter_time,
                     "kiosk_start_time": None,
                     "leave_time": leave_time if bool(customer.get("exited")) else None,
@@ -1345,7 +1339,6 @@ def _sync_gallery_state_after_entry(
                     session_id=session_id,
                     session_customer_id=int(session_customer["id"]),
                     person_id=person_id,
-                    display_code=display_code,
                     image_url=canonical_image_url,
                     image_kind="reid_view" if canonical_osnet is not None else "fashion_view",
                     embedding_osnet=canonical_osnet,
@@ -1388,7 +1381,6 @@ def _sync_gallery_state_after_entry(
                             session_id=active_session_id,
                             session_customer_id=active_session_customer_id,
                             person_id=active_person_id,
-                            display_code=display_code,
                             image_url=view_row.get("image_url"),
                             image_kind=str(view_row.get("image_kind") or "reid_view"),
                             embedding_osnet=view_row.get("embedding_osnet"),
@@ -1404,7 +1396,6 @@ def _sync_gallery_state_after_entry(
                             session_id=active_session_id,
                             session_customer_id=active_session_customer_id,
                             person_id=active_person_id,
-                            display_code=display_code,
                             image_url=image_url,
                             image_kind="reid_view",
                             embedding_osnet=_tensor_like_to_float_list(osnet_view),
@@ -1418,7 +1409,6 @@ def _sync_gallery_state_after_entry(
                         session_id=active_session_id,
                         session_customer_id=active_session_customer_id,
                         person_id=active_person_id,
-                        display_code=display_code,
                         image_url=canonical_image_url,
                         image_kind="fashion_view",
                         embedding_osnet=None,

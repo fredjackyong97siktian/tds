@@ -1394,13 +1394,12 @@ def create_session_customer(db: Session, session_id: int, payload: Mapping[str, 
         text(
             f"""
             insert into {session_customer_table} (
-                session_id, person_id, display_code, enter_time, kiosk_start_time, leave_time, match_status
+                session_id, person_id, enter_time, kiosk_start_time, leave_time, match_status
             )
             values (
-                :session_id, :person_id, :display_code, :enter_time, :kiosk_start_time, :leave_time, :match_status
+                :session_id, :person_id, :enter_time, :kiosk_start_time, :leave_time, :match_status
             )
             on duplicate key update
-                display_code = coalesce(values(display_code), display_code),
                 enter_time = values(enter_time),
                 kiosk_start_time = values(kiosk_start_time),
                 leave_time = values(leave_time),
@@ -1417,7 +1416,7 @@ def get_session_customer_by_session_person(db: Session, session_id: int, person_
     result = db.execute(
         text(
             f"""
-            select id, session_id, person_id, display_code, merged_into_session_customer_id, enter_time,
+            select id, session_id, person_id, merged_into_session_customer_id, enter_time,
                    kiosk_start_time, leave_time, match_status, merge_reason, merged_at,
                    created_at, updated_at
             from {session_customer_table}
