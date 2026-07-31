@@ -116,6 +116,8 @@ class RemoteRunnerResult:
     stderr: str
     processed_video_object_key: str | None
     processed_video_url: str | None
+    log_object_key: str | None = None
+    log_url: str | None = None
     tracking_summary: dict[str, Any] | None = None
     reid_views_summary: dict[str, Any] | None = None
 
@@ -438,6 +440,8 @@ def _remote_runner_result_from_runpod_body(body: dict[str, Any]) -> tuple[str, R
                 stderr=str(output.get("stderr") or ""),
                 processed_video_object_key=output.get("processed_video_object_key"),
                 processed_video_url=output.get("processed_video_url"),
+                log_object_key=output.get("log_object_key"),
+                log_url=output.get("log_url"),
                 tracking_summary=output.get("tracking_summary"),
                 reid_views_summary=output.get("reid_views_summary"),
             ),
@@ -453,6 +457,8 @@ def _remote_runner_result_from_runpod_body(body: dict[str, Any]) -> tuple[str, R
                 stderr=str(output.get("stderr") or error_detail),
                 processed_video_object_key=output.get("processed_video_object_key"),
                 processed_video_url=output.get("processed_video_url"),
+                log_object_key=output.get("log_object_key"),
+                log_url=output.get("log_url"),
                 tracking_summary=output.get("tracking_summary"),
                 reid_views_summary=output.get("reid_views_summary"),
             ),
@@ -497,6 +503,17 @@ def _finalize_remote_entry_script_run(
     gallery_state_path = Path(str(runner_payload["gallery_state_path"]))
     video_asset_id = int(runner_payload["video_asset_id"])
     processed_video_url = str(remote_result.processed_video_url or runner_payload.get("processed_video_url") or "")
+    repositories.assign_script_run_runner_job(
+        db,
+        script_run_id,
+        runner_job_id=str(script_run.get("runner_job_id") or ""),
+        runner_payload={
+            **runner_payload,
+            "processed_video_url": processed_video_url or runner_payload.get("processed_video_url"),
+            "log_object_key": remote_result.log_object_key or runner_payload.get("log_object_key"),
+            "log_url": remote_result.log_url or runner_payload.get("log_url"),
+        },
+    )
     video_asset_row = repositories.get_video_asset(db, video_asset_id)
     session = repositories.get_session(db, session_id)
 
@@ -637,6 +654,17 @@ def _finalize_remote_kiosk_script_run(
     script_run_id = int(script_run["id"])
     video_asset_id = int(runner_payload["video_asset_id"])
     processed_video_url = str(remote_result.processed_video_url or runner_payload.get("processed_video_url") or "")
+    repositories.assign_script_run_runner_job(
+        db,
+        script_run_id,
+        runner_job_id=str(script_run.get("runner_job_id") or ""),
+        runner_payload={
+            **runner_payload,
+            "processed_video_url": processed_video_url or runner_payload.get("processed_video_url"),
+            "log_object_key": remote_result.log_object_key or runner_payload.get("log_object_key"),
+            "log_url": remote_result.log_url or runner_payload.get("log_url"),
+        },
+    )
     video_asset_row = repositories.get_video_asset(db, video_asset_id)
 
     remote_status = "success" if remote_result.status == "success" else "failed"
