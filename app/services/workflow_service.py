@@ -1193,10 +1193,27 @@ def _sync_gallery_state_after_entry(
                 view for view in raw_views if isinstance(view, dict)
             ]
 
+    summary_customers = tracking_summary.get("customers", [])
+    if not summary_customers and reid_views_by_person:
+        summary_customers = [
+            {
+                "person_id": person_id,
+                "entered": True,
+                "exited": False,
+                "group_id": None,
+            }
+            for person_id in sorted(reid_views_by_person)
+        ]
+        logger.info(
+            "Tracking summary had no customers for video=%s; falling back to reid_views_summary customers=%s",
+            Path(video_path).name,
+            [customer["person_id"] for customer in summary_customers],
+        )
+
     transactional_db = TransactionalSessionLocal()
     vector_db = VectorSessionLocal()
     try:
-        for customer in tracking_summary.get("customers", []):
+        for customer in summary_customers:
             person_id = int(customer["person_id"])
             repositories.create_session_customer(
                 transactional_db,
