@@ -417,6 +417,18 @@ def _finalize_remote_entry_script_run(
     script_run: dict[str, Any],
     remote_result: RemoteRunnerResult,
 ) -> ScriptExecutionResult:
+    if str(script_run.get("status") or "").strip().lower() != "running":
+        return ScriptExecutionResult(
+            script_run_id=int(script_run["id"]),
+            runner_job_id=str(script_run.get("runner_job_id") or ""),
+            script_name="entry",
+            model_name=script_run.get("model_name"),
+            status=str(script_run.get("status") or "success"),
+            command=["runpod_serverless", "entry"],
+            stdout=str(script_run.get("stdout_log") or ""),
+            stderr=str(script_run.get("stderr_log") or ""),
+            message="Runpod callback already processed for this script run.",
+        )
     runner_payload = dict(script_run.get("runner_payload") or {})
     script_run_id = int(script_run["id"])
     session_id = int(script_run["session_id"])
@@ -426,7 +438,7 @@ def _finalize_remote_entry_script_run(
     output_dir = Path(str(runner_payload["output_dir"]))
     gallery_state_path = Path(str(runner_payload["gallery_state_path"]))
     video_asset_id = int(runner_payload["video_asset_id"])
-    processed_video_url = str(runner_payload.get("processed_video_url") or "")
+    processed_video_url = str(remote_result.processed_video_url or runner_payload.get("processed_video_url") or "")
     video_asset_row = repositories.get_video_asset(db, video_asset_id)
     session = repositories.get_session(db, session_id)
 
@@ -551,10 +563,22 @@ def _finalize_remote_kiosk_script_run(
     script_run: dict[str, Any],
     remote_result: RemoteRunnerResult,
 ) -> ScriptExecutionResult:
+    if str(script_run.get("status") or "").strip().lower() != "running":
+        return ScriptExecutionResult(
+            script_run_id=int(script_run["id"]),
+            runner_job_id=str(script_run.get("runner_job_id") or ""),
+            script_name="kiosk",
+            model_name=script_run.get("model_name"),
+            status=str(script_run.get("status") or "success"),
+            command=["runpod_serverless", "kiosk"],
+            stdout=str(script_run.get("stdout_log") or ""),
+            stderr=str(script_run.get("stderr_log") or ""),
+            message="Runpod callback already processed for this script run.",
+        )
     runner_payload = dict(script_run.get("runner_payload") or {})
     script_run_id = int(script_run["id"])
     video_asset_id = int(runner_payload["video_asset_id"])
-    processed_video_url = str(runner_payload.get("processed_video_url") or "")
+    processed_video_url = str(remote_result.processed_video_url or runner_payload.get("processed_video_url") or "")
     video_asset_row = repositories.get_video_asset(db, video_asset_id)
 
     remote_status = "success" if remote_result.status == "success" else "failed"
@@ -1859,6 +1883,7 @@ def run_entry_for_trigger(
             "video_url": source_video_url,
             "gallery_state_url": gallery_state_url,
             "processed_video_object_key": upload_target["object_key"],
+            "callback_url": _build_runpod_webhook_url("entry"),
             "session_id": session_id,
             "model_name": model_name,
         },
@@ -1965,6 +1990,7 @@ def run_kiosk_for_session(
             "video_url": source_video_url,
             "gallery_state_url": gallery_state_url,
             "processed_video_object_key": upload_target["object_key"],
+            "callback_url": _build_runpod_webhook_url("kiosk"),
             "model_name": model_name,
         },
     )
