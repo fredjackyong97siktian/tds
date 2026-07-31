@@ -86,6 +86,16 @@ class VideoAnalysisWorker:
 
         db = TransactionalSessionLocal()
         try:
+            reconciled = workflow_service.reconcile_running_remote_analysis_script_runs(db)
+            for item in reconciled:
+                logger.info(
+                    "Reconciled remote analysis script_run_id=%s runner_job_id=%s script=%s runpod_status=%s status=%s",
+                    item["script_run_id"],
+                    item["runner_job_id"],
+                    item["script_name"],
+                    item["runpod_status"],
+                    item["status"],
+                )
             if repositories.is_worker_paused(db, "analysis"):
                 return
             if repositories.has_active_remote_analysis_script_run(db):

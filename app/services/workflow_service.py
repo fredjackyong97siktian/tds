@@ -677,6 +677,46 @@ def process_runpod_webhook(
     }
 
 
+def _is_runpod_terminal_status(status: str) -> bool:
+    normalized = str(status or "").strip().upper()
+    return normalized in {"COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT", "ABORTED"}
+
+
+def reconcile_running_remote_analysis_script_runs(db: Session) -> list[dict[str, Any]]:
+    reconciled: list[dict[str, Any]] = []
+    for script_run in repositories.list_running_remote_analysis_script_runs(db):
+        job_id = str(script_run.get("runner_job_id") or "").strip()
+        script_name = str(script_run.get("script_name") or "").strip().lower()
+        if not job_id or script_name not in {"entry", "kiosk"}:
+            continue
+        try:
+            body = _runpod_request(
+                method="GET",
+                path=f"/status/{quote(job_id)}",
+                kind=script_name,
+            )
+        except Exception:
+            continue
+        runpod_status = str(body.get("status") or "").strip().upper()
+        if not _is_runpod_terminal_status(runpod_status):
+            continue
+        remote_status, remote_result = _remote_runner_result_from_runpod_body(body)
+        if script_name == "entry":
+            result = _finalize_remote_entry_script_run(db, script_run=script_run, remote_result=remote_result)
+        else:
+            result = _finalize_remote_kiosk_script_run(db, script_run=script_run, remote_result=remote_result)
+        reconciled.append(
+            {
+                "script_run_id": result.script_run_id,
+                "runner_job_id": result.runner_job_id,
+                "script_name": script_name,
+                "runpod_status": remote_status,
+                "status": result.status,
+            }
+        )
+    return reconciled
+
+
 def _post_remote_runner_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
     request = Request(
         url,

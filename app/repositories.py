@@ -1777,6 +1777,31 @@ def has_active_remote_analysis_script_run(db: Session) -> bool:
     return result.first() is not None
 
 
+def list_running_remote_analysis_script_runs(db: Session) -> list[dict[str, Any]]:
+    script_run_table = _table("script_run")
+    result = db.execute(
+        text(
+            f"""
+            select id, session_id, trigger_id, script_name, model_name, runner_job_id, runner_payload,
+                   status, command, stdout_log, stderr_log, started_at, finished_at
+            from {script_run_table}
+            where script_name in ('entry', 'kiosk')
+              and status = 'running'
+              and runner_job_id is not null
+            order by id asc
+            """
+        )
+    )
+    rows = _fetch_all_dicts(result)
+    for row in rows:
+        if isinstance(row.get("runner_payload"), str):
+            try:
+                row["runner_payload"] = json.loads(row["runner_payload"])
+            except json.JSONDecodeError:
+                pass
+    return rows
+
+
 def create_script_run(
     db: Session,
     *,
