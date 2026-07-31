@@ -2106,6 +2106,7 @@ def run_entry_for_trigger(
             "callback_url": _build_runpod_webhook_url("entry"),
             "script_run_id": script_run_id,
             "session_id": session_id,
+            "location_id": location_id,
             "model_name": model_name,
         },
     )
