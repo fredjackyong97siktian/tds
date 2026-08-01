@@ -1472,11 +1472,19 @@ def _sync_gallery_state_after_entry(
                     person_ids=delete_person_ids,
                 )
 
-        final_persistent_person_ids = {
-            int(gallery_id)
-            for gallery_id in persistent_gallery.keys()
-            if gallery_id is not None
-        }
+        summary_persistent_gallery_ids = tracking_summary.get("persistent_gallery_ids") or []
+        if isinstance(summary_persistent_gallery_ids, list):
+            final_persistent_person_ids = {
+                int(gallery_id)
+                for gallery_id in summary_persistent_gallery_ids
+                if gallery_id is not None
+            }
+        else:
+            final_persistent_person_ids = {
+                int(gallery_id)
+                for gallery_id in persistent_gallery.keys()
+                if gallery_id is not None
+            }
         stale_person_ids = sorted(active_person_ids_before - final_persistent_person_ids)
         if stale_person_ids:
             stale_session_customer_ids = sorted(
@@ -1487,11 +1495,14 @@ def _sync_gallery_state_after_entry(
                 }
             )
             logger.info(
-                "Reconciling active gallery for location_id=%s after video=%s; removing stale person_ids=%s final_persistent_person_ids=%s",
+                "Reconciling active gallery for location_id=%s after video=%s; removing stale person_ids=%s final_persistent_person_ids=%s source=%s",
                 location_id,
                 Path(video_path).name,
                 stale_person_ids,
                 sorted(final_persistent_person_ids),
+                "tracking_summary"
+                if isinstance(summary_persistent_gallery_ids, list)
+                else "gallery_state_pickle",
             )
             vector_repositories.delete_active_gallery_by_aliases(
                 vector_db,
