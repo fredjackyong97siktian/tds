@@ -3,7 +3,7 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.orm import Session
 
 from .config import settings
@@ -921,6 +921,8 @@ def claim_video_asset_for_retrieval(db: Session, video_asset_id: int) -> bool:
 def list_pending_video_asset_analyses(db: Session, limit: int = 50) -> list[dict[str, Any]]:
     video_asset_table = _table("video_asset")
     trigger_table = _table("trigger_event")
+    session_video_asset_table = _table("session_video_asset")
+    session_table = _table("session")
     result = db.execute(
         text(
             f"""
@@ -934,12 +936,17 @@ def list_pending_video_asset_analyses(db: Session, limit: int = 50) -> list[dict
                    va.retrieved_at,
                    va.analyzed_at,
                    va.created_at,
-                   te.location_id
+                   coalesce(te.location_id, min(s.location_id)) as location_id,
+                   min(sva.session_id) as session_id
             from {video_asset_table} va
-            inner join {trigger_table} te on te.id = va.trigger_id
-            where va.section = 'entrance'
+            left join {trigger_table} te on te.id = va.trigger_id
+            left join {session_video_asset_table} sva on sva.video_asset_id = va.id
+            left join {session_table} s on s.id = sva.session_id
+            where va.section in ('entrance', 'kiosk')
               and va.status = 'ready'
-              and not exists (
+              and (
+                va.section = 'kiosk'
+                or not exists (
                   select 1
                   from {video_asset_table} prev
                   inner join {trigger_table} prev_te on prev_te.id = prev.trigger_id
@@ -953,7 +960,11 @@ def list_pending_video_asset_analyses(db: Session, limit: int = 50) -> list[dict
                         )
                     )
                     and prev.status in ('not_retrieved', 'retrieving', 'ready', 'processing', 'issue')
+                )
               )
+            group by va.id, va.trigger_id, va.section, va.file_path, va.video_url,
+                     va.captured_start_time, va.captured_end_time, va.retrieved_at,
+                     va.analyzed_at, va.created_at, te.location_id
             order by coalesce(va.captured_start_time, va.created_at) asc, va.id asc
             limit :limit
             """
@@ -966,6 +977,8 @@ def list_pending_video_asset_analyses(db: Session, limit: int = 50) -> list[dict
 def list_running_video_asset_analyses(db: Session) -> list[dict[str, Any]]:
     video_asset_table = _table("video_asset")
     trigger_table = _table("trigger_event")
+    session_video_asset_table = _table("session_video_asset")
+    session_table = _table("session")
     result = db.execute(
         text(
             f"""
@@ -979,11 +992,17 @@ def list_running_video_asset_analyses(db: Session) -> list[dict[str, Any]]:
                    va.retrieved_at,
                    va.analyzed_at,
                    va.created_at,
-                   te.location_id
+                   coalesce(te.location_id, min(s.location_id)) as location_id,
+                   min(sva.session_id) as session_id
             from {video_asset_table} va
-            inner join {trigger_table} te on te.id = va.trigger_id
-            where va.section = 'entrance'
+            left join {trigger_table} te on te.id = va.trigger_id
+            left join {session_video_asset_table} sva on sva.video_asset_id = va.id
+            left join {session_table} s on s.id = sva.session_id
+            where va.section in ('entrance', 'kiosk')
               and va.status = 'processing'
+            group by va.id, va.trigger_id, va.section, va.file_path, va.video_url,
+                     va.captured_start_time, va.captured_end_time, va.retrieved_at,
+                     va.analyzed_at, va.created_at, te.location_id
             order by va.id asc
             """
         )
@@ -999,7 +1018,7 @@ def claim_video_asset_for_analysis(db: Session, video_asset_id: int) -> bool:
             update {video_asset_table}
             set status = 'processing'
             where id = :video_asset_id
-              and section = 'entrance'
+              and section in ('entrance', 'kiosk')
               and status = 'ready'
             """
         ),
@@ -1172,14 +1191,21 @@ def get_session(db: Session, session_id: int) -> dict[str, Any]:
         text(
             f"""
             select id, entry_trigger_id, exit_trigger_id, location_id, status, start_time, end_time,
-                   total_item_brought, actual_items_brought, transaction_total_items, total_customer
+                   total_item_brought, actual_items_brought, transaction_total_items, total_customer,
+                   result_summary
             from {session_table}
             where id = :session_id
             """
         ),
         {"session_id": session_id},
     )
-    return _fetch_one_dict(result)
+    row = _fetch_one_dict(result)
+    if isinstance(row.get("result_summary"), str):
+        try:
+            row["result_summary"] = json.loads(row["result_summary"])
+        except json.JSONDecodeError:
+            pass
+    return row
 
 
 def get_session_by_entry_trigger_id(db: Session, entry_trigger_id: int) -> dict[str, Any]:
@@ -1188,7 +1214,8 @@ def get_session_by_entry_trigger_id(db: Session, entry_trigger_id: int) -> dict[
         text(
             f"""
             select id, entry_trigger_id, exit_trigger_id, location_id, status, start_time, end_time,
-                   total_item_brought, actual_items_brought, transaction_total_items, total_customer
+                   total_item_brought, actual_items_brought, transaction_total_items, total_customer,
+                   result_summary
             from {session_table}
             where entry_trigger_id = :entry_trigger_id
             order by id asc
@@ -1197,7 +1224,46 @@ def get_session_by_entry_trigger_id(db: Session, entry_trigger_id: int) -> dict[
         ),
         {"entry_trigger_id": entry_trigger_id},
     )
-    return _fetch_one_dict(result)
+    row = _fetch_one_dict(result)
+    if isinstance(row.get("result_summary"), str):
+        try:
+            row["result_summary"] = json.loads(row["result_summary"])
+        except json.JSONDecodeError:
+            pass
+    return row
+
+
+def update_session_summary(
+    db: Session,
+    *,
+    session_id: int,
+    status: str | None = None,
+    total_customer: int | None = None,
+    transaction_total_items: int | None = None,
+    result_summary: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    session_table = _table("session")
+    db.execute(
+        text(
+            f"""
+            update {session_table}
+            set status = coalesce(:status, status),
+                total_customer = coalesce(:total_customer, total_customer),
+                transaction_total_items = coalesce(:transaction_total_items, transaction_total_items),
+                result_summary = coalesce(:result_summary, result_summary)
+            where id = :session_id
+            """
+        ),
+        {
+            "session_id": session_id,
+            "status": status,
+            "total_customer": total_customer,
+            "transaction_total_items": transaction_total_items,
+            "result_summary": json.dumps(dict(result_summary)) if result_summary is not None else None,
+        },
+    )
+    db.commit()
+    return get_session(db, session_id)
 
 
 def list_sessions(db: Session, limit: int = 50) -> list[dict[str, Any]]:
@@ -1241,6 +1307,135 @@ def get_transaction_total_items(db: Session, session_id: int) -> int:
     )
     row = _fetch_one_dict(result)
     return int(row["transaction_total_items"] or 0)
+
+
+def delete_session_transactions(db: Session, session_id: int) -> None:
+    transaction_table = _table("session_transaction")
+    db.execute(
+        text(
+            f"""
+            delete from {transaction_table}
+            where session_id = :session_id
+            """
+        ),
+        {"session_id": session_id},
+    )
+    db.commit()
+
+
+def list_session_customers(db: Session, session_id: int) -> list[dict[str, Any]]:
+    session_customer_table = _table("session_customer")
+    result = db.execute(
+        text(
+            f"""
+            select id, session_id, person_id, merged_into_session_customer_id, enter_time,
+                   kiosk_start_time, leave_time, match_status, merge_reason, merged_at,
+                   created_at, updated_at
+            from {session_customer_table}
+            where session_id = :session_id
+            order by person_id asc, id asc
+            """
+        ),
+        {"session_id": session_id},
+    )
+    return _fetch_all_dicts(result)
+
+
+def list_paid_transactions_for_session_window(
+    db: Session,
+    *,
+    location_id: int,
+    start_time,
+    end_time,
+) -> list[dict[str, Any]]:
+    transaction_table = _quote_identifier(settings.paid_transaction_table_name)
+    detail_table = _quote_identifier(settings.paid_transaction_detail_table_name)
+    transaction_id_column = _quote_identifier(settings.paid_transaction_id_column)
+    location_id_column = _quote_identifier(settings.paid_transaction_location_id_column)
+    transaction_time_column = _quote_identifier(settings.paid_transaction_time_column)
+    transaction_status_column = _quote_identifier(settings.paid_transaction_status_column)
+    receipt_column = _quote_identifier(settings.paid_transaction_receipt_column)
+    total_amount_column = _quote_identifier(settings.paid_transaction_total_amount_column)
+    detail_transaction_id_column = _quote_identifier(settings.paid_transaction_detail_transaction_id_column)
+    detail_quantity_column = _quote_identifier(settings.paid_transaction_detail_quantity_column)
+    detail_item_name_column = _quote_identifier(settings.paid_transaction_detail_item_name_column)
+
+    txn_result = db.execute(
+        text(
+            f"""
+            select t.*
+            from {transaction_table} t
+            where t.{location_id_column} = :location_id
+              and t.{transaction_status_column} = :status_value
+              and t.{transaction_time_column} between :start_time and :end_time
+            order by t.{transaction_time_column} asc, t.{transaction_id_column} asc
+            """
+        ),
+        {
+            "location_id": location_id,
+            "status_value": settings.paid_transaction_status_value,
+            "start_time": start_time,
+            "end_time": end_time,
+        },
+    )
+    transactions = _fetch_all_dicts(txn_result)
+    if not transactions:
+        return []
+
+    transaction_ids = [
+        row.get(settings.paid_transaction_id_column)
+        for row in transactions
+        if row.get(settings.paid_transaction_id_column) is not None
+    ]
+    details_by_transaction_id: dict[Any, list[dict[str, Any]]] = {}
+    if transaction_ids:
+        detail_result = db.execute(
+            text(
+                f"""
+                select d.*
+                from {detail_table} d
+                where d.{detail_transaction_id_column} in :transaction_ids
+                order by d.{detail_transaction_id_column} asc
+                """
+            ).bindparams(bindparam("transaction_ids", expanding=True)),
+            {"transaction_ids": transaction_ids},
+        )
+        for row in _fetch_all_dicts(detail_result):
+            txn_id = row.get(settings.paid_transaction_detail_transaction_id_column)
+            details_by_transaction_id.setdefault(txn_id, []).append(row)
+
+    payload: list[dict[str, Any]] = []
+    for row in transactions:
+        txn_id = row.get(settings.paid_transaction_id_column)
+        details = details_by_transaction_id.get(txn_id, [])
+        total_items = 0
+        normalized_details: list[dict[str, Any]] = []
+        for detail in details:
+            try:
+                quantity = int(detail.get(settings.paid_transaction_detail_quantity_column) or 0)
+            except (TypeError, ValueError):
+                quantity = 0
+            total_items += max(0, quantity)
+            normalized_details.append(
+                {
+                    "quantity": max(0, quantity),
+                    "item_name": detail.get(settings.paid_transaction_detail_item_name_column),
+                    "raw_payload": detail,
+                }
+            )
+        payload.append(
+            {
+                "transaction_id": txn_id,
+                "receipt_number": row.get(settings.paid_transaction_receipt_column),
+                "transaction_time": row.get(settings.paid_transaction_time_column),
+                "location_id": row.get(settings.paid_transaction_location_id_column),
+                "total_amount": row.get(settings.paid_transaction_total_amount_column),
+                "total_items": total_items,
+                "raw_payload": row,
+                "details": normalized_details,
+            }
+        )
+    return payload
 
 
 def create_trigger(db: Session, payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -1563,6 +1758,74 @@ def create_session_video_asset_link(db: Session, session_id: int, video_asset_id
     db.commit()
 
 
+def get_primary_session_id_for_video_asset(db: Session, video_asset_id: int) -> int | None:
+    session_video_asset_table = _table("session_video_asset")
+    result = db.execute(
+        text(
+            f"""
+            select session_id
+            from {session_video_asset_table}
+            where video_asset_id = :video_asset_id
+            order by is_primary desc, session_id asc
+            limit 1
+            """
+        ),
+        {"video_asset_id": video_asset_id},
+    )
+    row = result.mappings().first()
+    if row is None or row.get("session_id") is None:
+        return None
+    return int(row["session_id"])
+
+
+def list_session_video_assets(
+    db: Session,
+    *,
+    session_id: int,
+    section: str | None = None,
+) -> list[dict[str, Any]]:
+    session_video_asset_table = _table("session_video_asset")
+    video_asset_table = _table("video_asset")
+    if section is None:
+        result = db.execute(
+            text(
+                f"""
+                select sva.id, sva.session_id, sva.video_asset_id, sva.section, sva.sequence_no,
+                       sva.clip_start_time, sva.clip_end_time, sva.is_primary, sva.metadata,
+                       va.status as video_status, va.file_path, va.video_url
+                from {session_video_asset_table} sva
+                join {video_asset_table} va on va.id = sva.video_asset_id
+                where sva.session_id = :session_id
+                order by sva.section asc, sva.sequence_no asc, sva.id asc
+                """
+            ),
+            {"session_id": session_id},
+        )
+    else:
+        result = db.execute(
+            text(
+                f"""
+                select sva.id, sva.session_id, sva.video_asset_id, sva.section, sva.sequence_no,
+                       sva.clip_start_time, sva.clip_end_time, sva.is_primary, sva.metadata,
+                       va.status as video_status, va.file_path, va.video_url
+                from {session_video_asset_table} sva
+                join {video_asset_table} va on va.id = sva.video_asset_id
+                where sva.session_id = :session_id and sva.section = :section
+                order by sva.sequence_no asc, sva.id asc
+                """
+            ),
+            {"session_id": session_id, "section": section},
+        )
+    rows = _fetch_all_dicts(result)
+    for row in rows:
+        if isinstance(row.get("metadata"), str):
+            try:
+                row["metadata"] = json.loads(row["metadata"])
+            except json.JSONDecodeError:
+                pass
+    return rows
+
+
 def create_transaction(db: Session, session_id: int, payload: Mapping[str, Any]) -> None:
     transaction_table = _table("session_transaction")
     db.execute(
@@ -1839,25 +2102,29 @@ def finalize_session_result(
     session_id: int,
     kiosk_total_items: int,
     actual_items_brought: int | None = None,
+    tolerance: int = 1,
+    extra_result_summary: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     session_table = _table("session")
     transaction_total_items = get_transaction_total_items(db, session_id)
     actual_items = kiosk_total_items if actual_items_brought is None else actual_items_brought
+    difference = kiosk_total_items - transaction_total_items
 
-    if kiosk_total_items == transaction_total_items:
+    if abs(difference) <= max(0, int(tolerance)):
         status = "not_detected"
-    elif kiosk_total_items > transaction_total_items:
-        status = "detected"
     else:
-        status = "need_review"
+        status = "detected"
 
     result_summary = {
         "kiosk_total_items": kiosk_total_items,
         "transaction_total_items": transaction_total_items,
         "actual_items_brought": actual_items,
-        "difference": kiosk_total_items - transaction_total_items,
+        "difference": difference,
+        "tolerance": max(0, int(tolerance)),
         "decision": status,
     }
+    if extra_result_summary:
+        result_summary.update(dict(extra_result_summary))
 
     db.execute(
         text(

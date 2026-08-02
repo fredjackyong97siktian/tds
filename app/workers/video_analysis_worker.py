@@ -116,7 +116,13 @@ class VideoAnalysisWorker:
                 if not claimed:
                     continue
                 try:
-                    job = workflow_service.build_entrance_analysis_job_from_video_asset(db, video_asset_id)
+                    section = str(candidate.get("section") or "").strip().lower()
+                    if section == "kiosk":
+                        job = workflow_service.build_kiosk_analysis_job_from_video_asset(db, video_asset_id)
+                        future = self._executor.submit(workflow_service.start_kiosk_analysis_job, job)
+                    else:
+                        job = workflow_service.build_entrance_analysis_job_from_video_asset(db, video_asset_id)
+                        future = self._executor.submit(workflow_service.start_entrance_analysis_job, job)
                 except Exception as exc:
                     logger.exception("Could not build analysis job for video_asset_id=%s", video_asset_id)
                     repositories.update_video_asset_status(db, video_asset_id, "issue")
@@ -133,7 +139,6 @@ class VideoAnalysisWorker:
                     )
                     continue
 
-                future = self._executor.submit(workflow_service.start_entrance_analysis_job, job)
                 with self._lock:
                     self._running[video_asset_id] = RunningJob(
                         future=future,

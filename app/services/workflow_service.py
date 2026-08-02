@@ -110,6 +110,15 @@ class EntranceAnalysisQueued:
 
 
 @dataclass
+class KioskAnalysisQueued:
+    video_asset_id: int
+    session_id: int
+    location_id: int
+    video_path: str
+    model_name: str | None = None
+
+
+@dataclass
 class RemoteRunnerResult:
     status: str
     stdout: str
@@ -120,6 +129,7 @@ class RemoteRunnerResult:
     log_url: str | None = None
     tracking_summary: dict[str, Any] | None = None
     reid_views_summary: dict[str, Any] | None = None
+    kiosk_summary: dict[str, Any] | None = None
 
 
 @dataclass
@@ -445,6 +455,7 @@ def _remote_runner_result_from_runpod_body(body: dict[str, Any]) -> tuple[str, R
                 log_url=output.get("log_url"),
                 tracking_summary=output.get("tracking_summary"),
                 reid_views_summary=output.get("reid_views_summary"),
+                kiosk_summary=output.get("kiosk_summary"),
             ),
         )
 
@@ -462,6 +473,7 @@ def _remote_runner_result_from_runpod_body(body: dict[str, Any]) -> tuple[str, R
                 log_url=output.get("log_url"),
                 tracking_summary=output.get("tracking_summary"),
                 reid_views_summary=output.get("reid_views_summary"),
+                kiosk_summary=output.get("kiosk_summary"),
             ),
         )
     return (
@@ -630,6 +642,47 @@ def _finalize_remote_entry_script_run(
         object_key=remote_result.processed_video_object_key,
         video_url=processed_video_url,
     )
+    session_id = script_run.get("session_id")
+    if session_id is not None and remote_result.kiosk_summary:
+        session_row = repositories.get_session(db, int(session_id))
+        existing_summary = dict(session_row.get("result_summary") or {})
+        kiosk_runs = dict(existing_summary.get("kiosk_runs") or {})
+        kiosk_runs[str(video_asset_id)] = remote_result.kiosk_summary
+        cumulative_detected_total = sum(
+            int(run.get("detected_total_items") or 0)
+            for run in kiosk_runs.values()
+            if isinstance(run, dict)
+        )
+        merged_summary = {
+            **existing_summary,
+            "kiosk_runs": kiosk_runs,
+            "kiosk_detected_total_items": cumulative_detected_total,
+            "last_kiosk_video_asset_id": video_asset_id,
+        }
+        repositories.update_session_summary(
+            db,
+            session_id=int(session_id),
+            status="processing_kiosk",
+            result_summary=merged_summary,
+        )
+        session_videos = repositories.list_session_video_assets(
+            db,
+            session_id=int(session_id),
+            section="kiosk",
+        )
+        has_pending_kiosk = any(
+            str(item.get("video_status") or "").strip().lower()
+            in {"not_retrieved", "retrieving", "ready", "processing"}
+            for item in session_videos
+        )
+        if not has_pending_kiosk:
+            repositories.finalize_session_result(
+                db,
+                session_id=int(session_id),
+                kiosk_total_items=cumulative_detected_total,
+                tolerance=1,
+                extra_result_summary=merged_summary,
+            )
     return result
 
 
@@ -708,6 +761,18 @@ def _finalize_remote_kiosk_script_run(
             command=result.command,
             stdout=result.stdout,
             stderr=stderr,
+        )
+    session_id = script_run.get("session_id")
+    if session_id is not None and remote_result.kiosk_summary:
+        detected_total_items = int(remote_result.kiosk_summary.get("detected_total_items") or 0)
+        repositories.finalize_session_result(
+            db,
+            session_id=int(session_id),
+            kiosk_total_items=detected_total_items,
+            tolerance=1,
+            extra_result_summary={
+                "kiosk_summary": remote_result.kiosk_summary,
+            },
         )
     _apply_processed_video_upload_result(
         db,
@@ -914,6 +979,7 @@ def _invoke_remote_runner(
         processed_video_url=body.get("processed_video_url"),
         tracking_summary=body.get("tracking_summary"),
         reid_views_summary=body.get("reid_views_summary"),
+        kiosk_summary=body.get("kiosk_summary"),
     )
 
 
@@ -1248,6 +1314,223 @@ def _hydrate_gallery_state_from_active_gallery(location_id: int, gallery_state_p
     _write_cross_state_pickle(gallery_state_path, cross_state)
 
 
+def _build_cross_state_from_session_customer_gallery(
+    *,
+    session_id: int,
+    location_id: int,
+) -> dict[str, Any]:
+    vector_db = VectorSessionLocal()
+    try:
+        rows = vector_repositories.list_customer_gallery_records(
+            vector_db,
+            session_id=session_id,
+        )
+        persistent_gallery: dict[int, dict[str, Any]] = {}
+        persistent_gallery_view_paths: dict[int, list[str]] = {}
+        next_gid = 1
+
+        for row in rows:
+            gallery_id = _coerce_int(row.get("person_id"))
+            if gallery_id is None:
+                continue
+            next_gid = max(next_gid, gallery_id + 1)
+
+            image_paths = [str(row["image_url"])] if row.get("image_url") else []
+            osnet_views = []
+            osnet_tensor = _float_list_to_tensor(row.get("embedding_osnet"))
+            if osnet_tensor is not None:
+                osnet_views.append(osnet_tensor)
+
+            fashion_upper, fashion_lower = _split_fashion_embedding(row.get("embedding_fashion"))
+            if not osnet_views and fashion_upper is None and fashion_lower is None and not image_paths:
+                continue
+
+            gallery_entry = persistent_gallery.setdefault(
+                gallery_id,
+                {
+                    "views": [],
+                    "session_id": session_id,
+                    "session_customer_id": _coerce_int(row.get("session_customer_id")),
+                    "person_id": gallery_id,
+                    "location_id": location_id,
+                    "source": "session_customer_gallery",
+                },
+            )
+            gallery_entry["views"].extend(osnet_views)
+            if fashion_upper is not None:
+                fashion_upper_tensor = _float_list_to_tensor(fashion_upper)
+                if fashion_upper_tensor is not None and "fashion_upper_init" not in gallery_entry:
+                    gallery_entry["fashion_upper_init"] = fashion_upper_tensor
+            if fashion_lower is not None:
+                fashion_lower_tensor = _float_list_to_tensor(fashion_lower)
+                if fashion_lower_tensor is not None and "fashion_lower_init" not in gallery_entry:
+                    gallery_entry["fashion_lower_init"] = fashion_lower_tensor
+
+            if image_paths:
+                existing_paths = persistent_gallery_view_paths.setdefault(gallery_id, [])
+                for image_path in image_paths:
+                    if image_path not in existing_paths:
+                        existing_paths.append(image_path)
+
+        return {
+            "next_gid": next_gid,
+            "persistent_gallery": persistent_gallery,
+            "persistent_gallery_view_paths": persistent_gallery_view_paths,
+        }
+    finally:
+        vector_db.close()
+
+
+def _hydrate_gallery_state_from_session_customer_gallery(
+    *,
+    location_id: int,
+    session_id: int,
+    gallery_state_path: Path,
+) -> None:
+    cross_state = _build_cross_state_from_session_customer_gallery(
+        session_id=session_id,
+        location_id=location_id,
+    )
+    _write_cross_state_pickle(gallery_state_path, cross_state)
+
+
+def _build_transaction_window_bounds(
+    transaction_time: datetime,
+    total_items: int,
+) -> tuple[datetime, datetime]:
+    extra_seconds = max(0, int(total_items) - 3) * 5
+    padding_seconds = min(15 + extra_seconds, 40)
+    return (
+        transaction_time - timedelta(seconds=padding_seconds),
+        transaction_time + timedelta(seconds=padding_seconds),
+    )
+
+
+def _merge_time_windows(windows: list[tuple[datetime, datetime]]) -> list[tuple[datetime, datetime]]:
+    if not windows:
+        return []
+    sorted_windows = sorted(windows, key=lambda item: (item[0], item[1]))
+    merged: list[tuple[datetime, datetime]] = []
+    current_start, current_end = sorted_windows[0]
+    for start, end in sorted_windows[1:]:
+        if start <= current_end:
+            current_end = max(current_end, end)
+            continue
+        merged.append((current_start, current_end))
+        current_start, current_end = start, end
+    merged.append((current_start, current_end))
+    return merged
+
+
+def _maybe_close_session_and_prepare_kiosk(
+    db: Session,
+    *,
+    session_id: int,
+    exit_trigger_id: int | None = None,
+) -> None:
+    session = repositories.get_session(db, session_id)
+    if session.get("end_time") is not None:
+        return
+
+    session_customers = repositories.list_session_customers(db, session_id)
+    if not session_customers:
+        return
+    if any(customer.get("leave_time") is None for customer in session_customers):
+        return
+
+    leave_times = [customer.get("leave_time") for customer in session_customers if customer.get("leave_time") is not None]
+    if not leave_times:
+        return
+
+    session_end_time = max(leave_times)
+    closed_session = repositories.close_session(
+        db,
+        session_id,
+        end_time=session_end_time,
+        exit_trigger_id=exit_trigger_id,
+    )
+    session_start_time = closed_session.get("start_time")
+    if session_start_time is None:
+        return
+
+    paid_transactions = repositories.list_paid_transactions_for_session_window(
+        db,
+        location_id=int(closed_session["location_id"]),
+        start_time=session_start_time,
+        end_time=session_end_time,
+    )
+
+    repositories.delete_session_transactions(db, session_id)
+    total_transaction_items = 0
+    raw_windows: list[tuple[datetime, datetime]] = []
+    transaction_summaries: list[dict[str, Any]] = []
+    for transaction in paid_transactions:
+        transaction_time = transaction.get("transaction_time")
+        if transaction_time is None:
+            continue
+        total_items = int(transaction.get("total_items") or 0)
+        total_transaction_items += total_items
+        window_start, window_end = _build_transaction_window_bounds(transaction_time, total_items)
+        raw_windows.append((window_start, window_end))
+        repositories.create_transaction(
+            db,
+            session_id,
+            {
+                "receipt_number": str(transaction.get("receipt_number") or transaction.get("transaction_id") or ""),
+                "transaction_time": transaction_time,
+                "total_items": total_items,
+                "total_amount": transaction.get("total_amount"),
+                "raw_payload": transaction,
+            },
+        )
+        transaction_summaries.append(
+            {
+                "transaction_id": transaction.get("transaction_id"),
+                "receipt_number": transaction.get("receipt_number"),
+                "transaction_time": transaction_time.isoformat() if hasattr(transaction_time, "isoformat") else transaction_time,
+                "total_items": total_items,
+                "window_start": window_start.isoformat(),
+                "window_end": window_end.isoformat(),
+            }
+        )
+
+    merged_windows = _merge_time_windows(raw_windows)
+    queued_video_asset_ids: list[int] = []
+    for window_start, window_end in merged_windows:
+        queued = retrieve_kiosk_video_window(
+            db,
+            session_id=session_id,
+            location_id=int(closed_session["location_id"]),
+            start_time=window_start,
+            end_time=window_end,
+        )
+        queued_video_asset_ids.append(int(queued.video_asset_id))
+
+    repositories.update_session_summary(
+        db,
+        session_id=session_id,
+        status="processing_kiosk" if queued_video_asset_ids else "closed",
+        total_customer=len(session_customers),
+        transaction_total_items=total_transaction_items,
+        result_summary={
+            "session_close_pipeline": {
+                "session_start_time": session_start_time.isoformat() if hasattr(session_start_time, "isoformat") else session_start_time,
+                "session_end_time": session_end_time.isoformat() if hasattr(session_end_time, "isoformat") else session_end_time,
+                "paid_transaction_count": len(transaction_summaries),
+                "paid_transactions": transaction_summaries,
+                "merged_kiosk_windows": [
+                    {
+                        "start_time": start.isoformat(),
+                        "end_time": end.isoformat(),
+                    }
+                    for start, end in merged_windows
+                ],
+                "queued_kiosk_video_asset_ids": queued_video_asset_ids,
+            }
+        },
+    )
+
+
 def _sync_gallery_state_after_entry(
     *,
     location_id: int,
@@ -1510,6 +1793,10 @@ def _sync_gallery_state_after_entry(
                 session_customer_ids=stale_session_customer_ids,
                 person_ids=stale_person_ids,
             )
+        _maybe_close_session_and_prepare_kiosk(
+            transactional_db,
+            session_id=session_id,
+        )
     finally:
         vector_db.close()
         transactional_db.close()
@@ -2249,7 +2536,11 @@ def run_kiosk_for_session(
             "Runpod kiosk analysis is not configured. Set THEFT_API_RUNPOD_KIOSK_ENDPOINT_ID "
             "and THEFT_API_RUNPOD_API_KEY in the API environment."
         )
-    _hydrate_gallery_state_from_active_gallery(location_id, resolved_gallery_state)
+    _hydrate_gallery_state_from_session_customer_gallery(
+        location_id=location_id,
+        session_id=session_id,
+        gallery_state_path=resolved_gallery_state,
+    )
     video_asset_row = _lookup_video_asset_by_file_path(db, video_path)
     if video_asset_row is None:
         raise RuntimeError("Runpod kiosk analysis requires a matching video_asset row for the source video.")
@@ -2336,6 +2627,62 @@ def run_kiosk_for_session(
         stderr="",
         message="Runpod kiosk job queued. FastAPI will update MySQL when the webhook completes.",
     )
+
+
+def build_kiosk_analysis_job_from_video_asset(db: Session, video_asset_id: int) -> KioskAnalysisQueued:
+    video_asset = repositories.get_video_asset(db, video_asset_id)
+    if str(video_asset.get("section") or "") != "kiosk":
+        raise ValueError(f"Video asset {video_asset_id} is not a kiosk video.")
+    video_path = str(video_asset.get("file_path") or "").strip()
+    if not video_path:
+        raise ValueError(f"Video asset {video_asset_id} does not have a file path.")
+    session_id = repositories.get_primary_session_id_for_video_asset(db, video_asset_id)
+    if session_id is None:
+        raise ValueError(f"Video asset {video_asset_id} does not have a related session.")
+    session = repositories.get_session(db, session_id)
+    return KioskAnalysisQueued(
+        video_asset_id=video_asset_id,
+        session_id=session_id,
+        location_id=int(session["location_id"]),
+        video_path=video_path,
+        model_name=None,
+    )
+
+
+def start_kiosk_analysis_job(job: KioskAnalysisQueued) -> ScriptExecutionResult:
+    db = TransactionalSessionLocal()
+    try:
+        result = run_kiosk_for_session(
+            db,
+            session_id=job.session_id,
+            video_path=job.video_path,
+            model_name=job.model_name,
+        )
+        if result.status == "failed":
+            repositories.update_video_asset_status(db, job.video_asset_id, "issue")
+        elif result.status == "pending":
+            repositories.update_video_asset_status(db, job.video_asset_id, "ready")
+        return result
+    except Exception as exc:
+        repositories.update_video_asset_status(db, job.video_asset_id, "issue")
+        script_run_id = repositories.create_script_run_started(
+            db,
+            session_id=job.session_id,
+            trigger_id=None,
+            script_name="kiosk",
+            model_name=job.model_name or "analysis_worker",
+            command=SCRIPT_RUN_COMMAND_REDACTED,
+        )
+        repositories.finish_script_run(
+            db,
+            script_run_id,
+            status="failed",
+            stdout_log="",
+            stderr_log=str(exc),
+        )
+        raise
+    finally:
+        db.close()
 
 
 def check_video_ready_policy(created_time: datetime, retries_used: int) -> dict:
