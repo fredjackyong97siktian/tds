@@ -12,7 +12,7 @@ from .. import repositories
 from ..services import workflow_service
 
 
-logger = logging.getLogger("tds.video_analysis_worker")
+logger = logging.getLogger("tds.kiosk_analysis_worker")
 
 
 @dataclass
@@ -22,32 +22,32 @@ class RunningJob:
     video_asset_id: int
 
 
-class VideoAnalysisWorker:
+class KioskAnalysisWorker:
     def __init__(self) -> None:
-        self._executor = ThreadPoolExecutor(max_workers=max(1, settings.analysis_max_global_workers))
+        self._executor = ThreadPoolExecutor(max_workers=max(1, settings.kiosk_analysis_max_global_workers))
         self._running: dict[int, RunningJob] = {}
         self._lock = Lock()
         self._next_dispatch_after = 0.0
 
     def run_forever(self) -> None:
-        poll_seconds = max(1, settings.analysis_poll_seconds)
+        poll_seconds = max(1, settings.kiosk_analysis_poll_seconds)
         logger.info(
-            "Video analysis worker started with poll=%ss max_global=%s cooldown=%ss",
+            "Kiosk analysis worker started with poll=%ss max_global=%s cooldown=%ss",
             poll_seconds,
-            settings.analysis_max_global_workers,
-            settings.analysis_cooldown_seconds,
+            settings.kiosk_analysis_max_global_workers,
+            settings.kiosk_analysis_cooldown_seconds,
         )
         while True:
             try:
                 self._reap_finished_jobs()
                 self._fill_available_slots()
             except Exception:
-                logger.exception("Video analysis worker loop failed")
+                logger.exception("Kiosk analysis worker loop failed")
             time.sleep(poll_seconds)
 
     def _reap_finished_jobs(self) -> None:
         finished_ids: list[int] = []
-        cooldown_seconds = max(0, settings.analysis_cooldown_seconds)
+        cooldown_seconds = max(0, settings.kiosk_analysis_cooldown_seconds)
         with self._lock:
             items = list(self._running.items())
         for video_asset_id, job in items:
@@ -56,14 +56,14 @@ class VideoAnalysisWorker:
             try:
                 result = job.future.result()
                 logger.info(
-                    "Analysis dispatch finished for video_asset_id=%s location_id=%s status=%s runner_job_id=%s",
+                    "Kiosk analysis dispatch finished for video_asset_id=%s location_id=%s status=%s runner_job_id=%s",
                     job.video_asset_id,
                     job.location_id,
                     result.status,
                     result.runner_job_id,
                 )
             except Exception:
-                logger.exception("Analysis dispatch crashed for video_asset_id=%s", job.video_asset_id)
+                logger.exception("Kiosk analysis dispatch crashed for video_asset_id=%s", job.video_asset_id)
             finished_ids.append(video_asset_id)
         if not finished_ids:
             return
@@ -80,7 +80,7 @@ class VideoAnalysisWorker:
         if now < next_dispatch_after:
             return
 
-        available_slots = max(0, settings.analysis_max_global_workers - len(running_jobs))
+        available_slots = max(0, settings.kiosk_analysis_max_global_workers - len(running_jobs))
         if available_slots <= 0:
             return
 
@@ -89,23 +89,23 @@ class VideoAnalysisWorker:
             reconciled = workflow_service.reconcile_running_remote_analysis_script_runs(db)
             for item in reconciled:
                 logger.info(
-                    "Reconciled remote analysis script_run_id=%s runner_job_id=%s script=%s runpod_status=%s status=%s",
+                    "Reconciled remote kiosk analysis script_run_id=%s runner_job_id=%s script=%s runpod_status=%s status=%s",
                     item["script_run_id"],
                     item["runner_job_id"],
                     item["script_name"],
                     item["runpod_status"],
                     item["status"],
                 )
-            if repositories.is_worker_paused(db, "analysis"):
+            if repositories.is_worker_paused(db, "kiosk_analysis"):
                 return
             if repositories.has_active_remote_analysis_script_run(db):
                 return
             if repositories.list_running_video_asset_analyses(db):
                 return
 
-            candidates = repositories.list_pending_video_asset_analyses(
+            candidates = repositories.list_pending_kiosk_video_asset_analyses(
                 db,
-                limit=max(settings.analysis_max_global_workers * 10, 20),
+                limit=max(settings.kiosk_analysis_max_global_workers * 10, 20),
             )
             for candidate in candidates:
                 if available_slots <= 0:
@@ -116,16 +116,16 @@ class VideoAnalysisWorker:
                 if not claimed:
                     continue
                 try:
-                    job = workflow_service.build_entrance_analysis_job_from_video_asset(db, video_asset_id)
-                    future = self._executor.submit(workflow_service.start_entrance_analysis_job, job)
+                    job = workflow_service.build_kiosk_analysis_job_from_video_asset(db, video_asset_id)
+                    future = self._executor.submit(workflow_service.start_kiosk_analysis_job, job)
                 except Exception as exc:
-                    logger.exception("Could not build analysis job for video_asset_id=%s", video_asset_id)
+                    logger.exception("Could not build kiosk analysis job for video_asset_id=%s", video_asset_id)
                     repositories.update_video_asset_status(db, video_asset_id, "issue")
                     repositories.create_script_run(
                         db,
-                        session_id=None,
+                        session_id=int(candidate["session_id"]) if candidate.get("session_id") is not None else None,
                         trigger_id=None,
-                        script_name="entry",
+                        script_name="kiosk",
                         model_name="worker_build_job",
                         status="failed",
                         command="worker_build_job",
@@ -141,7 +141,7 @@ class VideoAnalysisWorker:
                         video_asset_id=video_asset_id,
                     )
                 available_slots -= 1
-                logger.info("Claimed analysis dispatch video_asset_id=%s location_id=%s", video_asset_id, location_id)
+                logger.info("Claimed kiosk analysis dispatch video_asset_id=%s location_id=%s", video_asset_id, location_id)
                 break
         finally:
             db.close()
@@ -152,7 +152,7 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
-    worker = VideoAnalysisWorker()
+    worker = KioskAnalysisWorker()
     worker.run_forever()
 
 

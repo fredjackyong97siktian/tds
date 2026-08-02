@@ -862,7 +862,9 @@ def list_pending_video_asset_retrievals(db: Session, limit: int = 50) -> list[di
             left join {session_table} s on s.id = sva.session_id
             where va.status = 'not_retrieved'
             group by va.id, va.trigger_id, va.section, va.file_path, va.captured_start_time, va.captured_end_time, va.retrieved_at, va.analyzed_at, va.created_at, te.location_id
-            order by va.created_at asc, va.id asc
+            order by case when va.section = 'entrance' then 0 else 1 end asc,
+                     coalesce(va.captured_start_time, va.created_at) asc,
+                     va.id asc
             limit :limit
             """
         ),
@@ -942,11 +944,9 @@ def list_pending_video_asset_analyses(db: Session, limit: int = 50) -> list[dict
             left join {trigger_table} te on te.id = va.trigger_id
             left join {session_video_asset_table} sva on sva.video_asset_id = va.id
             left join {session_table} s on s.id = sva.session_id
-            where va.section in ('entrance', 'kiosk')
+            where va.section = 'entrance'
               and va.status = 'ready'
-              and (
-                va.section = 'kiosk'
-                or not exists (
+              and not exists (
                   select 1
                   from {video_asset_table} prev
                   inner join {trigger_table} prev_te on prev_te.id = prev.trigger_id
@@ -960,11 +960,47 @@ def list_pending_video_asset_analyses(db: Session, limit: int = 50) -> list[dict
                         )
                     )
                     and prev.status in ('not_retrieved', 'retrieving', 'ready', 'processing', 'issue')
-                )
               )
             group by va.id, va.trigger_id, va.section, va.file_path, va.video_url,
                      va.captured_start_time, va.captured_end_time, va.retrieved_at,
                      va.analyzed_at, va.created_at, te.location_id
+            order by coalesce(va.captured_start_time, va.created_at) asc, va.id asc
+            limit :limit
+            """
+        ),
+        {"limit": limit},
+    )
+    return _fetch_all_dicts(result)
+
+
+def list_pending_kiosk_video_asset_analyses(db: Session, limit: int = 50) -> list[dict[str, Any]]:
+    video_asset_table = _table("video_asset")
+    session_video_asset_table = _table("session_video_asset")
+    session_table = _table("session")
+    result = db.execute(
+        text(
+            f"""
+            select va.id,
+                   va.trigger_id,
+                   va.section,
+                   va.file_path,
+                   va.video_url,
+                   va.captured_start_time,
+                   va.captured_end_time,
+                   va.retrieved_at,
+                   va.analyzed_at,
+                   va.created_at,
+                   s.location_id as location_id,
+                   min(sva.session_id) as session_id
+            from {video_asset_table} va
+            inner join {session_video_asset_table} sva on sva.video_asset_id = va.id
+            inner join {session_table} s on s.id = sva.session_id
+            where va.section = 'kiosk'
+              and va.status = 'ready'
+              and s.status = 'pending'
+            group by va.id, va.trigger_id, va.section, va.file_path, va.video_url,
+                     va.captured_start_time, va.captured_end_time, va.retrieved_at,
+                     va.analyzed_at, va.created_at, s.location_id
             order by coalesce(va.captured_start_time, va.created_at) asc, va.id asc
             limit :limit
             """

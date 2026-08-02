@@ -50,6 +50,9 @@ class Settings(BaseSettings):
     analysis_poll_seconds: int = 10
     analysis_max_global_workers: int = 1
     analysis_cooldown_seconds: int = 10
+    kiosk_analysis_poll_seconds: int = 10
+    kiosk_analysis_max_global_workers: int = 1
+    kiosk_analysis_cooldown_seconds: int = 10
     whitelist_qrentry_table_name: str = "phonenumber"
     whitelist_qrentry_value_column: str = "participantId"
     whitelist_qrentry_label_column: str = "participantId"

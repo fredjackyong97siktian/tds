@@ -91,7 +91,11 @@ def get_analysis_status(db: Session = Depends(get_transaction_db)) -> dict:
         db,
         limit=max(settings.analysis_max_global_workers * 50, 500),
     )
-    running_rows = repositories.list_running_video_asset_analyses(db)
+    running_rows = [
+        row
+        for row in repositories.list_running_video_asset_analyses(db)
+        if str(row.get("section") or "").strip().lower() == "entrance"
+    ]
 
     per_location: dict[int, dict] = {}
 
@@ -151,6 +155,82 @@ def get_analysis_status(db: Session = Depends(get_transaction_db)) -> dict:
 @router.post("/analysis-control")
 def update_analysis_control(payload: WorkerControlRequest, db: Session = Depends(get_transaction_db)) -> dict:
     state = repositories.set_worker_paused(db, "analysis", payload.paused)
+    return {
+        "ok": True,
+        **state,
+    }
+
+
+@router.get("/kiosk-analysis-status")
+def get_kiosk_analysis_status(db: Session = Depends(get_transaction_db)) -> dict:
+    pending_rows = repositories.list_pending_kiosk_video_asset_analyses(
+        db,
+        limit=max(settings.kiosk_analysis_max_global_workers * 50, 500),
+    )
+    running_rows = [
+        row
+        for row in repositories.list_running_video_asset_analyses(db)
+        if str(row.get("section") or "").strip().lower() == "kiosk"
+    ]
+
+    per_location: dict[int, dict] = {}
+
+    for row in pending_rows:
+        location_id = row.get("location_id")
+        if location_id is None:
+            continue
+        location_id = int(location_id)
+        current = per_location.setdefault(
+            location_id,
+            {
+                "location_id": location_id,
+                "queued_count": 0,
+                "running_count": 0,
+                "is_busy": False,
+                "running_video_asset_ids": [],
+                "queued_video_asset_ids": [],
+            },
+        )
+        current["queued_count"] += 1
+        current["queued_video_asset_ids"].append(int(row["id"]))
+
+    for row in running_rows:
+        location_id = row.get("location_id")
+        if location_id is None:
+            continue
+        location_id = int(location_id)
+        current = per_location.setdefault(
+            location_id,
+            {
+                "location_id": location_id,
+                "queued_count": 0,
+                "running_count": 0,
+                "is_busy": False,
+                "running_video_asset_ids": [],
+                "queued_video_asset_ids": [],
+            },
+        )
+        current["running_count"] += 1
+        current["is_busy"] = current["running_count"] > 0
+        current["running_video_asset_ids"].append(int(row["id"]))
+
+    locations = sorted(per_location.values(), key=lambda item: int(item["location_id"]))
+
+    return {
+        "poll_seconds": settings.kiosk_analysis_poll_seconds,
+        "max_global_workers": settings.kiosk_analysis_max_global_workers,
+        "cooldown_seconds": settings.kiosk_analysis_cooldown_seconds,
+        "queued_count": len(pending_rows),
+        "running_count": len(running_rows),
+        "remote_dispatch_busy": repositories.has_active_remote_analysis_script_run(db),
+        "paused": repositories.is_worker_paused(db, "kiosk_analysis"),
+        "locations": locations,
+    }
+
+
+@router.post("/kiosk-analysis-control")
+def update_kiosk_analysis_control(payload: WorkerControlRequest, db: Session = Depends(get_transaction_db)) -> dict:
+    state = repositories.set_worker_paused(db, "kiosk_analysis", payload.paused)
     return {
         "ok": True,
         **state,

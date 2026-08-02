@@ -662,7 +662,7 @@ def _finalize_remote_entry_script_run(
         repositories.update_session_summary(
             db,
             session_id=int(session_id),
-            status="processing_kiosk",
+            status="pending",
             result_summary=merged_summary,
         )
         session_videos = repositories.list_session_video_assets(
@@ -1509,7 +1509,7 @@ def _maybe_close_session_and_prepare_kiosk(
     repositories.update_session_summary(
         db,
         session_id=session_id,
-        status="processing_kiosk" if queued_video_asset_ids else "closed",
+        status="pending" if queued_video_asset_ids else "closed",
         total_customer=len(session_customers),
         transaction_total_items=total_transaction_items,
         result_summary={
@@ -2640,6 +2640,11 @@ def build_kiosk_analysis_job_from_video_asset(db: Session, video_asset_id: int) 
     if session_id is None:
         raise ValueError(f"Video asset {video_asset_id} does not have a related session.")
     session = repositories.get_session(db, session_id)
+    if str(session.get("status") or "").strip().lower() != "pending":
+        raise ValueError(
+            f"Video asset {video_asset_id} belongs to session {session_id} with status "
+            f"{session.get('status')!r}, expected 'pending'."
+        )
     return KioskAnalysisQueued(
         video_asset_id=video_asset_id,
         session_id=session_id,
