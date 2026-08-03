@@ -1355,6 +1355,36 @@ def _hydrate_gallery_state_from_active_gallery(location_id: int, gallery_state_p
     _write_cross_state_pickle(gallery_state_path, cross_state)
 
 
+def _find_open_active_session_for_location(db: Session, location_id: int) -> dict[str, Any] | None:
+    vector_db = VectorSessionLocal()
+    try:
+        active_rows = vector_repositories.list_active_gallery_records(
+            vector_db,
+            location_id=location_id,
+            limit=5000,
+        )
+    finally:
+        vector_db.close()
+
+    seen_session_ids: set[int] = set()
+    for row in active_rows:
+        active_session_id = _coerce_int(row.get("session_id"))
+        if active_session_id is None or active_session_id in seen_session_ids:
+            continue
+        seen_session_ids.add(active_session_id)
+        try:
+            session = repositories.get_session(db, active_session_id)
+        except ValueError:
+            continue
+        status = str(session.get("status") or "").strip().lower()
+        if int(session.get("location_id") or 0) != location_id:
+            continue
+        if status in {"detected", "not_detected", "closed", "issue", "whitelisted"}:
+            continue
+        return session
+    return None
+
+
 def _build_cross_state_from_session_customer_gallery(
     *,
     session_id: int,
@@ -2276,15 +2306,17 @@ def build_entrance_analysis_job_from_video_asset(db: Session, video_asset_id: in
     try:
         session = repositories.get_session_by_entry_trigger_id(db, int(trigger_id))
     except ValueError:
-        session = repositories.create_session(
-            db,
-            {
-                "entry_trigger_id": int(trigger_id),
-                "exit_trigger_id": None,
-                "location_id": int(trigger["location_id"]),
-                "start_time": trigger.get("trigger_time"),
-            },
-        )
+        session = _find_open_active_session_for_location(db, int(trigger["location_id"]))
+        if session is None:
+            session = repositories.create_session(
+                db,
+                {
+                    "entry_trigger_id": int(trigger_id),
+                    "exit_trigger_id": None,
+                    "location_id": int(trigger["location_id"]),
+                    "start_time": trigger.get("trigger_time"),
+                },
+            )
         repositories.update_trigger_status(db, int(trigger_id), "video_pending")
     return EntranceAnalysisQueued(
         video_asset_id=video_asset_id,
