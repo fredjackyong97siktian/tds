@@ -17,6 +17,10 @@ def _quote_identifier(name: str) -> str:
     return f"`{name.replace('`', '``')}`"
 
 
+def _json_dumps(value: Any) -> str:
+    return json.dumps(value, default=str)
+
+
 def _fetch_one_dict(result) -> dict[str, Any]:
     row = result.mappings().first()
     if row is None:
@@ -1330,7 +1334,7 @@ def update_session_summary(
             "status": status,
             "total_customer": total_customer,
             "transaction_total_items": transaction_total_items,
-            "result_summary": json.dumps(dict(result_summary)) if result_summary is not None else None,
+            "result_summary": _json_dumps(dict(result_summary)) if result_summary is not None else None,
         },
     )
     db.commit()
@@ -1371,7 +1375,7 @@ def update_session_fields(
             "exit_trigger_id": exit_trigger_id,
             "total_customer": total_customer,
             "transaction_total_items": transaction_total_items,
-            "result_summary": json.dumps(dict(result_summary)) if result_summary is not None else None,
+            "result_summary": _json_dumps(dict(result_summary)) if result_summary is not None else None,
             "issue_reason": issue_reason,
         },
     )
@@ -1597,7 +1601,7 @@ def create_trigger(db: Session, payload: Mapping[str, Any]) -> dict[str, Any]:
         ),
         {
             **payload,
-            "raw_payload": json.dumps(payload.get("raw_payload")) if payload.get("raw_payload") is not None else None,
+            "raw_payload": _json_dumps(payload.get("raw_payload")) if payload.get("raw_payload") is not None else None,
         },
     )
     db.commit()
@@ -1830,7 +1834,7 @@ def create_video_asset(db: Session, payload: Mapping[str, Any]) -> int:
         ),
         {
             **payload,
-            "metadata": json.dumps(payload.get("metadata")) if payload.get("metadata") is not None else None,
+            "metadata": _json_dumps(payload.get("metadata")) if payload.get("metadata") is not None else None,
         },
     )
     db.commit()
@@ -1851,7 +1855,7 @@ def update_video_asset_status(db: Session, video_asset_id: int, status: str, met
         {
             "video_asset_id": video_asset_id,
             "status": status,
-            "metadata": json.dumps(metadata) if metadata is not None else None,
+            "metadata": _json_dumps(metadata) if metadata is not None else None,
         },
     )
     db.commit()
@@ -1900,7 +1904,7 @@ def update_video_asset(db: Session, video_asset_id: int, payload: Mapping[str, A
             "analyzed_at": payload.get("analyzed_at"),
             "retention_until": payload.get("retention_until"),
             "status": payload.get("status"),
-            "metadata": json.dumps(payload.get("metadata")) if payload.get("metadata") is not None else None,
+            "metadata": _json_dumps(payload.get("metadata")) if payload.get("metadata") is not None else None,
         },
     )
     db.commit()
@@ -1934,7 +1938,7 @@ def create_session_video_asset_link(db: Session, session_id: int, video_asset_id
             "clip_start_time": payload.get("clip_start_time"),
             "clip_end_time": payload.get("clip_end_time"),
             "is_primary": 1 if payload.get("is_primary") else 0,
-            "metadata": json.dumps(payload.get("metadata")) if payload.get("metadata") is not None else None,
+            "metadata": _json_dumps(payload.get("metadata")) if payload.get("metadata") is not None else None,
         },
     )
     db.commit()
@@ -2024,7 +2028,7 @@ def create_transaction(db: Session, session_id: int, payload: Mapping[str, Any])
         {
             "session_id": session_id,
             **payload,
-            "raw_payload": json.dumps(payload.get("raw_payload")) if payload.get("raw_payload") is not None else None,
+            "raw_payload": _json_dumps(payload.get("raw_payload")) if payload.get("raw_payload") is not None else None,
         },
     )
     db.commit()
@@ -2062,7 +2066,7 @@ def create_script_run_started(
             "script_name": script_name,
             "model_name": model_name,
             "runner_job_id": runner_job_id,
-            "runner_payload": json.dumps(runner_payload) if runner_payload is not None else None,
+            "runner_payload": _json_dumps(runner_payload) if runner_payload is not None else None,
             "status": status,
             "command": command,
             "stdout_log": stdout_log,
@@ -2153,7 +2157,7 @@ def assign_script_run_runner_job(
         {
             "script_run_id": script_run_id,
             "runner_job_id": runner_job_id,
-            "runner_payload": json.dumps(runner_payload) if runner_payload is not None else None,
+            "runner_payload": _json_dumps(runner_payload) if runner_payload is not None else None,
         },
     )
     db.commit()
@@ -2327,7 +2331,7 @@ def finalize_session_result(
             "actual_items_brought": actual_items,
             "transaction_total_items": transaction_total_items,
             "status": status,
-            "result_summary": json.dumps(result_summary),
+            "result_summary": _json_dumps(result_summary),
         },
     )
     db.commit()

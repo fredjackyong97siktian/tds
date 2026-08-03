@@ -1,4 +1,5 @@
 from datetime import datetime
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
@@ -18,6 +19,7 @@ from ..schemas import (
 
 
 router = APIRouter(prefix="/api/v1/sessions", tags=["sessions"])
+logger = logging.getLogger("tds.sessions_router")
 
 
 @router.post("", response_model=SessionResponse)
@@ -72,3 +74,6 @@ def retry_session_issue(session_id: int, db: Session = Depends(get_transaction_d
         }
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Session retry failed for session_id=%s", session_id)
+        raise HTTPException(status_code=500, detail=f"Session retry failed: {exc}") from exc
