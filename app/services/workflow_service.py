@@ -584,6 +584,7 @@ def _finalize_remote_entry_script_run(
         _sync_gallery_state_after_entry(
             location_id=location_id,
             session_id=session_id,
+            exit_trigger_id=trigger_id,
             video_path=video_path,
             output_dir=output_dir,
             gallery_state_path=gallery_state_path,
@@ -1628,6 +1629,7 @@ def _sync_gallery_state_after_entry(
     *,
     location_id: int,
     session_id: int,
+    exit_trigger_id: int | None,
     video_path: str,
     output_dir: Path,
     gallery_state_path: Path,
@@ -1904,6 +1906,7 @@ def _sync_gallery_state_after_entry(
         _maybe_close_session_and_prepare_kiosk(
             transactional_db,
             session_id=session_id,
+            exit_trigger_id=exit_trigger_id,
         )
     finally:
         vector_db.close()
