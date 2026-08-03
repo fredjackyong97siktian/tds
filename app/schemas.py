@@ -138,6 +138,8 @@ class SessionResponse(BaseModel):
     actual_items_brought: int = 0
     transaction_total_items: int = 0
     total_customer: int = 0
+    issue_reason: str | None = None
+    result_summary: dict[str, Any] | None = None
 
 
 class SessionListItem(SessionResponse):

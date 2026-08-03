@@ -739,8 +739,16 @@ def _finalize_remote_kiosk_script_run(
         stdout=remote_result.stdout,
         stderr=remote_result.stderr,
     )
+    session_id = script_run.get("session_id")
     if result.status != "success":
         repositories.update_video_asset_status(db, video_asset_id, "issue")
+        if session_id is not None:
+            repositories.update_session_fields(
+                db,
+                session_id=int(session_id),
+                status="issue",
+                issue_reason=remote_result.stderr or "Kiosk analysis failed in the remote runner.",
+            )
         return result
     if not remote_result.processed_video_object_key:
         repositories.update_video_asset_status(db, video_asset_id, "issue")
@@ -752,6 +760,13 @@ def _finalize_remote_kiosk_script_run(
             stdout_log=result.stdout,
             stderr_log=stderr,
         )
+        if session_id is not None:
+            repositories.update_session_fields(
+                db,
+                session_id=int(session_id),
+                status="issue",
+                issue_reason="Kiosk analysis finished without a processed video object key.",
+            )
         return ScriptExecutionResult(
             script_run_id=result.script_run_id,
             runner_job_id=result.runner_job_id,
@@ -762,7 +777,32 @@ def _finalize_remote_kiosk_script_run(
             stdout=result.stdout,
             stderr=stderr,
         )
-    session_id = script_run.get("session_id")
+    if session_id is not None and not remote_result.kiosk_summary:
+        repositories.update_video_asset_status(db, video_asset_id, "issue")
+        stderr = f"{result.stderr}\nRemote runner did not return kiosk summary.".strip()
+        repositories.revise_script_run(
+            db,
+            result.script_run_id,
+            status="failed",
+            stdout_log=result.stdout,
+            stderr_log=stderr,
+        )
+        repositories.update_session_fields(
+            db,
+            session_id=int(session_id),
+            status="issue",
+            issue_reason="Kiosk analysis finished without kiosk summary data.",
+        )
+        return ScriptExecutionResult(
+            script_run_id=result.script_run_id,
+            runner_job_id=result.runner_job_id,
+            script_name=result.script_name,
+            model_name=result.model_name,
+            status="failed",
+            command=result.command,
+            stdout=result.stdout,
+            stderr=stderr,
+        )
     if session_id is not None and remote_result.kiosk_summary:
         detected_total_items = int(remote_result.kiosk_summary.get("detected_total_items") or 0)
         repositories.finalize_session_result(
@@ -1443,19 +1483,22 @@ def _maybe_close_session_and_prepare_kiosk(
         return
 
     session_end_time = max(leave_times)
-    closed_session = repositories.close_session(
-        db,
-        session_id,
-        end_time=session_end_time,
-        exit_trigger_id=exit_trigger_id,
-    )
-    session_start_time = closed_session.get("start_time")
+    session_start_time = session.get("start_time")
     if session_start_time is None:
+        repositories.update_session_fields(
+            db,
+            session_id=session_id,
+            status="issue",
+            end_time=session_end_time,
+            exit_trigger_id=exit_trigger_id,
+            total_customer=len(session_customers),
+            issue_reason="Session start_time is missing; kiosk analysis could not be prepared.",
+        )
         return
 
     paid_transactions = repositories.list_paid_transactions_for_session_window(
         db,
-        location_id=int(closed_session["location_id"]),
+        location_id=int(session["location_id"]),
         start_time=session_start_time,
         end_time=session_end_time,
     )
@@ -1495,39 +1538,81 @@ def _maybe_close_session_and_prepare_kiosk(
         )
 
     merged_windows = _merge_time_windows(raw_windows)
-    queued_video_asset_ids: list[int] = []
-    for window_start, window_end in merged_windows:
-        queued = retrieve_kiosk_video_window(
-            db,
-            session_id=session_id,
-            location_id=int(closed_session["location_id"]),
-            start_time=window_start,
-            end_time=window_end,
-        )
-        queued_video_asset_ids.append(int(queued.video_asset_id))
-
-    repositories.update_session_summary(
+    session_close_summary = {
+        "session_close_pipeline": {
+            "session_start_time": session_start_time.isoformat() if hasattr(session_start_time, "isoformat") else session_start_time,
+            "session_end_time": session_end_time.isoformat() if hasattr(session_end_time, "isoformat") else session_end_time,
+            "paid_transaction_count": len(transaction_summaries),
+            "paid_transactions": transaction_summaries,
+            "merged_kiosk_windows": [
+                {
+                    "start_time": start.isoformat(),
+                    "end_time": end.isoformat(),
+                }
+                for start, end in merged_windows
+            ],
+            "queued_kiosk_video_asset_ids": [],
+        }
+    }
+    repositories.update_session_fields(
         db,
         session_id=session_id,
-        status="pending" if queued_video_asset_ids else "closed",
+        end_time=session_end_time,
+        exit_trigger_id=exit_trigger_id,
         total_customer=len(session_customers),
         transaction_total_items=total_transaction_items,
-        result_summary={
-            "session_close_pipeline": {
-                "session_start_time": session_start_time.isoformat() if hasattr(session_start_time, "isoformat") else session_start_time,
-                "session_end_time": session_end_time.isoformat() if hasattr(session_end_time, "isoformat") else session_end_time,
-                "paid_transaction_count": len(transaction_summaries),
-                "paid_transactions": transaction_summaries,
-                "merged_kiosk_windows": [
-                    {
-                        "start_time": start.isoformat(),
-                        "end_time": end.isoformat(),
-                    }
-                    for start, end in merged_windows
-                ],
-                "queued_kiosk_video_asset_ids": queued_video_asset_ids,
-            }
-        },
+        result_summary=session_close_summary,
+        issue_reason=None,
+    )
+
+    if not merged_windows:
+        repositories.finalize_session_result(
+            db,
+            session_id=session_id,
+            kiosk_total_items=0,
+            actual_items_brought=0,
+            tolerance=1,
+            extra_result_summary=session_close_summary,
+        )
+        return
+
+    queued_video_asset_ids: list[int] = []
+    try:
+        for window_start, window_end in merged_windows:
+            queued = retrieve_kiosk_video_window(
+                db,
+                session_id=session_id,
+                location_id=int(session["location_id"]),
+                start_time=window_start,
+                end_time=window_end,
+            )
+            queued_video_asset_ids.append(int(queued.video_asset_id))
+    except Exception as exc:
+        session_close_summary["session_close_pipeline"]["queued_kiosk_video_asset_ids"] = queued_video_asset_ids
+        repositories.update_session_fields(
+            db,
+            session_id=session_id,
+            status="issue",
+            end_time=session_end_time,
+            exit_trigger_id=exit_trigger_id,
+            total_customer=len(session_customers),
+            transaction_total_items=total_transaction_items,
+            result_summary=session_close_summary,
+            issue_reason=f"Kiosk preparation failed: {exc}",
+        )
+        return
+
+    session_close_summary["session_close_pipeline"]["queued_kiosk_video_asset_ids"] = queued_video_asset_ids
+    repositories.update_session_fields(
+        db,
+        session_id=session_id,
+        status="pending",
+        end_time=session_end_time,
+        exit_trigger_id=exit_trigger_id,
+        total_customer=len(session_customers),
+        transaction_total_items=total_transaction_items,
+        result_summary=session_close_summary,
+        issue_reason=None,
     )
 
 
@@ -2287,6 +2372,13 @@ def _run_video_retrieval_job(
             stdout_log=completed.stdout,
             stderr_log=completed.stderr,
         )
+        if status != "success" and section == "kiosk" and session_id is not None:
+            repositories.update_session_fields(
+                db,
+                session_id=int(session_id),
+                status="issue",
+                issue_reason=(completed.stderr or completed.stdout or "Kiosk video retrieval failed.").strip(),
+            )
     except Exception as exc:
         repositories.update_video_asset(
             db,
@@ -2366,6 +2458,13 @@ def start_entrance_analysis_job(job: EntranceAnalysisQueued) -> ScriptExecutionR
             stdout_log="",
             stderr_log=str(exc),
         )
+        if section == "kiosk" and session_id is not None:
+            repositories.update_session_fields(
+                db,
+                session_id=int(session_id),
+                status="issue",
+                issue_reason=str(exc),
+            )
         raise
     finally:
         db.close()

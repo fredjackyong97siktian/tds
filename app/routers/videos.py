@@ -46,6 +46,14 @@ def retry_video_asset_issue(video_asset_id: int, db: Session = Depends(get_trans
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.post("/assets/{video_asset_id}/restart-analysis")
+def restart_video_asset_analysis(video_asset_id: int, db: Session = Depends(get_transaction_db)) -> dict:
+    try:
+        return repositories.restart_video_asset_analysis(db, video_asset_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.post("/triggers/{trigger_id}")
 def create_trigger_video_asset(trigger_id: int, payload: VideoAssetCreate, db: Session = Depends(get_transaction_db)) -> dict:
     trigger = repositories.get_trigger(db, trigger_id)
