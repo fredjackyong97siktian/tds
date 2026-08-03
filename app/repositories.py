@@ -10,6 +10,7 @@ from .config import settings
 
 PAID_TRANSACTION_ID_COLUMN = "receiptNumber"
 PAID_TRANSACTION_TIME_COLUMN = "Formatted Timestamp"
+PAID_TRANSACTION_DATABASE = "sesamedb"
 
 
 def _table(name: str) -> str:
@@ -18,6 +19,10 @@ def _table(name: str) -> str:
 
 def _quote_identifier(name: str) -> str:
     return f"`{name.replace('`', '``')}`"
+
+
+def _qualified_paid_table(name: str) -> str:
+    return f"{_quote_identifier(PAID_TRANSACTION_DATABASE)}.{_quote_identifier(name)}"
 
 
 def _json_dumps(value: Any) -> str:
@@ -1499,8 +1504,8 @@ def list_paid_transactions_for_session_window(
     start_time,
     end_time,
 ) -> list[dict[str, Any]]:
-    transaction_table = _quote_identifier(settings.paid_transaction_table_name)
-    detail_table = _quote_identifier(settings.paid_transaction_detail_table_name)
+    transaction_table = _qualified_paid_table(settings.paid_transaction_table_name)
+    detail_table = _qualified_paid_table(settings.paid_transaction_detail_table_name)
     transaction_id_column = _quote_identifier(PAID_TRANSACTION_ID_COLUMN)
     location_id_column = _quote_identifier(settings.paid_transaction_location_id_column)
     transaction_time_column = _quote_identifier(PAID_TRANSACTION_TIME_COLUMN)
