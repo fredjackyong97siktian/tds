@@ -1588,14 +1588,17 @@ def _sync_gallery_state_after_entry(
             if row.get("person_id") is not None
         }
         active_session_customer_ids_by_person: dict[int, set[int]] = {}
+        active_session_id_by_session_customer_id: dict[int, int | None] = {}
         for row in active_rows_before:
             row_person_id = _coerce_int(row.get("person_id"))
             row_session_customer_id = _coerce_int(row.get("session_customer_id"))
+            row_session_id = _coerce_int(row.get("session_id"))
             if row_person_id is None or row_session_customer_id is None:
                 continue
             active_session_customer_ids_by_person.setdefault(row_person_id, set()).add(
                 row_session_customer_id
             )
+            active_session_id_by_session_customer_id[row_session_customer_id] = row_session_id
 
         for customer in summary_customers:
             person_id = int(customer["person_id"])
@@ -1787,6 +1790,18 @@ def _sync_gallery_state_after_entry(
                 if isinstance(summary_persistent_gallery_ids, list)
                 else "gallery_state_pickle",
             )
+            current_session_stale_ids = [
+                session_customer_id
+                for session_customer_id in stale_session_customer_ids
+                if active_session_id_by_session_customer_id.get(session_customer_id) == session_id
+            ]
+            for session_customer_id in current_session_stale_ids:
+                repositories.update_session_customer_leave_time(
+                    transactional_db,
+                    session_customer_id=session_customer_id,
+                    leave_time=leave_time,
+                    match_status="resolved",
+                )
             vector_repositories.delete_active_gallery_by_aliases(
                 vector_db,
                 location_id=location_id,

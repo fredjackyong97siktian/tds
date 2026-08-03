@@ -1659,6 +1659,37 @@ def get_session_customer_by_session_person(db: Session, session_id: int, person_
     return _fetch_one_dict(result)
 
 
+def update_session_customer_leave_time(
+    db: Session,
+    *,
+    session_customer_id: int,
+    leave_time,
+    match_status: str | None = None,
+) -> None:
+    session_customer_table = _table("session_customer")
+    db.execute(
+        text(
+            f"""
+            update {session_customer_table}
+            set leave_time = case
+                    when leave_time is null then :leave_time
+                    when :leave_time is null then leave_time
+                    when leave_time < :leave_time then :leave_time
+                    else leave_time
+                end,
+                match_status = coalesce(:match_status, match_status)
+            where id = :session_customer_id
+            """
+        ),
+        {
+            "session_customer_id": session_customer_id,
+            "leave_time": leave_time,
+            "match_status": match_status,
+        },
+    )
+    db.commit()
+
+
 def create_video_asset(db: Session, payload: Mapping[str, Any]) -> int:
     video_asset_table = _table("video_asset")
     file_path = payload.get("file_path")
