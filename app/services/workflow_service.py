@@ -590,6 +590,7 @@ def _finalize_remote_entry_script_run(
             gallery_state_path=gallery_state_path,
             enter_time=session.get("start_time"),
             leave_time=video_asset_row.get("captured_end_time"),
+            captured_start_time=video_asset_row.get("captured_start_time"),
         )
     except Exception as exc:
         repositories.update_video_asset_status(db, video_asset_id, "issue")
@@ -1180,6 +1181,35 @@ def _load_reid_views_summary(video_path: str, output_dir: Path) -> dict[str, Any
     return json.loads(summary_path.read_text())
 
 
+def _customer_event_time(
+    *,
+    customer: dict[str, Any],
+    tracking_summary: dict[str, Any],
+    captured_start_time: datetime | None,
+    fallback_time: datetime | None,
+    event_key: str,
+) -> datetime | None:
+    if captured_start_time is None:
+        return fallback_time
+
+    offset_value = customer.get(f"{event_key}_time_offset_seconds")
+    if offset_value is None:
+        frame_value = customer.get(f"{event_key}_frame")
+        fps_value = tracking_summary.get("fps")
+        try:
+            if frame_value is not None and fps_value is not None and float(fps_value) > 0:
+                offset_value = float(frame_value) / float(fps_value)
+        except (TypeError, ValueError, ZeroDivisionError):
+            offset_value = None
+
+    try:
+        if offset_value is not None:
+            return captured_start_time + timedelta(seconds=max(0.0, float(offset_value)))
+    except (TypeError, ValueError):
+        pass
+    return fallback_time
+
+
 def _load_cross_state_pickle(gallery_state_path: Path) -> dict[str, Any]:
     import pickle
 
@@ -1665,6 +1695,7 @@ def _sync_gallery_state_after_entry(
     gallery_state_path: Path,
     enter_time: datetime | None,
     leave_time: datetime | None,
+    captured_start_time: datetime | None,
 ) -> None:
     tracking_summary = _load_tracking_summary(video_path, output_dir)
     reid_views_summary = _load_reid_views_summary(video_path, output_dir)
@@ -1704,14 +1735,36 @@ def _sync_gallery_state_after_entry(
     try:
         for customer in summary_customers:
             person_id = int(customer["person_id"])
+            customer_enter_time = (
+                _customer_event_time(
+                    customer=customer,
+                    tracking_summary=tracking_summary,
+                    captured_start_time=captured_start_time,
+                    fallback_time=enter_time,
+                    event_key="entry",
+                )
+                if bool(customer.get("entered"))
+                else enter_time
+            )
+            customer_leave_time = (
+                _customer_event_time(
+                    customer=customer,
+                    tracking_summary=tracking_summary,
+                    captured_start_time=captured_start_time,
+                    fallback_time=leave_time,
+                    event_key="exit",
+                )
+                if bool(customer.get("exited"))
+                else None
+            )
             repositories.create_session_customer(
                 transactional_db,
                 session_id,
                 {
                     "person_id": person_id,
-                    "enter_time": enter_time,
+                    "enter_time": customer_enter_time,
                     "kiosk_start_time": None,
-                    "leave_time": leave_time if bool(customer.get("exited")) else None,
+                    "leave_time": customer_leave_time,
                     "match_status": "resolved" if bool(customer.get("exited")) else "tracked",
                 },
             )
