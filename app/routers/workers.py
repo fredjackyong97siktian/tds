@@ -85,8 +85,7 @@ def update_retrieval_control(payload: WorkerControlRequest, db: Session = Depend
     }
 
 
-@router.get("/analysis-status")
-def get_analysis_status(db: Session = Depends(get_transaction_db)) -> dict:
+def _build_entrance_analysis_status(db: Session) -> dict:
     pending_rows = repositories.list_pending_video_asset_analyses(
         db,
         limit=max(settings.analysis_max_global_workers * 50, 500),
@@ -147,14 +146,33 @@ def get_analysis_status(db: Session = Depends(get_transaction_db)) -> dict:
         "queued_count": len(pending_rows),
         "running_count": len(running_rows),
         "remote_dispatch_busy": repositories.has_active_remote_analysis_script_run(db),
-        "paused": repositories.is_worker_paused(db, "analysis"),
+        "paused": repositories.is_worker_paused(db, "entrance_analysis"),
         "locations": locations,
+    }
+
+
+@router.get("/entrance-analysis-status")
+def get_entrance_analysis_status(db: Session = Depends(get_transaction_db)) -> dict:
+    return _build_entrance_analysis_status(db)
+
+
+@router.get("/analysis-status")
+def get_analysis_status(db: Session = Depends(get_transaction_db)) -> dict:
+    return _build_entrance_analysis_status(db)
+
+
+@router.post("/entrance-analysis-control")
+def update_entrance_analysis_control(payload: WorkerControlRequest, db: Session = Depends(get_transaction_db)) -> dict:
+    state = repositories.set_worker_paused(db, "entrance_analysis", payload.paused)
+    return {
+        "ok": True,
+        **state,
     }
 
 
 @router.post("/analysis-control")
 def update_analysis_control(payload: WorkerControlRequest, db: Session = Depends(get_transaction_db)) -> dict:
-    state = repositories.set_worker_paused(db, "analysis", payload.paused)
+    state = repositories.set_worker_paused(db, "entrance_analysis", payload.paused)
     return {
         "ok": True,
         **state,

@@ -96,7 +96,7 @@ class VideoAnalysisWorker:
                     item["runpod_status"],
                     item["status"],
                 )
-            if repositories.is_worker_paused(db, "analysis"):
+            if repositories.is_worker_paused(db, "entrance_analysis"):
                 return
             if repositories.has_active_remote_analysis_script_run(db):
                 return

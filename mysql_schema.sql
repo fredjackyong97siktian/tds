@@ -193,7 +193,7 @@ CREATE TABLE IF NOT EXISTS sesamedb.tds_worker_control (
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     UNIQUE KEY uq_worker_control_worker_name (worker_name),
     CONSTRAINT chk_worker_control_name
-        CHECK (worker_name IN ('retrieval', 'analysis', 'kiosk_analysis')),
+        CHECK (worker_name IN ('retrieval', 'entrance_analysis', 'kiosk_analysis')),
     CONSTRAINT chk_worker_control_paused
         CHECK (paused IN (0, 1))
 );
