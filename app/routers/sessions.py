@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from ..db import get_transaction_db
@@ -58,3 +58,11 @@ def finalize_session(session_id: int, payload: SessionFinalizeRequest, db: Sessi
         actual_items_brought=payload.actual_items_brought,
     )
     return SessionFinalizeResponse(**row)
+
+
+@router.post("/{session_id}/retry-issue")
+def retry_session_issue(session_id: int, db: Session = Depends(get_transaction_db)) -> dict:
+    try:
+        return repositories.retry_session_issue(db, session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

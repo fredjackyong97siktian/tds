@@ -1379,6 +1379,23 @@ def update_session_fields(
     return get_session(db, session_id)
 
 
+def retry_session_issue(db: Session, session_id: int) -> dict[str, Any]:
+    session = get_session(db, session_id)
+    if str(session.get("status") or "").strip().lower() != "issue":
+        raise ValueError("This session is not in issue state.")
+    updated = update_session_fields(
+        db,
+        session_id=session_id,
+        status="pending",
+        issue_reason=None,
+    )
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "new_status": str(updated.get("status") or "pending"),
+    }
+
+
 def list_sessions(db: Session, limit: int = 50) -> list[dict[str, Any]]:
     session_table = _table("session")
     session_customer_table = _table("session_customer")
@@ -1389,6 +1406,7 @@ def list_sessions(db: Session, limit: int = 50) -> list[dict[str, Any]]:
             select s.id, s.entry_trigger_id, s.exit_trigger_id, s.location_id, s.status,
                    s.start_time, s.end_time, s.total_item_brought, s.actual_items_brought,
                    s.transaction_total_items, s.total_customer, s.issue_reason, s.result_summary,
+                   case when s.status = 'issue' then true else false end as can_retry,
                    s.created_at, s.updated_at,
                    count(distinct sc.id) as linked_customer_count,
                    count(distinct sva.id) as linked_video_count
@@ -1398,6 +1416,7 @@ def list_sessions(db: Session, limit: int = 50) -> list[dict[str, Any]]:
             group by s.id, s.entry_trigger_id, s.exit_trigger_id, s.location_id, s.status,
                      s.start_time, s.end_time, s.total_item_brought, s.actual_items_brought,
                      s.transaction_total_items, s.total_customer, s.issue_reason, s.result_summary,
+                     can_retry,
                      s.created_at, s.updated_at
             order by s.created_at desc, s.id desc
             limit :limit

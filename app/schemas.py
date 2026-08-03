@@ -143,6 +143,7 @@ class SessionResponse(BaseModel):
 
 
 class SessionListItem(SessionResponse):
+    can_retry: bool = False
     linked_customer_count: int = 0
     linked_video_count: int = 0
     created_at: datetime
