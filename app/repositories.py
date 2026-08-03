@@ -8,6 +8,9 @@ from sqlalchemy.orm import Session
 
 from .config import settings
 
+PAID_TRANSACTION_ID_COLUMN = "receiptNumber"
+PAID_TRANSACTION_TIME_COLUMN = "Formatted Timestamp"
+
 
 def _table(name: str) -> str:
     return f"{settings.transactional_table_prefix}{name}"
@@ -1498,9 +1501,9 @@ def list_paid_transactions_for_session_window(
 ) -> list[dict[str, Any]]:
     transaction_table = _quote_identifier(settings.paid_transaction_table_name)
     detail_table = _quote_identifier(settings.paid_transaction_detail_table_name)
-    transaction_id_column = _quote_identifier(settings.paid_transaction_id_column)
+    transaction_id_column = _quote_identifier(PAID_TRANSACTION_ID_COLUMN)
     location_id_column = _quote_identifier(settings.paid_transaction_location_id_column)
-    transaction_time_column = _quote_identifier(settings.paid_transaction_time_column)
+    transaction_time_column = _quote_identifier(PAID_TRANSACTION_TIME_COLUMN)
     transaction_status_column = _quote_identifier(settings.paid_transaction_status_column)
     receipt_column = _quote_identifier(settings.paid_transaction_receipt_column)
     total_amount_column = _quote_identifier(settings.paid_transaction_total_amount_column)
@@ -1531,9 +1534,9 @@ def list_paid_transactions_for_session_window(
         return []
 
     transaction_ids = [
-        row.get(settings.paid_transaction_id_column)
+        row.get(PAID_TRANSACTION_ID_COLUMN)
         for row in transactions
-        if row.get(settings.paid_transaction_id_column) is not None
+        if row.get(PAID_TRANSACTION_ID_COLUMN) is not None
     ]
     details_by_transaction_id: dict[Any, list[dict[str, Any]]] = {}
     if transaction_ids:
@@ -1554,7 +1557,7 @@ def list_paid_transactions_for_session_window(
 
     payload: list[dict[str, Any]] = []
     for row in transactions:
-        txn_id = row.get(settings.paid_transaction_id_column)
+        txn_id = row.get(PAID_TRANSACTION_ID_COLUMN)
         details = details_by_transaction_id.get(txn_id, [])
         total_items = 0
         normalized_details: list[dict[str, Any]] = []
@@ -1575,7 +1578,7 @@ def list_paid_transactions_for_session_window(
             {
                 "transaction_id": txn_id,
                 "receipt_number": row.get(settings.paid_transaction_receipt_column),
-                "transaction_time": row.get(settings.paid_transaction_time_column),
+                "transaction_time": row.get(PAID_TRANSACTION_TIME_COLUMN),
                 "location_id": row.get(settings.paid_transaction_location_id_column),
                 "total_amount": row.get(settings.paid_transaction_total_amount_column),
                 "total_items": total_items,
