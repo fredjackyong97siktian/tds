@@ -67,7 +67,7 @@ class Settings(BaseSettings):
     theft_transaction_status_value: str = "theft"
     paid_transaction_table_name: str = "transaction"
     paid_transaction_detail_table_name: str = "transactionDetail"
-    paid_transaction_id_column: str = "id"
+    paid_transaction_id_column: str = "transactionId"
     paid_transaction_location_id_column: str = "locationId"
     paid_transaction_time_column: str = "createdAt"
     paid_transaction_status_column: str = "status"
