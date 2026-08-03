@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 
 from ..db import get_transaction_db
 from .. import repositories
+from ..services import workflow_service
 from ..schemas import (
     SessionCreate,
     SessionCustomerCreate,
@@ -63,6 +64,11 @@ def finalize_session(session_id: int, payload: SessionFinalizeRequest, db: Sessi
 @router.post("/{session_id}/retry-issue")
 def retry_session_issue(session_id: int, db: Session = Depends(get_transaction_db)) -> dict:
     try:
-        return repositories.retry_session_issue(db, session_id)
+        result = repositories.retry_session_issue(db, session_id)
+        inserted_video_asset_ids = workflow_service.ensure_kiosk_video_assets_for_session(db, session_id)
+        return {
+            **result,
+            "inserted_video_asset_ids": inserted_video_asset_ids,
+        }
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

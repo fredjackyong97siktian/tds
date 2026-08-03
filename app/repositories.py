@@ -1715,7 +1715,14 @@ def close_session(db: Session, session_id: int, end_time, exit_trigger_id: int |
             update {session_table}
             set end_time = :end_time,
                 exit_trigger_id = coalesce(:exit_trigger_id, exit_trigger_id),
-                status = 'closed'
+                status = case
+                    when status in ('detected', 'not_detected', 'issue') then status
+                    else 'pending'
+                end,
+                issue_reason = case
+                    when status in ('detected', 'not_detected', 'issue') then issue_reason
+                    else null
+                end
             where id = :session_id
             """
         ),

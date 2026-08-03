@@ -2516,6 +2516,53 @@ def retrieve_kiosk_video_window(
     )
 
 
+def ensure_kiosk_video_assets_for_session(db: Session, session_id: int) -> list[int]:
+    session = repositories.get_session(db, session_id)
+    existing_kiosk_videos = repositories.list_session_video_assets(
+        db,
+        session_id=session_id,
+        section="kiosk",
+    )
+    if existing_kiosk_videos:
+        return [int(row["video_asset_id"]) for row in existing_kiosk_videos if row.get("video_asset_id") is not None]
+
+    summary = dict(session.get("result_summary") or {})
+    pipeline = dict(summary.get("session_close_pipeline") or {})
+    merged_windows = pipeline.get("merged_kiosk_windows") or []
+    if not isinstance(merged_windows, list) or not merged_windows:
+        return []
+
+    location_id = int(session["location_id"])
+    queued_video_asset_ids: list[int] = []
+    for window in merged_windows:
+        if not isinstance(window, dict):
+            continue
+        start_value = window.get("start_time")
+        end_value = window.get("end_time")
+        if not start_value or not end_value:
+            continue
+        start_time = datetime.fromisoformat(str(start_value).replace("Z", "+00:00"))
+        end_time = datetime.fromisoformat(str(end_value).replace("Z", "+00:00"))
+        queued = retrieve_kiosk_video_window(
+            db,
+            session_id=session_id,
+            location_id=location_id,
+            start_time=start_time,
+            end_time=end_time,
+        )
+        queued_video_asset_ids.append(int(queued.video_asset_id))
+
+    if queued_video_asset_ids:
+        pipeline["queued_kiosk_video_asset_ids"] = queued_video_asset_ids
+        summary["session_close_pipeline"] = pipeline
+        repositories.update_session_fields(
+            db,
+            session_id=session_id,
+            result_summary=summary,
+        )
+    return queued_video_asset_ids
+
+
 def run_entry_for_trigger(
     db: Session,
     *,
