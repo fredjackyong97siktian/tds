@@ -1469,7 +1469,15 @@ def _maybe_close_session_and_prepare_kiosk(
     exit_trigger_id: int | None = None,
 ) -> None:
     session = repositories.get_session(db, session_id)
-    if session.get("end_time") is not None:
+    session_status = str(session.get("status") or "").strip().lower()
+    if session_status in {"detected", "not_detected"}:
+        return
+    existing_kiosk_videos = repositories.list_session_video_assets(
+        db,
+        session_id=session_id,
+        section="kiosk",
+    )
+    if session.get("end_time") is not None and existing_kiosk_videos:
         return
 
     session_customers = repositories.list_session_customers(db, session_id)
@@ -1482,7 +1490,7 @@ def _maybe_close_session_and_prepare_kiosk(
     if not leave_times:
         return
 
-    session_end_time = max(leave_times)
+    session_end_time = session.get("end_time") or max(leave_times)
     session_start_time = session.get("start_time")
     if session_start_time is None:
         repositories.update_session_fields(
