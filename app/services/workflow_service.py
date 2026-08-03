@@ -2530,27 +2530,143 @@ def ensure_kiosk_video_assets_for_session(db: Session, session_id: int) -> list[
     pipeline = dict(summary.get("session_close_pipeline") or {})
     merged_windows = pipeline.get("merged_kiosk_windows") or []
     if not isinstance(merged_windows, list) or not merged_windows:
-        return []
+        session_start_time = session.get("start_time")
+        session_end_time = session.get("end_time")
+        if session_start_time is None or session_end_time is None:
+            repositories.update_session_fields(
+                db,
+                session_id=session_id,
+                status="issue",
+                issue_reason="Kiosk retry failed because session start_time or end_time is missing.",
+            )
+            return []
+
+        paid_transactions = repositories.list_paid_transactions_for_session_window(
+            db,
+            location_id=int(session["location_id"]),
+            start_time=session_start_time,
+            end_time=session_end_time,
+        )
+        repositories.delete_session_transactions(db, session_id)
+        total_transaction_items = 0
+        raw_windows: list[tuple[datetime, datetime]] = []
+        transaction_summaries: list[dict[str, Any]] = []
+        for transaction in paid_transactions:
+            transaction_time = transaction.get("transaction_time")
+            if transaction_time is None:
+                continue
+            total_items = int(transaction.get("total_items") or 0)
+            total_transaction_items += total_items
+            window_start, window_end = _build_transaction_window_bounds(transaction_time, total_items)
+            raw_windows.append((window_start, window_end))
+            repositories.create_transaction(
+                db,
+                session_id,
+                {
+                    "receipt_number": str(transaction.get("receipt_number") or transaction.get("transaction_id") or ""),
+                    "transaction_time": transaction_time,
+                    "total_items": total_items,
+                    "total_amount": transaction.get("total_amount"),
+                    "raw_payload": transaction,
+                },
+            )
+            transaction_summaries.append(
+                {
+                    "transaction_id": transaction.get("transaction_id"),
+                    "receipt_number": transaction.get("receipt_number"),
+                    "transaction_time": transaction_time.isoformat() if hasattr(transaction_time, "isoformat") else transaction_time,
+                    "total_items": total_items,
+                    "window_start": window_start.isoformat(),
+                    "window_end": window_end.isoformat(),
+                }
+            )
+
+        recomputed_windows = _merge_time_windows(raw_windows)
+        if not recomputed_windows:
+            repositories.update_session_fields(
+                db,
+                session_id=session_id,
+                status="issue",
+                transaction_total_items=total_transaction_items,
+                result_summary={
+                    **summary,
+                    "session_close_pipeline": {
+                        "session_start_time": session_start_time.isoformat()
+                        if hasattr(session_start_time, "isoformat")
+                        else session_start_time,
+                        "session_end_time": session_end_time.isoformat()
+                        if hasattr(session_end_time, "isoformat")
+                        else session_end_time,
+                        "paid_transaction_count": len(transaction_summaries),
+                        "paid_transactions": transaction_summaries,
+                        "merged_kiosk_windows": [],
+                        "queued_kiosk_video_asset_ids": [],
+                    },
+                },
+                issue_reason="Kiosk retry failed because no paid transactions were found inside the session window.",
+            )
+            return []
+
+        pipeline = {
+            "session_start_time": session_start_time.isoformat()
+            if hasattr(session_start_time, "isoformat")
+            else session_start_time,
+            "session_end_time": session_end_time.isoformat()
+            if hasattr(session_end_time, "isoformat")
+            else session_end_time,
+            "paid_transaction_count": len(transaction_summaries),
+            "paid_transactions": transaction_summaries,
+            "merged_kiosk_windows": [
+                {
+                    "start_time": start.isoformat(),
+                    "end_time": end.isoformat(),
+                }
+                for start, end in recomputed_windows
+            ],
+            "queued_kiosk_video_asset_ids": [],
+        }
+        summary["session_close_pipeline"] = pipeline
+        repositories.update_session_fields(
+            db,
+            session_id=session_id,
+            status="pending",
+            transaction_total_items=total_transaction_items,
+            result_summary=summary,
+            issue_reason=None,
+        )
+        merged_windows = pipeline["merged_kiosk_windows"]
 
     location_id = int(session["location_id"])
     queued_video_asset_ids: list[int] = []
-    for window in merged_windows:
-        if not isinstance(window, dict):
-            continue
-        start_value = window.get("start_time")
-        end_value = window.get("end_time")
-        if not start_value or not end_value:
-            continue
-        start_time = datetime.fromisoformat(str(start_value).replace("Z", "+00:00"))
-        end_time = datetime.fromisoformat(str(end_value).replace("Z", "+00:00"))
-        queued = retrieve_kiosk_video_window(
+    try:
+        for window in merged_windows:
+            if not isinstance(window, dict):
+                continue
+            start_value = window.get("start_time")
+            end_value = window.get("end_time")
+            if not start_value or not end_value:
+                continue
+            start_time = datetime.fromisoformat(str(start_value).replace("Z", "+00:00"))
+            end_time = datetime.fromisoformat(str(end_value).replace("Z", "+00:00"))
+            queued = retrieve_kiosk_video_window(
+                db,
+                session_id=session_id,
+                location_id=location_id,
+                start_time=start_time,
+                end_time=end_time,
+            )
+            queued_video_asset_ids.append(int(queued.video_asset_id))
+    except Exception as exc:
+        pipeline["queued_kiosk_video_asset_ids"] = queued_video_asset_ids
+        summary["session_close_pipeline"] = pipeline
+        repositories.update_session_fields(
             db,
             session_id=session_id,
-            location_id=location_id,
-            start_time=start_time,
-            end_time=end_time,
+            status="issue",
+            result_summary=summary,
+            issue_reason=f"Kiosk retry failed while creating video asset: {exc}",
         )
-        queued_video_asset_ids.append(int(queued.video_asset_id))
+        return queued_video_asset_ids
 
     if queued_video_asset_ids:
         pipeline["queued_kiosk_video_asset_ids"] = queued_video_asset_ids

@@ -1382,8 +1382,8 @@ def update_session_fields(
 def retry_session_issue(db: Session, session_id: int) -> dict[str, Any]:
     session = get_session(db, session_id)
     current_status = str(session.get("status") or "").strip().lower()
-    if current_status not in {"issue", "closed"}:
-        raise ValueError("This session is not in issue or closed state.")
+    if current_status not in {"issue", "closed", "pending"}:
+        raise ValueError("This session is not in issue, closed, or pending state.")
     updated = update_session_fields(
         db,
         session_id=session_id,
@@ -1407,7 +1407,9 @@ def list_sessions(db: Session, limit: int = 50) -> list[dict[str, Any]]:
             select s.id, s.entry_trigger_id, s.exit_trigger_id, s.location_id, s.status,
                    s.start_time, s.end_time, s.total_item_brought, s.actual_items_brought,
                    s.transaction_total_items, s.total_customer, s.issue_reason, s.result_summary,
-                   case when s.status in ('issue', 'closed') then true else false end as can_retry,
+                   case when s.status in ('issue', 'closed')
+                          or (s.status = 'pending' and s.end_time is not null)
+                        then true else false end as can_retry,
                    s.created_at, s.updated_at,
                    count(distinct sc.id) as linked_customer_count,
                    count(distinct sva.id) as linked_video_count
