@@ -126,6 +126,11 @@ class SessionCreate(BaseModel):
     start_time: datetime | None = None
 
 
+class SessionEndTimeUpdateRequest(BaseModel):
+    end_time: datetime
+    exit_trigger_id: int | None = None
+
+
 class SessionResponse(BaseModel):
     id: int
     entry_trigger_id: int

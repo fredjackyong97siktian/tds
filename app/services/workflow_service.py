@@ -1687,7 +1687,7 @@ def _sync_gallery_state_after_entry(
         summary_customers = [
             {
                 "person_id": person_id,
-                "entered": True,
+                "entered": False,
                 "exited": False,
                 "group_id": None,
             }
@@ -1702,29 +1702,6 @@ def _sync_gallery_state_after_entry(
     transactional_db = TransactionalSessionLocal()
     vector_db = VectorSessionLocal()
     try:
-        active_rows_before = vector_repositories.list_active_gallery_records(
-            vector_db,
-            location_id=location_id,
-            limit=5000,
-        )
-        active_person_ids_before = {
-            int(row["person_id"])
-            for row in active_rows_before
-            if row.get("person_id") is not None
-        }
-        active_session_customer_ids_by_person: dict[int, set[int]] = {}
-        active_session_id_by_session_customer_id: dict[int, int | None] = {}
-        for row in active_rows_before:
-            row_person_id = _coerce_int(row.get("person_id"))
-            row_session_customer_id = _coerce_int(row.get("session_customer_id"))
-            row_session_id = _coerce_int(row.get("session_id"))
-            if row_person_id is None or row_session_customer_id is None:
-                continue
-            active_session_customer_ids_by_person.setdefault(row_person_id, set()).add(
-                row_session_customer_id
-            )
-            active_session_id_by_session_customer_id[row_session_customer_id] = row_session_id
-
         for customer in summary_customers:
             person_id = int(customer["person_id"])
             repositories.create_session_customer(
@@ -1820,6 +1797,9 @@ def _sync_gallery_state_after_entry(
                 )
                 continue
 
+            if not bool(customer.get("entered")):
+                continue
+
             if view_rows or osnet_views or fashion_embedding is not None or image_paths:
                 vector_repositories.delete_active_gallery_by_aliases(
                     vector_db,
@@ -1883,56 +1863,6 @@ def _sync_gallery_state_after_entry(
                     person_ids=delete_person_ids,
                 )
 
-        summary_persistent_gallery_ids = tracking_summary.get("persistent_gallery_ids") or []
-        if isinstance(summary_persistent_gallery_ids, list):
-            final_persistent_person_ids = {
-                int(gallery_id)
-                for gallery_id in summary_persistent_gallery_ids
-                if gallery_id is not None
-            }
-        else:
-            final_persistent_person_ids = {
-                int(gallery_id)
-                for gallery_id in persistent_gallery.keys()
-                if gallery_id is not None
-            }
-        stale_person_ids = sorted(active_person_ids_before - final_persistent_person_ids)
-        if stale_person_ids:
-            stale_session_customer_ids = sorted(
-                {
-                    session_customer_id
-                    for person_id in stale_person_ids
-                    for session_customer_id in active_session_customer_ids_by_person.get(person_id, set())
-                }
-            )
-            logger.info(
-                "Reconciling active gallery for location_id=%s after video=%s; removing stale person_ids=%s final_persistent_person_ids=%s source=%s",
-                location_id,
-                Path(video_path).name,
-                stale_person_ids,
-                sorted(final_persistent_person_ids),
-                "tracking_summary"
-                if isinstance(summary_persistent_gallery_ids, list)
-                else "gallery_state_pickle",
-            )
-            current_session_stale_ids = [
-                session_customer_id
-                for session_customer_id in stale_session_customer_ids
-                if active_session_id_by_session_customer_id.get(session_customer_id) == session_id
-            ]
-            for session_customer_id in current_session_stale_ids:
-                repositories.update_session_customer_leave_time(
-                    transactional_db,
-                    session_customer_id=session_customer_id,
-                    leave_time=leave_time,
-                    match_status="resolved",
-                )
-            vector_repositories.delete_active_gallery_by_aliases(
-                vector_db,
-                location_id=location_id,
-                session_customer_ids=stale_session_customer_ids,
-                person_ids=stale_person_ids,
-            )
         _maybe_close_session_and_prepare_kiosk(
             transactional_db,
             session_id=session_id,

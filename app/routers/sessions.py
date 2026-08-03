@@ -10,6 +10,7 @@ from ..services import workflow_service
 from ..schemas import (
     SessionCreate,
     SessionCustomerCreate,
+    SessionEndTimeUpdateRequest,
     SessionFinalizeRequest,
     SessionFinalizeResponse,
     SessionListItem,
@@ -50,6 +51,40 @@ def add_transaction(session_id: int, payload: TransactionCreate, db: Session = D
 def close_session(session_id: int, exit_trigger_id: int | None = None, db: Session = Depends(get_transaction_db)) -> SessionResponse:
     row = repositories.close_session(db, session_id, datetime.utcnow(), exit_trigger_id)
     return SessionResponse(**row)
+
+
+@router.post("/{session_id}/end-time")
+def update_session_end_time(
+    session_id: int,
+    payload: SessionEndTimeUpdateRequest,
+    db: Session = Depends(get_transaction_db),
+) -> dict:
+    try:
+        session = repositories.get_session(db, session_id)
+        if payload.exit_trigger_id is not None:
+            trigger = repositories.get_trigger(db, payload.exit_trigger_id)
+            if int(trigger["location_id"]) != int(session["location_id"]):
+                raise HTTPException(status_code=400, detail="Exit trigger must belong to the same location as the session.")
+        row = repositories.update_session_fields(
+            db,
+            session_id=session_id,
+            status="pending",
+            end_time=payload.end_time,
+            exit_trigger_id=payload.exit_trigger_id,
+            issue_reason=None,
+        )
+        inserted_video_asset_ids = workflow_service.ensure_kiosk_video_assets_for_session(db, session_id)
+        return {
+            "session": row,
+            "inserted_video_asset_ids": inserted_video_asset_ids,
+        }
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Session end-time update failed for session_id=%s", session_id)
+        raise HTTPException(status_code=500, detail=f"Session end-time update failed: {exc}") from exc
 
 
 @router.post("/{session_id}/finalize", response_model=SessionFinalizeResponse)
