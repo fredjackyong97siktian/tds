@@ -2006,6 +2006,22 @@ def _sync_gallery_state_after_entry(
                 or _coerce_int(gallery_entry.get("person_id"))
                 or person_id
             )
+            if source_session_customer_id is not None and source_session_id is None:
+                try:
+                    source_session_customer = repositories.get_session_customer(
+                        transactional_db,
+                        source_session_customer_id,
+                    )
+                    source_session_id = _coerce_int(source_session_customer.get("session_id"))
+                    source_person_id = _coerce_int(source_session_customer.get("person_id")) or source_person_id
+                except ValueError:
+                    logger.warning(
+                        "Matched active-gallery session_customer does not exist video=%s location_id=%s runtime_person_id=%s session_customer_id=%s",
+                        Path(video_path).name,
+                        location_id,
+                        person_id,
+                        source_session_customer_id,
+                    )
             if exited and source_session_customer_id is None:
                 fallback_person_ids = [
                     value
@@ -2063,6 +2079,18 @@ def _sync_gallery_state_after_entry(
                     person_id,
                 )
                 continue
+            elif entered and source_session_customer_id is not None:
+                session_customer_id = source_session_customer_id
+                customer_session_id = source_session_id or session_id
+                logger.info(
+                    "Entered customer matched active gallery; not creating a new session customer video=%s location_id=%s runtime_person_id=%s active_session_id=%s active_session_customer_id=%s active_person_id=%s",
+                    Path(video_path).name,
+                    location_id,
+                    person_id,
+                    customer_session_id,
+                    session_customer_id,
+                    source_person_id,
+                )
             else:
                 repositories.create_session_customer(
                     transactional_db,
@@ -2107,9 +2135,18 @@ def _sync_gallery_state_after_entry(
                         },
                     )
 
-            active_session_id = source_session_id or customer_session_id
-            active_session_customer_id = source_session_customer_id or session_customer_id
-            active_person_id = source_person_id or person_id
+            if entered and source_session_customer_id is not None:
+                active_session_id = customer_session_id
+                active_session_customer_id = session_customer_id
+                active_person_id = source_person_id or person_id
+            elif entered:
+                active_session_id = customer_session_id
+                active_session_customer_id = session_customer_id
+                active_person_id = person_id
+            else:
+                active_session_id = source_session_id or customer_session_id
+                active_session_customer_id = source_session_customer_id or session_customer_id
+                active_person_id = source_person_id or person_id
             delete_session_customer_ids = [active_session_customer_id, session_customer_id]
             delete_person_ids = [person_id, active_person_id, source_person_id]
 
@@ -2149,7 +2186,7 @@ def _sync_gallery_state_after_entry(
                 location_id=location_id,
                 session_id=customer_session_id,
                 session_customer_id=session_customer_id,
-                person_id=person_id,
+                person_id=active_person_id,
                 output_dir=output_dir,
             )
             if (
@@ -2162,7 +2199,7 @@ def _sync_gallery_state_after_entry(
                     location_id=location_id,
                     session_id=customer_session_id,
                     session_customer_id=session_customer_id,
-                    person_id=person_id,
+                    person_id=active_person_id,
                     image_url=canonical_image_url,
                     image_public_url=canonical_image_public_url,
                     image_kind="reid_view" if canonical_osnet is not None else "fashion_view",
@@ -2672,17 +2709,15 @@ def build_entrance_analysis_job_from_video_asset(db: Session, video_asset_id: in
     try:
         session = repositories.get_session_by_entry_trigger_id(db, int(trigger_id))
     except ValueError:
-        session = _find_open_active_session_for_location(db, int(trigger["location_id"]))
-        if session is None:
-            session = repositories.create_session(
-                db,
-                {
-                    "entry_trigger_id": int(trigger_id),
-                    "exit_trigger_id": None,
-                    "location_id": int(trigger["location_id"]),
-                    "start_time": trigger.get("trigger_time"),
-                },
-            )
+        session = repositories.create_session(
+            db,
+            {
+                "entry_trigger_id": int(trigger_id),
+                "exit_trigger_id": None,
+                "location_id": int(trigger["location_id"]),
+                "start_time": trigger.get("trigger_time"),
+            },
+        )
         repositories.update_trigger_status(db, int(trigger_id), "video_pending")
     return EntranceAnalysisQueued(
         video_asset_id=video_asset_id,
