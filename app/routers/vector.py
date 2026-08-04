@@ -29,6 +29,7 @@ def create_customer_gallery(
         person_id=payload.person_id,
         session_customer_id=payload.session_customer_id,
         image_url=payload.image_url,
+        image_public_url=payload.image_public_url,
         image_kind=payload.image_kind,
         embedding_osnet=payload.embedding_osnet,
         embedding_fashion=payload.embedding_fashion,

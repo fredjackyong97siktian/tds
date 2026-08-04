@@ -26,6 +26,7 @@ create table if not exists tds_customer_gallery (
     session_customer_id bigint,
     person_id integer not null,
     image_url text,
+    image_public_url text,
     image_kind varchar(50) not null default 'reid_view',
     embedding_osnet jsonb,
     embedding_fashion jsonb,

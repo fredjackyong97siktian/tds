@@ -273,6 +273,7 @@ class CustomerGalleryCreate(BaseModel):
     person_id: int
     session_customer_id: int | None = None
     image_url: str | None = None
+    image_public_url: str | None = None
     image_kind: str = "reid_view"
     embedding_osnet: list[float] | None = None
     embedding_fashion: list[float] | None = None
@@ -286,6 +287,7 @@ class CustomerGalleryResponse(BaseModel):
     session_customer_id: int | None = None
     person_id: int
     image_url: str | None = None
+    image_public_url: str | None = None
     image_kind: str
     embedding_osnet: Any | None = None
     embedding_fashion: Any | None = None

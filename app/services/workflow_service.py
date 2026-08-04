@@ -10,7 +10,7 @@ from os.path import basename, splitext
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
 from sqlalchemy.orm import Session
@@ -240,6 +240,51 @@ def _upload_runner_input_file(
     )
     upload_private_file(local_path, object_key, content_type=guess_media_type(str(local_path)))
     return object_key, _spaces_download_url_for_object_key(object_key)
+
+
+def _upload_customer_gallery_image_to_spaces(
+    image_url: str | None,
+    *,
+    location_id: int,
+    session_id: int,
+    session_customer_id: int,
+    person_id: int,
+    output_dir: Path,
+) -> str | None:
+    if not image_url:
+        return None
+
+    parsed = urlparse(image_url)
+    if parsed.scheme in {"http", "https"}:
+        return image_url
+    if not is_spaces_configured():
+        return None
+
+    candidate_path = Path(image_url)
+    if not candidate_path.exists():
+        candidate_path = output_dir / Path(image_url).name
+    if not candidate_path.exists() or not candidate_path.is_file():
+        logger.warning(
+            "Customer gallery image could not be uploaded because file was not found image_url=%s fallback=%s",
+            image_url,
+            candidate_path,
+        )
+        return None
+
+    object_key = build_spaces_object_key(
+        f"location_{location_id}",
+        f"session_{session_id}",
+        "customer_gallery",
+        f"sc_{session_customer_id}",
+        f"person_{person_id}",
+        candidate_path.name,
+    )
+    upload_result = upload_private_file(
+        candidate_path,
+        object_key,
+        content_type=guess_media_type(str(candidate_path)),
+    )
+    return upload_result.get("public_url") or generate_public_object_url(object_key)
 
 
 def _build_processed_video_upload_target(
@@ -2099,6 +2144,14 @@ def _sync_gallery_state_after_entry(
                 if canonical_view
                 else fashion_embedding
             )
+            canonical_image_public_url = _upload_customer_gallery_image_to_spaces(
+                canonical_image_url,
+                location_id=location_id,
+                session_id=customer_session_id,
+                session_customer_id=session_customer_id,
+                person_id=person_id,
+                output_dir=output_dir,
+            )
             if (
                 canonical_osnet is not None
                 or canonical_fashion is not None
@@ -2111,6 +2164,7 @@ def _sync_gallery_state_after_entry(
                     session_customer_id=session_customer_id,
                     person_id=person_id,
                     image_url=canonical_image_url,
+                    image_public_url=canonical_image_public_url,
                     image_kind="reid_view" if canonical_osnet is not None else "fashion_view",
                     embedding_osnet=canonical_osnet,
                     embedding_fashion=canonical_fashion,
