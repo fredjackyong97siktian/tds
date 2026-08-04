@@ -1733,8 +1733,14 @@ def _sync_gallery_state_after_entry(
     transactional_db = TransactionalSessionLocal()
     vector_db = VectorSessionLocal()
     try:
+        sessions_to_close: set[int] = set()
         for customer in summary_customers:
             person_id = int(customer["person_id"])
+            entered = bool(customer.get("entered"))
+            exited = bool(customer.get("exited"))
+            if not entered and not exited:
+                continue
+
             customer_enter_time = (
                 _customer_event_time(
                     customer=customer,
@@ -1743,7 +1749,7 @@ def _sync_gallery_state_after_entry(
                     fallback_time=enter_time,
                     event_key="entry",
                 )
-                if bool(customer.get("entered"))
+                if entered
                 else enter_time
             )
             customer_leave_time = (
@@ -1754,29 +1760,8 @@ def _sync_gallery_state_after_entry(
                     fallback_time=leave_time,
                     event_key="exit",
                 )
-                if bool(customer.get("exited"))
+                if exited
                 else None
-            )
-            repositories.create_session_customer(
-                transactional_db,
-                session_id,
-                {
-                    "person_id": person_id,
-                    "enter_time": customer_enter_time,
-                    "kiosk_start_time": None,
-                    "leave_time": customer_leave_time,
-                    "match_status": "resolved" if bool(customer.get("exited")) else "tracked",
-                },
-            )
-            session_customer = repositories.get_session_customer_by_session_person(
-                transactional_db,
-                session_id,
-                person_id,
-            )
-
-            vector_repositories.delete_customer_gallery_records_for_session_customer(
-                vector_db,
-                session_customer_id=int(session_customer["id"]),
             )
 
             gallery_entry = _resolve_runtime_gallery_entry(
@@ -1786,11 +1771,49 @@ def _sync_gallery_state_after_entry(
             source_session_id = _coerce_int(gallery_entry.get("session_id"))
             source_session_customer_id = _coerce_int(gallery_entry.get("session_customer_id"))
             source_person_id = _coerce_int(gallery_entry.get("person_id"))
-            active_session_id = source_session_id or session_id
-            active_session_customer_id = source_session_customer_id or int(session_customer["id"])
+            if exited and source_session_customer_id is not None:
+                repositories.update_session_customer_leave_time(
+                    transactional_db,
+                    session_customer_id=source_session_customer_id,
+                    leave_time=customer_leave_time,
+                    match_status="resolved",
+                )
+                session_customer_id = source_session_customer_id
+                customer_session_id = source_session_id or session_id
+                sessions_to_close.add(customer_session_id)
+            else:
+                repositories.create_session_customer(
+                    transactional_db,
+                    session_id,
+                    {
+                        "person_id": person_id,
+                        "enter_time": customer_enter_time,
+                        "kiosk_start_time": None,
+                        "leave_time": customer_leave_time,
+                        "match_status": "resolved" if exited else "tracked",
+                    },
+                )
+                session_customer = repositories.get_session_customer_by_session_person(
+                    transactional_db,
+                    session_id,
+                    person_id,
+                )
+                session_customer_id = int(session_customer["id"])
+                customer_session_id = session_id
+                if exited:
+                    sessions_to_close.add(session_id)
+
+            active_session_id = source_session_id or customer_session_id
+            active_session_customer_id = source_session_customer_id or session_customer_id
             active_person_id = source_person_id or person_id
-            delete_session_customer_ids = [active_session_customer_id, int(session_customer["id"])]
+            delete_session_customer_ids = [active_session_customer_id, session_customer_id]
             delete_person_ids = [person_id, active_person_id, source_person_id]
+
+            vector_repositories.delete_customer_gallery_records_for_session_customer(
+                vector_db,
+                session_customer_id=session_customer_id,
+            )
+
             osnet_views = gallery_entry.get("views") or []
             fashion_embedding = _combine_fashion_embedding(
                 gallery_entry.get("fashion_upper_init"),
@@ -1826,8 +1849,8 @@ def _sync_gallery_state_after_entry(
                 vector_repositories.create_customer_gallery_record(
                     vector_db,
                     location_id=location_id,
-                    session_id=session_id,
-                    session_customer_id=int(session_customer["id"]),
+                    session_id=customer_session_id,
+                    session_customer_id=session_customer_id,
                     person_id=person_id,
                     image_url=canonical_image_url,
                     image_kind="reid_view" if canonical_osnet is not None else "fashion_view",
@@ -1841,16 +1864,13 @@ def _sync_gallery_state_after_entry(
                         "active_image_count": len(view_rows) if view_rows else len(image_paths),
                     },
                 )
-            if bool(customer.get("exited")):
+            if exited:
                 vector_repositories.delete_active_gallery_by_aliases(
                     vector_db,
                     location_id=location_id,
                     session_customer_ids=delete_session_customer_ids,
                     person_ids=delete_person_ids,
                 )
-                continue
-
-            if not bool(customer.get("entered")):
                 continue
 
             if view_rows or osnet_views or fashion_embedding is not None or image_paths:
@@ -1916,11 +1936,14 @@ def _sync_gallery_state_after_entry(
                     person_ids=delete_person_ids,
                 )
 
-        _maybe_close_session_and_prepare_kiosk(
-            transactional_db,
-            session_id=session_id,
-            exit_trigger_id=exit_trigger_id,
-        )
+        if not sessions_to_close:
+            sessions_to_close.add(session_id)
+        for close_session_id in sorted(sessions_to_close):
+            _maybe_close_session_and_prepare_kiosk(
+                transactional_db,
+                session_id=close_session_id,
+                exit_trigger_id=exit_trigger_id,
+            )
     finally:
         vector_db.close()
         transactional_db.close()
