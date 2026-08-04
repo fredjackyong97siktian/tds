@@ -1437,8 +1437,36 @@ def _resolve_runtime_gallery_entry(
     return {}
 
 
+TERMINAL_SESSION_STATUSES = {"detected", "not_detected", "closed", "issue", "whitelisted"}
+
+
+def _resolve_open_session_customer_for_gallery(
+    db: Session,
+    *,
+    location_id: int,
+    session_customer_id: int,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    try:
+        session_customer = repositories.get_session_customer(db, session_customer_id)
+        session = repositories.get_session(db, int(session_customer["session_id"]))
+    except ValueError:
+        return None
+
+    session_status = str(session.get("status") or "").strip().lower()
+    if int(session.get("location_id") or 0) != location_id:
+        return None
+    if session_status in TERMINAL_SESSION_STATUSES:
+        return None
+    if session.get("end_time") is not None:
+        return None
+    if session_customer.get("leave_time") is not None:
+        return None
+    return session, session_customer
+
+
 def _build_cross_state_from_active_gallery(location_id: int) -> dict[str, Any]:
     vector_db = VectorSessionLocal()
+    transactional_db = TransactionalSessionLocal()
     try:
         active_rows = vector_repositories.list_active_gallery_records(
             vector_db,
@@ -1450,7 +1478,20 @@ def _build_cross_state_from_active_gallery(location_id: int) -> dict[str, Any]:
         next_gid = 1
 
         for row in active_rows:
+            session_customer_id = _coerce_int(row.get("session_customer_id"))
+            if session_customer_id is None:
+                continue
+            active_owner = _resolve_open_session_customer_for_gallery(
+                transactional_db,
+                location_id=location_id,
+                session_customer_id=session_customer_id,
+            )
+            if active_owner is None:
+                continue
+            active_session, active_session_customer = active_owner
             gallery_id = _coerce_int(row.get("person_id"))
+            if gallery_id is None:
+                gallery_id = _coerce_int(active_session_customer.get("person_id"))
             if gallery_id is None:
                 continue
 
@@ -1471,8 +1512,8 @@ def _build_cross_state_from_active_gallery(location_id: int) -> dict[str, Any]:
                 gallery_id,
                 {
                     "views": [],
-                    "session_id": _coerce_int(row.get("session_id")),
-                    "session_customer_id": _coerce_int(row.get("session_customer_id")),
+                    "session_id": int(active_session["id"]),
+                    "session_customer_id": session_customer_id,
                     "person_id": gallery_id,
                     "location_id": _coerce_int(row.get("location_id")),
                     "source": "postgresql_active_gallery",
@@ -1501,6 +1542,7 @@ def _build_cross_state_from_active_gallery(location_id: int) -> dict[str, Any]:
         }
     finally:
         vector_db.close()
+        transactional_db.close()
 
 
 def _hydrate_gallery_state_from_active_gallery(location_id: int, gallery_state_path: Path) -> None:
@@ -1940,6 +1982,19 @@ def _sync_gallery_state_after_entry(
                         session_customer_id,
                     )
                     continue
+                active_owner = _resolve_open_session_customer_for_gallery(
+                    transactional_db,
+                    location_id=location_id,
+                    session_customer_id=session_customer_id,
+                )
+                if active_owner is None:
+                    logger.info(
+                        "Ignoring stale tracking_summary exit_customer for closed/left session video=%s location_id=%s session_customer_id=%s",
+                        Path(video_path).name,
+                        location_id,
+                        session_customer_id,
+                    )
+                    continue
                 repositories.update_session_customer_leave_time(
                     transactional_db,
                     session_customer_id=session_customer_id,
@@ -1970,6 +2025,15 @@ def _sync_gallery_state_after_entry(
             exited = bool(customer.get("exited"))
             view_rows = reid_views_by_person.get(person_id) or []
             if not entered and not exited and not view_rows:
+                continue
+            if not entered and not exited:
+                logger.info(
+                    "Skipping gallery-only customer without entry/exit event video=%s location_id=%s runtime_person_id=%s view_count=%s",
+                    Path(video_path).name,
+                    location_id,
+                    person_id,
+                    len(view_rows),
+                )
                 continue
 
             customer_enter_time = (
@@ -2006,22 +2070,27 @@ def _sync_gallery_state_after_entry(
                 or _coerce_int(gallery_entry.get("person_id"))
                 or person_id
             )
-            if source_session_customer_id is not None and source_session_id is None:
-                try:
-                    source_session_customer = repositories.get_session_customer(
-                        transactional_db,
-                        source_session_customer_id,
-                    )
-                    source_session_id = _coerce_int(source_session_customer.get("session_id"))
-                    source_person_id = _coerce_int(source_session_customer.get("person_id")) or source_person_id
-                except ValueError:
-                    logger.warning(
-                        "Matched active-gallery session_customer does not exist video=%s location_id=%s runtime_person_id=%s session_customer_id=%s",
+            if source_session_customer_id is not None:
+                active_owner = _resolve_open_session_customer_for_gallery(
+                    transactional_db,
+                    location_id=location_id,
+                    session_customer_id=source_session_customer_id,
+                )
+                if active_owner is None:
+                    logger.info(
+                        "Ignoring stale active-gallery match for closed/left session video=%s location_id=%s runtime_person_id=%s session_customer_id=%s",
                         Path(video_path).name,
                         location_id,
                         person_id,
                         source_session_customer_id,
                     )
+                    source_session_customer_id = None
+                    source_session_id = None
+                    source_person_id = person_id
+                else:
+                    source_session, source_session_customer = active_owner
+                    source_session_id = int(source_session["id"])
+                    source_person_id = _coerce_int(source_session_customer.get("person_id")) or source_person_id
             if exited and source_session_customer_id is None:
                 fallback_person_ids = [
                     value
