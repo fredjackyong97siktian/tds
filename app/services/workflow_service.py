@@ -1741,7 +1741,8 @@ def _sync_gallery_state_after_entry(
             person_id = int(customer["person_id"])
             entered = bool(customer.get("entered"))
             exited = bool(customer.get("exited"))
-            if not entered and not exited:
+            view_rows = reid_views_by_person.get(person_id) or []
+            if not entered and not exited and not view_rows:
                 continue
 
             customer_enter_time = (
@@ -1827,7 +1828,6 @@ def _sync_gallery_state_after_entry(
                 output_dir=output_dir,
                 gallery_id=person_id,
             )
-            view_rows = reid_views_by_person.get(person_id) or []
             canonical_view = view_rows[0] if view_rows else None
             canonical_image_url = (
                 canonical_view.get("image_url")
@@ -1907,6 +1907,17 @@ def _sync_gallery_state_after_entry(
                             embedding_fashion=view_row.get("embedding_fashion"),
                             metadata={**active_metadata, "view_index": index},
                         )
+                    logger.info(
+                        "Inserted active gallery rows from reid_views video=%s location_id=%s session_id=%s session_customer_id=%s person_id=%s row_count=%s entered=%s exited=%s",
+                        Path(video_path).name,
+                        location_id,
+                        active_session_id,
+                        active_session_customer_id,
+                        active_person_id,
+                        len(view_rows),
+                        entered,
+                        exited,
+                    )
                 elif osnet_views:
                     for index, osnet_view in enumerate(osnet_views):
                         image_url = image_paths[index] if index < len(image_paths) else (image_paths[0] if image_paths else None)
@@ -1922,6 +1933,17 @@ def _sync_gallery_state_after_entry(
                             embedding_fashion=fashion_embedding,
                             metadata={**active_metadata, "view_index": index},
                         )
+                    logger.info(
+                        "Inserted active gallery rows from runtime gallery video=%s location_id=%s session_id=%s session_customer_id=%s person_id=%s row_count=%s entered=%s exited=%s",
+                        Path(video_path).name,
+                        location_id,
+                        active_session_id,
+                        active_session_customer_id,
+                        active_person_id,
+                        len(osnet_views),
+                        entered,
+                        exited,
+                    )
                 elif fashion_embedding is not None or canonical_image_url is not None:
                     vector_repositories.create_active_gallery_record(
                         vector_db,
@@ -1934,6 +1956,16 @@ def _sync_gallery_state_after_entry(
                         embedding_osnet=None,
                         embedding_fashion=fashion_embedding,
                         metadata=active_metadata,
+                    )
+                    logger.info(
+                        "Inserted active gallery fallback row video=%s location_id=%s session_id=%s session_customer_id=%s person_id=%s entered=%s exited=%s",
+                        Path(video_path).name,
+                        location_id,
+                        active_session_id,
+                        active_session_customer_id,
+                        active_person_id,
+                        entered,
+                        exited,
                     )
             else:
                 # Temporarily keep active gallery rows during session-close testing.
