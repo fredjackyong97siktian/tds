@@ -1539,7 +1539,8 @@ def list_paid_transactions_for_session_window(
     transaction_status_column = _quote_identifier(settings.paid_transaction_status_column)
     receipt_column = _quote_identifier(settings.paid_transaction_receipt_column)
     total_amount_column = _quote_identifier(settings.paid_transaction_total_amount_column)
-    detail_transaction_id_column = _quote_identifier(settings.paid_transaction_detail_transaction_id_column)
+    detail_transaction_id_name = settings.paid_transaction_receipt_column
+    detail_transaction_id_column = _quote_identifier(detail_transaction_id_name)
     detail_quantity_column = _quote_identifier(settings.paid_transaction_detail_quantity_column)
     detail_item_name_column = _quote_identifier(settings.paid_transaction_detail_item_name_column)
 
@@ -1584,7 +1585,7 @@ def list_paid_transactions_for_session_window(
             {"transaction_ids": transaction_ids},
         )
         for row in _fetch_all_dicts(detail_result):
-            txn_id = row.get(settings.paid_transaction_detail_transaction_id_column)
+            txn_id = row.get(detail_transaction_id_name)
             details_by_transaction_id.setdefault(txn_id, []).append(row)
 
     payload: list[dict[str, Any]] = []

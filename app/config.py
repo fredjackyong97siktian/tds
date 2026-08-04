@@ -72,7 +72,7 @@ class Settings(BaseSettings):
     paid_transaction_status_value: str = "paid"
     paid_transaction_receipt_column: str = "receiptNumber"
     paid_transaction_total_amount_column: str = "totalAmount"
-    paid_transaction_detail_transaction_id_column: str = "transactionId"
+    paid_transaction_detail_transaction_id_column: str = "receiptNumber"
     paid_transaction_detail_quantity_column: str = "quantity"
     paid_transaction_detail_item_name_column: str = "name"
 
