@@ -1813,6 +1813,36 @@ def get_session_customer_by_session_person(db: Session, session_id: int, person_
     return _fetch_one_dict(result)
 
 
+def get_latest_open_session_customer_by_location_person(
+    db: Session,
+    *,
+    location_id: int,
+    person_id: int,
+) -> dict[str, Any]:
+    session_table = _table("session")
+    session_customer_table = _table("session_customer")
+    result = db.execute(
+        text(
+            f"""
+            select sc.id, sc.session_id, sc.person_id, sc.merged_into_session_customer_id,
+                   sc.enter_time, sc.kiosk_start_time, sc.leave_time, sc.match_status,
+                   sc.merge_reason, sc.merged_at, sc.created_at, sc.updated_at
+            from {session_customer_table} sc
+            join {session_table} s on s.id = sc.session_id
+            where s.location_id = :location_id
+              and sc.person_id = :person_id
+              and sc.leave_time is null
+              and s.end_time is null
+              and s.status not in ('detected', 'not_detected', 'closed', 'issue', 'whitelisted')
+            order by sc.created_at desc, sc.id desc
+            limit 1
+            """
+        ),
+        {"location_id": location_id, "person_id": person_id},
+    )
+    return _fetch_one_dict(result)
+
+
 def update_session_customer_leave_time(
     db: Session,
     *,

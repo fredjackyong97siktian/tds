@@ -1775,6 +1775,35 @@ def _sync_gallery_state_after_entry(
             source_session_id = _coerce_int(gallery_entry.get("session_id"))
             source_session_customer_id = _coerce_int(gallery_entry.get("session_customer_id"))
             source_person_id = _coerce_int(gallery_entry.get("person_id"))
+            if exited and source_session_customer_id is None:
+                fallback_person_ids = [
+                    value
+                    for value in (source_person_id, person_id)
+                    if value is not None
+                ]
+                for fallback_person_id in dict.fromkeys(fallback_person_ids):
+                    try:
+                        fallback_session_customer = repositories.get_latest_open_session_customer_by_location_person(
+                            transactional_db,
+                            location_id=location_id,
+                            person_id=int(fallback_person_id),
+                        )
+                    except ValueError:
+                        continue
+                    source_session_customer_id = int(fallback_session_customer["id"])
+                    source_session_id = int(fallback_session_customer["session_id"])
+                    source_person_id = int(fallback_session_customer["person_id"])
+                    logger.info(
+                        "Resolved exit customer from MySQL open session fallback video=%s location_id=%s runtime_person_id=%s session_id=%s session_customer_id=%s person_id=%s",
+                        Path(video_path).name,
+                        location_id,
+                        person_id,
+                        source_session_id,
+                        source_session_customer_id,
+                        source_person_id,
+                    )
+                    break
+
             if exited and source_session_customer_id is not None:
                 repositories.update_session_customer_leave_time(
                     transactional_db,
@@ -1785,6 +1814,14 @@ def _sync_gallery_state_after_entry(
                 session_customer_id = source_session_customer_id
                 customer_session_id = source_session_id or session_id
                 sessions_to_close.add(customer_session_id)
+            elif exited and not entered:
+                logger.warning(
+                    "Exit-only customer had no matching active session; skipping new session_customer creation video=%s location_id=%s runtime_person_id=%s",
+                    Path(video_path).name,
+                    location_id,
+                    person_id,
+                )
+                continue
             else:
                 repositories.create_session_customer(
                     transactional_db,
