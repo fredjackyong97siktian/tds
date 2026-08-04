@@ -24,7 +24,12 @@ def list_video_assets(limit: int = 50, db: Session = Depends(get_transaction_db)
     rows = repositories.list_video_assets(db, limit=limit)
     for row in rows:
         file_path = row.get("file_path")
-        if str(row.get("status") or "") == "processed" and isinstance(file_path, str) and file_path.startswith("spaces://"):
+        if (
+            str(row.get("status") or "") == "processed"
+            and not row.get("video_url")
+            and isinstance(file_path, str)
+            and file_path.startswith("spaces://")
+        ):
             spaces_object_key = file_path.removeprefix("spaces://").lstrip("/")
             if spaces_object_key:
                 try:

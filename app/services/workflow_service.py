@@ -332,7 +332,8 @@ def _apply_processed_video_upload_result(
         int(video_asset_row["id"]),
         {
             "video_url": str(video_url or f"/api/v1/videos/assets/{int(video_asset_row['id'])}/content"),
-            "file_path": f"spaces://{object_key}",
+            # Keep file_path pointing at the raw/source video. Processed playback lives in video_url only.
+            "file_path": video_asset_row.get("file_path"),
             "captured_start_time": video_asset_row.get("captured_start_time"),
             "captured_end_time": video_asset_row.get("captured_end_time"),
             "retrieved_at": video_asset_row.get("retrieved_at"),
@@ -381,8 +382,13 @@ def _ensure_source_video_ready_for_runner(
 ) -> tuple[dict[str, Any], str]:
     source_video_url = str(video_asset_row.get("video_url") or "").strip()
     source_file_path = str(video_asset_row.get("file_path") or "").strip()
-    if source_video_url and source_file_path.startswith("spaces://"):
-        return video_asset_row, source_video_url
+    if source_file_path.startswith("spaces://"):
+        source_object_key = source_file_path.removeprefix("spaces://").lstrip("/")
+        if is_spaces_public_read_enabled():
+            source_url = generate_public_object_url(source_object_key)
+        else:
+            source_url = _spaces_download_url_for_object_key(source_object_key)
+        return video_asset_row, source_url
 
     local_path = Path(source_file_path)
     if not local_path.exists():
@@ -421,6 +427,23 @@ def _ensure_source_video_ready_for_runner(
     )
     refreshed_row = repositories.get_video_asset(db, int(video_asset_row["id"]))
     return refreshed_row, str(refreshed_row.get("video_url") or upload_target["video_url"])
+
+
+def _ensure_analysis_uses_source_video(video_path: str, *, video_asset_id: int) -> None:
+    normalized = video_path.replace("\\", "/")
+    if normalized.startswith("spaces://"):
+        object_key = normalized.removeprefix("spaces://").lstrip("/")
+        if "/source/" not in object_key:
+            raise ValueError(
+                f"Video asset {video_asset_id} does not point to a raw source video. "
+                "Refusing to analyze processed output. Re-retrieve the raw video first."
+            )
+        return
+    if "/processed/" in normalized or Path(normalized).stem.endswith("_output"):
+        raise ValueError(
+            f"Video asset {video_asset_id} points to a processed video. "
+            "Refusing to analyze processed output. Re-retrieve the raw video first."
+        )
 
 
 def _write_remote_entry_summaries(
@@ -2387,6 +2410,7 @@ def build_entrance_analysis_job_from_video_asset(db: Session, video_asset_id: in
     video_path = str(video_asset.get("file_path") or "").strip()
     if not video_path:
         raise ValueError(f"Video asset {video_asset_id} does not have a file path.")
+    _ensure_analysis_uses_source_video(video_path, video_asset_id=video_asset_id)
     trigger = repositories.get_trigger(db, int(trigger_id))
     try:
         session = repositories.get_session_by_entry_trigger_id(db, int(trigger_id))
@@ -3041,6 +3065,7 @@ def build_kiosk_analysis_job_from_video_asset(db: Session, video_asset_id: int) 
     video_path = str(video_asset.get("file_path") or "").strip()
     if not video_path:
         raise ValueError(f"Video asset {video_asset_id} does not have a file path.")
+    _ensure_analysis_uses_source_video(video_path, video_asset_id=video_asset_id)
     session_id = repositories.get_primary_session_id_for_video_asset(db, video_asset_id)
     if session_id is None:
         raise ValueError(f"Video asset {video_asset_id} does not have a related session.")
