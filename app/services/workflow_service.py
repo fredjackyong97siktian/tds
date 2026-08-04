@@ -1574,6 +1574,35 @@ def _hydrate_gallery_state_from_session_customer_gallery(
     _write_cross_state_pickle(gallery_state_path, cross_state)
 
 
+def _coerce_datetime_value(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    if value is None:
+        return None
+
+    text_value = str(value).strip()
+    if not text_value:
+        return None
+
+    normalized_value = text_value.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(normalized_value)
+    except ValueError:
+        pass
+
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S.%f",
+        "%d/%m/%Y %H:%M:%S",
+        "%d-%m-%Y %H:%M:%S",
+    ):
+        try:
+            return datetime.strptime(text_value, fmt)
+        except ValueError:
+            continue
+    return None
+
+
 def _build_transaction_window_bounds(
     transaction_time: datetime,
     total_items: int,
@@ -1656,7 +1685,7 @@ def _maybe_close_session_and_prepare_kiosk(
     raw_windows: list[tuple[datetime, datetime]] = []
     transaction_summaries: list[dict[str, Any]] = []
     for transaction in paid_transactions:
-        transaction_time = transaction.get("transaction_time")
+        transaction_time = _coerce_datetime_value(transaction.get("transaction_time"))
         if transaction_time is None:
             continue
         total_items = int(transaction.get("total_items") or 0)
@@ -2794,7 +2823,7 @@ def ensure_kiosk_video_assets_for_session(db: Session, session_id: int) -> list[
         raw_windows: list[tuple[datetime, datetime]] = []
         transaction_summaries: list[dict[str, Any]] = []
         for transaction in paid_transactions:
-            transaction_time = transaction.get("transaction_time")
+            transaction_time = _coerce_datetime_value(transaction.get("transaction_time"))
             if transaction_time is None:
                 continue
             total_items = int(transaction.get("total_items") or 0)
@@ -2888,8 +2917,10 @@ def ensure_kiosk_video_assets_for_session(db: Session, session_id: int) -> list[
             end_value = window.get("end_time")
             if not start_value or not end_value:
                 continue
-            start_time = datetime.fromisoformat(str(start_value).replace("Z", "+00:00"))
-            end_time = datetime.fromisoformat(str(end_value).replace("Z", "+00:00"))
+            start_time = _coerce_datetime_value(start_value)
+            end_time = _coerce_datetime_value(end_value)
+            if start_time is None or end_time is None:
+                continue
             queued = retrieve_kiosk_video_window(
                 db,
                 session_id=session_id,
