@@ -103,7 +103,7 @@ class VideoRetrievalQueued:
 class EntranceAnalysisQueued:
     video_asset_id: int
     trigger_id: int
-    session_id: int
+    session_id: int | None
     location_id: int
     video_path: str
     model_name: str | None = None
@@ -628,7 +628,7 @@ def _finalize_remote_entry_script_run(
         )
     runner_payload = dict(script_run.get("runner_payload") or {})
     script_run_id = int(script_run["id"])
-    session_id = int(script_run["session_id"])
+    session_id = int(script_run["session_id"]) if script_run.get("session_id") is not None else None
     trigger_id = int(script_run["trigger_id"]) if script_run.get("trigger_id") is not None else None
     location_id = int(runner_payload["location_id"])
     video_path = str(runner_payload["video_path"])
@@ -648,8 +648,8 @@ def _finalize_remote_entry_script_run(
         },
     )
     video_asset_row = repositories.get_video_asset(db, video_asset_id)
-    session = repositories.get_session(db, session_id)
     trigger = repositories.get_trigger(db, int(trigger_id)) if trigger_id is not None else None
+    session = repositories.get_session(db, session_id) if session_id is not None else None
 
     remote_status = "success" if remote_result.status == "success" else "failed"
     repositories.finish_script_run(
@@ -710,7 +710,11 @@ def _finalize_remote_entry_script_run(
             video_path=video_path,
             output_dir=output_dir,
             gallery_state_path=gallery_state_path,
-            enter_time=session.get("start_time"),
+            enter_time=(
+                session.get("start_time")
+                if session
+                else (trigger.get("trigger_time") if trigger else video_asset_row.get("captured_start_time"))
+            ),
             leave_time=(trigger.get("trigger_time") if trigger else video_asset_row.get("captured_end_time")),
             captured_start_time=video_asset_row.get("captured_start_time"),
             captured_end_time=video_asset_row.get("captured_end_time"),
@@ -1885,7 +1889,7 @@ def _maybe_close_session_and_prepare_kiosk(
 def _sync_gallery_state_after_entry(
     *,
     location_id: int,
-    session_id: int,
+    session_id: int | None,
     video_asset_id: int,
     exit_trigger_id: int | None,
     video_path: str,
@@ -1932,8 +1936,35 @@ def _sync_gallery_state_after_entry(
     transactional_db = TransactionalSessionLocal()
     vector_db = VectorSessionLocal()
     try:
+        current_entry_session_id = session_id
         sessions_to_close: set[int] = set()
         linked_session_video_keys: set[tuple[int, str]] = set()
+
+        def ensure_entry_session(start_time: datetime | None) -> int:
+            nonlocal current_entry_session_id
+            if current_entry_session_id is not None:
+                return int(current_entry_session_id)
+            session = repositories.create_session(
+                transactional_db,
+                {
+                    "entry_trigger_id": exit_trigger_id,
+                    "exit_trigger_id": None,
+                    "location_id": location_id,
+                    "start_time": start_time,
+                },
+            )
+            current_entry_session_id = int(session["id"])
+            if exit_trigger_id is not None:
+                repositories.update_trigger_status(transactional_db, int(exit_trigger_id), "video_pending")
+            logger.info(
+                "Created session after unmatched entry was confirmed video=%s location_id=%s session_id=%s trigger_id=%s start_time=%s",
+                Path(video_path).name,
+                location_id,
+                current_entry_session_id,
+                exit_trigger_id,
+                start_time,
+            )
+            return current_entry_session_id
 
         def link_session_video_asset(event_session_id: int | None, section: str, metadata: dict[str, Any]) -> None:
             if event_session_id is None:
@@ -2161,9 +2192,10 @@ def _sync_gallery_state_after_entry(
                     source_person_id,
                 )
             else:
+                entry_session_id = ensure_entry_session(customer_enter_time)
                 repositories.create_session_customer(
                     transactional_db,
-                    session_id,
+                    entry_session_id,
                     {
                         "person_id": person_id,
                         "enter_time": customer_enter_time,
@@ -2174,13 +2206,13 @@ def _sync_gallery_state_after_entry(
                 )
                 session_customer = repositories.get_session_customer_by_session_person(
                     transactional_db,
-                    session_id,
+                    entry_session_id,
                     person_id,
                 )
                 session_customer_id = int(session_customer["id"])
-                customer_session_id = session_id
+                customer_session_id = entry_session_id
                 if exited:
-                    sessions_to_close.add(session_id)
+                    sessions_to_close.add(entry_session_id)
                 if entered:
                     link_session_video_asset(
                         customer_session_id,
@@ -2393,8 +2425,6 @@ def _sync_gallery_state_after_entry(
                 # )
                 pass
 
-        if not sessions_to_close:
-            sessions_to_close.add(session_id)
         for close_session_id in sorted(sessions_to_close):
             _maybe_close_session_and_prepare_kiosk(
                 transactional_db,
@@ -2452,7 +2482,7 @@ def _record_followup_failure(
     db: Session,
     *,
     script_run_id: int,
-    session_id: int,
+    session_id: int | None,
     trigger_id: int | None,
     script_name: str,
     model_name: str | None,
@@ -2775,23 +2805,10 @@ def build_entrance_analysis_job_from_video_asset(db: Session, video_asset_id: in
     )
     video_path = str(video_asset.get("file_path") or "").strip()
     _ensure_analysis_uses_source_video(video_path, video_asset_id=video_asset_id)
-    try:
-        session = repositories.get_session_by_entry_trigger_id(db, int(trigger_id))
-    except ValueError:
-        session = repositories.create_session(
-            db,
-            {
-                "entry_trigger_id": int(trigger_id),
-                "exit_trigger_id": None,
-                "location_id": int(trigger["location_id"]),
-                "start_time": trigger.get("trigger_time"),
-            },
-        )
-        repositories.update_trigger_status(db, int(trigger_id), "video_pending")
     return EntranceAnalysisQueued(
         video_asset_id=video_asset_id,
         trigger_id=int(trigger_id),
-        session_id=int(session["id"]),
+        session_id=None,
         location_id=int(trigger["location_id"]),
         video_path=video_path,
         model_name=None,
@@ -3190,15 +3207,17 @@ def run_entry_for_trigger(
     db: Session,
     *,
     trigger_id: int,
-    session_id: int,
+    session_id: int | None = None,
     video_path: str,
     model_name: str | None = None,
     output_dir: str | None = None,
     gallery_state_path: str | None = None,
 ) -> ScriptExecutionResult:
-    session = repositories.get_session(db, session_id)
-    location_id = int(session["location_id"])
-    workdir = build_session_workdir(location_id, session_id)
+    trigger = repositories.get_trigger(db, trigger_id)
+    location_id = int(trigger["location_id"])
+    if session_id is not None:
+        session = repositories.get_session(db, session_id)
+        location_id = int(session["location_id"])
     resolved_output_dir = (
         Path(output_dir)
         if output_dir
