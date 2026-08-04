@@ -295,12 +295,6 @@ def _build_processed_video_upload_target(
 
     run_suffix = datetime.now(UTC).strftime("r%Y%m%d%H%M%S")
     upload_filename = f"{section_name[:1] or 'v'}_{shortened_stem}_{run_suffix}{suffix}"
-    if session_id is not None and trigger_id is not None:
-        upload_filename = f"s{session_id}_t{trigger_id}_{upload_filename}"
-    elif session_id is not None:
-        upload_filename = f"s{session_id}_{upload_filename}"
-    elif trigger_id is not None:
-        upload_filename = f"t{trigger_id}_{upload_filename}"
 
     object_key = processed_video_spaces_key(
         location_id=location_id,
