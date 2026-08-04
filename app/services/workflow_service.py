@@ -604,6 +604,7 @@ def _finalize_remote_entry_script_run(
     )
     video_asset_row = repositories.get_video_asset(db, video_asset_id)
     session = repositories.get_session(db, session_id)
+    trigger = repositories.get_trigger(db, int(trigger_id)) if trigger_id is not None else None
 
     remote_status = "success" if remote_result.status == "success" else "failed"
     repositories.finish_script_run(
@@ -664,7 +665,7 @@ def _finalize_remote_entry_script_run(
             output_dir=output_dir,
             gallery_state_path=gallery_state_path,
             enter_time=session.get("start_time"),
-            leave_time=video_asset_row.get("captured_end_time"),
+            leave_time=(trigger.get("trigger_time") if trigger else video_asset_row.get("captured_end_time")),
             captured_start_time=video_asset_row.get("captured_start_time"),
         )
     except Exception as exc:
@@ -1847,9 +1848,13 @@ def _sync_gallery_state_after_entry(
                 persistent_gallery=persistent_gallery,
                 runtime_person_id=person_id,
             )
-            source_session_id = _coerce_int(gallery_entry.get("session_id"))
-            source_session_customer_id = _coerce_int(gallery_entry.get("session_customer_id"))
-            source_person_id = _coerce_int(gallery_entry.get("person_id"))
+            source_session_id = _coerce_int(customer.get("session_id")) or _coerce_int(gallery_entry.get("session_id"))
+            source_session_customer_id = _coerce_int(customer.get("session_customer_id")) or _coerce_int(gallery_entry.get("session_customer_id"))
+            source_person_id = (
+                _coerce_int(customer.get("matched_person_id"))
+                or _coerce_int(gallery_entry.get("person_id"))
+                or person_id
+            )
             if exited and source_session_customer_id is None:
                 fallback_person_ids = [
                     value
