@@ -440,6 +440,64 @@ def _ensure_analysis_uses_source_video(video_path: str, *, video_asset_id: int) 
         )
 
 
+def _repair_video_asset_source_file_path_for_analysis(
+    db: Session,
+    *,
+    video_asset_row: dict[str, Any],
+    location_id: int,
+    session_id: int | None,
+    trigger_id: int | None,
+) -> dict[str, Any]:
+    file_path = str(video_asset_row.get("file_path") or "").strip()
+    normalized = file_path.replace("\\", "/")
+    if normalized.startswith("spaces://") and "/source/" in normalized:
+        return video_asset_row
+    if normalized and not normalized.startswith("spaces://") and "/processed/" not in normalized and not Path(normalized).stem.endswith("_output"):
+        return video_asset_row
+
+    captured_start = video_asset_row.get("captured_start_time")
+    captured_end = video_asset_row.get("captured_end_time")
+    section = str(video_asset_row.get("section") or "video").strip().lower()
+    if not isinstance(captured_start, datetime) or not isinstance(captured_end, datetime):
+        return video_asset_row
+
+    source_filename = (
+        f"{section}_playback_"
+        f"{_format_dahua_playback_time(captured_start)}_"
+        f"{_format_dahua_playback_time(captured_end)}.mp4"
+    )
+    source_object_key = source_video_spaces_key(
+        location_id=location_id,
+        section=section,
+        filename=source_filename,
+        session_id=session_id,
+        trigger_id=trigger_id,
+    )
+    repaired_file_path = f"spaces://{source_object_key}"
+    repositories.update_video_asset(
+        db,
+        int(video_asset_row["id"]),
+        {
+            "video_url": video_asset_row.get("video_url"),
+            "file_path": repaired_file_path,
+            "captured_start_time": captured_start,
+            "captured_end_time": captured_end,
+            "retrieved_at": video_asset_row.get("retrieved_at"),
+            "analyzed_at": video_asset_row.get("analyzed_at"),
+            "retention_until": video_asset_row.get("retention_until"),
+            "status": video_asset_row.get("status"),
+            "metadata": video_asset_row.get("metadata"),
+        },
+    )
+    logger.warning(
+        "Repaired video_asset source file_path before analysis video_asset_id=%s old_file_path=%s repaired_file_path=%s",
+        video_asset_row.get("id"),
+        file_path,
+        repaired_file_path,
+    )
+    return repositories.get_video_asset(db, int(video_asset_row["id"]))
+
+
 def _write_remote_entry_summaries(
     *,
     video_path: str,
@@ -2404,8 +2462,16 @@ def build_entrance_analysis_job_from_video_asset(db: Session, video_asset_id: in
     video_path = str(video_asset.get("file_path") or "").strip()
     if not video_path:
         raise ValueError(f"Video asset {video_asset_id} does not have a file path.")
-    _ensure_analysis_uses_source_video(video_path, video_asset_id=video_asset_id)
     trigger = repositories.get_trigger(db, int(trigger_id))
+    video_asset = _repair_video_asset_source_file_path_for_analysis(
+        db,
+        video_asset_row=video_asset,
+        location_id=int(trigger["location_id"]),
+        session_id=None,
+        trigger_id=int(trigger_id),
+    )
+    video_path = str(video_asset.get("file_path") or "").strip()
+    _ensure_analysis_uses_source_video(video_path, video_asset_id=video_asset_id)
     try:
         session = repositories.get_session_by_entry_trigger_id(db, int(trigger_id))
     except ValueError:
@@ -3059,11 +3125,19 @@ def build_kiosk_analysis_job_from_video_asset(db: Session, video_asset_id: int) 
     video_path = str(video_asset.get("file_path") or "").strip()
     if not video_path:
         raise ValueError(f"Video asset {video_asset_id} does not have a file path.")
-    _ensure_analysis_uses_source_video(video_path, video_asset_id=video_asset_id)
     session_id = repositories.get_primary_session_id_for_video_asset(db, video_asset_id)
     if session_id is None:
         raise ValueError(f"Video asset {video_asset_id} does not have a related session.")
     session = repositories.get_session(db, session_id)
+    video_asset = _repair_video_asset_source_file_path_for_analysis(
+        db,
+        video_asset_row=video_asset,
+        location_id=int(session["location_id"]),
+        session_id=session_id,
+        trigger_id=None,
+    )
+    video_path = str(video_asset.get("file_path") or "").strip()
+    _ensure_analysis_uses_source_video(video_path, video_asset_id=video_asset_id)
     if str(session.get("status") or "").strip().lower() != "pending":
         raise ValueError(
             f"Video asset {video_asset_id} belongs to session {session_id} with status "
