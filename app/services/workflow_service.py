@@ -1412,7 +1412,10 @@ def _find_open_active_session_for_location(db: Session, location_id: int) -> dic
         if status in {"detected", "not_detected", "closed", "issue", "whitelisted"}:
             continue
         return session
-    return None
+    try:
+        return repositories.get_latest_open_session_by_location(db, location_id)
+    except ValueError:
+        return None
 
 
 def _build_cross_state_from_session_customer_gallery(
