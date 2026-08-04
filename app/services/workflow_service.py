@@ -1813,6 +1813,39 @@ def _sync_gallery_state_after_entry(
     vector_db = VectorSessionLocal()
     try:
         sessions_to_close: set[int] = set()
+        raw_exit_customer_ids = tracking_summary.get("exit_customer") or []
+        if isinstance(raw_exit_customer_ids, list):
+            for raw_session_customer_id in raw_exit_customer_ids:
+                session_customer_id = _coerce_int(raw_session_customer_id)
+                if session_customer_id is None:
+                    continue
+                try:
+                    session_customer = repositories.get_session_customer(
+                        transactional_db,
+                        session_customer_id,
+                    )
+                except ValueError:
+                    logger.warning(
+                        "Tracking summary exit_customer id does not exist video=%s session_customer_id=%s",
+                        Path(video_path).name,
+                        session_customer_id,
+                    )
+                    continue
+                repositories.update_session_customer_leave_time(
+                    transactional_db,
+                    session_customer_id=session_customer_id,
+                    leave_time=leave_time,
+                    match_status="resolved",
+                )
+                sessions_to_close.add(int(session_customer["session_id"]))
+                logger.info(
+                    "Updated session customer from tracking_summary exit_customer video=%s session_id=%s session_customer_id=%s leave_time=%s",
+                    Path(video_path).name,
+                    session_customer.get("session_id"),
+                    session_customer_id,
+                    leave_time,
+                )
+
         for customer in summary_customers:
             person_id = int(customer["person_id"])
             entered = bool(customer.get("entered"))

@@ -1813,6 +1813,23 @@ def get_session_customer_by_session_person(db: Session, session_id: int, person_
     return _fetch_one_dict(result)
 
 
+def get_session_customer(db: Session, session_customer_id: int) -> dict[str, Any]:
+    session_customer_table = _table("session_customer")
+    result = db.execute(
+        text(
+            f"""
+            select id, session_id, person_id, merged_into_session_customer_id, enter_time,
+                   kiosk_start_time, leave_time, match_status, merge_reason, merged_at,
+                   created_at, updated_at
+            from {session_customer_table}
+            where id = :session_customer_id
+            """
+        ),
+        {"session_customer_id": session_customer_id},
+    )
+    return _fetch_one_dict(result)
+
+
 def get_latest_open_session_customer_by_location_person(
     db: Session,
     *,
