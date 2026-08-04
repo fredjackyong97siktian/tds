@@ -209,7 +209,7 @@ CREATE TABLE IF NOT EXISTS sesamedb.tds_session_video_asset (
     is_primary TINYINT(1) NOT NULL DEFAULT 0,
     metadata JSON,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE KEY uq_session_video_asset_session_video (session_id, video_asset_id),
+    UNIQUE KEY uq_session_video_asset_session_video_section (session_id, video_asset_id, section),
     KEY idx_session_video_asset_session_section_sequence (session_id, section, sequence_no),
     KEY idx_session_video_asset_video_asset_id (video_asset_id),
     CONSTRAINT fk_session_video_asset_session
@@ -217,7 +217,7 @@ CREATE TABLE IF NOT EXISTS sesamedb.tds_session_video_asset (
     CONSTRAINT fk_session_video_asset_video_asset
         FOREIGN KEY (video_asset_id) REFERENCES tds_video_asset(id) ON DELETE CASCADE,
     CONSTRAINT chk_session_video_asset_section
-        CHECK (section IN ('entrance', 'kiosk')),
+        CHECK (section IN ('entry', 'exit', 'kiosk')),
     CONSTRAINT chk_session_video_asset_primary
         CHECK (is_primary IN (0, 1))
 );

@@ -660,6 +660,7 @@ def _finalize_remote_entry_script_run(
         _sync_gallery_state_after_entry(
             location_id=location_id,
             session_id=session_id,
+            video_asset_id=video_asset_id,
             exit_trigger_id=trigger_id,
             video_path=video_path,
             output_dir=output_dir,
@@ -667,6 +668,7 @@ def _finalize_remote_entry_script_run(
             enter_time=session.get("start_time"),
             leave_time=(trigger.get("trigger_time") if trigger else video_asset_row.get("captured_end_time")),
             captured_start_time=video_asset_row.get("captured_start_time"),
+            captured_end_time=video_asset_row.get("captured_end_time"),
         )
     except Exception as exc:
         repositories.update_video_asset_status(db, video_asset_id, "issue")
@@ -1797,6 +1799,7 @@ def _sync_gallery_state_after_entry(
     *,
     location_id: int,
     session_id: int,
+    video_asset_id: int,
     exit_trigger_id: int | None,
     video_path: str,
     output_dir: Path,
@@ -1804,6 +1807,7 @@ def _sync_gallery_state_after_entry(
     enter_time: datetime | None,
     leave_time: datetime | None,
     captured_start_time: datetime | None,
+    captured_end_time: datetime | None,
 ) -> None:
     tracking_summary = _load_tracking_summary(video_path, output_dir)
     reid_views_summary = _load_reid_views_summary(video_path, output_dir)
@@ -1842,6 +1846,37 @@ def _sync_gallery_state_after_entry(
     vector_db = VectorSessionLocal()
     try:
         sessions_to_close: set[int] = set()
+        linked_session_video_keys: set[tuple[int, str]] = set()
+
+        def link_session_video_asset(event_session_id: int | None, section: str, metadata: dict[str, Any]) -> None:
+            if event_session_id is None:
+                return
+            normalized_session_id = int(event_session_id)
+            normalized_section = section.strip().lower()
+            if normalized_section not in {"entry", "exit"}:
+                return
+            key = (normalized_session_id, normalized_section)
+            if key in linked_session_video_keys:
+                return
+            repositories.create_session_video_asset_link(
+                transactional_db,
+                normalized_session_id,
+                video_asset_id,
+                {
+                    "link_section": normalized_section,
+                    "link_sequence_no": None,
+                    "clip_start_time": captured_start_time,
+                    "clip_end_time": captured_end_time,
+                    "is_primary": normalized_section == "entry",
+                    "metadata": {
+                        "source": "entry_analysis",
+                        "video": Path(video_path).name,
+                        **metadata,
+                    },
+                },
+            )
+            linked_session_video_keys.add(key)
+
         raw_exit_customer_ids = tracking_summary.get("exit_customer") or []
         if isinstance(raw_exit_customer_ids, list):
             for raw_session_customer_id in raw_exit_customer_ids:
@@ -1867,6 +1902,15 @@ def _sync_gallery_state_after_entry(
                     match_status="resolved",
                 )
                 sessions_to_close.add(int(session_customer["session_id"]))
+                link_session_video_asset(
+                    int(session_customer["session_id"]),
+                    "exit",
+                    {
+                        "session_customer_id": session_customer_id,
+                        "person_id": session_customer.get("person_id"),
+                        "source_event": "tracking_summary.exit_customer",
+                    },
+                )
                 logger.info(
                     "Updated session customer from tracking_summary exit_customer video=%s session_id=%s session_customer_id=%s leave_time=%s",
                     Path(video_path).name,
@@ -1956,6 +2000,16 @@ def _sync_gallery_state_after_entry(
                 session_customer_id = source_session_customer_id
                 customer_session_id = source_session_id or session_id
                 sessions_to_close.add(customer_session_id)
+                link_session_video_asset(
+                    customer_session_id,
+                    "exit",
+                    {
+                        "session_customer_id": session_customer_id,
+                        "person_id": source_person_id,
+                        "runtime_person_id": person_id,
+                        "source_event": "tracking_summary.customers.exited",
+                    },
+                )
             elif exited and not entered:
                 logger.warning(
                     "Exit-only customer had no matching active session; skipping new session_customer creation video=%s location_id=%s runtime_person_id=%s",
@@ -1985,6 +2039,28 @@ def _sync_gallery_state_after_entry(
                 customer_session_id = session_id
                 if exited:
                     sessions_to_close.add(session_id)
+                if entered:
+                    link_session_video_asset(
+                        customer_session_id,
+                        "entry",
+                        {
+                            "session_customer_id": session_customer_id,
+                            "person_id": person_id,
+                            "runtime_person_id": person_id,
+                            "source_event": "tracking_summary.customers.entered",
+                        },
+                    )
+                if exited:
+                    link_session_video_asset(
+                        customer_session_id,
+                        "exit",
+                        {
+                            "session_customer_id": session_customer_id,
+                            "person_id": person_id,
+                            "runtime_person_id": person_id,
+                            "source_event": "tracking_summary.customers.exited",
+                        },
+                    )
 
             active_session_id = source_session_id or customer_session_id
             active_session_customer_id = source_session_customer_id or session_customer_id

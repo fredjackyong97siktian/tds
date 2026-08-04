@@ -176,6 +176,43 @@ def list_customer_gallery_records(
     return _fetch_all_dicts(result)
 
 
+def list_all_customer_gallery_records(
+    db: Session,
+    *,
+    location_id: int | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    if location_id is None:
+        result = db.execute(
+            text(
+                """
+                select id, location_id, session_id, session_customer_id, person_id, image_url, image_kind,
+                       embedding_osnet, embedding_fashion, metadata, created_at
+                from tds_customer_gallery
+                order by created_at desc, id desc
+                limit :limit
+                """
+            ),
+            {"limit": limit},
+        )
+        return _fetch_all_dicts(result)
+
+    result = db.execute(
+        text(
+            """
+            select id, location_id, session_id, session_customer_id, person_id, image_url, image_kind,
+                   embedding_osnet, embedding_fashion, metadata, created_at
+            from tds_customer_gallery
+            where location_id = :location_id
+            order by created_at desc, id desc
+            limit :limit
+            """
+        ),
+        {"location_id": location_id, "limit": limit},
+    )
+    return _fetch_all_dicts(result)
+
+
 def list_customer_gallery_records_for_session_customer(
     db: Session,
     *,

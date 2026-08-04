@@ -43,6 +43,16 @@ def list_customer_gallery(session_id: int, db: Session = Depends(get_vector_db))
     return [CustomerGalleryResponse(**row) for row in rows]
 
 
+@router.get("/customer-gallery", response_model=list[CustomerGalleryResponse])
+def list_all_customer_gallery(
+    location_id: int | None = None,
+    limit: int = 100,
+    db: Session = Depends(get_vector_db),
+) -> list[CustomerGalleryResponse]:
+    rows = vector_repositories.list_all_customer_gallery_records(db, location_id=location_id, limit=limit)
+    return [CustomerGalleryResponse(**row) for row in rows]
+
+
 @router.post("/locations/{location_id}/active-gallery/{session_customer_id}", response_model=ActiveGalleryResponse)
 def create_active_gallery(
     location_id: int,

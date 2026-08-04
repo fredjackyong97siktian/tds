@@ -1440,12 +1440,16 @@ def list_sessions(db: Session, limit: int = 50) -> list[dict[str, Any]]:
     session_table = _table("session")
     session_customer_table = _table("session_customer")
     session_video_asset_table = _table("session_video_asset")
+    location_table = settings.location_table_name
+    location_id_column = settings.location_id_column
+    location_name_column = settings.location_name_column
     result = db.execute(
         text(
             f"""
             select s.id, s.entry_trigger_id, s.exit_trigger_id, s.location_id, s.status,
                    s.start_time, s.end_time, s.total_item_brought, s.actual_items_brought,
                    s.transaction_total_items, s.total_customer, s.issue_reason, s.result_summary,
+                   l.{location_name_column} as location_name,
                    case when s.status in ('issue', 'closed')
                           or (s.status = 'pending' and s.end_time is not null)
                         then true else false end as can_retry,
@@ -1453,11 +1457,13 @@ def list_sessions(db: Session, limit: int = 50) -> list[dict[str, Any]]:
                    count(distinct sc.id) as linked_customer_count,
                    count(distinct sva.id) as linked_video_count
             from {session_table} s
+            left join {location_table} l on l.{location_id_column} = s.location_id
             left join {session_customer_table} sc on sc.session_id = s.id
             left join {session_video_asset_table} sva on sva.session_id = s.id
             group by s.id, s.entry_trigger_id, s.exit_trigger_id, s.location_id, s.status,
                      s.start_time, s.end_time, s.total_item_brought, s.actual_items_brought,
                      s.transaction_total_items, s.total_customer, s.issue_reason, s.result_summary,
+                     l.{location_name_column},
                      can_retry,
                      s.created_at, s.updated_at
             order by s.created_at desc, s.id desc
@@ -1473,6 +1479,7 @@ def list_sessions(db: Session, limit: int = 50) -> list[dict[str, Any]]:
                 row["result_summary"] = json.loads(row["result_summary"])
             except json.JSONDecodeError:
                 pass
+        row["session_videos"] = list_session_video_assets(db, session_id=int(row["id"]))
     return rows
 
 

@@ -147,10 +147,26 @@ class SessionResponse(BaseModel):
     result_summary: dict[str, Any] | None = None
 
 
+class SessionVideoLink(BaseModel):
+    id: int
+    session_id: int
+    video_asset_id: int
+    section: str
+    sequence_no: int | None = None
+    clip_start_time: datetime | None = None
+    clip_end_time: datetime | None = None
+    is_primary: bool = False
+    video_status: str | None = None
+    file_path: str | None = None
+    video_url: str | None = None
+
+
 class SessionListItem(SessionResponse):
+    location_name: str | None = None
     can_retry: bool = False
     linked_customer_count: int = 0
     linked_video_count: int = 0
+    session_videos: list[SessionVideoLink] = []
     created_at: datetime
     updated_at: datetime
 
@@ -175,7 +191,7 @@ class VideoAssetCreate(BaseModel):
     retention_until: datetime | None = None
     status: str = Field(default="not_retrieved", pattern="^(not_retrieved|retrieving|ready|processing|processed|deleted|issue)$")
     trigger_id: int | None = None
-    link_section: str | None = Field(default=None, pattern="^(entrance|kiosk)$")
+    link_section: str | None = Field(default=None, pattern="^(entry|exit|kiosk)$")
     link_sequence_no: int | None = None
     clip_start_time: datetime | None = None
     clip_end_time: datetime | None = None
