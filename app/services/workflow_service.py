@@ -1876,7 +1876,7 @@ def _sync_gallery_state_after_entry(
                 #     session_customer_ids=delete_session_customer_ids,
                 #     person_ids=delete_person_ids,
                 # )
-                continue
+                pass
 
             if view_rows or osnet_views or fashion_embedding is not None or image_paths:
                 # Temporarily keep active gallery rows during session-close testing.
