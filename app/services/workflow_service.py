@@ -1812,7 +1812,6 @@ def _sync_gallery_state_after_entry(
     vector_db = VectorSessionLocal()
     try:
         sessions_to_close: set[int] = set()
-        unmatched_exit_customers: list[tuple[int, datetime | None]] = []
         for customer in summary_customers:
             person_id = int(customer["person_id"])
             entered = bool(customer.get("entered"))
@@ -1891,7 +1890,6 @@ def _sync_gallery_state_after_entry(
                 customer_session_id = source_session_id or session_id
                 sessions_to_close.add(customer_session_id)
             elif exited and not entered:
-                unmatched_exit_customers.append((person_id, customer_leave_time))
                 logger.warning(
                     "Exit-only customer had no matching active session; skipping new session_customer creation video=%s location_id=%s runtime_person_id=%s",
                     Path(video_path).name,
@@ -2092,55 +2090,7 @@ def _sync_gallery_state_after_entry(
                 # )
                 pass
 
-        if unmatched_exit_customers:
-            try:
-                fallback_session = repositories.get_latest_open_session_by_location(transactional_db, location_id)
-                fallback_session_id = int(fallback_session["id"])
-                open_session_customers = [
-                    row
-                    for row in repositories.list_session_customers(transactional_db, fallback_session_id)
-                    if row.get("leave_time") is None
-                ]
-            except ValueError:
-                fallback_session_id = None
-                open_session_customers = []
-
-            if fallback_session_id is not None and open_session_customers and len(unmatched_exit_customers) >= len(open_session_customers):
-                fallback_leave_time = max(
-                    (
-                        candidate_leave_time
-                        for _, candidate_leave_time in unmatched_exit_customers
-                        if candidate_leave_time is not None
-                    ),
-                    default=leave_time,
-                )
-                for open_customer in open_session_customers:
-                    repositories.update_session_customer_leave_time(
-                        transactional_db,
-                        session_customer_id=int(open_customer["id"]),
-                        leave_time=fallback_leave_time,
-                        match_status="resolved",
-                    )
-                sessions_to_close.add(fallback_session_id)
-                logger.warning(
-                    "Resolved unmatched exit customers by closing all open customers in latest session video=%s location_id=%s session_id=%s unmatched_exit_count=%s open_customer_count=%s",
-                    Path(video_path).name,
-                    location_id,
-                    fallback_session_id,
-                    len(unmatched_exit_customers),
-                    len(open_session_customers),
-                )
-            elif fallback_session_id is not None:
-                logger.warning(
-                    "Unmatched exit customers did not cover all open customers; session end_time not updated video=%s location_id=%s session_id=%s unmatched_exit_count=%s open_customer_count=%s",
-                    Path(video_path).name,
-                    location_id,
-                    fallback_session_id,
-                    len(unmatched_exit_customers),
-                    len(open_session_customers),
-                )
-
-        if not sessions_to_close and not unmatched_exit_customers:
+        if not sessions_to_close:
             sessions_to_close.add(session_id)
         for close_session_id in sorted(sessions_to_close):
             _maybe_close_session_and_prepare_kiosk(
