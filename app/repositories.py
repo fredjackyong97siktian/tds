@@ -1278,6 +1278,13 @@ def retry_video_asset_issue(db: Session, video_asset_id: int) -> dict[str, Any]:
             "metadata": video_asset.get("metadata"),
         },
     )
+    if section == "kiosk" and retry_to_status == "ready" and session_id is not None:
+        update_session_fields(
+            db,
+            session_id=int(session_id),
+            status="pending",
+            issue_reason=None,
+        )
     return {
         "ok": True,
         "video_asset_id": video_asset_id,
@@ -1299,6 +1306,7 @@ def restart_video_asset_analysis(db: Session, video_asset_id: int) -> dict[str, 
         raise ValueError("This video asset is already processing.")
     if not (video_asset.get("file_path") or video_asset.get("video_url")):
         raise ValueError("This video asset does not have a source path or URL to analyze.")
+    session_id = get_primary_session_id_for_video_asset(db, video_asset_id) if section == "kiosk" else None
 
     update_video_asset(
         db,
@@ -1315,9 +1323,17 @@ def restart_video_asset_analysis(db: Session, video_asset_id: int) -> dict[str, 
             "metadata": video_asset.get("metadata"),
         },
     )
+    if section == "kiosk" and session_id is not None:
+        update_session_fields(
+            db,
+            session_id=int(session_id),
+            status="pending",
+            issue_reason=None,
+        )
     return {
         "ok": True,
         "video_asset_id": video_asset_id,
+        "session_id": int(session_id) if session_id is not None else None,
         "new_status": "ready",
     }
 
