@@ -725,14 +725,22 @@ def list_triggers(db: Session, limit: int = 50) -> list[dict[str, Any]]:
                        limit 1
                    ) as can_retry,
                    case
-                       when (
+                       when lower(coalesce((
+                           select va.section
+                           from {video_asset_table} va
+                           where va.trigger_id = te.id
+                             and va.status = 'issue'
+                           order by coalesce(va.captured_start_time, va.created_at) desc, va.id desc
+                           limit 1
+                       ), '')) = 'kiosk' then 'ready'
+                       when lower(coalesce((
                            select sr.script_name
                            from {script_run_table} sr
                            where sr.trigger_id = te.id
                              and sr.status = 'failed'
                            order by sr.id desc
                            limit 1
-                       ) = 'entry' then 'ready'
+                       ), '')) in ('entry', 'kiosk') then 'ready'
                        when exists(
                            select 1
                            from {video_asset_table} issue_va
@@ -788,7 +796,7 @@ def retry_trigger_issue(db: Session, trigger_id: int) -> dict[str, Any]:
     if issue_video is None:
         raise ValueError("This trigger does not have an issue video to retry.")
 
-    retry_to_status = "ready" if latest_failed_script and latest_failed_script["script_name"] == "entry" else "not_retrieved"
+    retry_to_status = _issue_video_retry_status(issue_video, latest_failed_script)
     update_video_asset(
         db,
         int(issue_video["id"]),
@@ -811,6 +819,17 @@ def retry_trigger_issue(db: Session, trigger_id: int) -> dict[str, Any]:
         "video_asset_id": int(issue_video["id"]),
         "new_status": retry_to_status,
     }
+
+
+def _issue_video_retry_status(
+    video_asset: Mapping[str, Any],
+    latest_failed_script: Mapping[str, Any] | None,
+) -> str:
+    section = str(video_asset.get("section") or "").strip().lower()
+    script_name = str((latest_failed_script or {}).get("script_name") or "").strip().lower()
+    if section == "kiosk" or script_name in {"entry", "kiosk"}:
+        return "ready"
+    return "not_retrieved"
 
 
 def get_video_asset(db: Session, video_asset_id: int) -> dict[str, Any]:
@@ -1162,14 +1181,15 @@ def list_video_assets(db: Session, limit: int = 50) -> list[dict[str, Any]]:
                    case when va.status = 'issue' then true else false end as can_retry,
                    case
                        when va.status <> 'issue' then null
-                       when (
+                       when lower(coalesce(va.section, '')) = 'kiosk' then 'ready'
+                       when lower(coalesce((
                            select sr.script_name
                            from {script_run_table} sr
                            where sr.trigger_id = va.trigger_id
                              and sr.status = 'failed'
                            order by sr.id desc
                            limit 1
-                       ) = 'entry' then 'ready'
+                       ), '')) in ('entry', 'kiosk') then 'ready'
                        else 'not_retrieved'
                    end as retry_to_status
             from {video_asset_table} va
@@ -1209,7 +1229,7 @@ def retry_video_asset_issue(db: Session, video_asset_id: int) -> dict[str, Any]:
         ),
         {"trigger_id": trigger_id},
     ).mappings().first()
-    retry_to_status = "ready" if latest_failed_script and latest_failed_script["script_name"] == "entry" else "not_retrieved"
+    retry_to_status = _issue_video_retry_status(video_asset, latest_failed_script)
     update_video_asset(
         db,
         video_asset_id,
