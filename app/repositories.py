@@ -1213,22 +1213,55 @@ def retry_video_asset_issue(db: Session, video_asset_id: int) -> dict[str, Any]:
     if str(video_asset.get("status") or "") != "issue":
         raise ValueError("This video asset is not in issue state.")
     trigger_id = video_asset.get("trigger_id")
-    if trigger_id is None:
-        raise ValueError("This video asset is not linked to a trigger.")
-    script_run_table = _table("script_run")
-    latest_failed_script = db.execute(
+    section = str(video_asset.get("section") or "").strip().lower()
+    session_id = None
+    session_video_asset_table = _table("session_video_asset")
+    linked_session = db.execute(
         text(
             f"""
-            select script_name
-            from {script_run_table}
-            where trigger_id = :trigger_id
-              and status = 'failed'
-            order by id desc
+            select session_id
+            from {session_video_asset_table}
+            where video_asset_id = :video_asset_id
+            order by id asc
             limit 1
             """
         ),
-        {"trigger_id": trigger_id},
+        {"video_asset_id": video_asset_id},
     ).mappings().first()
+    if linked_session is not None:
+        session_id = linked_session.get("session_id")
+    if trigger_id is None and session_id is None and section != "kiosk":
+        raise ValueError("This video asset is not linked to a trigger or session.")
+    script_run_table = _table("script_run")
+    latest_failed_script = None
+    if trigger_id is not None:
+        latest_failed_script = db.execute(
+            text(
+                f"""
+                select script_name
+                from {script_run_table}
+                where trigger_id = :trigger_id
+                  and status = 'failed'
+                order by id desc
+                limit 1
+                """
+            ),
+            {"trigger_id": trigger_id},
+        ).mappings().first()
+    elif session_id is not None:
+        latest_failed_script = db.execute(
+            text(
+                f"""
+                select script_name
+                from {script_run_table}
+                where session_id = :session_id
+                  and status = 'failed'
+                order by id desc
+                limit 1
+                """
+            ),
+            {"session_id": session_id},
+        ).mappings().first()
     retry_to_status = _issue_video_retry_status(video_asset, latest_failed_script)
     update_video_asset(
         db,
@@ -1248,7 +1281,8 @@ def retry_video_asset_issue(db: Session, video_asset_id: int) -> dict[str, Any]:
     return {
         "ok": True,
         "video_asset_id": video_asset_id,
-        "trigger_id": int(trigger_id),
+        "trigger_id": int(trigger_id) if trigger_id is not None else None,
+        "session_id": int(session_id) if session_id is not None else None,
         "new_status": retry_to_status,
     }
 
