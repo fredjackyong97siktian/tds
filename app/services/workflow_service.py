@@ -1,6 +1,9 @@
 from __future__ import annotations
+import base64
 import json
 import logging
+import mimetypes
+import os
 import re
 import subprocess
 import time
@@ -8,7 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from os.path import basename, splitext
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
@@ -608,6 +611,156 @@ def _remote_runner_result_from_runpod_body(body: dict[str, Any]) -> tuple[str, R
     )
 
 
+def _extract_json_object(text_value: str) -> dict[str, Any]:
+    text_value = str(text_value or "").strip()
+    if text_value.startswith("```"):
+        text_value = re.sub(r"^```(?:json)?\s*", "", text_value, flags=re.IGNORECASE)
+        text_value = re.sub(r"\s*```$", "", text_value)
+    try:
+        parsed = json.loads(text_value)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+    start = text_value.find("{")
+    end = text_value.rfind("}")
+    if start >= 0 and end > start:
+        parsed = json.loads(text_value[start : end + 1])
+        if isinstance(parsed, dict):
+            return parsed
+    raise ValueError("Gemini response did not contain a JSON object.")
+
+
+def _download_image_for_gemini(image_url: str) -> dict[str, Any]:
+    with urlopen(image_url, timeout=settings.kiosk_gemini_timeout_seconds) as response:
+        payload = response.read()
+        content_type = response.headers.get_content_type()
+    if not content_type or content_type == "application/octet-stream":
+        guessed, _ = mimetypes.guess_type(image_url)
+        content_type = guessed or "image/jpeg"
+    return {
+        "inline_data": {
+            "mime_type": content_type,
+            "data": base64.b64encode(payload).decode("ascii"),
+        }
+    }
+
+
+def _call_kiosk_gemini_summary(*, prompt: str, image_urls: list[str]) -> tuple[dict[str, Any], dict[str, Any]]:
+    api_key = str(settings.gemini_api_key or os.environ.get("GEMINI_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("Gemini API key is not configured in tds_api. Set THEFT_API_GEMINI_API_KEY.")
+    if not image_urls:
+        raise RuntimeError("No kiosk evidence image URLs were returned by the runner.")
+
+    parts: list[dict[str, Any]] = [{"text": prompt}]
+    for image_url in image_urls:
+        parts.append(_download_image_for_gemini(image_url))
+
+    request_body = {
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {"response_mime_type": "application/json"},
+    }
+    url = (
+        f"{str(settings.kiosk_gemini_base_url).rstrip('/')}/models/"
+        f"{settings.kiosk_gemini_model}:generateContent?key={quote(api_key)}"
+    )
+    request = Request(
+        url,
+        data=json.dumps(request_body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=settings.kiosk_gemini_timeout_seconds) as response:
+            raw_body = response.read().decode("utf-8", errors="replace")
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Gemini request failed with HTTP {exc.code}: {detail[:1000]}") from exc
+
+    parsed = json.loads(raw_body)
+    candidates = parsed.get("candidates") or []
+    parts = (((candidates[0] or {}).get("content") or {}).get("parts") or []) if candidates else []
+    text_parts = [str(part.get("text") or "") for part in parts if isinstance(part, dict)]
+    result = _extract_json_object("\n".join(text_parts))
+    return result, {
+        "provider": "tds_api_gemini",
+        "model": settings.kiosk_gemini_model,
+        "image_count": len(image_urls),
+        "raw_usage": parsed.get("usageMetadata") or {},
+    }
+
+
+def _count_items_from_kiosk_vlm_result(result: Mapping[str, Any]) -> int:
+    for key in ("suspected_total_count", "confirmed_visible_count", "total_items_taken_out"):
+        try:
+            value = int(result.get(key) or 0)
+            if value >= 0:
+                return value
+        except (TypeError, ValueError):
+            continue
+    total = 0
+    for item in result.get("customers_left_with_items") or []:
+        if not isinstance(item, Mapping):
+            continue
+        try:
+            total += max(0, int(item.get("carried_out_count") or 0))
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
+def _complete_kiosk_summary_with_tds_gemini(kiosk_summary: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not kiosk_summary:
+        return kiosk_summary
+    groups = kiosk_summary.get("groups")
+    if not isinstance(groups, list):
+        return kiosk_summary
+
+    detected_total = 0
+    completed_groups: list[dict[str, Any]] = []
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        enriched_group = dict(group)
+        prompt = str(enriched_group.get("vlm_prompt") or "").strip()
+        image_urls = [
+            str(url).strip()
+            for url in (enriched_group.get("llm_input_image_urls") or [])
+            if str(url).strip()
+        ]
+        if not image_urls:
+            image_urls = [
+                _spaces_download_url_for_object_key(str(upload["object_key"]))
+                for upload in (enriched_group.get("llm_input_image_uploads") or [])
+                if isinstance(upload, Mapping) and str(upload.get("object_key") or "").strip()
+            ]
+            if image_urls:
+                enriched_group["llm_input_image_urls"] = image_urls
+        if enriched_group.get("vlm_pending") and prompt and not image_urls:
+            raise RuntimeError(
+                f"Kiosk group {enriched_group.get('group_id')} requires TDS Gemini, but runner returned no evidence image URLs or Spaces object keys."
+            )
+        if enriched_group.get("vlm_pending") and prompt and image_urls:
+            vlm_result, vlm_meta = _call_kiosk_gemini_summary(prompt=prompt, image_urls=image_urls)
+            enriched_group["vlm_result"] = vlm_result
+            enriched_group["vlm_meta"] = vlm_meta
+            enriched_group["vlm_pending"] = False
+            kiosk_event_summary = dict(enriched_group.get("kiosk_event_summary") or {})
+            kiosk_event_summary["total_items_taken_out"] = _count_items_from_kiosk_vlm_result(vlm_result)
+            kiosk_event_summary["vlm_result"] = vlm_result
+            enriched_group["kiosk_event_summary"] = kiosk_event_summary
+        detected_total += int((enriched_group.get("kiosk_event_summary") or {}).get("total_items_taken_out") or 0)
+        completed_groups.append(enriched_group)
+
+    return {
+        **kiosk_summary,
+        "groups": completed_groups,
+        "detected_total_items": detected_total,
+        "vlm_completed_by": "tds_api",
+    }
+
+
 def _finalize_remote_entry_script_run(
     db: Session,
     *,
@@ -772,11 +925,40 @@ def _finalize_remote_entry_script_run(
         video_url=processed_video_url,
     )
     session_id = script_run.get("session_id")
-    if session_id is not None and remote_result.kiosk_summary:
+    try:
+        completed_kiosk_summary = _complete_kiosk_summary_with_tds_gemini(remote_result.kiosk_summary)
+    except Exception as exc:
+        repositories.update_video_asset_status(db, video_asset_id, "issue")
+        stderr = f"{result.stderr}\nTDS API Gemini kiosk summary failed: {exc}".strip()
+        repositories.revise_script_run(
+            db,
+            result.script_run_id,
+            status="failed",
+            stdout_log=result.stdout,
+            stderr_log=stderr,
+        )
+        if session_id is not None:
+            repositories.update_session_fields(
+                db,
+                session_id=int(session_id),
+                status="issue",
+                issue_reason=f"TDS API Gemini kiosk summary failed: {exc}",
+            )
+        return ScriptExecutionResult(
+            script_run_id=result.script_run_id,
+            runner_job_id=result.runner_job_id,
+            script_name=result.script_name,
+            model_name=result.model_name,
+            status="failed",
+            command=result.command,
+            stdout=result.stdout,
+            stderr=stderr,
+        )
+    if session_id is not None and completed_kiosk_summary:
         session_row = repositories.get_session(db, int(session_id))
         existing_summary = dict(session_row.get("result_summary") or {})
         kiosk_runs = dict(existing_summary.get("kiosk_runs") or {})
-        kiosk_runs[str(video_asset_id)] = remote_result.kiosk_summary
+        kiosk_runs[str(video_asset_id)] = completed_kiosk_summary
         cumulative_detected_total = sum(
             int(run.get("detected_total_items") or 0)
             for run in kiosk_runs.values()
@@ -932,15 +1114,44 @@ def _finalize_remote_kiosk_script_run(
             stdout=result.stdout,
             stderr=stderr,
         )
-    if session_id is not None and remote_result.kiosk_summary:
-        detected_total_items = int(remote_result.kiosk_summary.get("detected_total_items") or 0)
+    try:
+        completed_kiosk_summary = _complete_kiosk_summary_with_tds_gemini(remote_result.kiosk_summary)
+    except Exception as exc:
+        repositories.update_video_asset_status(db, video_asset_id, "issue")
+        stderr = f"{result.stderr}\nTDS API Gemini kiosk summary failed: {exc}".strip()
+        repositories.revise_script_run(
+            db,
+            result.script_run_id,
+            status="failed",
+            stdout_log=result.stdout,
+            stderr_log=stderr,
+        )
+        if session_id is not None:
+            repositories.update_session_fields(
+                db,
+                session_id=int(session_id),
+                status="issue",
+                issue_reason=f"TDS API Gemini kiosk summary failed: {exc}",
+            )
+        return ScriptExecutionResult(
+            script_run_id=result.script_run_id,
+            runner_job_id=result.runner_job_id,
+            script_name=result.script_name,
+            model_name=result.model_name,
+            status="failed",
+            command=result.command,
+            stdout=result.stdout,
+            stderr=stderr,
+        )
+    if session_id is not None and completed_kiosk_summary:
+        detected_total_items = int(completed_kiosk_summary.get("detected_total_items") or 0)
         repositories.finalize_session_result(
             db,
             session_id=int(session_id),
             kiosk_total_items=detected_total_items,
             tolerance=1,
             extra_result_summary={
-                "kiosk_summary": remote_result.kiosk_summary,
+                "kiosk_summary": completed_kiosk_summary,
             },
         )
     _apply_processed_video_upload_result(

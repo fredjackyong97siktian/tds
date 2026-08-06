@@ -75,6 +75,10 @@ class Settings(BaseSettings):
     paid_transaction_detail_transaction_id_column: str = "receiptNumber"
     paid_transaction_detail_quantity_column: str = "quantity"
     paid_transaction_detail_item_name_column: str = "name"
+    gemini_api_key: str | None = None
+    kiosk_gemini_model: str = "gemini-3-flash-preview"
+    kiosk_gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
+    kiosk_gemini_timeout_seconds: int = 180
 
     model_config = SettingsConfigDict(
         env_prefix="THEFT_API_",
