@@ -2483,6 +2483,13 @@ def _sync_gallery_state_after_entry(
                 if canonical_view and canonical_view.get("image_url")
                 else (image_paths[0] if image_paths else None)
             )
+            canonical_image_public_url = (
+                canonical_view.get("image_public_url")
+                if canonical_view and canonical_view.get("image_public_url")
+                else None
+            )
+            if not canonical_image_public_url and canonical_view and canonical_view.get("image_object_key"):
+                canonical_image_public_url = _spaces_download_url_for_object_key(str(canonical_view["image_object_key"]))
             canonical_osnet = (
                 canonical_view.get("embedding_osnet")
                 if canonical_view
@@ -2493,14 +2500,15 @@ def _sync_gallery_state_after_entry(
                 if canonical_view
                 else fashion_embedding
             )
-            canonical_image_public_url = _upload_customer_gallery_image_to_spaces(
-                canonical_image_url,
-                location_id=location_id,
-                session_id=customer_session_id,
-                session_customer_id=session_customer_id,
-                person_id=active_person_id,
-                output_dir=output_dir,
-            )
+            if not canonical_image_public_url:
+                canonical_image_public_url = _upload_customer_gallery_image_to_spaces(
+                    canonical_image_url,
+                    location_id=location_id,
+                    session_id=customer_session_id,
+                    session_customer_id=session_customer_id,
+                    person_id=active_person_id,
+                    output_dir=output_dir,
+                )
             if (
                 canonical_osnet is not None
                 or canonical_fashion is not None
