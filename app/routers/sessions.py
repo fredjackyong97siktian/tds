@@ -9,6 +9,7 @@ from .. import repositories
 from ..services import workflow_service
 from ..schemas import (
     SessionCreate,
+    SessionCustomerResponse,
     SessionCustomerCreate,
     SessionEndTimeUpdateRequest,
     SessionFinalizeRequest,
@@ -33,6 +34,12 @@ def create_session(payload: SessionCreate, db: Session = Depends(get_transaction
 def list_sessions(limit: int = 50, db: Session = Depends(get_transaction_db)) -> list[SessionListItem]:
     rows = repositories.list_sessions(db, limit=limit)
     return [SessionListItem(**row) for row in rows]
+
+
+@router.get("/{session_id}/customers", response_model=list[SessionCustomerResponse])
+def list_session_customers(session_id: int, db: Session = Depends(get_transaction_db)) -> list[SessionCustomerResponse]:
+    rows = repositories.list_session_customers(db, session_id)
+    return [SessionCustomerResponse(**row) for row in rows]
 
 
 @router.post("/{session_id}/customers")

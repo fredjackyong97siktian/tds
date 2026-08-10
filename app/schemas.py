@@ -187,6 +187,21 @@ class SessionCustomerCreate(BaseModel):
     match_status: str = "tracked"
 
 
+class SessionCustomerResponse(BaseModel):
+    id: int
+    session_id: int
+    person_id: int
+    merged_into_session_customer_id: int | None = None
+    enter_time: datetime | None = None
+    kiosk_start_time: datetime | None = None
+    leave_time: datetime | None = None
+    match_status: str
+    merge_reason: str | None = None
+    merged_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
 class VideoAssetCreate(BaseModel):
     section: str = Field(pattern="^(entrance|kiosk)$")
     video_url: str
