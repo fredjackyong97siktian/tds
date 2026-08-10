@@ -2088,6 +2088,36 @@ def create_session_video_asset_link(db: Session, session_id: int, video_asset_id
                 "video_asset_id": video_asset_id,
             },
         )
+        db.execute(
+            text(
+                f"""
+                delete from {session_video_asset_table}
+                where session_id = :session_id
+                  and section = 'entry'
+                  and video_asset_id = :video_asset_id
+                """
+            ),
+            {
+                "session_id": session_id,
+                "video_asset_id": video_asset_id,
+            },
+        )
+    elif section_value:
+        db.execute(
+            text(
+                f"""
+                delete from {session_video_asset_table}
+                where session_id = :session_id
+                  and video_asset_id = :video_asset_id
+                  and section = :section
+                """
+            ),
+            {
+                "session_id": session_id,
+                "video_asset_id": video_asset_id,
+                "section": section_value,
+            },
+        )
     db.execute(
         text(
             f"""
