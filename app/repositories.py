@@ -2620,7 +2620,7 @@ def finalize_session_result(
     actual_items = kiosk_total_items if actual_items_brought is None else actual_items_brought
     difference = kiosk_total_items - transaction_total_items
 
-    if kiosk_total_items == 0:
+    if kiosk_total_items == 0 or kiosk_total_items < transaction_total_items:
         status = "need_review"
     elif abs(difference) <= max(0, int(tolerance)):
         status = "not_detected"
