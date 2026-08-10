@@ -102,7 +102,7 @@ def list_active_gallery(
     return [ActiveGalleryResponse(**row) for row in rows]
 
 
-@router.post("/locations/{location_id}/active-gallery/clear")
+@router.post("/locations/{location_id}/active-gallery/actions/clear")
 def clear_location_active_gallery(location_id: int, db: Session = Depends(get_vector_db)) -> dict:
     cleared_count = vector_repositories.clear_active_gallery_for_location(db, location_id=location_id)
     return {
