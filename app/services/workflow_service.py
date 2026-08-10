@@ -2385,6 +2385,8 @@ def _sync_gallery_state_after_entry(
     transactional_db = TransactionalSessionLocal()
     vector_db = VectorSessionLocal()
     try:
+        trigger_row = repositories.get_trigger(transactional_db, int(exit_trigger_id)) if exit_trigger_id is not None else None
+        allowed_video_link_section = "entry" if _trigger_has_required_entry_identity(trigger_row) else "exit"
         current_entry_session_id = session_id
         sessions_to_close: set[int] = set()
         linked_session_video_keys: set[tuple[int, str]] = set()
@@ -2393,7 +2395,6 @@ def _sync_gallery_state_after_entry(
             nonlocal current_entry_session_id
             if current_entry_session_id is not None:
                 return int(current_entry_session_id)
-            trigger_row = repositories.get_trigger(transactional_db, int(exit_trigger_id)) if exit_trigger_id is not None else None
             if not _trigger_has_required_entry_identity(trigger_row):
                 raise ValueError(
                     "Cannot create session from entry analysis because trigger_event does not have a matched "
@@ -2427,6 +2428,16 @@ def _sync_gallery_state_after_entry(
             normalized_session_id = int(event_session_id)
             normalized_section = section.strip().lower()
             if normalized_section not in {"entry", "exit"}:
+                return
+            if normalized_section != allowed_video_link_section:
+                logger.info(
+                    "Skipping mixed video section link video=%s location_id=%s session_id=%s requested_section=%s allowed_section=%s",
+                    Path(video_path).name,
+                    location_id,
+                    normalized_session_id,
+                    normalized_section,
+                    allowed_video_link_section,
+                )
                 return
             key = (normalized_session_id, normalized_section)
             if key in linked_session_video_keys:
