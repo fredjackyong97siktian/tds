@@ -2072,6 +2072,22 @@ def update_video_asset(db: Session, video_asset_id: int, payload: Mapping[str, A
 
 def create_session_video_asset_link(db: Session, session_id: int, video_asset_id: int, payload: Mapping[str, Any]) -> None:
     session_video_asset_table = _table("session_video_asset")
+    section_value = str(payload.get("link_section") or payload.get("section") or "").strip().lower()
+    if section_value == "entry":
+        db.execute(
+            text(
+                f"""
+                delete from {session_video_asset_table}
+                where session_id = :session_id
+                  and section = 'entry'
+                  and video_asset_id <> :video_asset_id
+                """
+            ),
+            {
+                "session_id": session_id,
+                "video_asset_id": video_asset_id,
+            },
+        )
     db.execute(
         text(
             f"""
@@ -2093,13 +2109,121 @@ def create_session_video_asset_link(db: Session, session_id: int, video_asset_id
         {
             "session_id": session_id,
             "video_asset_id": video_asset_id,
-            "section": payload.get("link_section") or payload.get("section"),
+            "section": section_value,
             "sequence_no": payload.get("link_sequence_no", payload.get("sequence_no")),
             "clip_start_time": payload.get("clip_start_time"),
             "clip_end_time": payload.get("clip_end_time"),
             "is_primary": 1 if payload.get("is_primary") else 0,
             "metadata": _json_dumps(payload.get("metadata")) if payload.get("metadata") is not None else None,
         },
+    )
+    db.commit()
+
+
+def find_video_asset_by_window(
+    db: Session,
+    *,
+    section: str,
+    location_id: int,
+    start_time: Any,
+    end_time: Any,
+) -> dict[str, Any] | None:
+    video_asset_table = _table("video_asset")
+    trigger_table = _table("trigger_event")
+    session_video_asset_table = _table("session_video_asset")
+    session_table = _table("session")
+    result = db.execute(
+        text(
+            f"""
+            select va.id, va.trigger_id, va.section, va.sequence_no, va.video_url, va.file_path,
+                   va.captured_start_time, va.captured_end_time, va.retrieved_at, va.analyzed_at,
+                   va.retention_until, va.status, va.metadata, va.created_at
+            from {video_asset_table} va
+            left join {trigger_table} te on te.id = va.trigger_id
+            left join {session_video_asset_table} sva on sva.video_asset_id = va.id
+            left join {session_table} s on s.id = sva.session_id
+            where va.section = :section
+              and va.captured_start_time = :start_time
+              and va.captured_end_time = :end_time
+              and coalesce(te.location_id, s.location_id) = :location_id
+              and va.status <> 'deleted'
+            order by va.id asc
+            limit 1
+            """
+        ),
+        {
+            "section": section,
+            "start_time": start_time,
+            "end_time": end_time,
+            "location_id": location_id,
+        },
+    )
+    row = result.mappings().first()
+    if row is None:
+        return None
+    payload = dict(row)
+    if isinstance(payload.get("metadata"), str):
+        try:
+            payload["metadata"] = json.loads(payload["metadata"])
+        except json.JSONDecodeError:
+            pass
+    return payload
+
+
+def list_video_asset_session_links(db: Session, video_asset_id: int) -> list[dict[str, Any]]:
+    session_video_asset_table = _table("session_video_asset")
+    session_table = _table("session")
+    result = db.execute(
+        text(
+            f"""
+            select sva.id, sva.session_id, sva.video_asset_id, sva.section, sva.sequence_no,
+                   sva.clip_start_time, sva.clip_end_time, sva.is_primary, sva.metadata,
+                   s.location_id, s.status as session_status, s.start_time as session_start_time,
+                   s.end_time as session_end_time
+            from {session_video_asset_table} sva
+            join {session_table} s on s.id = sva.session_id
+            where sva.video_asset_id = :video_asset_id
+            order by sva.section asc, sva.is_primary desc, sva.session_id asc, sva.id asc
+            """
+        ),
+        {"video_asset_id": video_asset_id},
+    )
+    rows = _fetch_all_dicts(result)
+    for row in rows:
+        if isinstance(row.get("metadata"), str):
+            try:
+                row["metadata"] = json.loads(row["metadata"])
+            except json.JSONDecodeError:
+                pass
+    return rows
+
+
+def delete_session_video_asset_links_for_video_asset_except(
+    db: Session,
+    *,
+    video_asset_id: int,
+    keep_session_id: int,
+    section: str | None = None,
+) -> None:
+    session_video_asset_table = _table("session_video_asset")
+    params: dict[str, Any] = {
+        "video_asset_id": video_asset_id,
+        "keep_session_id": keep_session_id,
+    }
+    where_section = ""
+    if section is not None:
+        where_section = " and section = :section"
+        params["section"] = section
+    db.execute(
+        text(
+            f"""
+            delete from {session_video_asset_table}
+            where video_asset_id = :video_asset_id
+              and session_id <> :keep_session_id
+              {where_section}
+            """
+        ),
+        params,
     )
     db.commit()
 

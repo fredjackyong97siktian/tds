@@ -49,6 +49,10 @@ from ..storage import (
 UTC = timezone.utc
 SCRIPT_RUN_COMMAND_REDACTED = "[redacted]"
 logger = logging.getLogger("tds.workflow_service")
+KIOSK_OWNERSHIP_SAMPLE_COUNT = 3
+KIOSK_OWNERSHIP_MAX_BOXES_PER_FRAME = 2
+KIOSK_OWNERSHIP_MIN_SCORE = 0.50
+KIOSK_OWNERSHIP_MIN_MARGIN = 0.03
 
 
 @dataclass
@@ -1613,6 +1617,181 @@ def _split_fashion_embedding(value: Any) -> tuple[list[float] | None, list[float
     return combined[:midpoint], combined[midpoint:]
 
 
+_KIOSK_OWNERSHIP_RUNTIME = None
+
+
+def _get_kiosk_ownership_runtime():
+    global _KIOSK_OWNERSHIP_RUNTIME
+    if _KIOSK_OWNERSHIP_RUNTIME is None:
+        from tds_runner.runtime import entry_runtime as ownership_runtime
+
+        _KIOSK_OWNERSHIP_RUNTIME = ownership_runtime
+    return _KIOSK_OWNERSHIP_RUNTIME
+
+
+def _merge_metadata(base: Any, extra: Mapping[str, Any]) -> dict[str, Any]:
+    payload = dict(base) if isinstance(base, Mapping) else {}
+    payload.update(extra)
+    return payload
+
+
+def _load_session_osnet_views(session_id: int) -> list[Any]:
+    vector_db = VectorSessionLocal()
+    try:
+        rows = vector_repositories.list_customer_gallery_records(
+            vector_db,
+            session_id=session_id,
+        )
+    finally:
+        vector_db.close()
+
+    views: list[Any] = []
+    for row in rows:
+        tensor = _float_list_to_tensor(row.get("embedding_osnet"))
+        if tensor is not None:
+            views.append(tensor)
+    return views
+
+
+def _sample_kiosk_video_embeddings(video_path: str) -> list[list[Any]]:
+    import cv2
+
+    runtime = _get_kiosk_ownership_runtime()
+    capture = cv2.VideoCapture(video_path)
+    if not capture.isOpened():
+        return []
+    try:
+        frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        if frame_count <= 0:
+            frame_positions = [0]
+        else:
+            last_index = max(frame_count - 1, 0)
+            frame_positions = sorted(
+                {
+                    min(last_index, max(0, int(round(last_index * ratio))))
+                    for ratio in (0.2, 0.5, 0.8)
+                }
+            )
+        samples: list[list[Any]] = []
+        for frame_index in frame_positions[:KIOSK_OWNERSHIP_SAMPLE_COUNT]:
+            capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                continue
+            try:
+                detections = runtime.yolo_model.predict(
+                    frame,
+                    classes=[0],
+                    conf=0.20,
+                    verbose=False,
+                )
+            except Exception:
+                continue
+            if not detections:
+                continue
+            boxes_obj = getattr(detections[0], "boxes", None)
+            xyxy = getattr(boxes_obj, "xyxy", None)
+            if xyxy is None:
+                continue
+            boxes: list[list[int]] = []
+            for raw_box in xyxy[: max(1, KIOSK_OWNERSHIP_MAX_BOXES_PER_FRAME * 3)]:
+                try:
+                    box = [int(value) for value in raw_box.tolist()]
+                except Exception:
+                    continue
+                boxes.append(box)
+            boxes.sort(
+                key=lambda box: max(0, box[2] - box[0]) * max(0, box[3] - box[1]),
+                reverse=True,
+            )
+            frame_embeddings: list[Any] = []
+            for box in boxes[:KIOSK_OWNERSHIP_MAX_BOXES_PER_FRAME]:
+                try:
+                    emb = runtime.extract_embedding(frame, box)
+                except Exception:
+                    emb = None
+                if emb is not None:
+                    frame_embeddings.append(emb)
+            if frame_embeddings:
+                samples.append(frame_embeddings)
+        return samples
+    finally:
+        capture.release()
+
+
+def _resolve_shared_kiosk_video_session(
+    db: Session,
+    *,
+    video_asset_id: int,
+    video_path: str,
+    session_ids: list[int],
+) -> tuple[int | None, dict[str, Any]]:
+    runtime = _get_kiosk_ownership_runtime()
+    unique_session_ids = list(dict.fromkeys(int(session_id) for session_id in session_ids))
+    details: dict[str, Any] = {
+        "video_asset_id": int(video_asset_id),
+        "candidate_session_ids": unique_session_ids,
+        "method": "local_embedding_vote",
+        "sample_count": 0,
+        "session_scores": {},
+    }
+    if len(unique_session_ids) == 1:
+        chosen_session_id = unique_session_ids[0]
+        details["chosen_session_id"] = chosen_session_id
+        details["reason"] = "single_candidate"
+        return chosen_session_id, details
+
+    frame_samples = _sample_kiosk_video_embeddings(video_path)
+    details["sample_count"] = len(frame_samples)
+    if not frame_samples:
+        details["reason"] = "no_embeddings_from_kiosk_video"
+        return None, details
+
+    score_rows: list[tuple[int, float]] = []
+    for session_id in unique_session_ids:
+        views = _load_session_osnet_views(session_id)
+        if not views:
+            details["session_scores"][str(session_id)] = {
+                "score": 0.0,
+                "view_count": 0,
+            }
+            continue
+        frame_scores: list[float] = []
+        for frame_embeddings in frame_samples:
+            best_frame_score = max(
+                runtime.best_sim_against_views(query_emb, views)
+                for query_emb in frame_embeddings
+            )
+            frame_scores.append(float(best_frame_score))
+        session_score = float(sum(frame_scores) / max(1, len(frame_scores)))
+        details["session_scores"][str(session_id)] = {
+            "score": session_score,
+            "view_count": len(views),
+            "frame_scores": frame_scores,
+        }
+        score_rows.append((session_id, session_score))
+
+    score_rows.sort(key=lambda item: item[1], reverse=True)
+    if not score_rows:
+        details["reason"] = "no_candidate_scores"
+        return None, details
+
+    best_session_id, best_score = score_rows[0]
+    second_score = score_rows[1][1] if len(score_rows) > 1 else 0.0
+    details["best_score"] = best_score
+    details["second_best_score"] = second_score
+    details["score_margin"] = best_score - second_score
+    if best_score < KIOSK_OWNERSHIP_MIN_SCORE:
+        details["reason"] = "best_score_below_threshold"
+        return None, details
+    if len(score_rows) > 1 and (best_score - second_score) < KIOSK_OWNERSHIP_MIN_MARGIN:
+        details["reason"] = "score_margin_too_small"
+        return None, details
+    details["chosen_session_id"] = int(best_session_id)
+    details["reason"] = "resolved"
+    return int(best_session_id), details
+
+
 def _coerce_int(value: Any) -> int | None:
     try:
         return int(value)
@@ -2534,25 +2713,38 @@ def _sync_gallery_state_after_entry(
                     },
                 )
             if exited:
-                # Temporarily keep active gallery rows during session-close testing.
-                # TODO: Re-enable once entrance exit/session matching is verified.
-                # vector_repositories.delete_active_gallery_by_aliases(
-                #     vector_db,
-                #     location_id=location_id,
-                #     session_customer_ids=delete_session_customer_ids,
-                #     person_ids=delete_person_ids,
-                # )
-                pass
+                archived_count = vector_repositories.archive_active_gallery_by_aliases(
+                    vector_db,
+                    location_id=location_id,
+                    session_customer_ids=delete_session_customer_ids,
+                    person_ids=delete_person_ids,
+                    archived_reason="customer_exited",
+                    metadata_extra={
+                        "source": "entry_analysis",
+                        "video": Path(video_path).name,
+                        "session_id": active_session_id,
+                        "session_customer_id": active_session_customer_id,
+                        "person_id": active_person_id,
+                    },
+                )
+                logger.info(
+                    "Archived active gallery rows for exited customer video=%s location_id=%s session_id=%s session_customer_id=%s person_id=%s archived_count=%s",
+                    Path(video_path).name,
+                    location_id,
+                    active_session_id,
+                    active_session_customer_id,
+                    active_person_id,
+                    archived_count,
+                )
+                continue
 
             if view_rows or osnet_views or fashion_embedding is not None or image_paths:
-                # Temporarily keep active gallery rows during session-close testing.
-                # TODO: Re-enable once entrance exit/session matching is verified.
-                # vector_repositories.delete_active_gallery_by_aliases(
-                #     vector_db,
-                #     location_id=location_id,
-                #     session_customer_ids=delete_session_customer_ids,
-                #     person_ids=delete_person_ids,
-                # )
+                vector_repositories.delete_active_gallery_by_aliases(
+                    vector_db,
+                    location_id=location_id,
+                    session_customer_ids=delete_session_customer_ids,
+                    person_ids=delete_person_ids,
+                )
                 active_metadata = {
                     "source": "entry_analysis",
                     "group_id": customer.get("group_id"),
@@ -2634,15 +2826,12 @@ def _sync_gallery_state_after_entry(
                         exited,
                     )
             else:
-                # Temporarily keep active gallery rows during session-close testing.
-                # TODO: Re-enable once entrance exit/session matching is verified.
-                # vector_repositories.delete_active_gallery_by_aliases(
-                #     vector_db,
-                #     location_id=location_id,
-                #     session_customer_ids=delete_session_customer_ids,
-                #     person_ids=delete_person_ids,
-                # )
-                pass
+                vector_repositories.delete_active_gallery_by_aliases(
+                    vector_db,
+                    location_id=location_id,
+                    session_customer_ids=delete_session_customer_ids,
+                    person_ids=delete_person_ids,
+                )
 
         for close_session_id in sorted(sessions_to_close):
             _maybe_close_session_and_prepare_kiosk(
@@ -2837,6 +3026,69 @@ def _prepare_video_retrieval(
     start_time: datetime,
     end_time: datetime,
 ) -> VideoRetrievalQueued:
+    existing_asset = None
+    if section == "kiosk":
+        existing_asset = repositories.find_video_asset_by_window(
+            db,
+            section=section,
+            location_id=location_id,
+            start_time=start_time,
+            end_time=end_time,
+        )
+    if existing_asset is not None:
+        existing_video_asset_id = int(existing_asset["id"])
+        access_url = str(existing_asset.get("video_url") or f"/api/v1/videos/assets/{existing_video_asset_id}/content")
+        if session_id is not None:
+            repositories.create_session_video_asset_link(
+                db,
+                session_id,
+                existing_video_asset_id,
+                {
+                    "section": section,
+                    "sequence_no": None,
+                    "clip_start_time": start_time,
+                    "clip_end_time": end_time,
+                    "is_primary": False,
+                    "metadata": {
+                        "retrieval_source": "shared_existing_video_asset",
+                        "reused_video_asset_id": existing_video_asset_id,
+                    },
+                },
+            )
+        cctv = repositories.get_cctv_by_location_section(db, location_id=location_id, section=section)
+        location = repositories.get_location_endpoint(db, location_id)
+        delayed_seconds = int(cctv.get("delayed_seconds") or 0)
+        adjusted_start_time = start_time - timedelta(seconds=delayed_seconds)
+        adjusted_end_time = end_time - timedelta(seconds=delayed_seconds)
+        rtsp_url = _build_dahua_rtsp_playback_url(
+            host=str(location.get("dahua_host") or "").strip(),
+            username=str(location.get("dahua_username") or "").strip(),
+            password=decrypt_secret(str(location.get("dahua_password_encrypted") or "").strip()),
+            rtsp_port=int(location.get("rtsp_port") or settings.dahua_rtsp_port),
+            channel=str(cctv.get("recorder_channel") or "").strip(),
+            start_time=adjusted_start_time,
+            end_time=adjusted_end_time,
+        )
+        return VideoRetrievalQueued(
+            video_asset_id=existing_video_asset_id,
+            session_id=session_id,
+            trigger_id=trigger_id,
+            location_id=location_id,
+            section=section,
+            requested_start_time=start_time,
+            requested_end_time=end_time,
+            delayed_seconds=delayed_seconds,
+            adjusted_start_time=adjusted_start_time,
+            adjusted_end_time=adjusted_end_time,
+            output_path=str(existing_asset.get("file_path") or ""),
+            rtsp_url=rtsp_url,
+            dahua_host=str(location.get("dahua_host") or "").strip(),
+            dahua_username=str(location.get("dahua_username") or "").strip(),
+            rtsp_port=int(location.get("rtsp_port") or settings.dahua_rtsp_port),
+            status=str(existing_asset.get("status") or "not_retrieved"),
+            video_url=access_url,
+        )
+
     cctv = repositories.get_cctv_by_location_section(db, location_id=location_id, section=section)
     location = repositories.get_location_endpoint(db, location_id)
     channel = str(cctv.get("recorder_channel") or "").strip()
@@ -3666,9 +3918,52 @@ def build_kiosk_analysis_job_from_video_asset(db: Session, video_asset_id: int) 
     video_path = str(video_asset.get("file_path") or "").strip()
     if not video_path:
         raise ValueError(f"Video asset {video_asset_id} does not have a file path.")
-    session_id = repositories.get_primary_session_id_for_video_asset(db, video_asset_id)
-    if session_id is None:
+    session_links = [
+        row
+        for row in repositories.list_video_asset_session_links(db, video_asset_id)
+        if str(row.get("section") or "").strip().lower() == "kiosk"
+        and str(row.get("session_status") or "").strip().lower() == "pending"
+    ]
+    session_ids = [int(row["session_id"]) for row in session_links if row.get("session_id") is not None]
+    session_id: int | None
+    if not session_ids:
         raise ValueError(f"Video asset {video_asset_id} does not have a related session.")
+    if len(dict.fromkeys(session_ids)) > 1:
+        chosen_session_id, ownership_meta = _resolve_shared_kiosk_video_session(
+            db,
+            video_asset_id=video_asset_id,
+            video_path=video_path,
+            session_ids=session_ids,
+        )
+        repositories.update_video_asset(
+            db,
+            video_asset_id,
+            {
+                "video_url": video_asset.get("video_url"),
+                "file_path": video_asset.get("file_path"),
+                "captured_start_time": video_asset.get("captured_start_time"),
+                "captured_end_time": video_asset.get("captured_end_time"),
+                "retrieved_at": video_asset.get("retrieved_at"),
+                "analyzed_at": video_asset.get("analyzed_at"),
+                "retention_until": video_asset.get("retention_until"),
+                "status": video_asset.get("status"),
+                "metadata": _merge_metadata(video_asset.get("metadata"), {"kiosk_ownership_resolution": ownership_meta}),
+            },
+        )
+        if chosen_session_id is None:
+            raise ValueError(
+                f"Video asset {video_asset_id} is linked to multiple pending sessions "
+                f"{sorted(dict.fromkeys(session_ids))}, but ownership is ambiguous."
+            )
+        repositories.delete_session_video_asset_links_for_video_asset_except(
+            db,
+            video_asset_id=video_asset_id,
+            keep_session_id=chosen_session_id,
+            section="kiosk",
+        )
+        session_id = chosen_session_id
+    else:
+        session_id = int(session_ids[0])
     session = repositories.get_session(db, session_id)
     video_asset = _repair_video_asset_source_file_path_for_analysis(
         db,
