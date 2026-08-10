@@ -451,8 +451,8 @@ def archive_active_gallery_by_aliases(
         db.rollback()
         if not _is_history_gallery_permission_error(exc):
             raise
-        logger.warning(
-            "Skipping tds_history_gallery archive because the database user lacks permission; deleting active rows only. "
+        logger.error(
+            "Cannot archive to tds_history_gallery because the database user lacks permission; active rows were preserved. "
             "location_id=%s session_customer_ids=%s person_ids=%s archived_reason=%s error=%s",
             location_id,
             normalized_session_customer_ids,
@@ -460,8 +460,11 @@ def archive_active_gallery_by_aliases(
             archived_reason,
             exc,
         )
-        _delete_active_gallery_by_clauses(db, clauses=clauses, params=params)
-        return 0
+        raise PermissionError(
+            "Permission denied for table tds_history_gallery. "
+            "Grant INSERT, SELECT, UPDATE on tds_history_gallery and USAGE, SELECT on its sequence "
+            "to the application database user before retrying."
+        ) from exc
 
     _delete_active_gallery_by_clauses(db, clauses=clauses, params=params)
     return archived_count
