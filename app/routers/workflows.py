@@ -7,6 +7,7 @@ from ..schemas import (
     KioskRunRequest,
     RetrievalAcceptedResponse,
     RetrievalRequest,
+    ScriptRunDetailResponse,
     ScriptRunResponse,
 )
 from ..services import workflow_service
@@ -49,6 +50,30 @@ def run_kiosk(
         gallery_state_path=payload.gallery_state_path,
     )
     return ScriptRunResponse(**result.__dict__)
+
+
+@router.get("/script-runs/{script_run_id}", response_model=ScriptRunDetailResponse)
+def get_script_run(
+    script_run_id: int,
+    db: Session = Depends(get_transaction_db),
+) -> ScriptRunDetailResponse:
+    try:
+        result = workflow_service.get_script_run_details(db, script_run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return ScriptRunDetailResponse(**result)
+
+
+@router.get("/script-runs/by-runner-job/{runner_job_id}", response_model=ScriptRunDetailResponse)
+def get_script_run_by_runner_job_id(
+    runner_job_id: str,
+    db: Session = Depends(get_transaction_db),
+) -> ScriptRunDetailResponse:
+    try:
+        result = workflow_service.get_script_run_details_by_runner_job_id(db, runner_job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return ScriptRunDetailResponse(**result)
 
 
 @router.post("/sessions/{session_id}/retrieve-kiosk-video", response_model=RetrievalAcceptedResponse, status_code=status.HTTP_202_ACCEPTED)

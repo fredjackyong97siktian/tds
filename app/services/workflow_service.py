@@ -68,6 +68,52 @@ class ScriptExecutionResult:
     message: str | None = None
 
 
+def get_script_run_details(db: Session, script_run_id: int) -> dict[str, Any]:
+    record = repositories.get_script_run(db, script_run_id)
+    if not record:
+        raise ValueError(f"Script run {script_run_id} was not found.")
+    return _build_script_run_details(record)
+
+
+def get_script_run_details_by_runner_job_id(db: Session, runner_job_id: str) -> dict[str, Any]:
+    record = repositories.get_script_run_by_runner_job_id(db, runner_job_id)
+    if not record:
+        raise ValueError(f"Script run with runner job id {runner_job_id} was not found.")
+    return _build_script_run_details(record)
+
+
+def _build_script_run_details(record: Mapping[str, Any]) -> dict[str, Any]:
+    runner_payload = record.get("runner_payload")
+    if not isinstance(runner_payload, dict):
+        runner_payload = {}
+
+    command = record.get("command")
+    if isinstance(command, list):
+        command_list = [str(item) for item in command]
+    elif isinstance(command, str):
+        command_list = [command]
+    else:
+        command_list = []
+
+    return {
+        "script_run_id": int(record["id"]),
+        "session_id": record.get("session_id"),
+        "trigger_id": record.get("trigger_id"),
+        "runner_job_id": record.get("runner_job_id"),
+        "script_name": str(record.get("script_name") or ""),
+        "model_name": record.get("model_name"),
+        "status": str(record.get("status") or ""),
+        "command": command_list,
+        "stdout": str(record.get("stdout_log") or ""),
+        "stderr": str(record.get("stderr_log") or ""),
+        "runner_payload": runner_payload,
+        "log_object_key": runner_payload.get("log_object_key"),
+        "log_url": runner_payload.get("log_url"),
+        "started_at": record.get("started_at"),
+        "finished_at": record.get("finished_at"),
+    }
+
+
 @dataclass
 class VideoRetrievalResult:
     video_asset_id: int | None

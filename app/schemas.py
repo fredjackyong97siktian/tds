@@ -219,6 +219,24 @@ class ScriptRunResponse(BaseModel):
     message: str | None = None
 
 
+class ScriptRunDetailResponse(BaseModel):
+    script_run_id: int
+    session_id: int | None = None
+    trigger_id: int | None = None
+    runner_job_id: str | None = None
+    script_name: str
+    model_name: str | None = None
+    status: str
+    command: list[str]
+    stdout: str
+    stderr: str
+    runner_payload: dict[str, Any] = Field(default_factory=dict)
+    log_object_key: str | None = None
+    log_url: str | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+
+
 class EntryRunRequest(BaseModel):
     video_path: str
     model_name: str | None = None
