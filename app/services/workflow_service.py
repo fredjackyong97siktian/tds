@@ -1883,9 +1883,6 @@ TERMINAL_SESSION_STATUSES = {"detected", "not_detected", "closed", "issue", "whi
 def _trigger_has_required_entry_identity(trigger: Mapping[str, Any] | None) -> bool:
     if not isinstance(trigger, Mapping):
         return False
-    match_status = str(trigger.get("entry_match_status") or "").strip().lower()
-    if match_status != "matched":
-        return False
     if trigger.get("phone_entry_id") is not None:
         return True
     if trigger.get("credit_card_entry_id") is not None:
