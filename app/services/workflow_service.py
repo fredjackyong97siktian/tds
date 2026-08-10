@@ -1880,6 +1880,19 @@ def _resolve_runtime_gallery_entry(
 TERMINAL_SESSION_STATUSES = {"detected", "not_detected", "closed", "issue", "whitelisted"}
 
 
+def _trigger_has_required_entry_identity(trigger: Mapping[str, Any] | None) -> bool:
+    if not isinstance(trigger, Mapping):
+        return False
+    match_status = str(trigger.get("entry_match_status") or "").strip().lower()
+    if match_status != "matched":
+        return False
+    if trigger.get("phone_entry_id") is not None:
+        return True
+    if trigger.get("credit_card_entry_id") is not None:
+        return True
+    return False
+
+
 def _resolve_open_session_customer_for_gallery(
     db: Session,
     *,
@@ -2380,6 +2393,12 @@ def _sync_gallery_state_after_entry(
             nonlocal current_entry_session_id
             if current_entry_session_id is not None:
                 return int(current_entry_session_id)
+            trigger_row = repositories.get_trigger(transactional_db, int(exit_trigger_id)) if exit_trigger_id is not None else None
+            if not _trigger_has_required_entry_identity(trigger_row):
+                raise ValueError(
+                    "Cannot create session from entry analysis because trigger_event does not have a matched "
+                    "phone_entry_id or credit_card_entry_id."
+                )
             session = repositories.create_session(
                 transactional_db,
                 {
@@ -2977,6 +2996,15 @@ def create_trigger_and_session(
         repositories.update_trigger_status(db, trigger["id"], "whitelisted")
         trigger = repositories.get_trigger(db, trigger["id"])
         return {"trigger": trigger, "session": None, "message": "Whitelist hit. Downstream LLM flow can be skipped."}
+
+    if not _trigger_has_required_entry_identity(trigger):
+        repositories.update_trigger_status(db, trigger["id"], "pending")
+        trigger = repositories.get_trigger(db, trigger["id"])
+        return {
+            "trigger": trigger,
+            "session": None,
+            "message": "Trigger created. Session creation blocked until trigger_event has matched phone_entry_id or credit_card_entry_id.",
+        }
 
     if not create_session:
         repositories.update_trigger_status(db, trigger["id"], "pending")

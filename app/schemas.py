@@ -90,12 +90,20 @@ class TriggerCreate(BaseModel):
     aqara_event_id: str | None = None
     trigger_source: str = "aqara"
     trigger_time: datetime
+    phone_entry_id: int | None = None
+    credit_card_entry_id: int | None = None
+    entry_source_type: str = Field(default="unknown", pattern="^(phone|credit_card|app|unknown)$")
+    entry_match_status: str = Field(default="pending", pattern="^(pending|matched|unmatched|not_applicable|ambiguous)$")
     raw_payload: dict[str, Any] | None = None
 
 
 class TriggerResponse(BaseModel):
     id: int
     location_id: int
+    phone_entry_id: int | None = None
+    credit_card_entry_id: int | None = None
+    entry_source_type: str = "unknown"
+    entry_match_status: str = "pending"
     status: str
     trigger_time: datetime
 

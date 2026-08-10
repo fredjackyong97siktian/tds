@@ -594,14 +594,22 @@ def get_trigger(db: Session, trigger_id: int) -> dict[str, Any]:
     result = db.execute(
         text(
             f"""
-            select id, location_id, status, trigger_time
+            select id, location_id, aqara_event_id, trigger_source, trigger_time,
+                   phone_entry_id, credit_card_entry_id, entry_source_type, entry_match_status,
+                   status, whitelist_hit, raw_payload, issue_reason, created_at, updated_at
             from {trigger_table}
             where id = :trigger_id
             """
         ),
         {"trigger_id": trigger_id},
     )
-    return _fetch_one_dict(result)
+    row = _fetch_one_dict(result)
+    if isinstance(row.get("raw_payload"), str):
+        try:
+            row["raw_payload"] = json.loads(row["raw_payload"])
+        except json.JSONDecodeError:
+            pass
+    return row
 
 
 def get_worker_control(db: Session, worker_name: str) -> dict[str, Any]:
@@ -1705,10 +1713,12 @@ def create_trigger(db: Session, payload: Mapping[str, Any]) -> dict[str, Any]:
         text(
             f"""
             insert into {trigger_table} (
-                location_id, aqara_event_id, trigger_source, trigger_time, raw_payload
+                location_id, aqara_event_id, trigger_source, trigger_time,
+                phone_entry_id, credit_card_entry_id, entry_source_type, entry_match_status, raw_payload
             )
             values (
-                :location_id, :aqara_event_id, :trigger_source, :trigger_time, :raw_payload
+                :location_id, :aqara_event_id, :trigger_source, :trigger_time,
+                :phone_entry_id, :credit_card_entry_id, :entry_source_type, :entry_match_status, :raw_payload
             )
             """
         ),
