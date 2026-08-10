@@ -1,9 +1,14 @@
 import json
+import logging
 from collections.abc import Mapping
 from typing import Any
 
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
+
+
+logger = logging.getLogger("tds.vector_repositories")
 
 
 def _fetch_one_dict(result) -> dict[str, Any]:
@@ -22,6 +27,10 @@ def _merge_metadata(base: Any, extra: Mapping[str, Any] | None = None) -> dict[s
     if extra:
         payload.update(dict(extra))
     return payload
+
+
+def _is_history_gallery_permission_error(exc: Exception) -> bool:
+    return "permission denied for table tds_history_gallery" in str(exc).lower()
 
 
 def create_active_gallery_record(
@@ -389,14 +398,11 @@ def archive_active_gallery_by_aliases(
     if not normalized_session_customer_ids and not normalized_person_ids:
         return 0
 
-    clauses = []
-    params: dict[str, Any] = {"location_id": location_id}
-    if normalized_session_customer_ids:
-        clauses.append("session_customer_id = any(:session_customer_ids)")
-        params["session_customer_ids"] = normalized_session_customer_ids
-    if normalized_person_ids:
-        clauses.append("person_id = any(:person_ids)")
-        params["person_ids"] = normalized_person_ids
+    clauses, params = _active_gallery_alias_clauses(
+        location_id=location_id,
+        session_customer_ids=normalized_session_customer_ids,
+        person_ids=normalized_person_ids,
+    )
 
     rows = _fetch_all_dicts(
         db.execute(
@@ -415,30 +421,75 @@ def archive_active_gallery_by_aliases(
     if not rows:
         return 0
 
-    for row in rows:
-        create_history_gallery_record(
-            db,
-            active_gallery_id=int(row["id"]) if row.get("id") is not None else None,
-            location_id=int(row["location_id"]),
-            session_id=int(row["session_id"]) if row.get("session_id") is not None else None,
-            session_customer_id=int(row["session_customer_id"]) if row.get("session_customer_id") is not None else None,
-            person_id=int(row["person_id"]) if row.get("person_id") is not None else None,
-            image_url=row.get("image_url"),
-            image_kind=str(row.get("image_kind") or "reid_view"),
-            embedding_osnet=row.get("embedding_osnet"),
-            embedding_fashion=row.get("embedding_fashion"),
-            metadata=_merge_metadata(
-                row.get("metadata"),
-                {
-                    "archived_reason": archived_reason,
-                    **(dict(metadata_extra) if metadata_extra is not None else {}),
-                },
-            ),
-            archived_reason=archived_reason,
-            created_at=row.get("created_at"),
-            updated_at=row.get("updated_at"),
+    archived_count = 0
+    try:
+        for row in rows:
+            create_history_gallery_record(
+                db,
+                active_gallery_id=int(row["id"]) if row.get("id") is not None else None,
+                location_id=int(row["location_id"]),
+                session_id=int(row["session_id"]) if row.get("session_id") is not None else None,
+                session_customer_id=int(row["session_customer_id"]) if row.get("session_customer_id") is not None else None,
+                person_id=int(row["person_id"]) if row.get("person_id") is not None else None,
+                image_url=row.get("image_url"),
+                image_kind=str(row.get("image_kind") or "reid_view"),
+                embedding_osnet=row.get("embedding_osnet"),
+                embedding_fashion=row.get("embedding_fashion"),
+                metadata=_merge_metadata(
+                    row.get("metadata"),
+                    {
+                        "archived_reason": archived_reason,
+                        **(dict(metadata_extra) if metadata_extra is not None else {}),
+                    },
+                ),
+                archived_reason=archived_reason,
+                created_at=row.get("created_at"),
+                updated_at=row.get("updated_at"),
+            )
+            archived_count += 1
+    except DBAPIError as exc:
+        db.rollback()
+        if not _is_history_gallery_permission_error(exc):
+            raise
+        logger.warning(
+            "Skipping tds_history_gallery archive because the database user lacks permission; deleting active rows only. "
+            "location_id=%s session_customer_ids=%s person_ids=%s archived_reason=%s error=%s",
+            location_id,
+            normalized_session_customer_ids,
+            normalized_person_ids,
+            archived_reason,
+            exc,
         )
+        _delete_active_gallery_by_clauses(db, clauses=clauses, params=params)
+        return 0
 
+    _delete_active_gallery_by_clauses(db, clauses=clauses, params=params)
+    return archived_count
+
+
+def _active_gallery_alias_clauses(
+    *,
+    location_id: int,
+    session_customer_ids: list[int] | None = None,
+    person_ids: list[int] | None = None,
+) -> tuple[list[str], dict[str, Any]]:
+    clauses: list[str] = []
+    params: dict[str, Any] = {"location_id": location_id}
+    if session_customer_ids:
+        clauses.append("session_customer_id = any(:session_customer_ids)")
+        params["session_customer_ids"] = session_customer_ids
+    if person_ids:
+        clauses.append("person_id = any(:person_ids)")
+        params["person_ids"] = person_ids
+    return clauses, params
+
+
+def _delete_active_gallery_by_clauses(
+    db: Session,
+    *,
+    clauses: list[str],
+    params: Mapping[str, Any],
+) -> None:
     db.execute(
         text(
             f"""
@@ -447,10 +498,9 @@ def archive_active_gallery_by_aliases(
               and ({' or '.join(clauses)})
             """
         ),
-        params,
+        dict(params),
     )
     db.commit()
-    return len(rows)
 
 
 def delete_active_gallery(
