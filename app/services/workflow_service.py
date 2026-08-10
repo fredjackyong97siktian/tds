@@ -2386,7 +2386,8 @@ def _sync_gallery_state_after_entry(
     vector_db = VectorSessionLocal()
     try:
         trigger_row = repositories.get_trigger(transactional_db, int(exit_trigger_id)) if exit_trigger_id is not None else None
-        allowed_video_link_section = "entry" if _trigger_has_required_entry_identity(trigger_row) else "exit"
+        can_create_entry_session = _trigger_has_required_entry_identity(trigger_row)
+        allowed_video_link_section = "entry" if can_create_entry_session else "exit"
         current_entry_session_id = session_id
         sessions_to_close: set[int] = set()
         linked_session_video_keys: set[tuple[int, str]] = set()
@@ -2395,7 +2396,7 @@ def _sync_gallery_state_after_entry(
             nonlocal current_entry_session_id
             if current_entry_session_id is not None:
                 return int(current_entry_session_id)
-            if not _trigger_has_required_entry_identity(trigger_row):
+            if not can_create_entry_session:
                 raise ValueError(
                     "Cannot create session from entry analysis because trigger_event does not have a matched "
                     "phone_entry_id or credit_card_entry_id."
@@ -2658,6 +2659,16 @@ def _sync_gallery_state_after_entry(
                     source_person_id,
                 )
             else:
+                if not can_create_entry_session:
+                    logger.info(
+                        "Skipping unmatched entry customer because trigger_event lacks matched phone/card identity "
+                        "video=%s location_id=%s runtime_person_id=%s trigger_id=%s",
+                        Path(video_path).name,
+                        location_id,
+                        person_id,
+                        exit_trigger_id,
+                    )
+                    continue
                 entry_session_id = ensure_entry_session(customer_enter_time)
                 repositories.create_session_customer(
                     transactional_db,
