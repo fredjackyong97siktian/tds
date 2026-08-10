@@ -534,3 +534,37 @@ def delete_active_gallery_by_aliases(
         person_ids=person_ids,
         archived_reason="delete_by_aliases",
     )
+
+
+def clear_active_gallery_for_location(
+    db: Session,
+    *,
+    location_id: int,
+) -> int:
+    rows = list_active_gallery_records(db, location_id=location_id, limit=100000)
+    if not rows:
+        return 0
+
+    session_customer_ids = sorted(
+        {
+            int(row["session_customer_id"])
+            for row in rows
+            if row.get("session_customer_id") is not None
+        }
+    )
+    person_ids = sorted(
+        {
+            int(row["person_id"])
+            for row in rows
+            if row.get("person_id") is not None
+        }
+    )
+
+    return archive_active_gallery_by_aliases(
+        db,
+        location_id=location_id,
+        session_customer_ids=session_customer_ids,
+        person_ids=person_ids,
+        archived_reason="clear_location_active_gallery",
+        metadata_extra={"source": "dashboard_clear_active_gallery"},
+    )
