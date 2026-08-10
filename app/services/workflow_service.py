@@ -3313,11 +3313,17 @@ def build_entrance_analysis_job_from_video_asset(db: Session, video_asset_id: in
     if not video_path:
         raise ValueError(f"Video asset {video_asset_id} does not have a file path.")
     trigger = repositories.get_trigger(db, int(trigger_id))
+    session_id = None
+    try:
+        existing_session = repositories.get_session_by_entry_trigger_id(db, int(trigger_id))
+        session_id = int(existing_session["id"])
+    except ValueError:
+        session_id = None
     video_asset = _repair_video_asset_source_file_path_for_analysis(
         db,
         video_asset_row=video_asset,
         location_id=int(trigger["location_id"]),
-        session_id=None,
+        session_id=session_id,
         trigger_id=int(trigger_id),
     )
     video_path = str(video_asset.get("file_path") or "").strip()
@@ -3325,7 +3331,7 @@ def build_entrance_analysis_job_from_video_asset(db: Session, video_asset_id: in
     return EntranceAnalysisQueued(
         video_asset_id=video_asset_id,
         trigger_id=int(trigger_id),
-        session_id=None,
+        session_id=session_id,
         location_id=int(trigger["location_id"]),
         video_path=video_path,
         model_name=None,
@@ -3732,6 +3738,12 @@ def run_entry_for_trigger(
 ) -> ScriptExecutionResult:
     trigger = repositories.get_trigger(db, trigger_id)
     location_id = int(trigger["location_id"])
+    if session_id is None:
+        try:
+            existing_session = repositories.get_session_by_entry_trigger_id(db, trigger_id)
+            session_id = int(existing_session["id"])
+        except ValueError:
+            session_id = None
     if session_id is not None:
         session = repositories.get_session(db, session_id)
         location_id = int(session["location_id"])
