@@ -88,6 +88,19 @@ def get_script_run_details_by_runner_job_id(db: Session, runner_job_id: str) -> 
     return _build_script_run_details(record)
 
 
+def get_latest_script_run_details_for_session(
+    db: Session,
+    session_id: int,
+    *,
+    script_name: str | None = None,
+) -> dict[str, Any]:
+    record = repositories.get_latest_script_run_for_session(db, session_id, script_name=script_name)
+    if not record:
+        scope = f" and script {script_name}" if script_name else ""
+        raise ValueError(f"Script run for session {session_id}{scope} was not found.")
+    return _build_script_run_details(record)
+
+
 def _build_script_run_details(record: Mapping[str, Any]) -> dict[str, Any]:
     runner_payload = record.get("runner_payload")
     if not isinstance(runner_payload, dict):

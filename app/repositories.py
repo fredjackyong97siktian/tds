@@ -2533,6 +2533,40 @@ def get_script_run_by_runner_job_id(db: Session, runner_job_id: str) -> dict[str
     return row
 
 
+def get_latest_script_run_for_session(
+    db: Session,
+    session_id: int,
+    *,
+    script_name: str | None = None,
+) -> dict[str, Any]:
+    script_run_table = _table("script_run")
+    filters = ["session_id = :session_id"]
+    params: dict[str, Any] = {"session_id": session_id}
+    if script_name:
+        filters.append("script_name = :script_name")
+        params["script_name"] = script_name
+    result = db.execute(
+        text(
+            f"""
+            select id, session_id, trigger_id, script_name, model_name, runner_job_id, runner_payload,
+                   status, command, stdout_log, stderr_log, started_at, finished_at
+            from {script_run_table}
+            where {" and ".join(filters)}
+            order by id desc
+            limit 1
+            """
+        ),
+        params,
+    )
+    row = _fetch_one_dict(result)
+    if isinstance(row.get("runner_payload"), str):
+        try:
+            row["runner_payload"] = json.loads(row["runner_payload"])
+        except json.JSONDecodeError:
+            pass
+    return row
+
+
 def has_active_remote_analysis_script_run(db: Session) -> bool:
     script_run_table = _table("script_run")
     result = db.execute(

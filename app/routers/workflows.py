@@ -76,6 +76,23 @@ def get_script_run_by_runner_job_id(
     return ScriptRunDetailResponse(**result)
 
 
+@router.get("/sessions/{session_id}/script-runs/latest", response_model=ScriptRunDetailResponse)
+def get_latest_script_run_for_session(
+    session_id: int,
+    script_name: str | None = None,
+    db: Session = Depends(get_transaction_db),
+) -> ScriptRunDetailResponse:
+    try:
+        result = workflow_service.get_latest_script_run_details_for_session(
+            db,
+            session_id,
+            script_name=script_name,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return ScriptRunDetailResponse(**result)
+
+
 @router.post("/sessions/{session_id}/retrieve-kiosk-video", response_model=RetrievalAcceptedResponse, status_code=status.HTTP_202_ACCEPTED)
 def retrieve_kiosk_video(
     session_id: int,
