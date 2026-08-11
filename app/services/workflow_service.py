@@ -2417,10 +2417,17 @@ def _build_transaction_window_bounds(
 ) -> tuple[datetime, datetime]:
     extra_seconds = max(0, int(total_items) - 3) * 5
     base_padding_seconds = min(15 + extra_seconds, 40)
-    padding_seconds = base_padding_seconds + max(0, int(settings.kiosk_transaction_extra_padding_seconds))
+    before_padding_seconds = max(
+        0,
+        base_padding_seconds + int(settings.kiosk_transaction_extra_before_seconds),
+    )
+    after_padding_seconds = max(
+        0,
+        base_padding_seconds + int(settings.kiosk_transaction_extra_after_seconds),
+    )
     return (
-        transaction_time - timedelta(seconds=padding_seconds),
-        transaction_time + timedelta(seconds=padding_seconds),
+        transaction_time - timedelta(seconds=before_padding_seconds),
+        transaction_time + timedelta(seconds=after_padding_seconds),
     )
 
 
