@@ -786,14 +786,31 @@ def _complete_kiosk_summary_with_tds_gemini(
     kiosk_summary: dict[str, Any] | None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     if not kiosk_summary:
-        return kiosk_summary, {"provider": "tds_api_gemini", "groups": [], "detected_total_items": 0}
+        return kiosk_summary, {
+            "status": "skipped",
+            "skip_reason": "no_kiosk_summary",
+            "provider": "tds_api_gemini",
+            "groups": [],
+            "detected_total_items": 0,
+        }
     groups = kiosk_summary.get("groups")
     if not isinstance(groups, list):
-        return kiosk_summary, {"provider": "tds_api_gemini", "groups": [], "detected_total_items": 0}
+        return kiosk_summary, {
+            "status": "skipped",
+            "skip_reason": "no_kiosk_groups",
+            "provider": "tds_api_gemini",
+            "groups": [],
+            "detected_total_items": 0,
+        }
 
     detected_total = 0
     completed_groups: list[dict[str, Any]] = []
     diagnostics_groups: list[dict[str, Any]] = []
+    match_diagnostics = (
+        dict(kiosk_summary.get("match_diagnostics") or {})
+        if isinstance(kiosk_summary.get("match_diagnostics"), Mapping)
+        else {}
+    )
     for group in groups:
         if not isinstance(group, dict):
             continue
@@ -859,8 +876,11 @@ def _complete_kiosk_summary_with_tds_gemini(
             kiosk_event_summary["vlm_result"] = vlm_result
             enriched_group["kiosk_event_summary"] = kiosk_event_summary
         else:
+            meta_status = str((enriched_group.get("vlm_meta") or {}).get("status") or "").strip()
             diagnostics_group["status"] = "skipped"
+            diagnostics_group["skip_reason"] = meta_status or "runner_completed_without_tds_gemini"
             diagnostics_group["result"] = (enriched_group.get("kiosk_event_summary") or {}).get("vlm_result")
+            diagnostics_group["meta"] = enriched_group.get("vlm_meta")
         detected_total += int((enriched_group.get("kiosk_event_summary") or {}).get("total_items_taken_out") or 0)
         completed_groups.append(enriched_group)
         diagnostics_group["group_detected_total_items"] = int(
@@ -875,11 +895,37 @@ def _complete_kiosk_summary_with_tds_gemini(
         "vlm_completed_by": "tds_api",
     }
     diagnostics = {
+        "status": "success",
         "provider": "tds_api_gemini",
         "model": settings.kiosk_gemini_model,
         "groups": diagnostics_groups,
         "detected_total_items": detected_total,
+        "match_diagnostics": match_diagnostics,
     }
+    if not completed_groups:
+        diagnostics["status"] = "skipped"
+        diagnostics["skip_reason"] = str(match_diagnostics.get("gemini_skip_reason") or "no_kiosk_groups")
+        diagnostics["message"] = str(
+            match_diagnostics.get("gemini_skip_message")
+            or "Gemini skipped because the kiosk runner produced no groups to summarize."
+        )
+    elif all(str(group.get("status") or "") == "skipped" for group in diagnostics_groups):
+        diagnostics["status"] = "skipped"
+        diagnostics["skip_reason"] = str(
+            match_diagnostics.get("gemini_skip_reason")
+            or next(
+                (
+                    str(group.get("skip_reason") or "")
+                    for group in diagnostics_groups
+                    if str(group.get("skip_reason") or "").strip()
+                ),
+                "runner_skipped_all_groups",
+            )
+        )
+        diagnostics["message"] = str(
+            match_diagnostics.get("gemini_skip_message")
+            or "Gemini skipped because the kiosk runner did not produce usable evidence groups."
+        )
     return completed_summary, diagnostics
 
 
@@ -1258,7 +1304,15 @@ def _finalize_remote_kiosk_script_run(
         )
     try:
         completed_kiosk_summary, gemini_log = _complete_kiosk_summary_with_tds_gemini(remote_result.kiosk_summary)
-        persist_gemini_log({"gemini_log": {"status": "success", **gemini_log}})
+        gemini_status = str(gemini_log.get("status") or "success")
+        persist_gemini_log(
+            {
+                "gemini_log": {
+                    "status": gemini_status,
+                    **{key: value for key, value in gemini_log.items() if key != "status"},
+                }
+            }
+        )
     except GeminiKioskSummaryError as exc:
         persist_gemini_log(
             {
