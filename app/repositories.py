@@ -1601,6 +1601,7 @@ def list_session_customers(db: Session, session_id: int) -> list[dict[str, Any]]
                    created_at, updated_at
             from {session_customer_table}
             where session_id = :session_id
+              and merged_into_session_customer_id is null
             order by person_id asc, id asc
             """
         ),
@@ -1884,6 +1885,29 @@ def create_session_customer(db: Session, session_id: int, payload: Mapping[str, 
     db.commit()
 
 
+def list_session_customers_by_session_person(
+    db: Session,
+    session_id: int,
+    person_id: int,
+) -> list[dict[str, Any]]:
+    session_customer_table = _table("session_customer")
+    result = db.execute(
+        text(
+            f"""
+            select id, session_id, person_id, merged_into_session_customer_id, enter_time,
+                   kiosk_start_time, leave_time, match_status, merge_reason, merged_at,
+                   created_at, updated_at
+            from {session_customer_table}
+            where session_id = :session_id and person_id = :person_id
+            order by case when merged_into_session_customer_id is null then 0 else 1 end asc,
+                     id asc
+            """
+        ),
+        {"session_id": session_id, "person_id": person_id},
+    )
+    return _fetch_all_dicts(result)
+
+
 def get_session_customer_by_session_person(db: Session, session_id: int, person_id: int) -> dict[str, Any]:
     session_customer_table = _table("session_customer")
     result = db.execute(
@@ -1894,6 +1918,9 @@ def get_session_customer_by_session_person(db: Session, session_id: int, person_
                    created_at, updated_at
             from {session_customer_table}
             where session_id = :session_id and person_id = :person_id
+              and merged_into_session_customer_id is null
+            order by id asc
+            limit 1
             """
         ),
         {"session_id": session_id, "person_id": person_id},
@@ -1936,6 +1963,7 @@ def get_latest_open_session_customer_by_location_person(
             join {session_table} s on s.id = sc.session_id
             where s.location_id = :location_id
               and sc.person_id = :person_id
+              and sc.merged_into_session_customer_id is null
               and sc.leave_time is null
               and s.end_time is null
               and s.status not in ('detected', 'not_detected', 'closed', 'issue', 'whitelisted')
@@ -1974,6 +2002,43 @@ def update_session_customer_leave_time(
             "session_customer_id": session_customer_id,
             "leave_time": leave_time,
             "match_status": match_status,
+        },
+    )
+    db.commit()
+
+
+def merge_session_customer_aliases(
+    db: Session,
+    *,
+    canonical_session_customer_id: int,
+    alias_session_customer_ids: list[int],
+    merge_reason: str,
+) -> None:
+    normalized_alias_ids = sorted(
+        {
+            int(value)
+            for value in alias_session_customer_ids
+            if value is not None and int(value) != int(canonical_session_customer_id)
+        }
+    )
+    if not normalized_alias_ids:
+        return
+
+    session_customer_table = _table("session_customer")
+    db.execute(
+        text(
+            f"""
+            update {session_customer_table}
+            set merged_into_session_customer_id = :canonical_session_customer_id,
+                merge_reason = :merge_reason,
+                merged_at = now()
+            where id = any(:alias_session_customer_ids)
+            """
+        ),
+        {
+            "canonical_session_customer_id": canonical_session_customer_id,
+            "alias_session_customer_ids": normalized_alias_ids,
+            "merge_reason": merge_reason,
         },
     )
     db.commit()

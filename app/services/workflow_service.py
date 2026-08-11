@@ -2074,6 +2074,61 @@ def _resolve_open_session_customer_for_gallery(
     return session, session_customer
 
 
+def _canonicalize_session_customer_for_person(
+    transactional_db: Session,
+    vector_db: Session,
+    *,
+    session_id: int,
+    person_id: int,
+    merge_reason: str,
+) -> dict[str, Any]:
+    rows = repositories.list_session_customers_by_session_person(
+        transactional_db,
+        session_id,
+        person_id,
+    )
+    if not rows:
+        raise ValueError(
+            f"Session customer for session_id={session_id} person_id={person_id} was not found."
+        )
+
+    canonical_row = next(
+        (row for row in rows if row.get("merged_into_session_customer_id") is None),
+        rows[0],
+    )
+    alias_ids = [
+        int(row["id"])
+        for row in rows
+        if int(row["id"]) != int(canonical_row["id"])
+    ]
+    if alias_ids:
+        vector_repositories.reassign_session_customer_aliases(
+            vector_db,
+            canonical_session_customer_id=int(canonical_row["id"]),
+            alias_session_customer_ids=alias_ids,
+            person_id=person_id,
+        )
+        repositories.merge_session_customer_aliases(
+            transactional_db,
+            canonical_session_customer_id=int(canonical_row["id"]),
+            alias_session_customer_ids=alias_ids,
+            merge_reason=merge_reason,
+        )
+        canonical_row = repositories.get_session_customer(
+            transactional_db,
+            int(canonical_row["id"]),
+        )
+        logger.info(
+            "Merged duplicate session_customer rows session_id=%s person_id=%s canonical_session_customer_id=%s alias_session_customer_ids=%s reason=%s",
+            session_id,
+            person_id,
+            canonical_row["id"],
+            alias_ids,
+            merge_reason,
+        )
+    return canonical_row
+
+
 def _build_cross_state_from_active_gallery(location_id: int) -> dict[str, Any]:
     vector_db = VectorSessionLocal()
     transactional_db = TransactionalSessionLocal()
@@ -2837,8 +2892,15 @@ def _sync_gallery_state_after_entry(
                     leave_time=customer_leave_time,
                     match_status="resolved",
                 )
-                session_customer_id = source_session_customer_id
                 customer_session_id = source_session_id or session_id
+                session_customer = _canonicalize_session_customer_for_person(
+                    transactional_db,
+                    vector_db,
+                    session_id=int(customer_session_id),
+                    person_id=int(source_person_id or person_id),
+                    merge_reason="duplicate_person_same_session",
+                )
+                session_customer_id = int(session_customer["id"])
                 resolved_exit_session_customer_ids.add(int(session_customer_id))
                 if source_person_id is not None:
                     resolved_exit_person_ids.add(int(source_person_id))
@@ -2862,8 +2924,15 @@ def _sync_gallery_state_after_entry(
                 )
                 continue
             elif entered and source_session_customer_id is not None:
-                session_customer_id = source_session_customer_id
                 customer_session_id = source_session_id or session_id
+                session_customer = _canonicalize_session_customer_for_person(
+                    transactional_db,
+                    vector_db,
+                    session_id=int(customer_session_id),
+                    person_id=int(source_person_id or person_id),
+                    merge_reason="duplicate_person_same_session",
+                )
+                session_customer_id = int(session_customer["id"])
                 logger.info(
                     "Entered customer matched active gallery; not creating a new session customer video=%s location_id=%s runtime_person_id=%s active_session_id=%s active_session_customer_id=%s active_person_id=%s",
                     Path(video_path).name,
@@ -2896,10 +2965,12 @@ def _sync_gallery_state_after_entry(
                         "match_status": "resolved" if exited else "tracked",
                     },
                 )
-                session_customer = repositories.get_session_customer_by_session_person(
+                session_customer = _canonicalize_session_customer_for_person(
                     transactional_db,
-                    entry_session_id,
-                    person_id,
+                    vector_db,
+                    session_id=int(entry_session_id),
+                    person_id=person_id,
+                    merge_reason="duplicate_person_same_session",
                 )
                 session_customer_id = int(session_customer["id"])
                 customer_session_id = entry_session_id

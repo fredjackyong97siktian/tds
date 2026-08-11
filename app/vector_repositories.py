@@ -290,6 +290,63 @@ def delete_customer_gallery_records_for_session_customer(
     db.commit()
 
 
+def reassign_session_customer_aliases(
+    db: Session,
+    *,
+    canonical_session_customer_id: int,
+    alias_session_customer_ids: list[int],
+    person_id: int | None = None,
+) -> None:
+    normalized_alias_ids = sorted(
+        {
+            int(value)
+            for value in alias_session_customer_ids
+            if value is not None and int(value) != int(canonical_session_customer_id)
+        }
+    )
+    if not normalized_alias_ids:
+        return
+
+    params = {
+        "canonical_session_customer_id": canonical_session_customer_id,
+        "alias_session_customer_ids": normalized_alias_ids,
+        "person_id": person_id,
+    }
+    for statement in (
+        """
+        update tds_active_gallery
+        set session_customer_id = :canonical_session_customer_id,
+            person_id = coalesce(:person_id, person_id)
+        where session_customer_id = any(:alias_session_customer_ids)
+        """,
+        """
+        update tds_customer_gallery
+        set session_customer_id = :canonical_session_customer_id,
+            person_id = coalesce(:person_id, person_id)
+        where session_customer_id = any(:alias_session_customer_ids)
+        """,
+        """
+        update tds_history_gallery
+        set session_customer_id = :canonical_session_customer_id,
+            person_id = coalesce(:person_id, person_id)
+        where session_customer_id = any(:alias_session_customer_ids)
+        """,
+    ):
+        try:
+            db.execute(text(statement), params)
+        except DBAPIError as exc:
+            if "tds_history_gallery" not in statement or not _is_history_gallery_permission_error(exc):
+                raise
+            logger.warning(
+                "Could not reassign history gallery aliases because the database user lacks permission; "
+                "canonical_session_customer_id=%s alias_session_customer_ids=%s error=%s",
+                canonical_session_customer_id,
+                normalized_alias_ids,
+                exc,
+            )
+    db.commit()
+
+
 def list_active_gallery_records(
     db: Session,
     *,
