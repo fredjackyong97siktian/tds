@@ -2027,6 +2027,29 @@ def _trigger_has_required_entry_identity(trigger: Mapping[str, Any] | None) -> b
     return False
 
 
+def _get_or_create_session_for_entry_trigger(
+    db: Session,
+    *,
+    entry_trigger_id: int,
+    location_id: int,
+    start_time: datetime | None,
+) -> tuple[dict[str, Any], bool]:
+    try:
+        session = repositories.get_session_by_entry_trigger_id(db, entry_trigger_id)
+        return session, False
+    except ValueError:
+        session = repositories.create_session(
+            db,
+            {
+                "entry_trigger_id": entry_trigger_id,
+                "exit_trigger_id": None,
+                "location_id": location_id,
+                "start_time": start_time,
+            },
+        )
+        return session, True
+
+
 def _resolve_open_session_customer_for_gallery(
     db: Session,
     *,
@@ -2537,26 +2560,32 @@ def _sync_gallery_state_after_entry(
                     "Cannot create session from entry analysis because trigger_event does not have a matched "
                     "phone_entry_id or credit_card_entry_id."
                 )
-            session = repositories.create_session(
+            session, created = _get_or_create_session_for_entry_trigger(
                 transactional_db,
-                {
-                    "entry_trigger_id": exit_trigger_id,
-                    "exit_trigger_id": None,
-                    "location_id": location_id,
-                    "start_time": start_time,
-                },
+                entry_trigger_id=int(exit_trigger_id),
+                location_id=location_id,
+                start_time=start_time,
             )
             current_entry_session_id = int(session["id"])
             if exit_trigger_id is not None:
                 repositories.update_trigger_status(transactional_db, int(exit_trigger_id), "video_pending")
-            logger.info(
-                "Created session after unmatched entry was confirmed video=%s location_id=%s session_id=%s trigger_id=%s start_time=%s",
-                Path(video_path).name,
-                location_id,
-                current_entry_session_id,
-                exit_trigger_id,
-                start_time,
-            )
+            if created:
+                logger.info(
+                    "Created session after unmatched entry was confirmed video=%s location_id=%s session_id=%s trigger_id=%s start_time=%s",
+                    Path(video_path).name,
+                    location_id,
+                    current_entry_session_id,
+                    exit_trigger_id,
+                    start_time,
+                )
+            else:
+                logger.info(
+                    "Reused existing session after unmatched entry was confirmed video=%s location_id=%s session_id=%s trigger_id=%s",
+                    Path(video_path).name,
+                    location_id,
+                    current_entry_session_id,
+                    exit_trigger_id,
+                )
             return current_entry_session_id
 
         def link_session_video_asset(event_session_id: int | None, section: str, metadata: dict[str, Any]) -> None:
@@ -3219,18 +3248,19 @@ def create_trigger_and_session(
         trigger = repositories.get_trigger(db, trigger["id"])
         return {"trigger": trigger, "session": None, "message": "Trigger created. Session creation deferred."}
 
-    session = repositories.create_session(
+    session, created = _get_or_create_session_for_entry_trigger(
         db,
-        {
-            "entry_trigger_id": trigger["id"],
-            "exit_trigger_id": None,
-            "location_id": location_id,
-            "start_time": trigger_time,
-        },
+        entry_trigger_id=int(trigger["id"]),
+        location_id=location_id,
+        start_time=trigger_time,
     )
     repositories.update_trigger_status(db, trigger["id"], "video_pending")
     trigger = repositories.get_trigger(db, trigger["id"])
-    return {"trigger": trigger, "session": session, "message": "Trigger and session created."}
+    return {
+        "trigger": trigger,
+        "session": session,
+        "message": "Trigger and session created." if created else "Trigger updated and existing session reused.",
+    }
 
 
 def _format_dahua_playback_time(value: datetime) -> str:
