@@ -1498,6 +1498,7 @@ def _fetch_runpod_status_with_retries(
             method="GET",
             path=f"/status/{quote(runner_job_id)}",
             kind=script_name,
+            timeout_seconds=settings.runpod_status_timeout_seconds,
         )
         last_body = body
         runpod_status = str(body.get("status") or "").strip().upper()
@@ -1538,6 +1539,7 @@ def reconcile_running_remote_analysis_script_runs(db: Session) -> list[dict[str,
                 method="GET",
                 path=f"/status/{quote(job_id)}",
                 kind=script_name,
+                timeout_seconds=settings.runpod_status_timeout_seconds,
             )
         except Exception:
             continue
@@ -1630,6 +1632,7 @@ def _runpod_request(
     path: str,
     payload: dict[str, Any] | None = None,
     kind: str | None = None,
+    timeout_seconds: int | float | None = None,
 ) -> dict[str, Any]:
     api_key = str(settings.runpod_api_key or "").strip()
     if not api_key:
@@ -1644,8 +1647,13 @@ def _runpod_request(
         },
         method=method,
     )
+    request_timeout = float(
+        timeout_seconds
+        if timeout_seconds is not None
+        else settings.runner_timeout_seconds
+    )
     try:
-        with urlopen(request, timeout=settings.runner_timeout_seconds) as response:
+        with urlopen(request, timeout=request_timeout) as response:
             response_text = response.read().decode("utf-8")
     except HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
@@ -1682,6 +1690,7 @@ def _enqueue_runpod_runner(
             "webhook": _build_runpod_webhook_url(kind),
         },
         kind=kind,
+        timeout_seconds=settings.runpod_enqueue_timeout_seconds,
     )
     job_id = str(enqueue_body.get("id") or "").strip()
     if not job_id:

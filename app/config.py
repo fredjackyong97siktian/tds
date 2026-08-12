@@ -37,6 +37,8 @@ class Settings(BaseSettings):
     spaces_public_base_url: str | None = None
     runner_base_url: str | None = None
     runner_timeout_seconds: int = 7200
+    runpod_enqueue_timeout_seconds: int = 15
+    runpod_status_timeout_seconds: int = 15
     runner_input_key_prefix: str = "runner_inputs"
     runpod_endpoint_id: str | None = None
     runpod_entry_endpoint_id: str | None = None
