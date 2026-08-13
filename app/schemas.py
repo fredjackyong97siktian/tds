@@ -230,6 +230,16 @@ class TransactionCreate(BaseModel):
     raw_payload: dict[str, Any] | None = None
 
 
+class SessionTransactionResponse(BaseModel):
+    id: int
+    session_id: int
+    receipt_number: str
+    transaction_time: datetime | None = None
+    total_items: int = 0
+    total_amount: float | None = None
+    raw_payload: dict[str, Any] | None = None
+
+
 class ScriptRunResponse(BaseModel):
     script_run_id: int | None = None
     runner_job_id: str | None = None

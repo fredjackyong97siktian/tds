@@ -16,6 +16,7 @@ from ..schemas import (
     SessionFinalizeResponse,
     SessionListItem,
     SessionResponse,
+    SessionTransactionResponse,
     TransactionCreate,
 )
 
@@ -40,6 +41,12 @@ def list_sessions(limit: int = 50, db: Session = Depends(get_transaction_db)) ->
 def list_session_customers(session_id: int, db: Session = Depends(get_transaction_db)) -> list[SessionCustomerResponse]:
     rows = repositories.list_session_customers(db, session_id)
     return [SessionCustomerResponse(**row) for row in rows]
+
+
+@router.get("/{session_id}/transactions", response_model=list[SessionTransactionResponse])
+def list_session_transactions(session_id: int, db: Session = Depends(get_transaction_db)) -> list[SessionTransactionResponse]:
+    rows = repositories.list_session_transactions(db, session_id)
+    return [SessionTransactionResponse(**row) for row in rows]
 
 
 @router.post("/{session_id}/customers")

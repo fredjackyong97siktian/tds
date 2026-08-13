@@ -1591,6 +1591,29 @@ def delete_session_transactions(db: Session, session_id: int) -> None:
     db.commit()
 
 
+def list_session_transactions(db: Session, session_id: int) -> list[dict[str, Any]]:
+    transaction_table = _table("session_transaction")
+    result = db.execute(
+        text(
+            f"""
+            select id, session_id, receipt_number, transaction_time, total_items, total_amount, raw_payload
+            from {transaction_table}
+            where session_id = :session_id
+            order by transaction_time asc, id asc
+            """
+        ),
+        {"session_id": session_id},
+    )
+    rows = _fetch_all_dicts(result)
+    for row in rows:
+        if isinstance(row.get("raw_payload"), str):
+            try:
+                row["raw_payload"] = json.loads(row["raw_payload"])
+            except json.JSONDecodeError:
+                pass
+    return rows
+
+
 def list_session_customers(db: Session, session_id: int) -> list[dict[str, Any]]:
     session_customer_table = _table("session_customer")
     result = db.execute(
@@ -2717,9 +2740,10 @@ def finalize_session_result(
     session_table = _table("session")
     transaction_total_items = get_transaction_total_items(db, session_id)
     actual_items = kiosk_total_items if actual_items_brought is None else actual_items_brought
-    difference = kiosk_total_items - transaction_total_items
+    comparison_items = actual_items if actual_items_brought is not None else kiosk_total_items
+    difference = comparison_items - transaction_total_items
 
-    if kiosk_total_items == 0 or kiosk_total_items < transaction_total_items:
+    if comparison_items == 0 or comparison_items < transaction_total_items:
         status = "need_review"
     elif abs(difference) <= max(0, int(tolerance)):
         status = "not_detected"
@@ -2731,6 +2755,7 @@ def finalize_session_result(
         "transaction_total_items": transaction_total_items,
         "actual_items_brought": actual_items,
         "difference": difference,
+        "comparison_items": comparison_items,
         "tolerance": max(0, int(tolerance)),
         "decision": status,
     }
