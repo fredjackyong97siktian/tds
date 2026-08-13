@@ -2134,12 +2134,6 @@ def _resolve_runtime_gallery_entry(
     gallery_entry = persistent_gallery.get(runtime_person_id) or {}
     if gallery_entry:
         return gallery_entry
-
-    # Backward-compatible fallback for older cross-state layouts that may have
-    # stored the same runtime person under a nested person_id field.
-    for entry in persistent_gallery.values():
-        if _coerce_int(entry.get("person_id")) == runtime_person_id:
-            return entry
     return {}
 
 
@@ -2283,11 +2277,7 @@ def _build_cross_state_from_active_gallery(location_id: int) -> dict[str, Any]:
             if active_owner is None:
                 continue
             active_session, active_session_customer = active_owner
-            gallery_id = _coerce_int(row.get("person_id"))
-            if gallery_id is None:
-                gallery_id = _coerce_int(active_session_customer.get("person_id"))
-            if gallery_id is None:
-                continue
+            gallery_id = session_customer_id
 
             next_gid = max(next_gid, gallery_id + 1)
 
@@ -2308,7 +2298,7 @@ def _build_cross_state_from_active_gallery(location_id: int) -> dict[str, Any]:
                     "views": [],
                     "session_id": int(active_session["id"]),
                     "session_customer_id": session_customer_id,
-                    "person_id": gallery_id,
+                    "person_id": _coerce_int(active_session_customer.get("person_id")),
                     "location_id": _coerce_int(row.get("location_id")),
                     "source": "postgresql_active_gallery",
                 },
@@ -2889,7 +2879,6 @@ def _sync_gallery_state_after_entry(
                     vector_db,
                     location_id=location_id,
                     session_customer_ids=[int(session_customer_id)],
-                    person_ids=[exit_person_id] if exit_person_id is not None else None,
                     archived_reason="customer_exited",
                     metadata_extra={
                         "source": "entry_analysis",
@@ -3166,7 +3155,6 @@ def _sync_gallery_state_after_entry(
                 active_session_customer_id = source_session_customer_id or session_customer_id
                 active_person_id = source_person_id or person_id
             delete_session_customer_ids = [active_session_customer_id, session_customer_id]
-            delete_person_ids = [person_id, active_person_id, source_person_id]
 
             vector_repositories.delete_customer_gallery_records_for_session_customer(
                 vector_db,
@@ -3244,7 +3232,6 @@ def _sync_gallery_state_after_entry(
                     vector_db,
                     location_id=location_id,
                     session_customer_ids=delete_session_customer_ids,
-                    person_ids=delete_person_ids,
                     archived_reason="customer_exited",
                     metadata_extra={
                         "source": "entry_analysis",
@@ -3270,7 +3257,6 @@ def _sync_gallery_state_after_entry(
                     vector_db,
                     location_id=location_id,
                     session_customer_ids=delete_session_customer_ids,
-                    person_ids=delete_person_ids,
                 )
                 active_metadata = {
                     "source": "entry_analysis",
