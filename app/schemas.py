@@ -245,6 +245,8 @@ class SessionTransactionDetailResponse(BaseModel):
     session_id: int
     receipt_number: str
     transaction_time: datetime | None = None
+    transaction_total_amount: float | None = None
+    transaction_status: str | None = None
     item_name: str | None = None
     barcode: str | None = None
     quantity: int = 0

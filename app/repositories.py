@@ -1648,6 +1648,8 @@ def list_session_transaction_details(db: Session, session_id: int) -> list[dict[
                     "session_id": int(row["session_id"]),
                     "receipt_number": row.get("receipt_number"),
                     "transaction_time": row.get("transaction_time"),
+                    "transaction_total_amount": row.get("total_amount"),
+                    "transaction_status": _pick_first(raw_payload, "status", "Status", "transaction_status", "transactionStatus"),
                     "item_name": _pick_first(detail, "item_name", "itemName", "name", "product_name", "productName"),
                     "barcode": _pick_first(detail, "barcode", "barCode", "sku", "SKU", "code"),
                     "quantity": max(0, quantity),
