@@ -3353,11 +3353,16 @@ def _sync_gallery_state_after_entry(
                         exited,
                     )
             else:
-                vector_repositories.delete_active_gallery_by_aliases(
-                    vector_db,
-                    location_id=location_id,
-                    session_customer_ids=delete_session_customer_ids,
-                    person_ids=delete_person_ids,
+                logger.info(
+                    "Preserving active gallery because there is no exit event and no fresh embeddings to refresh "
+                    "video=%s location_id=%s session_id=%s session_customer_id=%s person_id=%s entered=%s exited=%s",
+                    Path(video_path).name,
+                    location_id,
+                    active_session_id,
+                    active_session_customer_id,
+                    active_person_id,
+                    entered,
+                    exited,
                 )
 
         for close_session_id in sorted(sessions_to_close):
