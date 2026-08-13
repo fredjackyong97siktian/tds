@@ -2737,6 +2737,7 @@ def _sync_gallery_state_after_entry(
         trigger_row = repositories.get_trigger(transactional_db, int(exit_trigger_id)) if exit_trigger_id is not None else None
         can_create_entry_session = _trigger_has_required_entry_identity(trigger_row)
         allowed_video_link_section = "entry" if can_create_entry_session else "exit"
+        entrance_mode = allowed_video_link_section == "entry"
         current_entry_session_id = session_id
         sessions_to_close: set[int] = set()
         linked_session_video_keys: set[tuple[int, str]] = set()
@@ -2820,7 +2821,14 @@ def _sync_gallery_state_after_entry(
             linked_session_video_keys.add(key)
 
         raw_exit_customer_ids = tracking_summary.get("exit_customer") or []
-        if isinstance(raw_exit_customer_ids, list):
+        if entrance_mode and raw_exit_customer_ids:
+            logger.info(
+                "Ignoring exit_customer ids from entrance analysis video=%s location_id=%s exit_customer_ids=%s",
+                Path(video_path).name,
+                location_id,
+                raw_exit_customer_ids,
+            )
+        if not entrance_mode and isinstance(raw_exit_customer_ids, list):
             for raw_session_customer_id in raw_exit_customer_ids:
                 session_customer_id = _coerce_int(raw_session_customer_id)
                 if session_customer_id is None:
@@ -2906,6 +2914,15 @@ def _sync_gallery_state_after_entry(
             person_id = int(customer["person_id"])
             entered = bool(customer.get("entered"))
             exited = bool(customer.get("exited"))
+            if entrance_mode and exited:
+                logger.info(
+                    "Ignoring exited flag from entrance analysis video=%s location_id=%s runtime_person_id=%s group_id=%s",
+                    Path(video_path).name,
+                    location_id,
+                    person_id,
+                    customer.get("group_id"),
+                )
+                exited = False
             view_rows = reid_views_by_person.get(person_id) or []
             if not entered and not exited and not view_rows:
                 continue
