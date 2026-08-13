@@ -240,6 +240,19 @@ class SessionTransactionResponse(BaseModel):
     raw_payload: dict[str, Any] | None = None
 
 
+class SessionTransactionDetailResponse(BaseModel):
+    session_transaction_id: int
+    session_id: int
+    receipt_number: str
+    transaction_time: datetime | None = None
+    item_name: str | None = None
+    barcode: str | None = None
+    quantity: int = 0
+    price: float | None = None
+    subtotal: float | None = None
+    raw_payload: dict[str, Any] | None = None
+
+
 class ScriptRunResponse(BaseModel):
     script_run_id: int | None = None
     runner_job_id: str | None = None

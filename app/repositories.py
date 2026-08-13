@@ -1614,6 +1614,51 @@ def list_session_transactions(db: Session, session_id: int) -> list[dict[str, An
     return rows
 
 
+def list_session_transaction_details(db: Session, session_id: int) -> list[dict[str, Any]]:
+    rows = list_session_transactions(db, session_id)
+    payload: list[dict[str, Any]] = []
+    for row in rows:
+        raw_payload = row.get("raw_payload") or {}
+        details = raw_payload.get("details") if isinstance(raw_payload, Mapping) else None
+        if not isinstance(details, list):
+            continue
+        for detail in details:
+            if not isinstance(detail, Mapping):
+                continue
+            quantity_value = _pick_first(detail, "quantity", "qty")
+            try:
+                quantity = int(quantity_value or 0)
+            except (TypeError, ValueError):
+                quantity = 0
+            price_value = _pick_first(detail, "price", "unit_price", "unitPrice", "sellingPrice", "priceAmount")
+            try:
+                price = float(price_value) if price_value is not None else None
+            except (TypeError, ValueError):
+                price = None
+            subtotal_value = _pick_first(detail, "subtotal", "subTotal", "total", "line_total", "lineTotal")
+            try:
+                subtotal = float(subtotal_value) if subtotal_value is not None else None
+            except (TypeError, ValueError):
+                subtotal = None
+            if subtotal is None and price is not None:
+                subtotal = float(price) * max(0, quantity)
+            payload.append(
+                {
+                    "session_transaction_id": int(row["id"]),
+                    "session_id": int(row["session_id"]),
+                    "receipt_number": row.get("receipt_number"),
+                    "transaction_time": row.get("transaction_time"),
+                    "item_name": _pick_first(detail, "item_name", "itemName", "name", "product_name", "productName"),
+                    "barcode": _pick_first(detail, "barcode", "barCode", "sku", "SKU", "code"),
+                    "quantity": max(0, quantity),
+                    "price": price,
+                    "subtotal": subtotal,
+                    "raw_payload": dict(detail),
+                }
+            )
+    return payload
+
+
 def list_session_customers(db: Session, session_id: int) -> list[dict[str, Any]]:
     session_customer_table = _table("session_customer")
     result = db.execute(
