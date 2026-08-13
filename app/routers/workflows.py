@@ -7,6 +7,7 @@ from ..schemas import (
     KioskRunRequest,
     RetrievalAcceptedResponse,
     RetrievalRequest,
+    SessionPipelineLogResponse,
     ScriptRunDetailResponse,
     ScriptRunResponse,
 )
@@ -91,6 +92,18 @@ def get_latest_script_run_for_session(
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return ScriptRunDetailResponse(**result)
+
+
+@router.get("/sessions/{session_id}/pipeline-log", response_model=SessionPipelineLogResponse)
+def get_session_pipeline_log(
+    session_id: int,
+    db: Session = Depends(get_transaction_db),
+) -> SessionPipelineLogResponse:
+    try:
+        result = workflow_service.get_session_pipeline_log_details(db, session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return SessionPipelineLogResponse(**result)
 
 
 @router.post("/sessions/{session_id}/retrieve-kiosk-video", response_model=RetrievalAcceptedResponse, status_code=status.HTTP_202_ACCEPTED)

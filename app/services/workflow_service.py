@@ -101,6 +101,62 @@ def get_latest_script_run_details_for_session(
     return _build_script_run_details(record)
 
 
+def get_session_pipeline_log_details(db: Session, session_id: int) -> dict[str, Any]:
+    session = repositories.get_session(db, session_id)
+    session_videos = repositories.list_session_video_assets(db, session_id=session_id)
+
+    entry_videos = [row for row in session_videos if str(row.get("section") or "").strip().lower() == "entry"]
+    kiosk_videos = [row for row in session_videos if str(row.get("section") or "").strip().lower() == "kiosk"]
+    exit_videos = [row for row in session_videos if str(row.get("section") or "").strip().lower() == "exit"]
+
+    entry_run = None
+    entry_trigger_id = session.get("entry_trigger_id")
+    if entry_trigger_id is not None:
+        try:
+            entry_record = repositories.get_latest_script_run_for_trigger(db, int(entry_trigger_id), script_name="entry")
+        except ValueError:
+            entry_record = {}
+        if entry_record:
+            entry_run = _build_script_run_details(entry_record)
+
+    kiosk_run = None
+    try:
+        kiosk_record = repositories.get_latest_script_run_for_session(db, session_id, script_name="kiosk")
+    except ValueError:
+        kiosk_record = {}
+    if kiosk_record:
+        kiosk_run = _build_script_run_details(kiosk_record)
+
+    exit_run = None
+    exit_trigger_id = session.get("exit_trigger_id")
+    if exit_trigger_id is not None:
+        try:
+            exit_record = repositories.get_latest_script_run_for_trigger(db, int(exit_trigger_id), script_name="retrieve_video")
+        except ValueError:
+            exit_record = {}
+        if exit_record:
+            exit_run = _build_script_run_details(exit_record)
+
+    return {
+        "session_id": session_id,
+        "entry": {
+            "label": "Entry",
+            "script_run": entry_run,
+            "video_assets": entry_videos,
+        },
+        "kiosk": {
+            "label": "Kiosk",
+            "script_run": kiosk_run,
+            "video_assets": kiosk_videos,
+        },
+        "exit": {
+            "label": "Exit",
+            "script_run": exit_run,
+            "video_assets": exit_videos,
+        },
+    }
+
+
 def _build_script_run_details(record: Mapping[str, Any]) -> dict[str, Any]:
     runner_payload = record.get("runner_payload")
     if not isinstance(runner_payload, dict):

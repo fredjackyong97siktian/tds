@@ -285,6 +285,19 @@ class ScriptRunDetailResponse(BaseModel):
     finished_at: datetime | None = None
 
 
+class SessionPipelineLogSectionResponse(BaseModel):
+    label: str
+    script_run: ScriptRunDetailResponse | None = None
+    video_assets: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class SessionPipelineLogResponse(BaseModel):
+    session_id: int
+    entry: SessionPipelineLogSectionResponse
+    kiosk: SessionPipelineLogSectionResponse
+    exit: SessionPipelineLogSectionResponse
+
+
 class EntryRunRequest(BaseModel):
     video_path: str
     model_name: str | None = None
