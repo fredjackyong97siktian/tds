@@ -3450,7 +3450,7 @@ def create_trigger_and_session(
         db,
         entry_trigger_id=int(trigger["id"]),
         location_id=location_id,
-        start_time=trigger_time,
+        start_time=trigger_time - timedelta(seconds=int(settings.entrance_trigger_extra_before_seconds)),
     )
     repositories.update_trigger_status(db, trigger["id"], "video_pending")
     trigger = repositories.get_trigger(db, trigger["id"])

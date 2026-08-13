@@ -55,6 +55,7 @@ class Settings(BaseSettings):
     kiosk_analysis_poll_seconds: int = 10
     kiosk_analysis_max_global_workers: int = 1
     kiosk_analysis_cooldown_seconds: int = 10
+    entrance_trigger_extra_before_seconds: int = 10
     kiosk_transaction_extra_before_seconds: int = 10
     kiosk_transaction_extra_after_seconds: int = -10
     whitelist_qrentry_table_name: str = "phonenumber"
