@@ -1625,17 +1625,38 @@ def list_session_transaction_details(db: Session, session_id: int) -> list[dict[
         for detail in details:
             if not isinstance(detail, Mapping):
                 continue
+            detail_payload = detail.get("raw_payload") if isinstance(detail.get("raw_payload"), Mapping) else {}
             quantity_value = _pick_first(detail, "quantity", "qty")
+            if quantity_value is None:
+                quantity_value = _pick_first(detail_payload, "quantity", "qty")
             try:
                 quantity = int(quantity_value or 0)
             except (TypeError, ValueError):
                 quantity = 0
             price_value = _pick_first(detail, "price", "unit_price", "unitPrice", "sellingPrice", "priceAmount")
+            if price_value is None:
+                price_value = _pick_first(
+                    detail_payload,
+                    "price",
+                    "unit_price",
+                    "unitPrice",
+                    "sellingPrice",
+                    "priceAmount",
+                )
             try:
                 price = float(price_value) if price_value is not None else None
             except (TypeError, ValueError):
                 price = None
             subtotal_value = _pick_first(detail, "subtotal", "subTotal", "total", "line_total", "lineTotal")
+            if subtotal_value is None:
+                subtotal_value = _pick_first(
+                    detail_payload,
+                    "subtotal",
+                    "subTotal",
+                    "total",
+                    "line_total",
+                    "lineTotal",
+                )
             try:
                 subtotal = float(subtotal_value) if subtotal_value is not None else None
             except (TypeError, ValueError):
@@ -1649,9 +1670,34 @@ def list_session_transaction_details(db: Session, session_id: int) -> list[dict[
                     "receipt_number": row.get("receipt_number"),
                     "transaction_time": row.get("transaction_time"),
                     "transaction_total_amount": row.get("total_amount"),
-                    "transaction_status": _pick_first(raw_payload, "status", "Status", "transaction_status", "transactionStatus"),
-                    "item_name": _pick_first(detail, "item_name", "itemName", "name", "product_name", "productName"),
-                    "barcode": _pick_first(detail, "barcode", "barCode", "sku", "SKU", "code"),
+                    "transaction_status": _pick_first(
+                        raw_payload,
+                        "status",
+                        "Status",
+                        "transaction_status",
+                        "transactionStatus",
+                    )
+                    or settings.paid_transaction_status_value,
+                    "item_name": _pick_first(
+                        detail,
+                        "item_name",
+                        "itemName",
+                        "name",
+                        "text",
+                        "product_name",
+                        "productName",
+                    )
+                    or _pick_first(
+                        detail_payload,
+                        "item_name",
+                        "itemName",
+                        "name",
+                        "text",
+                        "product_name",
+                        "productName",
+                    ),
+                    "barcode": _pick_first(detail, "barcode", "barCode", "sku", "SKU", "code")
+                    or _pick_first(detail_payload, "barcode", "barCode", "sku", "SKU", "code"),
                     "quantity": max(0, quantity),
                     "price": price,
                     "subtotal": subtotal,
@@ -1759,7 +1805,26 @@ def list_paid_transactions_for_session_window(
             normalized_details.append(
                 {
                     "quantity": max(0, quantity),
-                    "item_name": detail.get(settings.paid_transaction_detail_item_name_column),
+                    "item_name": _pick_first(
+                        detail,
+                        settings.paid_transaction_detail_item_name_column,
+                        "item_name",
+                        "itemName",
+                        "name",
+                        "text",
+                        "product_name",
+                        "productName",
+                    ),
+                    "barcode": _pick_first(detail, "barcode", "barCode", "sku", "SKU", "code"),
+                    "price": _pick_first(
+                        detail,
+                        "price",
+                        "unit_price",
+                        "unitPrice",
+                        "sellingPrice",
+                        "priceAmount",
+                    ),
+                    "subtotal": _pick_first(detail, "subtotal", "subTotal", "total", "line_total", "lineTotal"),
                     "raw_payload": detail,
                 }
             )
