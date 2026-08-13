@@ -94,6 +94,18 @@ def get_latest_script_run_for_session(
     return ScriptRunDetailResponse(**result)
 
 
+@router.get("/videos/{video_asset_id}/script-runs/latest", response_model=ScriptRunDetailResponse)
+def get_latest_script_run_for_video_asset(
+    video_asset_id: int,
+    db: Session = Depends(get_transaction_db),
+) -> ScriptRunDetailResponse:
+    try:
+        result = workflow_service.get_latest_script_run_details_for_video_asset(db, video_asset_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return ScriptRunDetailResponse(**result)
+
+
 @router.get("/sessions/{session_id}/pipeline-log", response_model=SessionPipelineLogResponse)
 def get_session_pipeline_log(
     session_id: int,

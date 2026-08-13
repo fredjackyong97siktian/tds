@@ -101,6 +101,16 @@ def get_latest_script_run_details_for_session(
     return _build_script_run_details(record)
 
 
+def get_latest_script_run_details_for_video_asset(
+    db: Session,
+    video_asset_id: int,
+) -> dict[str, Any]:
+    record = repositories.get_latest_script_run_for_video_asset(db, video_asset_id)
+    if not record:
+        raise ValueError(f"Script run for video asset {video_asset_id} was not found.")
+    return _build_script_run_details(record)
+
+
 def get_session_pipeline_log_details(db: Session, session_id: int) -> dict[str, Any]:
     session = repositories.get_session(db, session_id)
     session_videos = repositories.list_session_video_assets(db, session_id=session_id)
