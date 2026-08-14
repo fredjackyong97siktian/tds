@@ -53,6 +53,10 @@ KIOSK_OWNERSHIP_SAMPLE_COUNT = 3
 KIOSK_OWNERSHIP_MAX_BOXES_PER_FRAME = 2
 KIOSK_OWNERSHIP_MIN_SCORE = 0.50
 KIOSK_OWNERSHIP_MIN_MARGIN = 0.03
+KIOSK_TRANSACTION_IDENTIFICATION_SAMPLE_COUNT = 10
+KIOSK_TRANSACTION_IDENTIFICATION_MAX_BOXES = 2
+KIOSK_TRANSACTION_IDENTIFICATION_MIN_SCORE = 0.74
+KIOSK_TRANSACTION_IDENTIFICATION_MIN_MARGIN = 0.03
 
 
 @dataclass
@@ -1965,6 +1969,66 @@ def _load_session_osnet_views(session_id: int) -> list[Any]:
     return views
 
 
+def _load_session_history_target_views(
+    *,
+    location_id: int,
+    session_id: int,
+) -> dict[str, Any]:
+    session_db = TransactionalSessionLocal()
+    try:
+        session_customers = repositories.list_session_customers(session_db, session_id)
+    finally:
+        session_db.close()
+    session_customer_ids = [
+        int(row["id"])
+        for row in session_customers
+        if row.get("id") is not None
+    ]
+    if not session_customer_ids:
+        return {"osnet_views": [], "fashion_pairs": [], "history_rows": 0, "session_customer_ids": []}
+
+    vector_db = VectorSessionLocal()
+    try:
+        history_rows = vector_repositories.list_history_gallery_records(
+            vector_db,
+            location_id=location_id,
+            session_customer_ids=session_customer_ids,
+            limit=500,
+        )
+    finally:
+        vector_db.close()
+
+    osnet_views: list[Any] = []
+    fashion_pairs: list[tuple[Any, Any]] = []
+    for row in history_rows:
+        osnet_tensor = _float_list_to_tensor(row.get("embedding_osnet"))
+        if osnet_tensor is not None:
+            osnet_views.append(osnet_tensor)
+        fashion_upper, fashion_lower = _split_fashion_embedding(row.get("embedding_fashion"))
+        fashion_upper_tensor = _float_list_to_tensor(fashion_upper)
+        fashion_lower_tensor = _float_list_to_tensor(fashion_lower)
+        if fashion_upper_tensor is not None or fashion_lower_tensor is not None:
+            fashion_pairs.append((fashion_upper_tensor, fashion_lower_tensor))
+    return {
+        "osnet_views": osnet_views,
+        "fashion_pairs": fashion_pairs,
+        "history_rows": len(history_rows),
+        "session_customer_ids": session_customer_ids,
+    }
+
+
+def _sample_frame_positions(frame_count: int, sample_count: int) -> list[int]:
+    if frame_count <= 0:
+        return [0]
+    last_index = max(frame_count - 1, 0)
+    return sorted(
+        {
+            min(last_index, max(0, int(round(last_index * ratio))))
+            for ratio in [index / max(1, sample_count - 1) for index in range(sample_count)]
+        }
+    )
+
+
 def _sample_kiosk_video_embeddings(video_path: str) -> list[list[Any]]:
     import cv2
 
@@ -2029,6 +2093,401 @@ def _sample_kiosk_video_embeddings(video_path: str) -> list[list[Any]]:
         return samples
     finally:
         capture.release()
+
+
+def _score_kiosk_detection_against_history(
+    *,
+    query_osnet: Any,
+    query_fashion_upper: Any,
+    query_fashion_lower: Any,
+    target_osnet_views: list[Any],
+    target_fashion_pairs: list[tuple[Any, Any]],
+) -> dict[str, float]:
+    runtime = _get_kiosk_ownership_runtime()
+    osnet_score = (
+        float(runtime.best_sim_against_views(query_osnet, target_osnet_views))
+        if query_osnet is not None and target_osnet_views
+        else -1.0
+    )
+    fashion_score = -1.0
+    if (query_fashion_upper is not None or query_fashion_lower is not None) and target_fashion_pairs:
+        fashion_scores = [
+            float(runtime.fashion_pair_similarity(query_fashion_upper, query_fashion_lower, ref_upper, ref_lower))
+            for ref_upper, ref_lower in target_fashion_pairs
+        ]
+        if fashion_scores:
+            fashion_score = max(fashion_scores)
+
+    valid_scores = [score for score in (osnet_score, fashion_score) if score >= 0.0]
+    fused_score = float(sum(valid_scores) / len(valid_scores)) if valid_scores else -1.0
+    return {
+        "osnet_score": osnet_score,
+        "fashion_score": fashion_score,
+        "fused_score": fused_score,
+    }
+
+
+def _capture_kiosk_transaction_snapshots(
+    *,
+    location_id: int,
+    session_id: int,
+    transaction_label: str,
+    start_time: datetime,
+    end_time: datetime,
+    sample_count: int,
+) -> list[dict[str, Any]]:
+    session_db = TransactionalSessionLocal()
+    try:
+        cctv = repositories.get_cctv_by_location_section(session_db, location_id=location_id, section="kiosk")
+        location = repositories.get_location_endpoint(session_db, location_id)
+    finally:
+        session_db.close()
+
+    channel = str(cctv.get("recorder_channel") or "").strip()
+    if not channel:
+        raise ValueError("Kiosk CCTV record does not have a recorder_channel.")
+
+    delayed_seconds = int(cctv.get("delayed_seconds") or 0)
+    window_seconds = max(1.0, (end_time - start_time).total_seconds())
+    offsets = [window_seconds * (index / max(1, sample_count - 1)) for index in range(sample_count)]
+    output_root = build_session_workdir(location_id, session_id) / "kiosk" / "transaction_samples" / transaction_label
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    snapshots: list[dict[str, Any]] = []
+    for index, offset_seconds in enumerate(offsets, start=1):
+        sample_time = start_time + timedelta(seconds=float(offset_seconds))
+        adjusted_start = sample_time - timedelta(seconds=delayed_seconds)
+        adjusted_end = adjusted_start + timedelta(seconds=2)
+        rtsp_url = _build_dahua_rtsp_playback_url(
+            host=str(location.get("dahua_host") or "").strip(),
+            username=str(location.get("dahua_username") or "").strip(),
+            password=decrypt_secret(str(location.get("dahua_password_encrypted") or "").strip()),
+            rtsp_port=int(location.get("rtsp_port") or settings.dahua_rtsp_port),
+            channel=channel,
+            start_time=adjusted_start,
+            end_time=adjusted_end,
+        )
+        output_path = output_root / f"sample_{index:02d}_{sample_time.strftime('%Y%m%d_%H%M%S')}.jpg"
+        command = [
+            settings.ffmpeg_bin,
+            "-y",
+            "-rtsp_transport",
+            "tcp",
+            "-i",
+            rtsp_url,
+            "-frames:v",
+            "1",
+            "-q:v",
+            "2",
+            str(output_path),
+        ]
+        completed = subprocess.run(command, capture_output=True, text=True)
+        snapshots.append(
+            {
+                "index": index,
+                "sample_time": sample_time.isoformat(),
+                "path": str(output_path),
+                "status": "ok" if completed.returncode == 0 and output_path.exists() else "failed",
+                "stderr": str(completed.stderr or "").strip()[-1000:],
+            }
+        )
+    return snapshots
+
+
+def _identify_session_transaction_from_history(
+    *,
+    location_id: int,
+    session_id: int,
+    transaction_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    target_views = _load_session_history_target_views(location_id=location_id, session_id=session_id)
+    osnet_views = list(target_views.get("osnet_views") or [])
+    fashion_pairs = list(target_views.get("fashion_pairs") or [])
+    if not osnet_views and not fashion_pairs:
+        return {
+            "method": "history_gallery_snapshot_match",
+            "status": "unidentified",
+            "reason": "no_target_history_views",
+            "history_rows": int(target_views.get("history_rows") or 0),
+            "session_customer_ids": list(target_views.get("session_customer_ids") or []),
+            "transactions": [],
+        }
+
+    import cv2
+
+    runtime = _get_kiosk_ownership_runtime()
+    transaction_results: list[dict[str, Any]] = []
+    for row in transaction_rows:
+        transaction_label = str(row.get("receipt_number") or row.get("transaction_id") or row.get("session_transaction_id") or "transaction")
+        transaction_time = _coerce_datetime_value(row.get("transaction_time"))
+        window_start = _coerce_datetime_value(row.get("window_start"))
+        window_end = _coerce_datetime_value(row.get("window_end"))
+        if transaction_time is None or window_start is None or window_end is None:
+            continue
+
+        snapshots = _capture_kiosk_transaction_snapshots(
+            location_id=location_id,
+            session_id=session_id,
+            transaction_label=re.sub(r"[^A-Za-z0-9._-]+", "_", transaction_label),
+            start_time=window_start,
+            end_time=window_end,
+            sample_count=KIOSK_TRANSACTION_IDENTIFICATION_SAMPLE_COUNT,
+        )
+
+        sample_results: list[dict[str, Any]] = []
+        for snapshot in snapshots:
+            if snapshot.get("status") != "ok":
+                sample_results.append(snapshot)
+                continue
+            image_path = str(snapshot["path"])
+            frame = cv2.imread(image_path)
+            if frame is None:
+                sample_results.append({**snapshot, "status": "failed", "reason": "image_unreadable"})
+                continue
+            try:
+                detections = runtime.yolo_model.predict(frame, classes=[0], conf=0.20, verbose=False)
+            except Exception as exc:
+                sample_results.append({**snapshot, "status": "failed", "reason": f"detector_error:{exc}"})
+                continue
+
+            boxes_obj = getattr(detections[0], "boxes", None) if detections else None
+            xyxy = getattr(boxes_obj, "xyxy", None)
+            if xyxy is None:
+                sample_results.append({**snapshot, "status": "no_person"})
+                continue
+
+            boxes: list[list[int]] = []
+            for raw_box in xyxy[: max(1, KIOSK_TRANSACTION_IDENTIFICATION_MAX_BOXES * 3)]:
+                try:
+                    box = [int(value) for value in raw_box.tolist()]
+                except Exception:
+                    continue
+                boxes.append(box)
+            boxes.sort(
+                key=lambda box: max(0, box[2] - box[0]) * max(0, box[3] - box[1]),
+                reverse=True,
+            )
+
+            candidate_scores: list[dict[str, Any]] = []
+            for box in boxes[:KIOSK_TRANSACTION_IDENTIFICATION_MAX_BOXES]:
+                try:
+                    query_osnet = runtime.extract_embedding(frame, box)
+                    query_upper, query_lower = runtime.extract_fashion_pair(frame, box)
+                except Exception as exc:
+                    candidate_scores.append({"box": box, "status": f"embedding_error:{exc}"})
+                    continue
+                score_payload = _score_kiosk_detection_against_history(
+                    query_osnet=query_osnet,
+                    query_fashion_upper=query_upper,
+                    query_fashion_lower=query_lower,
+                    target_osnet_views=osnet_views,
+                    target_fashion_pairs=fashion_pairs,
+                )
+                candidate_scores.append(
+                    {
+                        "box": box,
+                        **score_payload,
+                    }
+                )
+
+            best_candidate = max(
+                candidate_scores,
+                key=lambda item: float(item.get("fused_score") or -1.0),
+                default=None,
+            )
+            if best_candidate is None:
+                sample_results.append({**snapshot, "status": "no_embedding"})
+                continue
+            sample_results.append(
+                {
+                    **snapshot,
+                    "status": "ok",
+                    "best_candidate": best_candidate,
+                }
+            )
+
+        scored_samples = [
+            sample
+            for sample in sample_results
+            if isinstance(sample.get("best_candidate"), dict)
+            and float(sample["best_candidate"].get("fused_score") or -1.0) >= 0.0
+        ]
+        sample_scores = sorted(
+            [float(sample["best_candidate"]["fused_score"]) for sample in scored_samples],
+            reverse=True,
+        )
+        transaction_score = float(sum(sample_scores[:3]) / min(3, len(sample_scores))) if sample_scores else -1.0
+        transaction_results.append(
+            {
+                "session_transaction_id": row.get("session_transaction_id"),
+                "transaction_id": row.get("transaction_id"),
+                "receipt_number": row.get("receipt_number"),
+                "transaction_time": transaction_time.isoformat(),
+                "window_start": window_start.isoformat(),
+                "window_end": window_end.isoformat(),
+                "score": transaction_score,
+                "matched_sample_count": len(scored_samples),
+                "samples": sample_results,
+            }
+        )
+
+    ranked = sorted(transaction_results, key=lambda item: float(item.get("score") or -1.0), reverse=True)
+    best = ranked[0] if ranked else None
+    second = ranked[1] if len(ranked) > 1 else None
+    best_score = float(best.get("score") or -1.0) if best else -1.0
+    second_score = float(second.get("score") or -1.0) if second else -1.0
+    if best is None:
+        status = "unidentified"
+        reason = "no_transaction_scores"
+        chosen_session_transaction_id = None
+    elif (
+        best_score >= KIOSK_TRANSACTION_IDENTIFICATION_MIN_SCORE
+        and best_score - second_score >= KIOSK_TRANSACTION_IDENTIFICATION_MIN_MARGIN
+    ):
+        status = "matched"
+        reason = "score_above_threshold"
+        chosen_session_transaction_id = best.get("session_transaction_id")
+    else:
+        status = "unidentified"
+        reason = "score_below_threshold_or_margin"
+        chosen_session_transaction_id = None
+
+    return {
+        "method": "history_gallery_snapshot_match",
+        "status": status,
+        "reason": reason,
+        "history_rows": int(target_views.get("history_rows") or 0),
+        "session_customer_ids": list(target_views.get("session_customer_ids") or []),
+        "chosen_session_transaction_id": chosen_session_transaction_id,
+        "best_score": best_score if best_score >= 0.0 else None,
+        "second_score": second_score if second_score >= 0.0 else None,
+        "transactions": ranked,
+    }
+
+
+def _prepare_session_kiosk_pipeline(
+    db: Session,
+    *,
+    session_id: int,
+    location_id: int,
+    session_start_time: datetime,
+    session_end_time: datetime,
+) -> tuple[int, dict[str, Any], list[tuple[datetime, datetime]]]:
+    paid_transactions = repositories.list_paid_transactions_for_session_window(
+        db,
+        location_id=location_id,
+        start_time=session_start_time,
+        end_time=session_end_time,
+    )
+
+    repositories.delete_session_transactions(db, session_id)
+    total_transaction_items = 0
+    raw_windows: list[tuple[datetime, datetime]] = []
+    transaction_summaries: list[dict[str, Any]] = []
+    for transaction in paid_transactions:
+        transaction_time = _coerce_datetime_value(transaction.get("transaction_time"))
+        if transaction_time is None:
+            continue
+        total_items = int(transaction.get("total_items") or 0)
+        total_transaction_items += total_items
+        window_start, window_end = _build_transaction_window_bounds(transaction_time, total_items)
+        raw_windows.append((window_start, window_end))
+        repositories.create_transaction(
+            db,
+            session_id,
+            {
+                "receipt_number": str(transaction.get("receipt_number") or transaction.get("transaction_id") or ""),
+                "transaction_time": transaction_time,
+                "total_items": total_items,
+                "total_amount": transaction.get("total_amount"),
+                "raw_payload": transaction,
+            },
+        )
+        transaction_summaries.append(
+            {
+                "transaction_id": transaction.get("transaction_id"),
+                "receipt_number": transaction.get("receipt_number"),
+                "transaction_time": transaction_time.isoformat() if hasattr(transaction_time, "isoformat") else transaction_time,
+                "total_items": total_items,
+                "window_start": window_start.isoformat(),
+                "window_end": window_end.isoformat(),
+            }
+        )
+
+    merged_windows = _merge_time_windows(raw_windows)
+    identification_summary: dict[str, Any] | None = None
+    selected_windows = list(merged_windows)
+    if len(transaction_summaries) > 1:
+        session_transactions = repositories.list_session_transactions(db, session_id)
+        session_transaction_rows: list[dict[str, Any]] = []
+        for summary_row, session_row in zip(transaction_summaries, session_transactions, strict=False):
+            payload = dict(summary_row)
+            payload["session_transaction_id"] = int(session_row["id"])
+            session_transaction_rows.append(payload)
+        identification_summary = _identify_session_transaction_from_history(
+            location_id=location_id,
+            session_id=session_id,
+            transaction_rows=session_transaction_rows,
+        )
+        chosen_id = identification_summary.get("chosen_session_transaction_id")
+        if chosen_id is not None:
+            selected_row = next(
+                (row for row in session_transaction_rows if int(row.get("session_transaction_id") or 0) == int(chosen_id)),
+                None,
+            )
+            if selected_row is not None:
+                selected_windows = [
+                    (
+                        _coerce_datetime_value(selected_row.get("window_start")) or session_start_time,
+                        _coerce_datetime_value(selected_row.get("window_end")) or session_end_time,
+                    )
+                ]
+        else:
+            selected_windows = []
+
+        transaction_results = identification_summary.get("transactions")
+        if isinstance(transaction_results, list):
+            transaction_by_id = {
+                int(row["id"]): row
+                for row in repositories.list_session_transactions(db, session_id)
+                if row.get("id") is not None
+            }
+            for result_row in transaction_results:
+                session_transaction_id = result_row.get("session_transaction_id")
+                if session_transaction_id is None:
+                    continue
+                stored_row = transaction_by_id.get(int(session_transaction_id))
+                if stored_row is None:
+                    continue
+                raw_payload = dict(stored_row.get("raw_payload") or {})
+                raw_payload["transaction_identification"] = result_row
+                repositories.update_session_transaction_raw_payload(db, int(session_transaction_id), raw_payload)
+
+    session_close_summary = {
+        "session_close_pipeline": {
+            "session_start_time": session_start_time.isoformat() if hasattr(session_start_time, "isoformat") else session_start_time,
+            "session_end_time": session_end_time.isoformat() if hasattr(session_end_time, "isoformat") else session_end_time,
+            "paid_transaction_count": len(transaction_summaries),
+            "paid_transactions": transaction_summaries,
+            "merged_kiosk_windows": [
+                {
+                    "start_time": start.isoformat(),
+                    "end_time": end.isoformat(),
+                }
+                for start, end in merged_windows
+            ],
+            "selected_kiosk_windows": [
+                {
+                    "start_time": start.isoformat(),
+                    "end_time": end.isoformat(),
+                }
+                for start, end in selected_windows
+            ],
+            "transaction_identification": identification_summary,
+            "queued_kiosk_video_asset_ids": [],
+        }
+    }
+    return total_transaction_items, session_close_summary, selected_windows
 
 
 def _resolve_shared_kiosk_video_session(
@@ -2661,64 +3120,13 @@ def _maybe_close_session_and_prepare_kiosk(
         )
         return
 
-    paid_transactions = repositories.list_paid_transactions_for_session_window(
+    total_transaction_items, session_close_summary, selected_windows = _prepare_session_kiosk_pipeline(
         db,
+        session_id=session_id,
         location_id=int(session["location_id"]),
-        start_time=session_start_time,
-        end_time=session_end_time,
+        session_start_time=session_start_time,
+        session_end_time=session_end_time,
     )
-
-    repositories.delete_session_transactions(db, session_id)
-    total_transaction_items = 0
-    raw_windows: list[tuple[datetime, datetime]] = []
-    transaction_summaries: list[dict[str, Any]] = []
-    for transaction in paid_transactions:
-        transaction_time = _coerce_datetime_value(transaction.get("transaction_time"))
-        if transaction_time is None:
-            continue
-        total_items = int(transaction.get("total_items") or 0)
-        total_transaction_items += total_items
-        window_start, window_end = _build_transaction_window_bounds(transaction_time, total_items)
-        raw_windows.append((window_start, window_end))
-        repositories.create_transaction(
-            db,
-            session_id,
-            {
-                "receipt_number": str(transaction.get("receipt_number") or transaction.get("transaction_id") or ""),
-                "transaction_time": transaction_time,
-                "total_items": total_items,
-                "total_amount": transaction.get("total_amount"),
-                "raw_payload": transaction,
-            },
-        )
-        transaction_summaries.append(
-            {
-                "transaction_id": transaction.get("transaction_id"),
-                "receipt_number": transaction.get("receipt_number"),
-                "transaction_time": transaction_time.isoformat() if hasattr(transaction_time, "isoformat") else transaction_time,
-                "total_items": total_items,
-                "window_start": window_start.isoformat(),
-                "window_end": window_end.isoformat(),
-            }
-        )
-
-    merged_windows = _merge_time_windows(raw_windows)
-    session_close_summary = {
-        "session_close_pipeline": {
-            "session_start_time": session_start_time.isoformat() if hasattr(session_start_time, "isoformat") else session_start_time,
-            "session_end_time": session_end_time.isoformat() if hasattr(session_end_time, "isoformat") else session_end_time,
-            "paid_transaction_count": len(transaction_summaries),
-            "paid_transactions": transaction_summaries,
-            "merged_kiosk_windows": [
-                {
-                    "start_time": start.isoformat(),
-                    "end_time": end.isoformat(),
-                }
-                for start, end in merged_windows
-            ],
-            "queued_kiosk_video_asset_ids": [],
-        }
-    }
     repositories.update_session_fields(
         db,
         session_id=session_id,
@@ -2730,7 +3138,7 @@ def _maybe_close_session_and_prepare_kiosk(
         issue_reason=None,
     )
 
-    if not merged_windows:
+    if not selected_windows:
         repositories.finalize_session_result(
             db,
             session_id=session_id,
@@ -2743,7 +3151,7 @@ def _maybe_close_session_and_prepare_kiosk(
 
     queued_video_asset_ids: list[int] = []
     try:
-        for window_start, window_end in merged_windows:
+        for window_start, window_end in selected_windows:
             queued = retrieve_kiosk_video_window(
                 db,
                 session_id=session_id,
@@ -4235,7 +4643,10 @@ def ensure_kiosk_video_assets_for_session(db: Session, session_id: int) -> list[
 
     summary = dict(session.get("result_summary") or {})
     pipeline = dict(summary.get("session_close_pipeline") or {})
-    merged_windows = pipeline.get("merged_kiosk_windows") or []
+    selected_windows = pipeline.get("selected_kiosk_windows")
+    merged_windows = selected_windows if isinstance(selected_windows, list) else (pipeline.get("merged_kiosk_windows") or [])
+    if isinstance(selected_windows, list) and not selected_windows and pipeline.get("transaction_identification"):
+        return []
     if not isinstance(merged_windows, list) or not merged_windows:
         session_start_time = session.get("start_time")
         session_end_time = session.get("end_time")
@@ -4248,90 +4659,25 @@ def ensure_kiosk_video_assets_for_session(db: Session, session_id: int) -> list[
             )
             return []
 
-        paid_transactions = repositories.list_paid_transactions_for_session_window(
+        total_transaction_items, prepared_summary, recomputed_windows = _prepare_session_kiosk_pipeline(
             db,
+            session_id=session_id,
             location_id=int(session["location_id"]),
-            start_time=session_start_time,
-            end_time=session_end_time,
+            session_start_time=session_start_time,
+            session_end_time=session_end_time,
         )
-        repositories.delete_session_transactions(db, session_id)
-        total_transaction_items = 0
-        raw_windows: list[tuple[datetime, datetime]] = []
-        transaction_summaries: list[dict[str, Any]] = []
-        for transaction in paid_transactions:
-            transaction_time = _coerce_datetime_value(transaction.get("transaction_time"))
-            if transaction_time is None:
-                continue
-            total_items = int(transaction.get("total_items") or 0)
-            total_transaction_items += total_items
-            window_start, window_end = _build_transaction_window_bounds(transaction_time, total_items)
-            raw_windows.append((window_start, window_end))
-            repositories.create_transaction(
-                db,
-                session_id,
-                {
-                    "receipt_number": str(transaction.get("receipt_number") or transaction.get("transaction_id") or ""),
-                    "transaction_time": transaction_time,
-                    "total_items": total_items,
-                    "total_amount": transaction.get("total_amount"),
-                    "raw_payload": transaction,
-                },
-            )
-            transaction_summaries.append(
-                {
-                    "transaction_id": transaction.get("transaction_id"),
-                    "receipt_number": transaction.get("receipt_number"),
-                    "transaction_time": transaction_time.isoformat() if hasattr(transaction_time, "isoformat") else transaction_time,
-                    "total_items": total_items,
-                    "window_start": window_start.isoformat(),
-                    "window_end": window_end.isoformat(),
-                }
-            )
-
-        recomputed_windows = _merge_time_windows(raw_windows)
         if not recomputed_windows:
             repositories.update_session_fields(
                 db,
                 session_id=session_id,
                 status="issue",
                 transaction_total_items=total_transaction_items,
-                result_summary={
-                    **summary,
-                    "session_close_pipeline": {
-                        "session_start_time": session_start_time.isoformat()
-                        if hasattr(session_start_time, "isoformat")
-                        else session_start_time,
-                        "session_end_time": session_end_time.isoformat()
-                        if hasattr(session_end_time, "isoformat")
-                        else session_end_time,
-                        "paid_transaction_count": len(transaction_summaries),
-                        "paid_transactions": transaction_summaries,
-                        "merged_kiosk_windows": [],
-                        "queued_kiosk_video_asset_ids": [],
-                    },
-                },
+                result_summary={**summary, **prepared_summary},
                 issue_reason="Kiosk retry failed because no paid transactions were found inside the session window.",
             )
             return []
 
-        pipeline = {
-            "session_start_time": session_start_time.isoformat()
-            if hasattr(session_start_time, "isoformat")
-            else session_start_time,
-            "session_end_time": session_end_time.isoformat()
-            if hasattr(session_end_time, "isoformat")
-            else session_end_time,
-            "paid_transaction_count": len(transaction_summaries),
-            "paid_transactions": transaction_summaries,
-            "merged_kiosk_windows": [
-                {
-                    "start_time": start.isoformat(),
-                    "end_time": end.isoformat(),
-                }
-                for start, end in recomputed_windows
-            ],
-            "queued_kiosk_video_asset_ids": [],
-        }
+        pipeline = dict(prepared_summary.get("session_close_pipeline") or {})
         summary["session_close_pipeline"] = pipeline
         repositories.update_session_fields(
             db,
@@ -4341,7 +4687,7 @@ def ensure_kiosk_video_assets_for_session(db: Session, session_id: int) -> list[
             result_summary=summary,
             issue_reason=None,
         )
-        merged_windows = pipeline["merged_kiosk_windows"]
+        merged_windows = pipeline.get("selected_kiosk_windows") or pipeline.get("merged_kiosk_windows") or []
 
     location_id = int(session["location_id"])
     queued_video_asset_ids: list[int] = []

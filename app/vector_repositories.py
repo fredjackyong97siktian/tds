@@ -564,6 +564,49 @@ def list_active_gallery_records(
     return _fetch_all_dicts(result)
 
 
+def list_history_gallery_records(
+    db: Session,
+    *,
+    location_id: int | None = None,
+    session_id: int | None = None,
+    session_customer_ids: list[int] | None = None,
+    limit: int = 1000,
+) -> list[dict[str, Any]]:
+    clauses: list[str] = []
+    params: dict[str, Any] = {"limit": limit}
+    if location_id is not None:
+        clauses.append("location_id = :location_id")
+        params["location_id"] = location_id
+    if session_id is not None:
+        clauses.append("session_id = :session_id")
+        params["session_id"] = session_id
+    normalized_session_customer_ids = sorted(
+        {int(value) for value in (session_customer_ids or []) if value is not None}
+    )
+    if normalized_session_customer_ids:
+        clauses.append("session_customer_id = any(:session_customer_ids)")
+        params["session_customer_ids"] = normalized_session_customer_ids
+
+    where_sql = ""
+    if clauses:
+        where_sql = "where " + " and ".join(clauses)
+
+    result = db.execute(
+        text(
+            f"""
+            select id, active_gallery_id, location_id, session_id, session_customer_id, person_id, image_url, image_kind,
+                   embedding_osnet, embedding_fashion, metadata, archived_reason, archived_at, created_at, updated_at
+            from tds_history_gallery
+            {where_sql}
+            order by updated_at desc nulls last, archived_at desc nulls last, id desc
+            limit :limit
+            """
+        ),
+        params,
+    )
+    return _fetch_all_dicts(result)
+
+
 def create_history_gallery_record(
     db: Session,
     *,

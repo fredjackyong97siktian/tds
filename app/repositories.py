@@ -2558,6 +2558,28 @@ def create_transaction(db: Session, session_id: int, payload: Mapping[str, Any])
     db.commit()
 
 
+def update_session_transaction_raw_payload(
+    db: Session,
+    session_transaction_id: int,
+    raw_payload: Mapping[str, Any],
+) -> None:
+    transaction_table = _table("session_transaction")
+    db.execute(
+        text(
+            f"""
+            update {transaction_table}
+            set raw_payload = :raw_payload
+            where id = :session_transaction_id
+            """
+        ),
+        {
+            "session_transaction_id": session_transaction_id,
+            "raw_payload": _json_dumps(dict(raw_payload)),
+        },
+    )
+    db.commit()
+
+
 def create_script_run_started(
     db: Session,
     *,
