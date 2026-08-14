@@ -1,13 +1,10 @@
 from __future__ import annotations
 import base64
-import importlib
-import importlib.util
 import json
 import logging
 import mimetypes
 import os
 import re
-import sys
 import subprocess
 import time
 from dataclasses import dataclass
@@ -52,14 +49,7 @@ from ..storage import (
 UTC = timezone.utc
 SCRIPT_RUN_COMMAND_REDACTED = "[redacted]"
 logger = logging.getLogger("tds.workflow_service")
-KIOSK_OWNERSHIP_SAMPLE_COUNT = 3
-KIOSK_OWNERSHIP_MAX_BOXES_PER_FRAME = 2
-KIOSK_OWNERSHIP_MIN_SCORE = 0.50
-KIOSK_OWNERSHIP_MIN_MARGIN = 0.03
-KIOSK_TRANSACTION_IDENTIFICATION_SAMPLE_COUNT = 10
-KIOSK_TRANSACTION_IDENTIFICATION_MAX_BOXES = 2
-KIOSK_TRANSACTION_IDENTIFICATION_MIN_SCORE = 0.74
-KIOSK_TRANSACTION_IDENTIFICATION_MIN_MARGIN = 0.03
+KIOSK_OWNERSHIP_MIN_MARGIN_SECONDS = 10.0
 
 
 @dataclass
@@ -1936,467 +1926,53 @@ def _split_fashion_embedding(value: Any) -> tuple[list[float] | None, list[float
     return combined[:midpoint], combined[midpoint:]
 
 
-_KIOSK_OWNERSHIP_RUNTIME = None
-
-
-def _get_kiosk_ownership_runtime():
-    global _KIOSK_OWNERSHIP_RUNTIME
-    if _KIOSK_OWNERSHIP_RUNTIME is None:
-        try:
-            _KIOSK_OWNERSHIP_RUNTIME = importlib.import_module("tds_runner.runtime.entry_runtime")
-        except ModuleNotFoundError as exc:
-            if exc.name != "tds_runner":
-                raise
-            repo_root = Path(__file__).resolve().parents[3]
-            candidate_roots = [
-                repo_root,
-                repo_root.parent,
-            ]
-            ownership_runtime = None
-            for root in candidate_roots:
-                candidate = root / "tds_runner" / "runtime" / "entry_runtime.py"
-                if not candidate.exists():
-                    continue
-                if str(root) not in sys.path:
-                    sys.path.insert(0, str(root))
-                spec = importlib.util.spec_from_file_location(
-                    "tds_runner.runtime.entry_runtime",
-                    candidate,
-                )
-                if spec is None or spec.loader is None:
-                    continue
-                module = importlib.util.module_from_spec(spec)
-                sys.modules.setdefault("tds_runner.runtime.entry_runtime", module)
-                spec.loader.exec_module(module)
-                ownership_runtime = module
-                break
-            if ownership_runtime is None:
-                raise ModuleNotFoundError(
-                    "Kiosk transaction identification requires tds_runner.runtime.entry_runtime. "
-                    "Install the tds_runner package or deploy the tds_runner checkout beside the tds repo."
-                ) from exc
-            _KIOSK_OWNERSHIP_RUNTIME = ownership_runtime
-    return _KIOSK_OWNERSHIP_RUNTIME
-
-
 def _merge_metadata(base: Any, extra: Mapping[str, Any]) -> dict[str, Any]:
     payload = dict(base) if isinstance(base, Mapping) else {}
     payload.update(extra)
     return payload
 
 
-def _load_session_osnet_views(session_id: int) -> list[Any]:
-    vector_db = VectorSessionLocal()
-    try:
-        rows = vector_repositories.list_customer_gallery_records(
-            vector_db,
-            session_id=session_id,
-        )
-    finally:
-        vector_db.close()
-
-    views: list[Any] = []
-    for row in rows:
-        tensor = _float_list_to_tensor(row.get("embedding_osnet"))
-        if tensor is not None:
-            views.append(tensor)
-    return views
-
-
-def _load_session_history_target_views(
-    *,
-    location_id: int,
-    session_id: int,
-) -> dict[str, Any]:
-    session_db = TransactionalSessionLocal()
-    try:
-        session_customers = repositories.list_session_customers(session_db, session_id)
-    finally:
-        session_db.close()
-    session_customer_ids = [
-        int(row["id"])
+def _resolve_session_effective_end_time(db: Session, session_id: int) -> datetime | None:
+    session = repositories.get_session(db, session_id)
+    end_time = _coerce_datetime_value(session.get("end_time"))
+    if end_time is not None:
+        return end_time
+    session_customers = repositories.list_session_customers(db, session_id)
+    leave_times = [
+        _coerce_datetime_value(row.get("leave_time"))
         for row in session_customers
-        if row.get("id") is not None
+        if row.get("leave_time") is not None
     ]
-    if not session_customer_ids:
-        return {"osnet_views": [], "fashion_pairs": [], "history_rows": 0, "session_customer_ids": []}
-
-    vector_db = VectorSessionLocal()
-    try:
-        history_rows = vector_repositories.list_history_gallery_records(
-            vector_db,
-            location_id=location_id,
-            session_customer_ids=session_customer_ids,
-            limit=500,
-        )
-    finally:
-        vector_db.close()
-
-    osnet_views: list[Any] = []
-    fashion_pairs: list[tuple[Any, Any]] = []
-    for row in history_rows:
-        osnet_tensor = _float_list_to_tensor(row.get("embedding_osnet"))
-        if osnet_tensor is not None:
-            osnet_views.append(osnet_tensor)
-        fashion_upper, fashion_lower = _split_fashion_embedding(row.get("embedding_fashion"))
-        fashion_upper_tensor = _float_list_to_tensor(fashion_upper)
-        fashion_lower_tensor = _float_list_to_tensor(fashion_lower)
-        if fashion_upper_tensor is not None or fashion_lower_tensor is not None:
-            fashion_pairs.append((fashion_upper_tensor, fashion_lower_tensor))
-    return {
-        "osnet_views": osnet_views,
-        "fashion_pairs": fashion_pairs,
-        "history_rows": len(history_rows),
-        "session_customer_ids": session_customer_ids,
-    }
+    leave_times = [value for value in leave_times if value is not None]
+    if leave_times:
+        return max(leave_times)
+    return _coerce_datetime_value(session.get("start_time"))
 
 
-def _sample_frame_positions(frame_count: int, sample_count: int) -> list[int]:
-    if frame_count <= 0:
-        return [0]
-    last_index = max(frame_count - 1, 0)
-    return sorted(
-        {
-            min(last_index, max(0, int(round(last_index * ratio))))
-            for ratio in [index / max(1, sample_count - 1) for index in range(sample_count)]
-        }
-    )
+def _time_window_overlap_seconds(
+    first_start: datetime | None,
+    first_end: datetime | None,
+    second_start: datetime | None,
+    second_end: datetime | None,
+) -> float:
+    if first_start is None or first_end is None or second_start is None or second_end is None:
+        return 0.0
+    overlap_start = max(first_start, second_start)
+    overlap_end = min(first_end, second_end)
+    return max(0.0, (overlap_end - overlap_start).total_seconds())
 
 
-def _sample_kiosk_video_embeddings(video_path: str) -> list[list[Any]]:
-    import cv2
-
-    runtime = _get_kiosk_ownership_runtime()
-    capture = cv2.VideoCapture(video_path)
-    if not capture.isOpened():
-        return []
-    try:
-        frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        if frame_count <= 0:
-            frame_positions = [0]
-        else:
-            last_index = max(frame_count - 1, 0)
-            frame_positions = sorted(
-                {
-                    min(last_index, max(0, int(round(last_index * ratio))))
-                    for ratio in (0.2, 0.5, 0.8)
-                }
-            )
-        samples: list[list[Any]] = []
-        for frame_index in frame_positions[:KIOSK_OWNERSHIP_SAMPLE_COUNT]:
-            capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
-            ok, frame = capture.read()
-            if not ok or frame is None:
-                continue
-            try:
-                detections = runtime.yolo_model.predict(
-                    frame,
-                    classes=[0],
-                    conf=0.20,
-                    verbose=False,
-                )
-            except Exception:
-                continue
-            if not detections:
-                continue
-            boxes_obj = getattr(detections[0], "boxes", None)
-            xyxy = getattr(boxes_obj, "xyxy", None)
-            if xyxy is None:
-                continue
-            boxes: list[list[int]] = []
-            for raw_box in xyxy[: max(1, KIOSK_OWNERSHIP_MAX_BOXES_PER_FRAME * 3)]:
-                try:
-                    box = [int(value) for value in raw_box.tolist()]
-                except Exception:
-                    continue
-                boxes.append(box)
-            boxes.sort(
-                key=lambda box: max(0, box[2] - box[0]) * max(0, box[3] - box[1]),
-                reverse=True,
-            )
-            frame_embeddings: list[Any] = []
-            for box in boxes[:KIOSK_OWNERSHIP_MAX_BOXES_PER_FRAME]:
-                try:
-                    emb = runtime.extract_embedding(frame, box)
-                except Exception:
-                    emb = None
-                if emb is not None:
-                    frame_embeddings.append(emb)
-            if frame_embeddings:
-                samples.append(frame_embeddings)
-        return samples
-    finally:
-        capture.release()
-
-
-def _score_kiosk_detection_against_history(
-    *,
-    query_osnet: Any,
-    query_fashion_upper: Any,
-    query_fashion_lower: Any,
-    target_osnet_views: list[Any],
-    target_fashion_pairs: list[tuple[Any, Any]],
-) -> dict[str, float]:
-    runtime = _get_kiosk_ownership_runtime()
-    osnet_score = (
-        float(runtime.best_sim_against_views(query_osnet, target_osnet_views))
-        if query_osnet is not None and target_osnet_views
-        else -1.0
-    )
-    fashion_score = -1.0
-    if (query_fashion_upper is not None or query_fashion_lower is not None) and target_fashion_pairs:
-        fashion_scores = [
-            float(runtime.fashion_pair_similarity(query_fashion_upper, query_fashion_lower, ref_upper, ref_lower))
-            for ref_upper, ref_lower in target_fashion_pairs
-        ]
-        if fashion_scores:
-            fashion_score = max(fashion_scores)
-
-    valid_scores = [score for score in (osnet_score, fashion_score) if score >= 0.0]
-    fused_score = float(sum(valid_scores) / len(valid_scores)) if valid_scores else -1.0
-    return {
-        "osnet_score": osnet_score,
-        "fashion_score": fashion_score,
-        "fused_score": fused_score,
-    }
-
-
-def _capture_kiosk_transaction_snapshots(
-    *,
-    location_id: int,
-    session_id: int,
-    transaction_label: str,
-    start_time: datetime,
-    end_time: datetime,
-    sample_count: int,
-) -> list[dict[str, Any]]:
-    session_db = TransactionalSessionLocal()
-    try:
-        cctv = repositories.get_cctv_by_location_section(session_db, location_id=location_id, section="kiosk")
-        location = repositories.get_location_endpoint(session_db, location_id)
-    finally:
-        session_db.close()
-
-    channel = str(cctv.get("recorder_channel") or "").strip()
-    if not channel:
-        raise ValueError("Kiosk CCTV record does not have a recorder_channel.")
-
-    delayed_seconds = int(cctv.get("delayed_seconds") or 0)
-    window_seconds = max(1.0, (end_time - start_time).total_seconds())
-    offsets = [window_seconds * (index / max(1, sample_count - 1)) for index in range(sample_count)]
-    output_root = build_session_workdir(location_id, session_id) / "kiosk" / "transaction_samples" / transaction_label
-    output_root.mkdir(parents=True, exist_ok=True)
-
-    snapshots: list[dict[str, Any]] = []
-    for index, offset_seconds in enumerate(offsets, start=1):
-        sample_time = start_time + timedelta(seconds=float(offset_seconds))
-        adjusted_start = sample_time - timedelta(seconds=delayed_seconds)
-        adjusted_end = adjusted_start + timedelta(seconds=2)
-        rtsp_url = _build_dahua_rtsp_playback_url(
-            host=str(location.get("dahua_host") or "").strip(),
-            username=str(location.get("dahua_username") or "").strip(),
-            password=decrypt_secret(str(location.get("dahua_password_encrypted") or "").strip()),
-            rtsp_port=int(location.get("rtsp_port") or settings.dahua_rtsp_port),
-            channel=channel,
-            start_time=adjusted_start,
-            end_time=adjusted_end,
-        )
-        output_path = output_root / f"sample_{index:02d}_{sample_time.strftime('%Y%m%d_%H%M%S')}.jpg"
-        command = [
-            settings.ffmpeg_bin,
-            "-y",
-            "-rtsp_transport",
-            "tcp",
-            "-i",
-            rtsp_url,
-            "-frames:v",
-            "1",
-            "-q:v",
-            "2",
-            str(output_path),
-        ]
-        completed = subprocess.run(command, capture_output=True, text=True)
-        snapshots.append(
-            {
-                "index": index,
-                "sample_time": sample_time.isoformat(),
-                "path": str(output_path),
-                "status": "ok" if completed.returncode == 0 and output_path.exists() else "failed",
-                "stderr": str(completed.stderr or "").strip()[-1000:],
-            }
-        )
-    return snapshots
-
-
-def _identify_session_transaction_from_history(
-    *,
-    location_id: int,
-    session_id: int,
-    transaction_rows: list[dict[str, Any]],
-) -> dict[str, Any]:
-    target_views = _load_session_history_target_views(location_id=location_id, session_id=session_id)
-    osnet_views = list(target_views.get("osnet_views") or [])
-    fashion_pairs = list(target_views.get("fashion_pairs") or [])
-    if not osnet_views and not fashion_pairs:
-        return {
-            "method": "history_gallery_snapshot_match",
-            "status": "unidentified",
-            "reason": "no_target_history_views",
-            "history_rows": int(target_views.get("history_rows") or 0),
-            "session_customer_ids": list(target_views.get("session_customer_ids") or []),
-            "transactions": [],
-        }
-
-    import cv2
-
-    runtime = _get_kiosk_ownership_runtime()
-    transaction_results: list[dict[str, Any]] = []
-    for row in transaction_rows:
-        transaction_label = str(row.get("receipt_number") or row.get("transaction_id") or row.get("session_transaction_id") or "transaction")
-        transaction_time = _coerce_datetime_value(row.get("transaction_time"))
-        window_start = _coerce_datetime_value(row.get("window_start"))
-        window_end = _coerce_datetime_value(row.get("window_end"))
-        if transaction_time is None or window_start is None or window_end is None:
-            continue
-
-        snapshots = _capture_kiosk_transaction_snapshots(
-            location_id=location_id,
-            session_id=session_id,
-            transaction_label=re.sub(r"[^A-Za-z0-9._-]+", "_", transaction_label),
-            start_time=window_start,
-            end_time=window_end,
-            sample_count=KIOSK_TRANSACTION_IDENTIFICATION_SAMPLE_COUNT,
-        )
-
-        sample_results: list[dict[str, Any]] = []
-        for snapshot in snapshots:
-            if snapshot.get("status") != "ok":
-                sample_results.append(snapshot)
-                continue
-            image_path = str(snapshot["path"])
-            frame = cv2.imread(image_path)
-            if frame is None:
-                sample_results.append({**snapshot, "status": "failed", "reason": "image_unreadable"})
-                continue
-            try:
-                detections = runtime.yolo_model.predict(frame, classes=[0], conf=0.20, verbose=False)
-            except Exception as exc:
-                sample_results.append({**snapshot, "status": "failed", "reason": f"detector_error:{exc}"})
-                continue
-
-            boxes_obj = getattr(detections[0], "boxes", None) if detections else None
-            xyxy = getattr(boxes_obj, "xyxy", None)
-            if xyxy is None:
-                sample_results.append({**snapshot, "status": "no_person"})
-                continue
-
-            boxes: list[list[int]] = []
-            for raw_box in xyxy[: max(1, KIOSK_TRANSACTION_IDENTIFICATION_MAX_BOXES * 3)]:
-                try:
-                    box = [int(value) for value in raw_box.tolist()]
-                except Exception:
-                    continue
-                boxes.append(box)
-            boxes.sort(
-                key=lambda box: max(0, box[2] - box[0]) * max(0, box[3] - box[1]),
-                reverse=True,
-            )
-
-            candidate_scores: list[dict[str, Any]] = []
-            for box in boxes[:KIOSK_TRANSACTION_IDENTIFICATION_MAX_BOXES]:
-                try:
-                    query_osnet = runtime.extract_embedding(frame, box)
-                    query_upper, query_lower = runtime.extract_fashion_pair(frame, box)
-                except Exception as exc:
-                    candidate_scores.append({"box": box, "status": f"embedding_error:{exc}"})
-                    continue
-                score_payload = _score_kiosk_detection_against_history(
-                    query_osnet=query_osnet,
-                    query_fashion_upper=query_upper,
-                    query_fashion_lower=query_lower,
-                    target_osnet_views=osnet_views,
-                    target_fashion_pairs=fashion_pairs,
-                )
-                candidate_scores.append(
-                    {
-                        "box": box,
-                        **score_payload,
-                    }
-                )
-
-            best_candidate = max(
-                candidate_scores,
-                key=lambda item: float(item.get("fused_score") or -1.0),
-                default=None,
-            )
-            if best_candidate is None:
-                sample_results.append({**snapshot, "status": "no_embedding"})
-                continue
-            sample_results.append(
-                {
-                    **snapshot,
-                    "status": "ok",
-                    "best_candidate": best_candidate,
-                }
-            )
-
-        scored_samples = [
-            sample
-            for sample in sample_results
-            if isinstance(sample.get("best_candidate"), dict)
-            and float(sample["best_candidate"].get("fused_score") or -1.0) >= 0.0
-        ]
-        sample_scores = sorted(
-            [float(sample["best_candidate"]["fused_score"]) for sample in scored_samples],
-            reverse=True,
-        )
-        transaction_score = float(sum(sample_scores[:3]) / min(3, len(sample_scores))) if sample_scores else -1.0
-        transaction_results.append(
-            {
-                "session_transaction_id": row.get("session_transaction_id"),
-                "transaction_id": row.get("transaction_id"),
-                "receipt_number": row.get("receipt_number"),
-                "transaction_time": transaction_time.isoformat(),
-                "window_start": window_start.isoformat(),
-                "window_end": window_end.isoformat(),
-                "score": transaction_score,
-                "matched_sample_count": len(scored_samples),
-                "samples": sample_results,
-            }
-        )
-
-    ranked = sorted(transaction_results, key=lambda item: float(item.get("score") or -1.0), reverse=True)
-    best = ranked[0] if ranked else None
-    second = ranked[1] if len(ranked) > 1 else None
-    best_score = float(best.get("score") or -1.0) if best else -1.0
-    second_score = float(second.get("score") or -1.0) if second else -1.0
-    if best is None:
-        status = "unidentified"
-        reason = "no_transaction_scores"
-        chosen_session_transaction_id = None
-    elif (
-        best_score >= KIOSK_TRANSACTION_IDENTIFICATION_MIN_SCORE
-        and best_score - second_score >= KIOSK_TRANSACTION_IDENTIFICATION_MIN_MARGIN
-    ):
-        status = "matched"
-        reason = "score_above_threshold"
-        chosen_session_transaction_id = best.get("session_transaction_id")
-    else:
-        status = "unidentified"
-        reason = "score_below_threshold_or_margin"
-        chosen_session_transaction_id = None
-
-    return {
-        "method": "history_gallery_snapshot_match",
-        "status": status,
-        "reason": reason,
-        "history_rows": int(target_views.get("history_rows") or 0),
-        "session_customer_ids": list(target_views.get("session_customer_ids") or []),
-        "chosen_session_transaction_id": chosen_session_transaction_id,
-        "best_score": best_score if best_score >= 0.0 else None,
-        "second_score": second_score if second_score >= 0.0 else None,
-        "transactions": ranked,
-    }
+def _seconds_to_nearest_transaction(db: Session, session_id: int, anchor_time: datetime) -> float:
+    transaction_rows = repositories.list_session_transactions(db, session_id)
+    transaction_times = [
+        _coerce_datetime_value(row.get("transaction_time"))
+        for row in transaction_rows
+        if row.get("transaction_time") is not None
+    ]
+    transaction_times = [value for value in transaction_times if value is not None]
+    if not transaction_times:
+        return float("inf")
+    return min(abs((value - anchor_time).total_seconds()) for value in transaction_times)
 
 
 def _prepare_session_kiosk_pipeline(
@@ -2452,50 +2028,12 @@ def _prepare_session_kiosk_pipeline(
     identification_summary: dict[str, Any] | None = None
     selected_windows = list(merged_windows)
     if len(transaction_summaries) > 1:
-        session_transactions = repositories.list_session_transactions(db, session_id)
-        session_transaction_rows: list[dict[str, Any]] = []
-        for summary_row, session_row in zip(transaction_summaries, session_transactions, strict=False):
-            payload = dict(summary_row)
-            payload["session_transaction_id"] = int(session_row["id"])
-            session_transaction_rows.append(payload)
-        identification_summary = _identify_session_transaction_from_history(
-            location_id=location_id,
-            session_id=session_id,
-            transaction_rows=session_transaction_rows,
-        )
-        chosen_id = identification_summary.get("chosen_session_transaction_id")
-        if chosen_id is not None:
-            selected_row = next(
-                (row for row in session_transaction_rows if int(row.get("session_transaction_id") or 0) == int(chosen_id)),
-                None,
-            )
-            if selected_row is not None:
-                selected_windows = [
-                    (
-                        _coerce_datetime_value(selected_row.get("window_start")) or session_start_time,
-                        _coerce_datetime_value(selected_row.get("window_end")) or session_end_time,
-                    )
-                ]
-        else:
-            selected_windows = []
-
-        transaction_results = identification_summary.get("transactions")
-        if isinstance(transaction_results, list):
-            transaction_by_id = {
-                int(row["id"]): row
-                for row in repositories.list_session_transactions(db, session_id)
-                if row.get("id") is not None
-            }
-            for result_row in transaction_results:
-                session_transaction_id = result_row.get("session_transaction_id")
-                if session_transaction_id is None:
-                    continue
-                stored_row = transaction_by_id.get(int(session_transaction_id))
-                if stored_row is None:
-                    continue
-                raw_payload = dict(stored_row.get("raw_payload") or {})
-                raw_payload["transaction_identification"] = result_row
-                repositories.update_session_transaction_raw_payload(db, int(session_transaction_id), raw_payload)
+        identification_summary = {
+            "method": "deferred_runner_only",
+            "status": "skipped",
+            "reason": "transaction_pre_routing_not_run_in_tds_api",
+            "message": "tds_api does not run local model-based transaction routing.",
+        }
 
     session_close_summary = {
         "session_close_pipeline": {
@@ -2531,13 +2069,17 @@ def _resolve_shared_kiosk_video_session(
     video_path: str,
     session_ids: list[int],
 ) -> tuple[int | None, dict[str, Any]]:
-    runtime = _get_kiosk_ownership_runtime()
     unique_session_ids = list(dict.fromkeys(int(session_id) for session_id in session_ids))
+    video_asset = repositories.get_video_asset(db, video_asset_id)
+    captured_start = _coerce_datetime_value(video_asset.get("captured_start_time"))
+    captured_end = _coerce_datetime_value(video_asset.get("captured_end_time"))
+    video_midpoint = None
+    if captured_start is not None and captured_end is not None:
+        video_midpoint = captured_start + (captured_end - captured_start) / 2
     details: dict[str, Any] = {
         "video_asset_id": int(video_asset_id),
         "candidate_session_ids": unique_session_ids,
-        "method": "local_embedding_vote",
-        "sample_count": 0,
+        "method": "temporal_heuristic",
         "session_scores": {},
     }
     if len(unique_session_ids) == 1:
@@ -2546,35 +2088,31 @@ def _resolve_shared_kiosk_video_session(
         details["reason"] = "single_candidate"
         return chosen_session_id, details
 
-    frame_samples = _sample_kiosk_video_embeddings(video_path)
-    details["sample_count"] = len(frame_samples)
-    if not frame_samples:
-        details["reason"] = "no_embeddings_from_kiosk_video"
-        return None, details
-
-    score_rows: list[tuple[int, float]] = []
+    score_rows: list[tuple[int, tuple[int, float, float]]] = []
     for session_id in unique_session_ids:
-        views = _load_session_osnet_views(session_id)
-        if not views:
-            details["session_scores"][str(session_id)] = {
-                "score": 0.0,
-                "view_count": 0,
-            }
-            continue
-        frame_scores: list[float] = []
-        for frame_embeddings in frame_samples:
-            best_frame_score = max(
-                runtime.best_sim_against_views(query_emb, views)
-                for query_emb in frame_embeddings
-            )
-            frame_scores.append(float(best_frame_score))
-        session_score = float(sum(frame_scores) / max(1, len(frame_scores)))
+        session = repositories.get_session(db, session_id)
+        session_start = _coerce_datetime_value(session.get("start_time"))
+        session_end = _resolve_session_effective_end_time(db, session_id)
+        overlap_seconds = _time_window_overlap_seconds(
+            captured_start,
+            captured_end,
+            session_start,
+            session_end,
+        )
+        transaction_distance_seconds = (
+            _seconds_to_nearest_transaction(db, session_id, video_midpoint)
+            if video_midpoint is not None
+            else float("inf")
+        )
+        transaction_hit = 1 if transaction_distance_seconds <= 60.0 else 0
         details["session_scores"][str(session_id)] = {
-            "score": session_score,
-            "view_count": len(views),
-            "frame_scores": frame_scores,
+            "transaction_hit": transaction_hit,
+            "overlap_seconds": overlap_seconds,
+            "transaction_distance_seconds": None if transaction_distance_seconds == float("inf") else transaction_distance_seconds,
+            "session_start": session_start.isoformat() if session_start is not None else None,
+            "session_end": session_end.isoformat() if session_end is not None else None,
         }
-        score_rows.append((session_id, session_score))
+        score_rows.append((session_id, (transaction_hit, overlap_seconds, -transaction_distance_seconds)))
 
     score_rows.sort(key=lambda item: item[1], reverse=True)
     if not score_rows:
@@ -2582,15 +2120,23 @@ def _resolve_shared_kiosk_video_session(
         return None, details
 
     best_session_id, best_score = score_rows[0]
-    second_score = score_rows[1][1] if len(score_rows) > 1 else 0.0
-    details["best_score"] = best_score
-    details["second_best_score"] = second_score
-    details["score_margin"] = best_score - second_score
-    if best_score < KIOSK_OWNERSHIP_MIN_SCORE:
-        details["reason"] = "best_score_below_threshold"
-        return None, details
-    if len(score_rows) > 1 and (best_score - second_score) < KIOSK_OWNERSHIP_MIN_MARGIN:
+    second_score = score_rows[1][1] if len(score_rows) > 1 else None
+    details["best_score"] = {
+        "transaction_hit": best_score[0],
+        "overlap_seconds": best_score[1],
+        "negative_transaction_distance_seconds": best_score[2],
+    }
+    if second_score is not None:
+        details["second_best_score"] = {
+            "transaction_hit": second_score[0],
+            "overlap_seconds": second_score[1],
+            "negative_transaction_distance_seconds": second_score[2],
+        }
+    if second_score is not None and best_score == second_score:
         details["reason"] = "score_margin_too_small"
+        return None, details
+    if best_score[0] == 0 and best_score[1] <= KIOSK_OWNERSHIP_MIN_MARGIN_SECONDS:
+        details["reason"] = "insufficient_temporal_signal"
         return None, details
     details["chosen_session_id"] = int(best_session_id)
     details["reason"] = "resolved"
