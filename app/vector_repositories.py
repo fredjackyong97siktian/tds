@@ -33,6 +33,157 @@ def _is_history_gallery_permission_error(exc: Exception) -> bool:
     return "permission denied for table tds_history_gallery" in str(exc).lower()
 
 
+def create_identity(
+    db: Session,
+    *,
+    location_id: int,
+    status: str = "active",
+    current_session_id: int | None = None,
+    current_session_customer_id: int | None = None,
+    person_id: int | None = None,
+    first_seen_at: Any | None = None,
+    last_seen_at: Any | None = None,
+    exited_at: Any | None = None,
+    merged_into_identity_id: int | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    result = db.execute(
+        text(
+            """
+            insert into tds_identity (
+                location_id, status, current_session_id, current_session_customer_id, person_id,
+                first_seen_at, last_seen_at, exited_at, merged_into_identity_id, metadata
+            )
+            values (
+                :location_id, :status, :current_session_id, :current_session_customer_id, :person_id,
+                coalesce(:first_seen_at, now()),
+                coalesce(:last_seen_at, coalesce(:first_seen_at, now())),
+                :exited_at,
+                :merged_into_identity_id,
+                cast(:metadata as jsonb)
+            )
+            returning id, location_id, status, current_session_id, current_session_customer_id, person_id,
+                      first_seen_at, last_seen_at, exited_at, merged_into_identity_id, metadata,
+                      created_at, updated_at
+            """
+        ),
+        {
+            "location_id": location_id,
+            "status": status,
+            "current_session_id": current_session_id,
+            "current_session_customer_id": current_session_customer_id,
+            "person_id": person_id,
+            "first_seen_at": first_seen_at,
+            "last_seen_at": last_seen_at,
+            "exited_at": exited_at,
+            "merged_into_identity_id": merged_into_identity_id,
+            "metadata": json.dumps(dict(metadata)) if metadata is not None else None,
+        },
+    )
+    db.commit()
+    return _fetch_one_dict(result)
+
+
+def get_identity_record(db: Session, identity_id: int) -> dict[str, Any]:
+    result = db.execute(
+        text(
+            """
+            select id, location_id, status, current_session_id, current_session_customer_id, person_id,
+                   first_seen_at, last_seen_at, exited_at, merged_into_identity_id, metadata,
+                   created_at, updated_at
+            from tds_identity
+            where id = :identity_id
+            """
+        ),
+        {"identity_id": identity_id},
+    )
+    return _fetch_one_dict(result)
+
+
+def list_identity_records(
+    db: Session,
+    *,
+    location_id: int | None = None,
+    status: str | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    clauses = []
+    params: dict[str, Any] = {"limit": limit}
+    if location_id is not None:
+        clauses.append("location_id = :location_id")
+        params["location_id"] = location_id
+    if status is not None:
+        clauses.append("status = :status")
+        params["status"] = status
+    where_sql = f"where {' and '.join(clauses)}" if clauses else ""
+    result = db.execute(
+        text(
+            f"""
+            select id, location_id, status, current_session_id, current_session_customer_id, person_id,
+                   first_seen_at, last_seen_at, exited_at, merged_into_identity_id, metadata,
+                   created_at, updated_at
+            from tds_identity
+            {where_sql}
+            order by updated_at desc, id desc
+            limit :limit
+            """
+        ),
+        params,
+    )
+    return _fetch_all_dicts(result)
+
+
+def update_identity_record(
+    db: Session,
+    identity_id: int,
+    *,
+    status: str | None = None,
+    current_session_id: int | None = None,
+    current_session_customer_id: int | None = None,
+    person_id: int | None = None,
+    first_seen_at: Any | None = None,
+    last_seen_at: Any | None = None,
+    exited_at: Any | None = None,
+    merged_into_identity_id: int | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    result = db.execute(
+        text(
+            """
+            update tds_identity
+            set status = coalesce(:status, status),
+                current_session_id = coalesce(:current_session_id, current_session_id),
+                current_session_customer_id = coalesce(:current_session_customer_id, current_session_customer_id),
+                person_id = coalesce(:person_id, person_id),
+                first_seen_at = coalesce(:first_seen_at, first_seen_at),
+                last_seen_at = coalesce(:last_seen_at, last_seen_at),
+                exited_at = coalesce(:exited_at, exited_at),
+                merged_into_identity_id = coalesce(:merged_into_identity_id, merged_into_identity_id),
+                metadata = coalesce(cast(:metadata as jsonb), metadata),
+                updated_at = now()
+            where id = :identity_id
+            returning id, location_id, status, current_session_id, current_session_customer_id, person_id,
+                      first_seen_at, last_seen_at, exited_at, merged_into_identity_id, metadata,
+                      created_at, updated_at
+            """
+        ),
+        {
+            "identity_id": identity_id,
+            "status": status,
+            "current_session_id": current_session_id,
+            "current_session_customer_id": current_session_customer_id,
+            "person_id": person_id,
+            "first_seen_at": first_seen_at,
+            "last_seen_at": last_seen_at,
+            "exited_at": exited_at,
+            "merged_into_identity_id": merged_into_identity_id,
+            "metadata": json.dumps(dict(metadata)) if metadata is not None else None,
+        },
+    )
+    db.commit()
+    return _fetch_one_dict(result)
+
+
 def create_active_gallery_record(
     db: Session,
     *,

@@ -46,6 +46,37 @@ create index if not exists idx_customer_gallery_session_customer
 create index if not exists idx_customer_gallery_image_kind
     on tds_customer_gallery(image_kind);
 
+create table if not exists tds_identity (
+    id bigserial primary key,
+    location_id bigint not null,
+    status varchar(50) not null default 'active',
+    current_session_id bigint,
+    current_session_customer_id bigint,
+    person_id integer,
+    first_seen_at timestamptz not null default now(),
+    last_seen_at timestamptz not null default now(),
+    exited_at timestamptz,
+    merged_into_identity_id bigint,
+    metadata jsonb,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now()
+);
+
+create index if not exists idx_identity_location_id
+    on tds_identity(location_id);
+
+create index if not exists idx_identity_location_status
+    on tds_identity(location_id, status);
+
+create index if not exists idx_identity_current_session_id
+    on tds_identity(current_session_id);
+
+create index if not exists idx_identity_current_session_customer_id
+    on tds_identity(current_session_customer_id);
+
+create index if not exists idx_identity_person_id
+    on tds_identity(person_id);
+
 create table if not exists tds_active_gallery (
     id bigserial primary key,
     location_id bigint not null,
@@ -117,6 +148,21 @@ comment on column tds_customer_gallery.location_id is
 
 comment on column tds_customer_gallery.session_customer_id is
     'Value-copied MySQL session_customer.id for the exact detected person row that produced this gallery entry.';
+
+comment on column tds_identity.location_id is
+    'Store/location partition key for stable pre-session and in-session identity tracking.';
+
+comment on column tds_identity.status is
+    'Identity lifecycle state, for example active, exited, merged, or archived.';
+
+comment on column tds_identity.current_session_customer_id is
+    'Attached MySQL session_customer.id when a tracked identity is linked to a session.';
+
+comment on column tds_identity.person_id is
+    'Optional legacy/runtime person id currently associated with this identity.';
+
+comment on column tds_identity.merged_into_identity_id is
+    'Points to the canonical tds_identity.id when this identity is merged into another.';
 
 comment on column tds_active_gallery.location_id is
     'Store/location partition key for the active gallery currently used in comparisons.';
