@@ -2197,6 +2197,30 @@ def _resolve_open_session_customer_for_gallery(
     return session, session_customer
 
 
+def _resolve_session_customer_identity_from_active_gallery(
+    db: Session,
+    *,
+    location_id: int,
+    session_customer_id: int,
+    fallback_session_id: int | None = None,
+    fallback_person_id: int | None = None,
+) -> tuple[int | None, int | None] | None:
+    try:
+        session_customer = repositories.get_session_customer(db, session_customer_id)
+        session = repositories.get_session(db, int(session_customer["session_id"]))
+    except ValueError:
+        if fallback_session_id is None and fallback_person_id is None:
+            return None
+        return fallback_session_id, fallback_person_id
+
+    if int(session.get("location_id") or 0) != location_id:
+        return None
+    return (
+        int(session["id"]),
+        _coerce_int(session_customer.get("person_id")) or fallback_person_id,
+    )
+
+
 def _canonicalize_session_customer_for_person(
     transactional_db: Session,
     vector_db: Session,
@@ -2264,19 +2288,25 @@ def _build_cross_state_from_active_gallery(location_id: int) -> dict[str, Any]:
         persistent_gallery: dict[int, dict[str, Any]] = {}
         persistent_gallery_view_paths: dict[int, list[str]] = {}
         next_gid = 1
+        hydrated_rows = 0
+        skipped_rows = 0
 
         for row in active_rows:
             session_customer_id = _coerce_int(row.get("session_customer_id"))
             if session_customer_id is None:
+                skipped_rows += 1
                 continue
-            active_owner = _resolve_open_session_customer_for_gallery(
+            resolved_identity = _resolve_session_customer_identity_from_active_gallery(
                 transactional_db,
                 location_id=location_id,
                 session_customer_id=session_customer_id,
+                fallback_session_id=_coerce_int(row.get("session_id")),
+                fallback_person_id=_coerce_int(row.get("person_id")),
             )
-            if active_owner is None:
+            if resolved_identity is None:
+                skipped_rows += 1
                 continue
-            active_session, active_session_customer = active_owner
+            resolved_session_id, resolved_person_id = resolved_identity
             gallery_id = session_customer_id
 
             next_gid = max(next_gid, gallery_id + 1)
@@ -2296,9 +2326,9 @@ def _build_cross_state_from_active_gallery(location_id: int) -> dict[str, Any]:
                 gallery_id,
                 {
                     "views": [],
-                    "session_id": int(active_session["id"]),
+                    "session_id": resolved_session_id,
                     "session_customer_id": session_customer_id,
-                    "person_id": _coerce_int(active_session_customer.get("person_id")),
+                    "person_id": resolved_person_id,
                     "location_id": _coerce_int(row.get("location_id")),
                     "source": "postgresql_active_gallery",
                 },
@@ -2318,6 +2348,16 @@ def _build_cross_state_from_active_gallery(location_id: int) -> dict[str, Any]:
                 for image_path in image_paths:
                     if image_path not in existing_paths:
                         existing_paths.append(image_path)
+            hydrated_rows += 1
+
+        logger.info(
+            "Hydrated entrance persistent gallery from tds_active_gallery location_id=%s active_rows=%s hydrated_rows=%s skipped_rows=%s persistent_ids=%s",
+            location_id,
+            len(active_rows),
+            hydrated_rows,
+            skipped_rows,
+            sorted(int(gid) for gid in persistent_gallery.keys()),
+        )
 
         return {
             "next_gid": next_gid,
@@ -2960,14 +3000,16 @@ def _sync_gallery_state_after_entry(
                 or person_id
             )
             if source_session_customer_id is not None:
-                active_owner = _resolve_open_session_customer_for_gallery(
+                resolved_identity = _resolve_session_customer_identity_from_active_gallery(
                     transactional_db,
                     location_id=location_id,
                     session_customer_id=source_session_customer_id,
+                    fallback_session_id=source_session_id,
+                    fallback_person_id=source_person_id,
                 )
-                if active_owner is None:
+                if resolved_identity is None:
                     logger.info(
-                        "Ignoring stale active-gallery match for closed/left session video=%s location_id=%s runtime_person_id=%s session_customer_id=%s",
+                        "Ignoring active-gallery match because session identity could not be resolved video=%s location_id=%s runtime_person_id=%s session_customer_id=%s",
                         Path(video_path).name,
                         location_id,
                         person_id,
@@ -2977,9 +3019,8 @@ def _sync_gallery_state_after_entry(
                     source_session_id = None
                     source_person_id = person_id
                 else:
-                    source_session, source_session_customer = active_owner
-                    source_session_id = int(source_session["id"])
-                    source_person_id = _coerce_int(source_session_customer.get("person_id")) or source_person_id
+                    source_session_id, resolved_person_id = resolved_identity
+                    source_person_id = resolved_person_id or source_person_id
             if exited and source_session_customer_id is None:
                 fallback_person_ids = [
                     value
