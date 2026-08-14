@@ -265,6 +265,7 @@ class RemoteRunnerResult:
     tracking_summary: dict[str, Any] | None = None
     reid_views_summary: dict[str, Any] | None = None
     kiosk_summary: dict[str, Any] | None = None
+    transaction_match_summary: dict[str, Any] | None = None
 
 
 @dataclass
@@ -711,6 +712,7 @@ def _remote_runner_result_from_runpod_body(body: dict[str, Any]) -> tuple[str, R
                 tracking_summary=output.get("tracking_summary"),
                 reid_views_summary=output.get("reid_views_summary"),
                 kiosk_summary=output.get("kiosk_summary"),
+                transaction_match_summary=output.get("transaction_match_summary"),
             ),
         )
 
@@ -729,6 +731,7 @@ def _remote_runner_result_from_runpod_body(body: dict[str, Any]) -> tuple[str, R
                 tracking_summary=output.get("tracking_summary"),
                 reid_views_summary=output.get("reid_views_summary"),
                 kiosk_summary=output.get("kiosk_summary"),
+                transaction_match_summary=output.get("transaction_match_summary"),
             ),
         )
     return (
@@ -1467,6 +1470,152 @@ def _finalize_remote_kiosk_script_run(
     return result
 
 
+def _finalize_remote_kiosk_match_script_run(
+    db: Session,
+    *,
+    script_run: dict[str, Any],
+    remote_result: RemoteRunnerResult,
+) -> ScriptExecutionResult:
+    if str(script_run.get("status") or "").strip().lower() != "running":
+        return ScriptExecutionResult(
+            script_run_id=int(script_run["id"]),
+            runner_job_id=str(script_run.get("runner_job_id") or ""),
+            script_name="kiosk_match",
+            model_name=script_run.get("model_name"),
+            status=str(script_run.get("status") or "success"),
+            command=["runpod_serverless", "kiosk_match"],
+            stdout=str(script_run.get("stdout_log") or ""),
+            stderr=str(script_run.get("stderr_log") or ""),
+            message="Runpod callback already processed for this script run.",
+        )
+    script_run_id = int(script_run["id"])
+    runner_payload = dict(script_run.get("runner_payload") or {})
+    session_id = int(script_run["session_id"]) if script_run.get("session_id") is not None else None
+    location_id = int(runner_payload.get("location_id") or 0) if runner_payload.get("location_id") is not None else None
+
+    remote_status = "success" if remote_result.status == "success" else "failed"
+    repositories.finish_script_run(
+        db,
+        script_run_id,
+        status=remote_status,
+        stdout_log=remote_result.stdout,
+        stderr_log=remote_result.stderr,
+    )
+    result = ScriptExecutionResult(
+        script_run_id=script_run_id,
+        runner_job_id=str(script_run.get("runner_job_id") or ""),
+        script_name="kiosk_match",
+        model_name=script_run.get("model_name"),
+        status=remote_status,
+        command=["runpod_serverless", "kiosk_match"],
+        stdout=remote_result.stdout,
+        stderr=remote_result.stderr,
+    )
+    if session_id is None or location_id is None:
+        return result
+
+    session_row = repositories.get_session(db, session_id)
+    existing_summary = dict(session_row.get("result_summary") or {})
+    pipeline = dict(existing_summary.get("session_close_pipeline") or {})
+    transaction_identification = dict(remote_result.transaction_match_summary or {})
+    pipeline["transaction_identification"] = transaction_identification
+    existing_summary["session_close_pipeline"] = pipeline
+
+    transaction_results = transaction_identification.get("transactions")
+    if isinstance(transaction_results, list):
+        transaction_by_id = {
+            int(row["id"]): row
+            for row in repositories.list_session_transactions(db, session_id)
+            if row.get("id") is not None
+        }
+        for result_row in transaction_results:
+            session_transaction_id = result_row.get("session_transaction_id")
+            if session_transaction_id is None:
+                continue
+            stored_row = transaction_by_id.get(int(session_transaction_id))
+            if stored_row is None:
+                continue
+            raw_payload = dict(stored_row.get("raw_payload") or {})
+            raw_payload["transaction_identification"] = result_row
+            repositories.update_session_transaction_raw_payload(db, int(session_transaction_id), raw_payload)
+
+    if result.status != "success":
+        repositories.update_session_fields(
+            db,
+            session_id=session_id,
+            status="issue",
+            result_summary=existing_summary,
+            issue_reason=remote_result.stderr or "Kiosk transaction matching failed in the remote runner.",
+        )
+        return result
+
+    chosen_session_transaction_id = transaction_identification.get("chosen_session_transaction_id")
+    if chosen_session_transaction_id is None:
+        repositories.update_session_fields(
+            db,
+            session_id=session_id,
+            status="issue",
+            result_summary=existing_summary,
+            issue_reason="No kiosk transaction matched confidently for this session.",
+        )
+        return result
+
+    chosen_row = next(
+        (
+            row
+            for row in repositories.list_session_transactions(db, session_id)
+            if int(row.get("id") or 0) == int(chosen_session_transaction_id)
+        ),
+        None,
+    )
+    if chosen_row is None:
+        repositories.update_session_fields(
+            db,
+            session_id=session_id,
+            status="issue",
+            result_summary=existing_summary,
+            issue_reason="Matched kiosk transaction could not be found in session transactions.",
+        )
+        return result
+
+    raw_payload = dict(chosen_row.get("raw_payload") or {})
+    window_start = _coerce_datetime_value(raw_payload.get("window_start"))
+    window_end = _coerce_datetime_value(raw_payload.get("window_end"))
+    if window_start is None or window_end is None:
+        repositories.update_session_fields(
+            db,
+            session_id=session_id,
+            status="issue",
+            result_summary=existing_summary,
+            issue_reason="Matched kiosk transaction is missing window bounds.",
+        )
+        return result
+
+    queued = retrieve_kiosk_video_window(
+        db,
+        session_id=session_id,
+        location_id=location_id,
+        start_time=window_start,
+        end_time=window_end,
+    )
+    pipeline["selected_kiosk_windows"] = [
+        {
+            "start_time": window_start.isoformat(),
+            "end_time": window_end.isoformat(),
+        }
+    ]
+    pipeline["queued_kiosk_video_asset_ids"] = [int(queued.video_asset_id)]
+    existing_summary["session_close_pipeline"] = pipeline
+    repositories.update_session_fields(
+        db,
+        session_id=session_id,
+        status="pending",
+        result_summary=existing_summary,
+        issue_reason=None,
+    )
+    return result
+
+
 def process_runpod_webhook(
     db: Session,
     *,
@@ -1500,7 +1649,7 @@ def process_runpod_webhook(
         if not runner_job_id:
             raise ValueError("Runpod webhook is missing runner job id for status fetch.")
         script_name = str(script_run.get("script_name") or normalized_kind or "").strip().lower()
-        if script_name not in {"entry", "kiosk"}:
+        if script_name not in {"entry", "kiosk", "kiosk_match"}:
             raise ValueError("Unsupported Runpod webhook kind.")
         effective_body = _fetch_runpod_status_with_retries(
             runner_job_id=runner_job_id,
@@ -1530,6 +1679,8 @@ def process_runpod_webhook(
         result = _finalize_remote_entry_script_run(db, script_run=script_run, remote_result=remote_result)
     elif normalized_kind == "kiosk":
         result = _finalize_remote_kiosk_script_run(db, script_run=script_run, remote_result=remote_result)
+    elif normalized_kind == "kiosk_match":
+        result = _finalize_remote_kiosk_match_script_run(db, script_run=script_run, remote_result=remote_result)
     else:
         raise ValueError("Unsupported Runpod webhook kind.")
 
@@ -1674,7 +1825,7 @@ def _runpod_endpoint_id(kind: str | None = None) -> str:
     endpoint_id = ""
     if normalized_kind == "entry":
         endpoint_id = str(settings.runpod_entry_endpoint_id or "").strip()
-    elif normalized_kind == "kiosk":
+    elif normalized_kind in {"kiosk", "kiosk_match"}:
         endpoint_id = str(settings.runpod_kiosk_endpoint_id or "").strip()
     if not endpoint_id:
         endpoint_id = str(settings.runpod_endpoint_id or "").strip()
@@ -1975,6 +2126,233 @@ def _seconds_to_nearest_transaction(db: Session, session_id: int, anchor_time: d
     return min(abs((value - anchor_time).total_seconds()) for value in transaction_times)
 
 
+def _capture_snapshot_frame(
+    *,
+    location_id: int,
+    session_id: int,
+    section: str,
+    recorder_channel: str,
+    start_time: datetime,
+    delayed_seconds: int,
+    snapshot_path: Path,
+) -> dict[str, Any]:
+    session_db = TransactionalSessionLocal()
+    try:
+        location = repositories.get_location_endpoint(session_db, location_id)
+    finally:
+        session_db.close()
+    adjusted_start = start_time - timedelta(seconds=delayed_seconds)
+    adjusted_end = adjusted_start + timedelta(seconds=2)
+    rtsp_url = _build_dahua_rtsp_playback_url(
+        host=str(location.get("dahua_host") or "").strip(),
+        username=str(location.get("dahua_username") or "").strip(),
+        password=decrypt_secret(str(location.get("dahua_password_encrypted") or "").strip()),
+        rtsp_port=int(location.get("rtsp_port") or settings.dahua_rtsp_port),
+        channel=recorder_channel,
+        start_time=adjusted_start,
+        end_time=adjusted_end,
+    )
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        settings.ffmpeg_bin,
+        "-y",
+        "-rtsp_transport",
+        "tcp",
+        "-i",
+        rtsp_url,
+        "-frames:v",
+        "1",
+        "-q:v",
+        "2",
+        str(snapshot_path),
+    ]
+    completed = subprocess.run(command, capture_output=True, text=True)
+    return {
+        "status": "ok" if completed.returncode == 0 and snapshot_path.exists() else "failed",
+        "stderr": str(completed.stderr or "").strip()[-1000:],
+    }
+
+
+def _build_kiosk_transaction_match_manifest(
+    db: Session,
+    *,
+    session_id: int,
+    location_id: int,
+    transaction_summaries: list[dict[str, Any]],
+) -> dict[str, Any]:
+    session_customers = repositories.list_session_customers(db, session_id)
+    session_customer_ids = [
+        int(row["id"])
+        for row in session_customers
+        if row.get("id") is not None
+    ]
+    vector_db = VectorSessionLocal()
+    try:
+        history_rows = vector_repositories.list_history_gallery_records(
+            vector_db,
+            location_id=location_id,
+            session_customer_ids=session_customer_ids,
+            limit=500,
+        )
+    finally:
+        vector_db.close()
+
+    cctv = repositories.get_cctv_by_location_section(db, location_id=location_id, section="kiosk")
+    recorder_channel = str(cctv.get("recorder_channel") or "").strip()
+    if not recorder_channel:
+        raise ValueError("Kiosk CCTV record does not have a recorder_channel.")
+    delayed_seconds = int(cctv.get("delayed_seconds") or 0)
+
+    snapshot_root = build_session_workdir(location_id, session_id) / "kiosk" / "transaction_match_inputs"
+    snapshot_root.mkdir(parents=True, exist_ok=True)
+
+    transactions_payload: list[dict[str, Any]] = []
+    for transaction in transaction_summaries:
+        receipt_number = str(transaction.get("receipt_number") or transaction.get("transaction_id") or "transaction")
+        window_start = _coerce_datetime_value(transaction.get("window_start"))
+        window_end = _coerce_datetime_value(transaction.get("window_end"))
+        if window_start is None or window_end is None:
+            continue
+        total_seconds = max(1.0, (window_end - window_start).total_seconds())
+        sample_count = 10
+        sample_offsets = [total_seconds * (index / max(1, sample_count - 1)) for index in range(sample_count)]
+        samples_payload: list[dict[str, Any]] = []
+        safe_receipt = re.sub(r"[^A-Za-z0-9._-]+", "_", receipt_number) or "transaction"
+        for index, offset_seconds in enumerate(sample_offsets, start=1):
+            sample_time = window_start + timedelta(seconds=float(offset_seconds))
+            snapshot_path = snapshot_root / safe_receipt / f"sample_{index:02d}_{sample_time.strftime('%Y%m%d_%H%M%S')}.jpg"
+            capture_meta = _capture_snapshot_frame(
+                location_id=location_id,
+                session_id=session_id,
+                section="kiosk",
+                recorder_channel=recorder_channel,
+                start_time=sample_time,
+                delayed_seconds=delayed_seconds,
+                snapshot_path=snapshot_path,
+            )
+            if capture_meta["status"] != "ok":
+                samples_payload.append(
+                    {
+                        "sample_index": index,
+                        "sample_time": sample_time.isoformat(),
+                        "status": "failed",
+                        "stderr": capture_meta["stderr"],
+                    }
+                )
+                continue
+            object_key, image_url = _upload_runner_input_file(
+                snapshot_path,
+                kind="kiosk_match_image",
+                location_id=location_id,
+                session_id=session_id,
+                trigger_id=None,
+                section="kiosk",
+            )
+            samples_payload.append(
+                {
+                    "sample_index": index,
+                    "sample_time": sample_time.isoformat(),
+                    "status": "ok",
+                    "image_object_key": object_key,
+                    "image_url": image_url,
+                }
+            )
+        transactions_payload.append(
+            {
+                "session_transaction_id": transaction.get("session_transaction_id"),
+                "transaction_id": transaction.get("transaction_id"),
+                "receipt_number": transaction.get("receipt_number"),
+                "transaction_time": transaction.get("transaction_time"),
+                "window_start": transaction.get("window_start"),
+                "window_end": transaction.get("window_end"),
+                "samples": samples_payload,
+            }
+        )
+
+    return {
+        "session_id": session_id,
+        "location_id": location_id,
+        "min_score": 0.74,
+        "min_margin": 0.03,
+        "target_history_rows": [
+            {
+                "history_gallery_id": row.get("id"),
+                "session_customer_id": row.get("session_customer_id"),
+                "embedding_osnet": row.get("embedding_osnet"),
+                "embedding_fashion": row.get("embedding_fashion"),
+            }
+            for row in history_rows
+        ],
+        "transactions": transactions_payload,
+    }
+
+
+def _queue_kiosk_transaction_match_for_session(
+    db: Session,
+    *,
+    session_id: int,
+    location_id: int,
+    session_close_summary: dict[str, Any],
+) -> dict[str, Any]:
+    pipeline = dict(session_close_summary.get("session_close_pipeline") or {})
+    transaction_rows = list(pipeline.get("paid_transactions") or [])
+    manifest_payload = _build_kiosk_transaction_match_manifest(
+        db,
+        session_id=session_id,
+        location_id=location_id,
+        transaction_summaries=transaction_rows,
+    )
+    manifest_path = build_session_workdir(location_id, session_id) / "kiosk" / "transaction_match_manifest.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(manifest_payload, indent=2))
+    manifest_object_key, manifest_url = _upload_runner_input_file(
+        manifest_path,
+        kind="kiosk_match_manifest",
+        location_id=location_id,
+        session_id=session_id,
+        trigger_id=None,
+        section="kiosk",
+    )
+    script_run_id = repositories.create_script_run_started(
+        db,
+        session_id=session_id,
+        trigger_id=None,
+        script_name="kiosk_match",
+        model_name="runpod_runner",
+        status="running",
+        command=SCRIPT_RUN_COMMAND_REDACTED,
+    )
+    enqueue_result = _enqueue_runpod_runner(
+        kind="kiosk_match",
+        payload={
+            "kind": "kiosk_match",
+            "manifest_url": manifest_url,
+            "callback_url": _build_runpod_webhook_url("kiosk_match"),
+            "script_run_id": script_run_id,
+        },
+    )
+    runner_payload = {
+        "session_id": session_id,
+        "location_id": location_id,
+        "manifest_object_key": manifest_object_key,
+        "manifest_url": manifest_url,
+    }
+    repositories.assign_script_run_runner_job(
+        db,
+        script_run_id,
+        runner_job_id=enqueue_result.job_id,
+        runner_payload=runner_payload,
+    )
+    return {
+        "method": "runpod_snapshot_embedding_match",
+        "status": "running",
+        "script_run_id": script_run_id,
+        "runner_job_id": enqueue_result.job_id,
+        "manifest_object_key": manifest_object_key,
+        "manifest_url": manifest_url,
+    }
+
+
 def _prepare_session_kiosk_pipeline(
     db: Session,
     *,
@@ -2015,6 +2393,7 @@ def _prepare_session_kiosk_pipeline(
         )
         transaction_summaries.append(
             {
+                "session_transaction_id": None,
                 "transaction_id": transaction.get("transaction_id"),
                 "receipt_number": transaction.get("receipt_number"),
                 "transaction_time": transaction_time.isoformat() if hasattr(transaction_time, "isoformat") else transaction_time,
@@ -2027,13 +2406,21 @@ def _prepare_session_kiosk_pipeline(
     merged_windows = _merge_time_windows(raw_windows)
     identification_summary: dict[str, Any] | None = None
     selected_windows = list(merged_windows)
+    session_transactions = repositories.list_session_transactions(db, session_id)
+    for summary_row, session_row in zip(transaction_summaries, session_transactions, strict=False):
+        summary_row["session_transaction_id"] = int(session_row["id"])
     if len(transaction_summaries) > 1:
-        identification_summary = {
-            "method": "deferred_runner_only",
-            "status": "skipped",
-            "reason": "transaction_pre_routing_not_run_in_tds_api",
-            "message": "tds_api does not run local model-based transaction routing.",
-        }
+        identification_summary = _queue_kiosk_transaction_match_for_session(
+            db,
+            session_id=session_id,
+            location_id=location_id,
+            session_close_summary={
+                "session_close_pipeline": {
+                    "paid_transactions": transaction_summaries,
+                }
+            },
+        )
+        selected_windows = []
 
     session_close_summary = {
         "session_close_pipeline": {
@@ -2717,6 +3104,20 @@ def _maybe_close_session_and_prepare_kiosk(
         result_summary=session_close_summary,
         issue_reason=None,
     )
+
+    if not selected_windows and session_close_summary.get("session_close_pipeline", {}).get("transaction_identification"):
+        repositories.update_session_fields(
+            db,
+            session_id=session_id,
+            status="pending",
+            end_time=session_end_time,
+            exit_trigger_id=exit_trigger_id,
+            total_customer=len(session_customers),
+            transaction_total_items=total_transaction_items,
+            result_summary=session_close_summary,
+            issue_reason=None,
+        )
+        return
 
     if not selected_windows:
         repositories.finalize_session_result(
