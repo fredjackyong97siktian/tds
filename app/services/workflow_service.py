@@ -3566,6 +3566,12 @@ def _prepare_video_retrieval(
     if existing_asset is not None:
         existing_video_asset_id = int(existing_asset["id"])
         access_url = str(existing_asset.get("video_url") or f"/api/v1/videos/assets/{existing_video_asset_id}/content")
+        output_path = _resolve_local_video_retrieval_output_path(
+            video_asset_row=existing_asset,
+            location_id=location_id,
+            session_id=session_id,
+            trigger_id=trigger_id,
+        )
         if session_id is not None:
             repositories.create_session_video_asset_link(
                 db,
@@ -3608,7 +3614,7 @@ def _prepare_video_retrieval(
             delayed_seconds=delayed_seconds,
             adjusted_start_time=adjusted_start_time,
             adjusted_end_time=adjusted_end_time,
-            output_path=str(existing_asset.get("file_path") or ""),
+            output_path=output_path,
             rtsp_url=rtsp_url,
             dahua_host=str(location.get("dahua_host") or "").strip(),
             dahua_username=str(location.get("dahua_username") or "").strip(),
@@ -3707,6 +3713,33 @@ def _prepare_video_retrieval(
     )
 
 
+def _resolve_local_video_retrieval_output_path(
+    *,
+    video_asset_row: dict[str, Any],
+    location_id: int,
+    session_id: int | None,
+    trigger_id: int | None,
+) -> str:
+    existing_file_path = str(video_asset_row.get("file_path") or "").strip()
+    if existing_file_path and not existing_file_path.startswith("spaces://"):
+        return existing_file_path
+
+    captured_start = video_asset_row.get("captured_start_time")
+    captured_end = video_asset_row.get("captured_end_time")
+    section = str(video_asset_row.get("section") or "").strip()
+    if not section:
+        raise ValueError(f"Video asset {int(video_asset_row['id'])} does not have a section.")
+    if not isinstance(captured_start, datetime) or not isinstance(captured_end, datetime):
+        raise ValueError(f"Video asset {int(video_asset_row['id'])} is missing capture timestamps.")
+
+    filename = f"{section}_playback_{_format_dahua_playback_time(captured_start)}_{_format_dahua_playback_time(captured_end)}.mp4"
+    if session_id is not None:
+        return str(session_tmp_video_path(location_id, session_id, section, filename))
+    if trigger_id is not None:
+        return str(trigger_tmp_video_path(location_id, trigger_id, section, filename))
+    raise ValueError("Either session_id or trigger_id is required for video retrieval.")
+
+
 def build_retrieval_job_from_video_asset(db: Session, video_asset_id: int) -> VideoRetrievalQueued:
     video_asset = repositories.get_video_asset(db, video_asset_id)
     section = str(video_asset.get("section") or "").strip()
@@ -3762,6 +3795,12 @@ def build_retrieval_job_from_video_asset(db: Session, video_asset_id: int) -> Vi
         start_time=adjusted_start_time,
         end_time=adjusted_end_time,
     )
+    output_path = _resolve_local_video_retrieval_output_path(
+        video_asset_row=video_asset,
+        location_id=location_id,
+        session_id=session_id,
+        trigger_id=int(trigger_id) if trigger_id is not None else None,
+    )
 
     return VideoRetrievalQueued(
         video_asset_id=video_asset_id,
@@ -3774,7 +3813,7 @@ def build_retrieval_job_from_video_asset(db: Session, video_asset_id: int) -> Vi
         delayed_seconds=delayed_seconds,
         adjusted_start_time=adjusted_start_time,
         adjusted_end_time=adjusted_end_time,
-        output_path=str(video_asset.get("file_path") or ""),
+        output_path=output_path,
         rtsp_url=rtsp_url,
         dahua_host=dahua_host,
         dahua_username=dahua_username,
