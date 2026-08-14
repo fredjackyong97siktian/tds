@@ -2221,6 +2221,57 @@ def _resolve_session_customer_identity_from_active_gallery(
     )
 
 
+def _extract_identity_id_from_metadata(value: Any) -> int | None:
+    if not isinstance(value, Mapping):
+        return None
+    return _coerce_int(value.get("identity_id"))
+
+
+def _ensure_identity_for_session_customer(
+    vector_db: Session,
+    *,
+    location_id: int,
+    session_id: int | None,
+    session_customer_id: int,
+    person_id: int | None,
+    seen_at: datetime | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    identity = vector_repositories.find_identity_by_current_session_customer(
+        vector_db,
+        location_id=location_id,
+        current_session_customer_id=session_customer_id,
+    )
+    payload_metadata = dict(metadata or {})
+    if identity is not None:
+        merged_metadata = (
+            _merge_metadata(identity.get("metadata"), payload_metadata)
+            if payload_metadata
+            else identity.get("metadata")
+        )
+        return vector_repositories.update_identity_record(
+            vector_db,
+            int(identity["id"]),
+            status="active",
+            current_session_id=session_id,
+            current_session_customer_id=session_customer_id,
+            person_id=person_id,
+            last_seen_at=seen_at,
+            metadata=merged_metadata,
+        )
+    return vector_repositories.create_identity(
+        vector_db,
+        location_id=location_id,
+        status="active",
+        current_session_id=session_id,
+        current_session_customer_id=session_customer_id,
+        person_id=person_id,
+        first_seen_at=seen_at,
+        last_seen_at=seen_at,
+        metadata=payload_metadata or None,
+    )
+
+
 def _canonicalize_session_customer_for_person(
     transactional_db: Session,
     vector_db: Session,
@@ -2307,7 +2358,22 @@ def _build_cross_state_from_active_gallery(location_id: int) -> dict[str, Any]:
                 skipped_rows += 1
                 continue
             resolved_session_id, resolved_person_id = resolved_identity
-            gallery_id = session_customer_id
+            metadata = row.get("metadata") if isinstance(row.get("metadata"), Mapping) else {}
+            identity_id = _extract_identity_id_from_metadata(metadata)
+            if identity_id is None:
+                identity = _ensure_identity_for_session_customer(
+                    vector_db,
+                    location_id=location_id,
+                    session_id=resolved_session_id,
+                    session_customer_id=session_customer_id,
+                    person_id=resolved_person_id,
+                    metadata={
+                        "source": "active_gallery_hydration",
+                        "legacy_person_id": _coerce_int(row.get("person_id")),
+                    },
+                )
+                identity_id = int(identity["id"])
+            gallery_id = identity_id
 
             next_gid = max(next_gid, gallery_id + 1)
 
@@ -2329,6 +2395,7 @@ def _build_cross_state_from_active_gallery(location_id: int) -> dict[str, Any]:
                     "session_id": resolved_session_id,
                     "session_customer_id": session_customer_id,
                     "person_id": resolved_person_id,
+                    "identity_id": identity_id,
                     "location_id": _coerce_int(row.get("location_id")),
                     "source": "postgresql_active_gallery",
                 },
@@ -3196,6 +3263,21 @@ def _sync_gallery_state_after_entry(
                 active_session_customer_id = source_session_customer_id or session_customer_id
                 active_person_id = source_person_id or person_id
             delete_session_customer_ids = [active_session_customer_id, session_customer_id]
+            identity_seen_at = customer_leave_time if exited else customer_enter_time
+            identity_row = _ensure_identity_for_session_customer(
+                vector_db,
+                location_id=location_id,
+                session_id=active_session_id,
+                session_customer_id=int(active_session_customer_id),
+                person_id=active_person_id,
+                seen_at=identity_seen_at,
+                metadata={
+                    "source": "entry_analysis",
+                    "runtime_person_id": person_id,
+                    "group_id": customer.get("group_id"),
+                },
+            )
+            identity_id = int(identity_row["id"])
 
             vector_repositories.delete_customer_gallery_records_for_session_customer(
                 vector_db,
@@ -3262,6 +3344,7 @@ def _sync_gallery_state_after_entry(
                     embedding_fashion=canonical_fashion,
                     metadata={
                         "source": "entry_analysis",
+                        "identity_id": identity_id,
                         "exited": bool(customer.get("exited")),
                         "group_id": customer.get("group_id"),
                         "active_view_count": len(view_rows) if view_rows else len(osnet_views),
@@ -3269,6 +3352,21 @@ def _sync_gallery_state_after_entry(
                     },
                 )
             if exited:
+                vector_repositories.update_identity_record(
+                    vector_db,
+                    identity_id,
+                    status="exited",
+                    current_session_id=active_session_id,
+                    current_session_customer_id=active_session_customer_id,
+                    person_id=active_person_id,
+                    last_seen_at=customer_leave_time,
+                    exited_at=customer_leave_time,
+                    metadata={
+                        "source": "entry_analysis_exit",
+                        "runtime_person_id": person_id,
+                        "group_id": customer.get("group_id"),
+                    },
+                )
                 archived_count = vector_repositories.archive_active_gallery_by_aliases(
                     vector_db,
                     location_id=location_id,
@@ -3276,6 +3374,7 @@ def _sync_gallery_state_after_entry(
                     archived_reason="customer_exited",
                     metadata_extra={
                         "source": "entry_analysis",
+                        "identity_id": identity_id,
                         "video": Path(video_path).name,
                         "session_id": active_session_id,
                         "session_customer_id": active_session_customer_id,
@@ -3301,6 +3400,7 @@ def _sync_gallery_state_after_entry(
                 )
                 active_metadata = {
                     "source": "entry_analysis",
+                    "identity_id": identity_id,
                     "group_id": customer.get("group_id"),
                     "entered": bool(customer.get("entered")),
                     "exited": False,

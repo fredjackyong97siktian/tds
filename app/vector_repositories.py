@@ -100,6 +100,35 @@ def get_identity_record(db: Session, identity_id: int) -> dict[str, Any]:
     return _fetch_one_dict(result)
 
 
+def find_identity_by_current_session_customer(
+    db: Session,
+    *,
+    location_id: int,
+    current_session_customer_id: int,
+) -> dict[str, Any] | None:
+    result = db.execute(
+        text(
+            """
+            select id, location_id, status, current_session_id, current_session_customer_id, person_id,
+                   first_seen_at, last_seen_at, exited_at, merged_into_identity_id, metadata,
+                   created_at, updated_at
+            from tds_identity
+            where location_id = :location_id
+              and current_session_customer_id = :current_session_customer_id
+              and merged_into_identity_id is null
+            order by updated_at desc, id desc
+            limit 1
+            """
+        ),
+        {
+            "location_id": location_id,
+            "current_session_customer_id": current_session_customer_id,
+        },
+    )
+    row = result.mappings().first()
+    return dict(row) if row is not None else None
+
+
 def list_identity_records(
     db: Session,
     *,
