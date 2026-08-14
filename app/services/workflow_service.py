@@ -2409,7 +2409,7 @@ def _prepare_session_kiosk_pipeline(
     session_transactions = repositories.list_session_transactions(db, session_id)
     for summary_row, session_row in zip(transaction_summaries, session_transactions, strict=False):
         summary_row["session_transaction_id"] = int(session_row["id"])
-    if len(transaction_summaries) > 1:
+    if transaction_summaries:
         identification_summary = _queue_kiosk_transaction_match_for_session(
             db,
             session_id=session_id,
