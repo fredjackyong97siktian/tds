@@ -1,10 +1,13 @@
 from __future__ import annotations
 import base64
+import importlib
+import importlib.util
 import json
 import logging
 import mimetypes
 import os
 import re
+import sys
 import subprocess
 import time
 from dataclasses import dataclass
@@ -1939,9 +1942,40 @@ _KIOSK_OWNERSHIP_RUNTIME = None
 def _get_kiosk_ownership_runtime():
     global _KIOSK_OWNERSHIP_RUNTIME
     if _KIOSK_OWNERSHIP_RUNTIME is None:
-        from tds_runner.runtime import entry_runtime as ownership_runtime
-
-        _KIOSK_OWNERSHIP_RUNTIME = ownership_runtime
+        try:
+            _KIOSK_OWNERSHIP_RUNTIME = importlib.import_module("tds_runner.runtime.entry_runtime")
+        except ModuleNotFoundError as exc:
+            if exc.name != "tds_runner":
+                raise
+            repo_root = Path(__file__).resolve().parents[3]
+            candidate_roots = [
+                repo_root,
+                repo_root.parent,
+            ]
+            ownership_runtime = None
+            for root in candidate_roots:
+                candidate = root / "tds_runner" / "runtime" / "entry_runtime.py"
+                if not candidate.exists():
+                    continue
+                if str(root) not in sys.path:
+                    sys.path.insert(0, str(root))
+                spec = importlib.util.spec_from_file_location(
+                    "tds_runner.runtime.entry_runtime",
+                    candidate,
+                )
+                if spec is None or spec.loader is None:
+                    continue
+                module = importlib.util.module_from_spec(spec)
+                sys.modules.setdefault("tds_runner.runtime.entry_runtime", module)
+                spec.loader.exec_module(module)
+                ownership_runtime = module
+                break
+            if ownership_runtime is None:
+                raise ModuleNotFoundError(
+                    "Kiosk transaction identification requires tds_runner.runtime.entry_runtime. "
+                    "Install the tds_runner package or deploy the tds_runner checkout beside the tds repo."
+                ) from exc
+            _KIOSK_OWNERSHIP_RUNTIME = ownership_runtime
     return _KIOSK_OWNERSHIP_RUNTIME
 
 
