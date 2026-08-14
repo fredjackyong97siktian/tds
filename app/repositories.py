@@ -835,7 +835,7 @@ def _issue_video_retry_status(
 ) -> str:
     section = str(video_asset.get("section") or "").strip().lower()
     script_name = str((latest_failed_script or {}).get("script_name") or "").strip().lower()
-    if section == "kiosk" or script_name in {"entry", "kiosk"}:
+    if section == "kiosk" or script_name in {"entry", "kiosk", "kiosk_match"}:
         return "ready"
     return "not_retrieved"
 
@@ -2885,7 +2885,7 @@ def has_active_remote_analysis_script_run(
         if str(script_name or "").strip()
     ]
     params: dict[str, Any] = {}
-    name_clause = "script_name in ('entry', 'kiosk')"
+    name_clause = "script_name in ('entry', 'kiosk', 'kiosk_match')"
     if normalized_names:
         placeholders: list[str] = []
         for index, script_name in enumerate(normalized_names):
@@ -2917,7 +2917,7 @@ def list_running_remote_analysis_script_runs(db: Session) -> list[dict[str, Any]
             select id, session_id, trigger_id, script_name, model_name, runner_job_id, runner_payload,
                    status, command, stdout_log, stderr_log, started_at, finished_at
             from {script_run_table}
-            where script_name in ('entry', 'kiosk')
+            where script_name in ('entry', 'kiosk', 'kiosk_match')
               and status = 'running'
               and runner_job_id is not null
             order by id asc

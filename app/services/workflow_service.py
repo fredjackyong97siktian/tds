@@ -1746,7 +1746,7 @@ def reconcile_running_remote_analysis_script_runs(db: Session) -> list[dict[str,
     for script_run in repositories.list_running_remote_analysis_script_runs(db):
         job_id = str(script_run.get("runner_job_id") or "").strip()
         script_name = str(script_run.get("script_name") or "").strip().lower()
-        if not job_id or script_name not in {"entry", "kiosk"}:
+        if not job_id or script_name not in {"entry", "kiosk", "kiosk_match"}:
             continue
         try:
             body = _runpod_request(

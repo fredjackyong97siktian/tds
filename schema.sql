@@ -154,7 +154,7 @@ create table if not exists script_run (
     started_at timestamptz not null default now(),
     finished_at timestamptz,
     constraint chk_script_run_name
-        check (script_name in ('retrieve_video', 'entry', 'kiosk')),
+        check (script_name in ('retrieve_video', 'entry', 'kiosk', 'kiosk_match')),
     constraint chk_script_run_status
         check (status in ('pending', 'running', 'success', 'failed'))
 );

@@ -244,7 +244,7 @@ CREATE TABLE IF NOT EXISTS sesamedb.tds_script_run (
     CONSTRAINT fk_script_run_trigger
         FOREIGN KEY (trigger_id) REFERENCES tds_trigger_event(id) ON DELETE CASCADE,
     CONSTRAINT chk_script_run_name
-        CHECK (script_name IN ('retrieve_video', 'entry', 'kiosk')),
+        CHECK (script_name IN ('retrieve_video', 'entry', 'kiosk', 'kiosk_match')),
     CONSTRAINT chk_script_run_status
         CHECK (status IN ('pending', 'running', 'success', 'failed'))
 );
