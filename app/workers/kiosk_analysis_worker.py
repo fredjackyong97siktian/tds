@@ -98,9 +98,9 @@ class KioskAnalysisWorker:
                 )
             if repositories.is_worker_paused(db, "kiosk_analysis"):
                 return
-            if repositories.has_active_remote_analysis_script_run(db):
+            if repositories.has_active_remote_analysis_script_run(db, script_names=["kiosk"]):
                 return
-            if repositories.list_running_video_asset_analyses(db):
+            if repositories.list_running_video_asset_analyses(db, sections=["kiosk"]):
                 return
 
             candidates = repositories.list_pending_kiosk_video_asset_analyses(

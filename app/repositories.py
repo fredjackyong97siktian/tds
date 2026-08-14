@@ -1049,11 +1049,29 @@ def list_pending_kiosk_video_asset_analyses(db: Session, limit: int = 50) -> lis
     return _fetch_all_dicts(result)
 
 
-def list_running_video_asset_analyses(db: Session) -> list[dict[str, Any]]:
+def list_running_video_asset_analyses(
+    db: Session,
+    *,
+    sections: list[str] | None = None,
+) -> list[dict[str, Any]]:
     video_asset_table = _table("video_asset")
     trigger_table = _table("trigger_event")
     session_video_asset_table = _table("session_video_asset")
     session_table = _table("session")
+    normalized_sections = [
+        str(section).strip().lower()
+        for section in (sections or [])
+        if str(section or "").strip()
+    ]
+    params: dict[str, Any] = {}
+    section_clause = ""
+    if normalized_sections:
+        placeholders: list[str] = []
+        for index, section in enumerate(normalized_sections):
+            key = f"section_{index}"
+            placeholders.append(f":{key}")
+            params[key] = section
+        section_clause = f" and lower(va.section) in ({', '.join(placeholders)})"
     result = db.execute(
         text(
             f"""
@@ -1075,12 +1093,14 @@ def list_running_video_asset_analyses(db: Session) -> list[dict[str, Any]]:
             left join {session_table} s on s.id = sva.session_id
             where va.section in ('entrance', 'kiosk')
               and va.status = 'processing'
+              {section_clause}
             group by va.id, va.trigger_id, va.section, va.file_path, va.video_url,
                      va.captured_start_time, va.captured_end_time, va.retrieved_at,
                      va.analyzed_at, va.created_at, te.location_id
             order by va.id asc
             """
-        )
+        ),
+        params,
     )
     return _fetch_all_dicts(result)
 
@@ -2853,19 +2873,38 @@ def get_latest_script_run_for_video_asset(db: Session, video_asset_id: int) -> d
     return payload
 
 
-def has_active_remote_analysis_script_run(db: Session) -> bool:
+def has_active_remote_analysis_script_run(
+    db: Session,
+    *,
+    script_names: list[str] | None = None,
+) -> bool:
     script_run_table = _table("script_run")
+    normalized_names = [
+        str(script_name).strip().lower()
+        for script_name in (script_names or [])
+        if str(script_name or "").strip()
+    ]
+    params: dict[str, Any] = {}
+    name_clause = "script_name in ('entry', 'kiosk')"
+    if normalized_names:
+        placeholders: list[str] = []
+        for index, script_name in enumerate(normalized_names):
+            key = f"script_name_{index}"
+            placeholders.append(f":{key}")
+            params[key] = script_name
+        name_clause = f"lower(script_name) in ({', '.join(placeholders)})"
     result = db.execute(
         text(
             f"""
             select 1
             from {script_run_table}
-            where script_name in ('entry', 'kiosk')
+            where {name_clause}
               and status = 'running'
               and runner_job_id is not null
             limit 1
             """
-        )
+        ),
+        params,
     )
     return result.first() is not None
 
