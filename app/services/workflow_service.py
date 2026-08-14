@@ -1581,6 +1581,18 @@ def _finalize_remote_kiosk_match_script_run(
     raw_payload = dict(chosen_row.get("raw_payload") or {})
     window_start = _coerce_datetime_value(raw_payload.get("window_start"))
     window_end = _coerce_datetime_value(raw_payload.get("window_end"))
+    if (window_start is None or window_end is None) and isinstance(transaction_results, list):
+        matched_result = next(
+            (
+                row
+                for row in transaction_results
+                if int(row.get("session_transaction_id") or 0) == int(chosen_session_transaction_id)
+            ),
+            None,
+        )
+        if isinstance(matched_result, dict):
+            window_start = _coerce_datetime_value(matched_result.get("window_start"))
+            window_end = _coerce_datetime_value(matched_result.get("window_end"))
     if window_start is None or window_end is None:
         repositories.update_session_fields(
             db,
@@ -2388,7 +2400,11 @@ def _prepare_session_kiosk_pipeline(
                 "transaction_time": transaction_time,
                 "total_items": total_items,
                 "total_amount": transaction.get("total_amount"),
-                "raw_payload": transaction,
+                "raw_payload": {
+                    **dict(transaction),
+                    "window_start": window_start.isoformat(),
+                    "window_end": window_end.isoformat(),
+                },
             },
         )
         transaction_summaries.append(
