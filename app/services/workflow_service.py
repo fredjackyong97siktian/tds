@@ -4672,6 +4672,18 @@ def ensure_kiosk_video_assets_for_session(db: Session, session_id: int) -> list[
             session_start_time=session_start_time,
             session_end_time=session_end_time,
         )
+        prepared_pipeline = dict(prepared_summary.get("session_close_pipeline") or {})
+        if not recomputed_windows and prepared_pipeline.get("transaction_identification"):
+            summary["session_close_pipeline"] = prepared_pipeline
+            repositories.update_session_fields(
+                db,
+                session_id=session_id,
+                status="pending",
+                transaction_total_items=total_transaction_items,
+                result_summary=summary,
+                issue_reason=None,
+            )
+            return []
         if not recomputed_windows:
             merged_summary = {**summary, **prepared_summary}
             repositories.finalize_session_result(
