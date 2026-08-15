@@ -51,6 +51,7 @@ def _whitelist_source_config(method: str) -> dict[str, str]:
     if method == "qrentry":
         return {
             "table_name": settings.whitelist_qrentry_table_name,
+            "id_column": settings.whitelist_qrentry_id_column,
             "value_column": settings.whitelist_qrentry_value_column,
             "label_column": settings.whitelist_qrentry_label_column,
             "display_column": settings.whitelist_qrentry_display_column,
@@ -60,6 +61,7 @@ def _whitelist_source_config(method: str) -> dict[str, str]:
     if method == "entrylogs":
         return {
             "table_name": settings.whitelist_entrylogs_table_name,
+            "id_column": settings.whitelist_entrylogs_id_column,
             "value_column": settings.whitelist_entrylogs_value_column,
             "label_column": settings.whitelist_entrylogs_label_column,
             "display_column": settings.whitelist_entrylogs_display_column,
@@ -88,6 +90,29 @@ def _normalize_international_phone_number(value: str) -> str:
     return normalized
 
 
+def _resolve_entry_source_value(
+    db: Session,
+    *,
+    source: Mapping[str, str],
+    entry_id: Any,
+) -> str | None:
+    row = db.execute(
+        text(
+            f"""
+            select cast({source["display_column"]} as char) as resolved_value
+            from {source["table_name"]}
+            where cast({source["value_column"]} as char) = :entry_id
+               or cast({source["id_column"]} as char) = :entry_id
+            limit 1
+            """
+        ),
+        {"entry_id": str(entry_id)},
+    ).mappings().first()
+    if row and row.get("resolved_value") is not None:
+        return str(row["resolved_value"])
+    return None
+
+
 def _resolve_trigger_entry_identity(
     db: Session,
     *,
@@ -96,33 +121,13 @@ def _resolve_trigger_entry_identity(
 ) -> tuple[str | None, str | None]:
     if phone_entry_id is not None:
         source = _whitelist_source_config("qrentry")
-        row = db.execute(
-            text(
-                f"""
-                select cast({source["display_column"]} as char) as resolved_value
-                from {source["table_name"]}
-                where {source["value_column"]} = :entry_id
-                limit 1
-                """
-            ),
-            {"entry_id": phone_entry_id},
-        ).mappings().first()
-        return "Phone Number", str(row["resolved_value"]) if row and row.get("resolved_value") is not None else str(phone_entry_id)
+        resolved_value = _resolve_entry_source_value(db, source=source, entry_id=phone_entry_id)
+        return "Phone Number", resolved_value if resolved_value is not None else str(phone_entry_id)
 
     if credit_card_entry_id is not None:
         source = _whitelist_source_config("entrylogs")
-        row = db.execute(
-            text(
-                f"""
-                select cast({source["display_column"]} as char) as resolved_value
-                from {source["table_name"]}
-                where {source["value_column"]} = :entry_id
-                limit 1
-                """
-            ),
-            {"entry_id": credit_card_entry_id},
-        ).mappings().first()
-        return "Fingerprint", str(row["resolved_value"]) if row and row.get("resolved_value") is not None else str(credit_card_entry_id)
+        resolved_value = _resolve_entry_source_value(db, source=source, entry_id=credit_card_entry_id)
+        return "Fingerprint", resolved_value if resolved_value is not None else str(credit_card_entry_id)
 
     return None, None
 
@@ -929,6 +934,43 @@ def get_video_asset_by_file_path(db: Session, file_path: str) -> dict[str, Any]:
         {"file_path": file_path},
     )
     return _fetch_one_dict(result)
+
+
+def get_latest_video_asset_for_trigger(
+    db: Session,
+    *,
+    trigger_id: int,
+    section: str | None = None,
+) -> dict[str, Any]:
+    video_asset_table = _table("video_asset")
+    where_section = ""
+    params: dict[str, Any] = {"trigger_id": trigger_id}
+    if section is not None:
+        where_section = " and section = :section"
+        params["section"] = section
+    result = db.execute(
+        text(
+            f"""
+            select id, trigger_id, section, sequence_no, video_url, file_path,
+                   captured_start_time, captured_end_time, retrieved_at, analyzed_at,
+                   retention_until, status, metadata, created_at
+            from {video_asset_table}
+            where trigger_id = :trigger_id
+              and status <> 'deleted'
+              {where_section}
+            order by coalesce(captured_start_time, created_at) desc, id desc
+            limit 1
+            """
+        ),
+        params,
+    )
+    row = _fetch_one_dict(result)
+    if isinstance(row.get("metadata"), str):
+        try:
+            row["metadata"] = json.loads(row["metadata"])
+        except json.JSONDecodeError:
+            pass
+    return row
 
 
 def list_pending_video_asset_retrievals(db: Session, limit: int = 50) -> list[dict[str, Any]]:

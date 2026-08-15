@@ -56,14 +56,17 @@ class Settings(BaseSettings):
     kiosk_analysis_max_global_workers: int = 1
     kiosk_analysis_cooldown_seconds: int = 10
     entrance_trigger_extra_before_seconds: int = 10
+    entrance_trigger_extra_after_seconds: int = 40
     kiosk_transaction_extra_before_seconds: int = 10
     kiosk_transaction_extra_after_seconds: int = -10
     whitelist_qrentry_table_name: str = "phonenumber"
+    whitelist_qrentry_id_column: str = "id"
     whitelist_qrentry_value_column: str = "participantId"
     whitelist_qrentry_label_column: str = "participantId"
     whitelist_qrentry_display_column: str = "participantId"
     whitelist_qrentry_create_column: str = "participantId"
     whitelist_entrylogs_table_name: str = "fingerprint"
+    whitelist_entrylogs_id_column: str = "id"
     whitelist_entrylogs_value_column: str = "fingerprint"
     whitelist_entrylogs_label_column: str = "fingerprint"
     whitelist_entrylogs_display_column: str = "fingerprint"
