@@ -2312,7 +2312,7 @@ def _queue_kiosk_transaction_match_for_session(
     )
     manifest_path = build_session_workdir(location_id, session_id) / "kiosk" / "transaction_match_manifest.json"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest_path.write_text(json.dumps(manifest_payload, indent=2))
+    manifest_path.write_text(json.dumps(manifest_payload, indent=2, default=str))
     manifest_object_key, manifest_url = _upload_runner_input_file(
         manifest_path,
         kind="kiosk_match_manifest",
