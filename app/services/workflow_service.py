@@ -50,6 +50,7 @@ UTC = timezone.utc
 SCRIPT_RUN_COMMAND_REDACTED = "[redacted]"
 logger = logging.getLogger("tds.workflow_service")
 KIOSK_OWNERSHIP_MIN_MARGIN_SECONDS = 10.0
+NO_KIOSK_VIDEO_REASON = "No kiosk video was queued because no paid transactions were found inside the session window."
 
 
 @dataclass
@@ -3141,6 +3142,17 @@ def _maybe_close_session_and_prepare_kiosk(
             tolerance=1,
             extra_result_summary=session_close_summary,
         )
+        repositories.update_session_fields(
+            db,
+            session_id=session_id,
+            status="closed",
+            end_time=session_end_time,
+            exit_trigger_id=exit_trigger_id,
+            total_customer=len(session_customers),
+            transaction_total_items=total_transaction_items,
+            result_summary=session_close_summary,
+            issue_reason=NO_KIOSK_VIDEO_REASON,
+        )
         return
 
     queued_video_asset_ids: list[int] = []
@@ -4661,13 +4673,22 @@ def ensure_kiosk_video_assets_for_session(db: Session, session_id: int) -> list[
             session_end_time=session_end_time,
         )
         if not recomputed_windows:
+            merged_summary = {**summary, **prepared_summary}
+            repositories.finalize_session_result(
+                db,
+                session_id=session_id,
+                kiosk_total_items=0,
+                actual_items_brought=0,
+                tolerance=1,
+                extra_result_summary=merged_summary,
+            )
             repositories.update_session_fields(
                 db,
                 session_id=session_id,
-                status="issue",
+                status="closed",
                 transaction_total_items=total_transaction_items,
-                result_summary={**summary, **prepared_summary},
-                issue_reason="Kiosk retry failed because no paid transactions were found inside the session window.",
+                result_summary=merged_summary,
+                issue_reason=NO_KIOSK_VIDEO_REASON,
             )
             return []
 
