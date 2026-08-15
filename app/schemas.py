@@ -139,6 +139,12 @@ class SessionEndTimeUpdateRequest(BaseModel):
     exit_trigger_id: int | None = None
 
 
+class SessionStatusUpdateRequest(BaseModel):
+    status: str = Field(
+        pattern="^(pending|processing_entry|processing_kiosk|detected|not_detected|need_review|issue|whitelisted|closed)$"
+    )
+
+
 class SessionResponse(BaseModel):
     id: int
     entry_trigger_id: int

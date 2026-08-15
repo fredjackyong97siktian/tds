@@ -4,8 +4,8 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from ..db import get_transaction_db
-from .. import repositories
+from ..db import VectorSessionLocal, get_transaction_db
+from .. import repositories, vector_repositories
 from ..services import workflow_service
 from ..schemas import (
     SessionCreate,
@@ -16,6 +16,7 @@ from ..schemas import (
     SessionFinalizeResponse,
     SessionListItem,
     SessionResponse,
+    SessionStatusUpdateRequest,
     SessionTransactionDetailResponse,
     SessionTransactionResponse,
     TransactionCreate,
@@ -108,6 +109,21 @@ def update_session_end_time(
         raise HTTPException(status_code=500, detail=f"Session end-time update failed: {exc}") from exc
 
 
+@router.patch("/{session_id}/status", response_model=SessionResponse)
+def update_session_status(
+    session_id: int,
+    payload: SessionStatusUpdateRequest,
+    db: Session = Depends(get_transaction_db),
+) -> SessionResponse:
+    row = repositories.update_session_fields(
+        db,
+        session_id=session_id,
+        status=payload.status,
+        issue_reason=None if payload.status != "issue" else repositories.get_session(db, session_id).get("issue_reason"),
+    )
+    return SessionResponse(**row)
+
+
 @router.post("/{session_id}/finalize", response_model=SessionFinalizeResponse)
 def finalize_session(session_id: int, payload: SessionFinalizeRequest, db: Session = Depends(get_transaction_db)) -> SessionFinalizeResponse:
     row = repositories.finalize_session_result(
@@ -133,3 +149,47 @@ def retry_session_issue(session_id: int, db: Session = Depends(get_transaction_d
     except Exception as exc:
         logger.exception("Session retry failed for session_id=%s", session_id)
         raise HTTPException(status_code=500, detail=f"Session retry failed: {exc}") from exc
+
+
+@router.delete("/{session_id}", status_code=204)
+def delete_session(session_id: int, db: Session = Depends(get_transaction_db)) -> None:
+    try:
+        session = repositories.get_session(db, session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    session_customers = repositories.list_session_customers(db, session_id)
+    session_customer_ids = [int(row["id"]) for row in session_customers if row.get("id") is not None]
+    with VectorSessionLocal() as vector_db:
+        if session_customer_ids:
+            vector_repositories.purge_session_customer_records(
+                vector_db,
+                session_customer_ids=session_customer_ids,
+            )
+        vector_repositories.purge_session_records(vector_db, session_id=session_id)
+    repositories.delete_session(db, session_id)
+    logger.info(
+        "Deleted session session_id=%s location_id=%s customers=%s",
+        session_id,
+        session.get("location_id"),
+        len(session_customer_ids),
+    )
+
+
+@router.delete("/customers/{session_customer_id}", status_code=204)
+def delete_session_customer(session_customer_id: int, db: Session = Depends(get_transaction_db)) -> None:
+    try:
+        row = repositories.get_session_customer(db, session_customer_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    session_id = int(row["session_id"])
+    repositories.delete_session_customer(db, session_customer_id)
+    with VectorSessionLocal() as vector_db:
+        vector_repositories.purge_session_customer_records(
+            vector_db,
+            session_customer_ids=[session_customer_id],
+        )
+    repositories.update_session_fields(
+        db,
+        session_id=session_id,
+        total_customer=repositories.get_session_customer_count(db, session_id),
+    )

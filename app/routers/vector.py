@@ -126,3 +126,12 @@ def get_customer_gallery_image(gallery_id: int, db: Session = Depends(get_vector
     if not resolved.exists() or not resolved.is_file():
         raise HTTPException(status_code=404, detail="Private gallery image not found.")
     return FileResponse(path=resolved, media_type=guess_media_type(str(resolved)), filename=resolved.name)
+
+
+@router.delete("/customer-gallery/{gallery_id}", status_code=204)
+def delete_customer_gallery(gallery_id: int, db: Session = Depends(get_vector_db)) -> None:
+    try:
+        vector_repositories.get_customer_gallery_record(db, gallery_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    vector_repositories.delete_customer_gallery_record(db, gallery_id)

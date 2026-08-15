@@ -59,6 +59,15 @@ def restart_video_asset_analysis(video_asset_id: int, db: Session = Depends(get_
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.delete("/assets/{video_asset_id}", status_code=204)
+def delete_video_asset(video_asset_id: int, db: Session = Depends(get_transaction_db)) -> None:
+    try:
+        repositories.get_video_asset(db, video_asset_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    repositories.delete_video_asset(db, video_asset_id)
+
+
 @router.post("/triggers/{trigger_id}")
 def create_trigger_video_asset(trigger_id: int, payload: VideoAssetCreate, db: Session = Depends(get_transaction_db)) -> dict:
     trigger = repositories.get_trigger(db, trigger_id)

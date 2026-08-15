@@ -1516,6 +1516,37 @@ def update_session_fields(
     return get_session(db, session_id)
 
 
+def get_session_customer_count(db: Session, session_id: int) -> int:
+    session_customer_table = _table("session_customer")
+    result = db.execute(
+        text(
+            f"""
+            select count(*) as customer_count
+            from {session_customer_table}
+            where session_id = :session_id
+              and merged_into_session_customer_id is null
+            """
+        ),
+        {"session_id": session_id},
+    )
+    row = _fetch_one_dict(result)
+    return int(row.get("customer_count") or 0)
+
+
+def delete_session(db: Session, session_id: int) -> None:
+    session_table = _table("session")
+    db.execute(
+        text(
+            f"""
+            delete from {session_table}
+            where id = :session_id
+            """
+        ),
+        {"session_id": session_id},
+    )
+    db.commit()
+
+
 def retry_session_issue(db: Session, session_id: int) -> dict[str, Any]:
     session = get_session(db, session_id)
     current_status = str(session.get("status") or "").strip().lower()
@@ -2100,6 +2131,22 @@ def get_session_customer(db: Session, session_customer_id: int) -> dict[str, Any
     return _fetch_one_dict(result)
 
 
+def delete_session_customer(db: Session, session_customer_id: int) -> dict[str, Any]:
+    row = get_session_customer(db, session_customer_id)
+    session_customer_table = _table("session_customer")
+    db.execute(
+        text(
+            f"""
+            delete from {session_customer_table}
+            where id = :session_customer_id
+            """
+        ),
+        {"session_customer_id": session_customer_id},
+    )
+    db.commit()
+    return row
+
+
 def get_latest_open_session_customer_by_location_person(
     db: Session,
     *,
@@ -2296,6 +2343,20 @@ def update_video_asset(db: Session, video_asset_id: int, payload: Mapping[str, A
             "status": payload.get("status"),
             "metadata": _json_dumps(payload.get("metadata")) if payload.get("metadata") is not None else None,
         },
+    )
+    db.commit()
+
+
+def delete_video_asset(db: Session, video_asset_id: int) -> None:
+    video_asset_table = _table("video_asset")
+    db.execute(
+        text(
+            f"""
+            delete from {video_asset_table}
+            where id = :video_asset_id
+            """
+        ),
+        {"video_asset_id": video_asset_id},
     )
     db.commit()
 

@@ -470,6 +470,99 @@ def delete_customer_gallery_records_for_session_customer(
     db.commit()
 
 
+def delete_customer_gallery_record(db: Session, gallery_id: int) -> None:
+    db.execute(
+        text(
+            """
+            delete from tds_customer_gallery
+            where id = :gallery_id
+            """
+        ),
+        {"gallery_id": gallery_id},
+    )
+    db.commit()
+
+
+def purge_session_customer_records(
+    db: Session,
+    *,
+    session_customer_ids: list[int],
+) -> None:
+    normalized_ids = sorted({int(value) for value in session_customer_ids if value is not None})
+    if not normalized_ids:
+        return
+
+    db.execute(
+        text(
+            """
+            update tds_identity
+            set current_session_id = null,
+                current_session_customer_id = null
+            where current_session_customer_id = any(:session_customer_ids)
+            """
+        ),
+        {"session_customer_ids": normalized_ids},
+    )
+    db.execute(
+        text(
+            """
+            delete from tds_active_gallery
+            where session_customer_id = any(:session_customer_ids)
+            """
+        ),
+        {"session_customer_ids": normalized_ids},
+    )
+    db.execute(
+        text(
+            """
+            delete from tds_customer_gallery
+            where session_customer_id = any(:session_customer_ids)
+            """
+        ),
+        {"session_customer_ids": normalized_ids},
+    )
+    db.execute(
+        text(
+            """
+            delete from tds_history_gallery
+            where session_customer_id = any(:session_customer_ids)
+            """
+        ),
+        {"session_customer_ids": normalized_ids},
+    )
+    db.commit()
+
+
+def purge_session_records(db: Session, *, session_id: int) -> None:
+    db.execute(
+        text(
+            """
+            update tds_identity
+            set current_session_id = null,
+                current_session_customer_id = null
+            where current_session_id = :session_id
+            """
+        ),
+        {"session_id": session_id},
+    )
+    for statement in (
+        """
+        delete from tds_active_gallery
+        where session_id = :session_id
+        """,
+        """
+        delete from tds_customer_gallery
+        where session_id = :session_id
+        """,
+        """
+        delete from tds_history_gallery
+        where session_id = :session_id
+        """,
+    ):
+        db.execute(text(statement), {"session_id": session_id})
+    db.commit()
+
+
 def reassign_session_customer_aliases(
     db: Session,
     *,
