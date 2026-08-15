@@ -2657,6 +2657,10 @@ def _resolve_session_customer_identity_from_active_gallery(
 
     if int(session.get("location_id") or 0) != location_id:
         return None
+    if session_customer.get("merged_into_session_customer_id") is not None:
+        return None
+    if session_customer.get("leave_time") is not None:
+        return None
     return (
         int(session["id"]),
         _coerce_int(session_customer.get("person_id")) or fallback_person_id,
@@ -2773,6 +2777,14 @@ def _build_cross_state_from_active_gallery(location_id: int) -> dict[str, Any]:
     vector_db = VectorSessionLocal()
     transactional_db = TransactionalSessionLocal()
     try:
+        active_session_customer_ids = {
+            int(row["id"])
+            for row in repositories.list_active_session_customers_for_location(
+                transactional_db,
+                location_id=location_id,
+            )
+            if row.get("id") is not None
+        }
         active_rows = vector_repositories.list_active_gallery_records(
             vector_db,
             location_id=location_id,
@@ -2787,6 +2799,9 @@ def _build_cross_state_from_active_gallery(location_id: int) -> dict[str, Any]:
         for row in active_rows:
             session_customer_id = _coerce_int(row.get("session_customer_id"))
             if session_customer_id is None:
+                skipped_rows += 1
+                continue
+            if session_customer_id not in active_session_customer_ids:
                 skipped_rows += 1
                 continue
             resolved_identity = _resolve_session_customer_identity_from_active_gallery(
@@ -2886,6 +2901,14 @@ def _hydrate_gallery_state_from_active_gallery(location_id: int, gallery_state_p
 def _find_open_active_session_for_location(db: Session, location_id: int) -> dict[str, Any] | None:
     vector_db = VectorSessionLocal()
     try:
+        active_session_customer_ids = {
+            int(row["id"])
+            for row in repositories.list_active_session_customers_for_location(
+                db,
+                location_id=location_id,
+            )
+            if row.get("id") is not None
+        }
         active_rows = vector_repositories.list_active_gallery_records(
             vector_db,
             location_id=location_id,
@@ -2896,6 +2919,9 @@ def _find_open_active_session_for_location(db: Session, location_id: int) -> dic
 
     seen_session_ids: set[int] = set()
     for row in active_rows:
+        session_customer_id = _coerce_int(row.get("session_customer_id"))
+        if session_customer_id is None or session_customer_id not in active_session_customer_ids:
+            continue
         active_session_id = _coerce_int(row.get("session_id"))
         if active_session_id is None or active_session_id in seen_session_ids:
             continue

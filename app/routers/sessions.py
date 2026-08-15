@@ -294,7 +294,7 @@ def mark_session_customer_exit(session_customer_id: int, db: Session = Depends(g
             db,
             session_customer_id=session_customer_id,
             leave_time=leave_time,
-            match_status="manual_exit",
+            match_status="resolved",
         )
 
         workflow_service._maybe_close_session_and_prepare_kiosk(  # noqa: SLF001
