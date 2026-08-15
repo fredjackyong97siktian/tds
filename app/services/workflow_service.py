@@ -2408,7 +2408,21 @@ def _prepare_session_kiosk_pipeline(
     merged_windows = _merge_time_windows(raw_windows)
     identification_summary: dict[str, Any] | None = None
     selected_windows = list(merged_windows)
-    if transaction_summaries:
+    if len(transaction_summaries) == 1:
+        selected = transaction_summaries[0]
+        selected_transaction_id = repositories.create_transaction(
+            db,
+            session_id,
+            {
+                "receipt_number": str(selected.get("receipt_number") or selected.get("transaction_id") or ""),
+                "transaction_time": _coerce_datetime_value(selected.get("transaction_time")),
+                "total_items": int(selected.get("total_items") or 0),
+                "total_amount": selected.get("total_amount"),
+                "raw_payload": dict(selected.get("raw_payload") or {}),
+            },
+        )
+        selected["session_transaction_id"] = selected_transaction_id
+    elif len(transaction_summaries) > 1:
         identification_summary = _queue_kiosk_transaction_match_for_session(
             db,
             session_id=session_id,
