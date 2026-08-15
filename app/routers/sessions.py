@@ -244,72 +244,77 @@ def delete_session_customer(session_customer_id: int, db: Session = Depends(get_
 def mark_session_customer_exit(session_customer_id: int, db: Session = Depends(get_transaction_db)) -> dict:
     try:
         session_customer = repositories.get_session_customer(db, session_customer_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        session_id = int(session_customer["session_id"])
+        session = repositories.get_session(db, session_id)
+        location_id = int(session["location_id"])
+        person_id = session_customer.get("person_id")
+        leave_time = session.get("end_time") or datetime.utcnow()
 
-    session_id = int(session_customer["session_id"])
-    session = repositories.get_session(db, session_id)
-    location_id = int(session["location_id"])
-    person_id = session_customer.get("person_id")
-    leave_time = session.get("end_time") or datetime.utcnow()
-
-    repositories.update_session_customer_leave_time(
-        db,
-        session_customer_id=session_customer_id,
-        leave_time=leave_time,
-        match_status="manual_exit",
-    )
-
-    archived_count = 0
-    identity_id = None
-    with VectorSessionLocal() as vector_db:
-        identity = vector_repositories.find_identity_by_current_session_customer(
-            vector_db,
-            location_id=location_id,
-            current_session_customer_id=session_customer_id,
-        )
-        if identity is not None:
-            identity_id = int(identity["id"])
-            vector_repositories.update_identity_record(
+        archived_count = 0
+        identity_id = None
+        with VectorSessionLocal() as vector_db:
+            identity = vector_repositories.find_identity_by_current_session_customer(
                 vector_db,
-                identity_id,
-                status="exited",
-                current_session_id=session_id,
+                location_id=location_id,
                 current_session_customer_id=session_customer_id,
-                person_id=int(person_id) if person_id is not None else None,
-                last_seen_at=leave_time,
-                exited_at=leave_time,
-                metadata={
+            )
+            if identity is not None:
+                identity_id = int(identity["id"])
+                vector_repositories.update_identity_record(
+                    vector_db,
+                    identity_id,
+                    status="exited",
+                    current_session_id=session_id,
+                    current_session_customer_id=session_customer_id,
+                    person_id=int(person_id) if person_id is not None else None,
+                    last_seen_at=leave_time,
+                    exited_at=leave_time,
+                    metadata={
+                        "source": "dashboard_manual_exit",
+                        "session_id": session_id,
+                        "session_customer_id": session_customer_id,
+                        "person_id": person_id,
+                    },
+                )
+            archived_count = vector_repositories.archive_active_gallery_by_aliases(
+                vector_db,
+                location_id=location_id,
+                session_customer_ids=[session_customer_id],
+                archived_reason="manual_exit",
+                metadata_extra={
                     "source": "dashboard_manual_exit",
                     "session_id": session_id,
                     "session_customer_id": session_customer_id,
                     "person_id": person_id,
+                    "identity_id": identity_id,
                 },
             )
-        archived_count = vector_repositories.archive_active_gallery_by_aliases(
-            vector_db,
-            location_id=location_id,
-            session_customer_ids=[session_customer_id],
-            archived_reason="manual_exit",
-            metadata_extra={
-                "source": "dashboard_manual_exit",
-                "session_id": session_id,
-                "session_customer_id": session_customer_id,
-                "person_id": person_id,
-                "identity_id": identity_id,
-            },
+
+        repositories.update_session_customer_leave_time(
+            db,
+            session_customer_id=session_customer_id,
+            leave_time=leave_time,
+            match_status="manual_exit",
         )
 
-    workflow_service._maybe_close_session_and_prepare_kiosk(  # noqa: SLF001
-        db,
-        session_id=session_id,
-        exit_trigger_id=session.get("exit_trigger_id"),
-    )
-    updated_customer = repositories.get_session_customer(db, session_customer_id)
-    updated_session = repositories.get_session(db, session_id)
-    return {
-        "ok": True,
-        "session_customer": updated_customer,
-        "session": updated_session,
-        "archived_count": archived_count,
-    }
+        workflow_service._maybe_close_session_and_prepare_kiosk(  # noqa: SLF001
+            db,
+            session_id=session_id,
+            exit_trigger_id=session.get("exit_trigger_id"),
+        )
+        updated_customer = repositories.get_session_customer(db, session_customer_id)
+        updated_session = repositories.get_session(db, session_id)
+        return {
+            "ok": True,
+            "session_customer": updated_customer,
+            "session": updated_session,
+            "archived_count": archived_count,
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PermissionError as exc:
+        logger.exception("Manual exit failed due to vector gallery permission issue for session_customer_id=%s", session_customer_id)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Manual exit failed for session_customer_id=%s", session_customer_id)
+        raise HTTPException(status_code=500, detail=f"Manual exit failed: {exc}") from exc
