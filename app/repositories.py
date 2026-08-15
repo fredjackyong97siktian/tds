@@ -88,6 +88,45 @@ def _normalize_international_phone_number(value: str) -> str:
     return normalized
 
 
+def _resolve_trigger_entry_identity(
+    db: Session,
+    *,
+    phone_entry_id: Any | None,
+    credit_card_entry_id: Any | None,
+) -> tuple[str | None, str | None]:
+    if phone_entry_id is not None:
+        source = _whitelist_source_config("qrentry")
+        row = db.execute(
+            text(
+                f"""
+                select cast({source["display_column"]} as char) as resolved_value
+                from {source["table_name"]}
+                where {source["value_column"]} = :entry_id
+                limit 1
+                """
+            ),
+            {"entry_id": phone_entry_id},
+        ).mappings().first()
+        return "Phone Number", str(row["resolved_value"]) if row and row.get("resolved_value") is not None else str(phone_entry_id)
+
+    if credit_card_entry_id is not None:
+        source = _whitelist_source_config("entrylogs")
+        row = db.execute(
+            text(
+                f"""
+                select cast({source["display_column"]} as char) as resolved_value
+                from {source["table_name"]}
+                where {source["value_column"]} = :entry_id
+                limit 1
+                """
+            ),
+            {"entry_id": credit_card_entry_id},
+        ).mappings().first()
+        return "Fingerprint", str(row["resolved_value"]) if row and row.get("resolved_value") is not None else str(credit_card_entry_id)
+
+    return None, None
+
+
 def get_cctv(db: Session, cctv_id: int) -> dict[str, Any]:
     cctv_table = _table("cctv")
     location_endpoint_table = _table("location_endpoint")
@@ -609,6 +648,13 @@ def get_trigger(db: Session, trigger_id: int) -> dict[str, Any]:
             row["raw_payload"] = json.loads(row["raw_payload"])
         except json.JSONDecodeError:
             pass
+    label, value = _resolve_trigger_entry_identity(
+        db,
+        phone_entry_id=row.get("phone_entry_id"),
+        credit_card_entry_id=row.get("credit_card_entry_id"),
+    )
+    row["resolved_entry_label"] = label
+    row["resolved_entry_value"] = value
     return row
 
 
@@ -766,7 +812,16 @@ def list_triggers(db: Session, limit: int = 50) -> list[dict[str, Any]]:
         ),
         {"limit": limit},
     )
-    return _fetch_all_dicts(result)
+    rows = _fetch_all_dicts(result)
+    for row in rows:
+        label, value = _resolve_trigger_entry_identity(
+            db,
+            phone_entry_id=row.get("phone_entry_id"),
+            credit_card_entry_id=row.get("credit_card_entry_id"),
+        )
+        row["resolved_entry_label"] = label
+        row["resolved_entry_value"] = value
+    return rows
 
 
 def retry_trigger_issue(db: Session, trigger_id: int) -> dict[str, Any]:
