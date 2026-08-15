@@ -29,6 +29,10 @@ def _merge_metadata(base: Any, extra: Mapping[str, Any] | None = None) -> dict[s
     return payload
 
 
+def _json_dumps(value: Any) -> str:
+    return json.dumps(value, default=str)
+
+
 def _is_history_gallery_permission_error(exc: Exception) -> bool:
     return "permission denied for table tds_history_gallery" in str(exc).lower()
 
@@ -77,7 +81,7 @@ def create_identity(
             "last_seen_at": last_seen_at,
             "exited_at": exited_at,
             "merged_into_identity_id": merged_into_identity_id,
-            "metadata": json.dumps(dict(metadata)) if metadata is not None else None,
+            "metadata": _json_dumps(dict(metadata)) if metadata is not None else None,
         },
     )
     db.commit()
@@ -206,7 +210,7 @@ def update_identity_record(
             "last_seen_at": last_seen_at,
             "exited_at": exited_at,
             "merged_into_identity_id": merged_into_identity_id,
-            "metadata": json.dumps(dict(metadata)) if metadata is not None else None,
+            "metadata": _json_dumps(dict(metadata)) if metadata is not None else None,
         },
     )
     db.commit()
@@ -248,9 +252,9 @@ def create_active_gallery_record(
             "person_id": person_id,
             "image_url": image_url,
             "image_kind": image_kind,
-            "embedding_osnet": json.dumps(embedding_osnet) if embedding_osnet is not None else None,
-            "embedding_fashion": json.dumps(embedding_fashion) if embedding_fashion is not None else None,
-            "metadata": json.dumps(dict(metadata)) if metadata is not None else None,
+            "embedding_osnet": _json_dumps(embedding_osnet) if embedding_osnet is not None else None,
+            "embedding_fashion": _json_dumps(embedding_fashion) if embedding_fashion is not None else None,
+            "metadata": _json_dumps(dict(metadata)) if metadata is not None else None,
         },
     )
     db.commit()
@@ -294,9 +298,9 @@ def create_customer_gallery_record(
             "image_url": image_url,
             "image_public_url": image_public_url,
             "image_kind": image_kind,
-            "embedding_osnet": json.dumps(embedding_osnet) if embedding_osnet is not None else None,
-            "embedding_fashion": json.dumps(embedding_fashion) if embedding_fashion is not None else None,
-            "metadata": json.dumps(dict(metadata)) if metadata is not None else None,
+            "embedding_osnet": _json_dumps(embedding_osnet) if embedding_osnet is not None else None,
+            "embedding_fashion": _json_dumps(embedding_fashion) if embedding_fashion is not None else None,
+            "metadata": _json_dumps(dict(metadata)) if metadata is not None else None,
         },
     )
     db.commit()
@@ -741,9 +745,9 @@ def create_history_gallery_record(
             "person_id": person_id,
             "image_url": image_url,
             "image_kind": image_kind,
-            "embedding_osnet": json.dumps(embedding_osnet) if embedding_osnet is not None else None,
-            "embedding_fashion": json.dumps(embedding_fashion) if embedding_fashion is not None else None,
-            "metadata": json.dumps(dict(metadata)) if metadata is not None else None,
+            "embedding_osnet": _json_dumps(embedding_osnet) if embedding_osnet is not None else None,
+            "embedding_fashion": _json_dumps(embedding_fashion) if embedding_fashion is not None else None,
+            "metadata": _json_dumps(dict(metadata)) if metadata is not None else None,
             "archived_reason": archived_reason,
             "created_at": created_at,
             "updated_at": updated_at,
