@@ -1521,24 +1521,6 @@ def _finalize_remote_kiosk_match_script_run(
     pipeline["transaction_identification"] = transaction_identification
     existing_summary["session_close_pipeline"] = pipeline
 
-    transaction_results = transaction_identification.get("transactions")
-    if isinstance(transaction_results, list):
-        transaction_by_id = {
-            int(row["id"]): row
-            for row in repositories.list_session_transactions(db, session_id)
-            if row.get("id") is not None
-        }
-        for result_row in transaction_results:
-            session_transaction_id = result_row.get("session_transaction_id")
-            if session_transaction_id is None:
-                continue
-            stored_row = transaction_by_id.get(int(session_transaction_id))
-            if stored_row is None:
-                continue
-            raw_payload = dict(stored_row.get("raw_payload") or {})
-            raw_payload["transaction_identification"] = result_row
-            repositories.update_session_transaction_raw_payload(db, int(session_transaction_id), raw_payload)
-
     if result.status != "success":
         repositories.update_session_fields(
             db,
@@ -1549,8 +1531,12 @@ def _finalize_remote_kiosk_match_script_run(
         )
         return result
 
-    chosen_session_transaction_id = transaction_identification.get("chosen_session_transaction_id")
-    if chosen_session_transaction_id is None:
+    transaction_results = transaction_identification.get("transactions")
+    if not isinstance(transaction_results, list):
+        transaction_results = []
+
+    chosen_candidate_index = transaction_identification.get("chosen_candidate_index")
+    if chosen_candidate_index is None:
         repositories.update_session_fields(
             db,
             session_id=session_id,
@@ -1560,39 +1546,28 @@ def _finalize_remote_kiosk_match_script_run(
         )
         return result
 
-    chosen_row = next(
+    matched_result = next(
         (
             row
-            for row in repositories.list_session_transactions(db, session_id)
-            if int(row.get("id") or 0) == int(chosen_session_transaction_id)
+            for row in transaction_results
+            if int(row.get("candidate_index") or 0) == int(chosen_candidate_index)
         ),
         None,
     )
-    if chosen_row is None:
+    if not isinstance(matched_result, dict):
         repositories.update_session_fields(
             db,
             session_id=session_id,
             status="issue",
             result_summary=existing_summary,
-            issue_reason="Matched kiosk transaction could not be found in session transactions.",
+            issue_reason="Matched kiosk transaction could not be found in candidate transactions.",
         )
         return result
 
-    raw_payload = dict(chosen_row.get("raw_payload") or {})
+    raw_payload = dict(matched_result.get("raw_payload") or {})
+    raw_payload["transaction_identification"] = matched_result
     window_start = _coerce_datetime_value(raw_payload.get("window_start"))
     window_end = _coerce_datetime_value(raw_payload.get("window_end"))
-    if (window_start is None or window_end is None) and isinstance(transaction_results, list):
-        matched_result = next(
-            (
-                row
-                for row in transaction_results
-                if int(row.get("session_transaction_id") or 0) == int(chosen_session_transaction_id)
-            ),
-            None,
-        )
-        if isinstance(matched_result, dict):
-            window_start = _coerce_datetime_value(matched_result.get("window_start"))
-            window_end = _coerce_datetime_value(matched_result.get("window_end"))
     if window_start is None or window_end is None:
         repositories.update_session_fields(
             db,
@@ -1602,6 +1577,22 @@ def _finalize_remote_kiosk_match_script_run(
             issue_reason="Matched kiosk transaction is missing window bounds.",
         )
         return result
+
+    repositories.delete_session_transactions(db, session_id)
+    selected_transaction_id = repositories.create_transaction(
+        db,
+        session_id,
+        {
+            "receipt_number": str(matched_result.get("receipt_number") or matched_result.get("transaction_id") or ""),
+            "transaction_time": _coerce_datetime_value(matched_result.get("transaction_time")),
+            "total_items": int(matched_result.get("total_items") or 0),
+            "total_amount": matched_result.get("total_amount"),
+            "raw_payload": raw_payload,
+        },
+    )
+    transaction_identification["chosen_session_transaction_id"] = selected_transaction_id
+    pipeline["paid_transactions"] = [matched_result]
+    existing_summary["session_close_pipeline"] = pipeline
 
     queued = retrieve_kiosk_video_window(
         db,
@@ -1622,6 +1613,7 @@ def _finalize_remote_kiosk_match_script_run(
         db,
         session_id=session_id,
         status="pending",
+        transaction_total_items=int(matched_result.get("total_items") or 0),
         result_summary=existing_summary,
         issue_reason=None,
     )
@@ -2271,12 +2263,15 @@ def _build_kiosk_transaction_match_manifest(
             )
         transactions_payload.append(
             {
-                "session_transaction_id": transaction.get("session_transaction_id"),
+                "candidate_index": transaction.get("candidate_index"),
                 "transaction_id": transaction.get("transaction_id"),
                 "receipt_number": transaction.get("receipt_number"),
                 "transaction_time": transaction.get("transaction_time"),
+                "total_items": transaction.get("total_items"),
+                "total_amount": transaction.get("total_amount"),
                 "window_start": transaction.get("window_start"),
                 "window_end": transaction.get("window_end"),
+                "raw_payload": transaction.get("raw_payload"),
                 "samples": samples_payload,
             }
         )
@@ -2384,7 +2379,7 @@ def _prepare_session_kiosk_pipeline(
     total_transaction_items = 0
     raw_windows: list[tuple[datetime, datetime]] = []
     transaction_summaries: list[dict[str, Any]] = []
-    for transaction in paid_transactions:
+    for candidate_index, transaction in enumerate(paid_transactions, start=1):
         transaction_time = _coerce_datetime_value(transaction.get("transaction_time"))
         if transaction_time is None:
             continue
@@ -2392,39 +2387,27 @@ def _prepare_session_kiosk_pipeline(
         total_transaction_items += total_items
         window_start, window_end = _build_transaction_window_bounds(transaction_time, total_items)
         raw_windows.append((window_start, window_end))
-        repositories.create_transaction(
-            db,
-            session_id,
+        transaction_summaries.append(
             {
-                "receipt_number": str(transaction.get("receipt_number") or transaction.get("transaction_id") or ""),
-                "transaction_time": transaction_time,
+                "candidate_index": candidate_index,
+                "transaction_id": transaction.get("transaction_id"),
+                "receipt_number": transaction.get("receipt_number"),
+                "transaction_time": transaction_time.isoformat() if hasattr(transaction_time, "isoformat") else transaction_time,
                 "total_items": total_items,
                 "total_amount": transaction.get("total_amount"),
+                "window_start": window_start.isoformat(),
+                "window_end": window_end.isoformat(),
                 "raw_payload": {
                     **dict(transaction),
                     "window_start": window_start.isoformat(),
                     "window_end": window_end.isoformat(),
                 },
-            },
-        )
-        transaction_summaries.append(
-            {
-                "session_transaction_id": None,
-                "transaction_id": transaction.get("transaction_id"),
-                "receipt_number": transaction.get("receipt_number"),
-                "transaction_time": transaction_time.isoformat() if hasattr(transaction_time, "isoformat") else transaction_time,
-                "total_items": total_items,
-                "window_start": window_start.isoformat(),
-                "window_end": window_end.isoformat(),
             }
         )
 
     merged_windows = _merge_time_windows(raw_windows)
     identification_summary: dict[str, Any] | None = None
     selected_windows = list(merged_windows)
-    session_transactions = repositories.list_session_transactions(db, session_id)
-    for summary_row, session_row in zip(transaction_summaries, session_transactions, strict=False):
-        summary_row["session_transaction_id"] = int(session_row["id"])
     if transaction_summaries:
         identification_summary = _queue_kiosk_transaction_match_for_session(
             db,

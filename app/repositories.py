@@ -2556,9 +2556,9 @@ def list_session_video_assets(
     return rows
 
 
-def create_transaction(db: Session, session_id: int, payload: Mapping[str, Any]) -> None:
+def create_transaction(db: Session, session_id: int, payload: Mapping[str, Any]) -> int:
     transaction_table = _table("session_transaction")
-    db.execute(
+    result = db.execute(
         text(
             f"""
             insert into {transaction_table} (
@@ -2576,6 +2576,11 @@ def create_transaction(db: Session, session_id: int, payload: Mapping[str, Any])
         },
     )
     db.commit()
+    inserted_id = getattr(result, "lastrowid", None)
+    if inserted_id is None:
+        row = db.execute(text("select last_insert_id()")).first()
+        inserted_id = row[0] if row else None
+    return int(inserted_id or 0)
 
 
 def update_session_transaction_raw_payload(
