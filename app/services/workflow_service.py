@@ -1768,6 +1768,8 @@ def reconcile_running_remote_analysis_script_runs(db: Session) -> list[dict[str,
         remote_status, remote_result = _remote_runner_result_from_runpod_body(body)
         if script_name == "entry":
             result = _finalize_remote_entry_script_run(db, script_run=script_run, remote_result=remote_result)
+        elif script_name == "kiosk_match":
+            result = _finalize_remote_kiosk_match_script_run(db, script_run=script_run, remote_result=remote_result)
         else:
             result = _finalize_remote_kiosk_script_run(db, script_run=script_run, remote_result=remote_result)
         reconciled.append(
