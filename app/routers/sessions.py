@@ -10,6 +10,7 @@ from .. import repositories, vector_repositories
 from ..services import workflow_service
 from ..schemas import (
     SessionCreate,
+    SessionManualCreateRequest,
     SessionCustomerResponse,
     SessionCustomerCreate,
     SessionEndTimeUpdateRequest,
@@ -20,6 +21,7 @@ from ..schemas import (
     SessionStatusUpdateRequest,
     SessionTransactionDetailResponse,
     SessionTransactionResponse,
+    SessionVideoAttachRequest,
     TransactionCreate,
 )
 
@@ -28,10 +30,173 @@ router = APIRouter(prefix="/api/v1/sessions", tags=["sessions"])
 logger = logging.getLogger("tds.sessions_router")
 
 
+def _archive_and_mark_session_customer_exited(
+    db: Session,
+    *,
+    session_customer: dict,
+    session: dict,
+    leave_time: datetime,
+    source: str,
+) -> dict:
+    session_id = int(session_customer["session_id"])
+    session_customer_id = int(session_customer["id"])
+    location_id = int(session["location_id"])
+    person_id = session_customer.get("person_id")
+
+    archived_count = 0
+    identity_id = None
+    with VectorSessionLocal() as vector_db:
+        identity = vector_repositories.find_identity_by_current_session_customer(
+            vector_db,
+            location_id=location_id,
+            current_session_customer_id=session_customer_id,
+        )
+        if identity is not None:
+            identity_id = int(identity["id"])
+            vector_repositories.update_identity_record(
+                vector_db,
+                identity_id,
+                status="exited",
+                current_session_id=session_id,
+                current_session_customer_id=session_customer_id,
+                person_id=int(person_id) if person_id is not None else None,
+                last_seen_at=leave_time,
+                exited_at=leave_time,
+                metadata={
+                    "source": source,
+                    "session_id": session_id,
+                    "session_customer_id": session_customer_id,
+                    "person_id": person_id,
+                },
+            )
+        archived_count = vector_repositories.archive_active_gallery_by_aliases(
+            vector_db,
+            location_id=location_id,
+            session_customer_ids=[session_customer_id],
+            archived_reason="manual_exit",
+            metadata_extra={
+                "source": source,
+                "session_id": session_id,
+                "session_customer_id": session_customer_id,
+                "person_id": person_id,
+                "identity_id": identity_id,
+            },
+        )
+
+    repositories.update_session_customer_leave_time(
+        db,
+        session_customer_id=session_customer_id,
+        leave_time=leave_time,
+        match_status="resolved",
+    )
+    return {
+        "session_customer_id": session_customer_id,
+        "archived_count": archived_count,
+    }
+
+
+def _auto_mark_session_customers_exited(
+    db: Session,
+    *,
+    session: dict,
+    leave_time: datetime,
+    source: str,
+) -> list[dict]:
+    start_time = session.get("start_time")
+    updated: list[dict] = []
+    for customer in repositories.list_session_customers(db, int(session["id"])):
+        if customer.get("leave_time") is not None:
+            continue
+        enter_time = customer.get("enter_time")
+        if start_time is not None and enter_time is not None and enter_time < start_time:
+            continue
+        if enter_time is not None and enter_time > leave_time:
+            continue
+        updated.append(
+            _archive_and_mark_session_customer_exited(
+                db,
+                session_customer=customer,
+                session=session,
+                leave_time=leave_time,
+                source=source,
+            )
+        )
+    return updated
+
+
 @router.post("", response_model=SessionResponse)
 def create_session(payload: SessionCreate, db: Session = Depends(get_transaction_db)) -> SessionResponse:
     row = repositories.create_session(db, payload.model_dump())
     return SessionResponse(**row)
+
+
+@router.post("/manual", response_model=SessionResponse)
+def create_manual_session(payload: SessionManualCreateRequest, db: Session = Depends(get_transaction_db)) -> SessionResponse:
+    entry_video = repositories.get_video_asset(db, payload.entry_video_asset_id)
+    entry_trigger_id = entry_video.get("trigger_id")
+    if entry_trigger_id is None:
+        raise HTTPException(status_code=400, detail="Entry video must belong to a trigger.")
+    entry_trigger = repositories.get_trigger(db, int(entry_trigger_id))
+    session = repositories.create_session(
+        db,
+        {
+            "entry_trigger_id": int(entry_trigger_id),
+            "exit_trigger_id": None,
+            "location_id": int(entry_trigger["location_id"]),
+            "start_time": entry_video.get("captured_start_time") or entry_trigger.get("trigger_time"),
+        },
+    )
+    repositories.create_session_video_asset_link(
+        db,
+        int(session["id"]),
+        int(payload.entry_video_asset_id),
+        {
+            "link_section": "entry",
+            "sequence_no": 1,
+            "clip_start_time": entry_video.get("captured_start_time"),
+            "clip_end_time": entry_video.get("captured_end_time"),
+            "is_primary": True,
+            "metadata": {
+                "source": "dashboard_manual_session_create",
+            },
+        },
+    )
+
+    if payload.exit_video_asset_id is not None:
+        exit_video = repositories.get_video_asset(db, payload.exit_video_asset_id)
+        exit_trigger_id = exit_video.get("trigger_id")
+        if exit_trigger_id is not None:
+            exit_trigger = repositories.get_trigger(db, int(exit_trigger_id))
+            if int(exit_trigger["location_id"]) != int(session["location_id"]):
+                raise HTTPException(status_code=400, detail="Exit video must belong to the same location as the entry video.")
+        repositories.create_session_video_asset_link(
+            db,
+            int(session["id"]),
+            int(payload.exit_video_asset_id),
+            {
+                "link_section": "exit",
+                "sequence_no": 1,
+                "clip_start_time": exit_video.get("captured_start_time"),
+                "clip_end_time": exit_video.get("captured_end_time"),
+                "is_primary": False,
+                "metadata": {
+                    "source": "dashboard_manual_session_create",
+                },
+            },
+        )
+        end_time = exit_video.get("captured_end_time") or exit_video.get("captured_start_time")
+        if end_time is not None:
+            session = repositories.update_session_fields(
+                db,
+                session_id=int(session["id"]),
+                status="pending",
+                end_time=end_time,
+                exit_trigger_id=int(exit_trigger_id) if exit_trigger_id is not None else None,
+                issue_reason=None,
+            )
+            workflow_service.ensure_kiosk_video_assets_for_session(db, int(session["id"]))
+
+    return SessionResponse(**repositories.get_session(db, int(session["id"])))
 
 
 @router.get("", response_model=list[SessionListItem])
@@ -96,6 +261,12 @@ def update_session_end_time(
             exit_trigger_id=payload.exit_trigger_id,
             issue_reason=None,
         )
+        auto_exited_customers = _auto_mark_session_customers_exited(
+            db,
+            session=row,
+            leave_time=payload.end_time,
+            source="dashboard_end_time_update",
+        )
         exit_video_asset_id = None
         if payload.exit_trigger_id is not None:
             trigger = repositories.get_trigger(db, payload.exit_trigger_id)
@@ -144,6 +315,7 @@ def update_session_end_time(
             "session": row,
             "inserted_video_asset_ids": inserted_video_asset_ids,
             "exit_video_asset_id": exit_video_asset_id,
+            "auto_exited_customers": auto_exited_customers,
         }
     except HTTPException:
         raise
@@ -167,6 +339,64 @@ def update_session_status(
         issue_reason=None if payload.status != "issue" else repositories.get_session(db, session_id).get("issue_reason"),
     )
     return SessionResponse(**row)
+
+
+@router.post("/{session_id}/videos")
+def attach_session_video(
+    session_id: int,
+    payload: SessionVideoAttachRequest,
+    db: Session = Depends(get_transaction_db),
+) -> dict:
+    session = repositories.get_session(db, session_id)
+    video_asset = repositories.get_video_asset(db, payload.video_asset_id)
+    if payload.section == "entry" and video_asset.get("trigger_id") != session.get("entry_trigger_id"):
+        logger.info(
+            "Attaching manual entry video with different trigger session_id=%s video_asset_id=%s",
+            session_id,
+            payload.video_asset_id,
+        )
+    repositories.create_session_video_asset_link(
+        db,
+        session_id,
+        payload.video_asset_id,
+        {
+            "link_section": payload.section,
+            "sequence_no": payload.sequence_no,
+            "clip_start_time": payload.clip_start_time or video_asset.get("captured_start_time"),
+            "clip_end_time": payload.clip_end_time or video_asset.get("captured_end_time"),
+            "is_primary": payload.is_primary,
+            "metadata": payload.metadata or {"source": "dashboard_session_video_attach"},
+        },
+    )
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "video_asset_id": payload.video_asset_id,
+        "section": payload.section,
+    }
+
+
+@router.delete("/{session_id}/videos/{video_asset_id}")
+def detach_session_video(
+    session_id: int,
+    video_asset_id: int,
+    section: str | None = None,
+    db: Session = Depends(get_transaction_db),
+) -> dict:
+    repositories.get_session(db, session_id)
+    repositories.get_video_asset(db, video_asset_id)
+    deleted = repositories.delete_session_video_asset_link(
+        db,
+        session_id=session_id,
+        video_asset_id=video_asset_id,
+        section=section,
+    )
+    return {
+        "ok": deleted,
+        "session_id": session_id,
+        "video_asset_id": video_asset_id,
+        "section": section,
+    }
 
 
 @router.post("/{session_id}/finalize", response_model=SessionFinalizeResponse)
@@ -250,51 +480,12 @@ def mark_session_customer_exit(session_customer_id: int, db: Session = Depends(g
         person_id = session_customer.get("person_id")
         leave_time = session.get("end_time") or datetime.utcnow()
 
-        archived_count = 0
-        identity_id = None
-        with VectorSessionLocal() as vector_db:
-            identity = vector_repositories.find_identity_by_current_session_customer(
-                vector_db,
-                location_id=location_id,
-                current_session_customer_id=session_customer_id,
-            )
-            if identity is not None:
-                identity_id = int(identity["id"])
-                vector_repositories.update_identity_record(
-                    vector_db,
-                    identity_id,
-                    status="exited",
-                    current_session_id=session_id,
-                    current_session_customer_id=session_customer_id,
-                    person_id=int(person_id) if person_id is not None else None,
-                    last_seen_at=leave_time,
-                    exited_at=leave_time,
-                    metadata={
-                        "source": "dashboard_manual_exit",
-                        "session_id": session_id,
-                        "session_customer_id": session_customer_id,
-                        "person_id": person_id,
-                    },
-                )
-            archived_count = vector_repositories.archive_active_gallery_by_aliases(
-                vector_db,
-                location_id=location_id,
-                session_customer_ids=[session_customer_id],
-                archived_reason="manual_exit",
-                metadata_extra={
-                    "source": "dashboard_manual_exit",
-                    "session_id": session_id,
-                    "session_customer_id": session_customer_id,
-                    "person_id": person_id,
-                    "identity_id": identity_id,
-                },
-            )
-
-        repositories.update_session_customer_leave_time(
+        result = _archive_and_mark_session_customer_exited(
             db,
-            session_customer_id=session_customer_id,
+            session_customer=session_customer,
+            session=session,
             leave_time=leave_time,
-            match_status="resolved",
+            source="dashboard_manual_exit",
         )
 
         workflow_service._maybe_close_session_and_prepare_kiosk(  # noqa: SLF001
@@ -308,7 +499,7 @@ def mark_session_customer_exit(session_customer_id: int, db: Session = Depends(g
             "ok": True,
             "session_customer": updated_customer,
             "session": updated_session,
-            "archived_count": archived_count,
+            "archived_count": result["archived_count"],
         }
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

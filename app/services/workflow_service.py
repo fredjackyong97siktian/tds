@@ -31,6 +31,7 @@ from ..spaces import (
 )
 from .. import vector_repositories
 from ..storage import (
+    alert_tmp_video_path,
     build_spaces_object_key,
     guess_media_type,
     gallery_state_path as build_private_gallery_state_path,
@@ -4134,6 +4135,7 @@ def _prepare_video_retrieval(
     location_id: int,
     session_id: int | None,
     trigger_id: int | None,
+    alert_id: int | None,
     start_time: datetime,
     end_time: datetime,
 ) -> VideoRetrievalQueued:
@@ -4154,6 +4156,7 @@ def _prepare_video_retrieval(
             location_id=location_id,
             session_id=session_id,
             trigger_id=trigger_id,
+            alert_id=alert_id,
         )
         if session_id is not None:
             repositories.create_session_video_asset_link(
@@ -4236,8 +4239,10 @@ def _prepare_video_retrieval(
         output_path = session_tmp_video_path(location_id, session_id, section, filename)
     elif trigger_id is not None:
         output_path = trigger_tmp_video_path(location_id, trigger_id, section, filename)
+    elif alert_id is not None:
+        output_path = alert_tmp_video_path(location_id, alert_id, section, filename)
     else:
-        raise ValueError("Either session_id or trigger_id is required for video retrieval.")
+        raise ValueError("Either session_id, trigger_id, or alert_id is required for video retrieval.")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     retention_until = end_time + timedelta(days=3)
     video_asset_id = repositories.create_video_asset(
@@ -4254,7 +4259,11 @@ def _prepare_video_retrieval(
             "analyzed_at": None,
             "retention_until": retention_until,
             "status": "not_retrieved",
-            "metadata": None,
+            "metadata": {
+                "location_id": location_id,
+                "alert_id": alert_id,
+                "retrieval_source": "dahua_rtsp_playback",
+            },
         },
     )
     access_url = f"/api/v1/videos/assets/{video_asset_id}/content"
@@ -4302,6 +4311,7 @@ def _resolve_local_video_retrieval_output_path(
     location_id: int,
     session_id: int | None,
     trigger_id: int | None,
+    alert_id: int | None,
 ) -> str:
     existing_file_path = str(video_asset_row.get("file_path") or "").strip()
     if existing_file_path and not existing_file_path.startswith("spaces://"):
@@ -4320,7 +4330,9 @@ def _resolve_local_video_retrieval_output_path(
         return str(session_tmp_video_path(location_id, session_id, section, filename))
     if trigger_id is not None:
         return str(trigger_tmp_video_path(location_id, trigger_id, section, filename))
-    raise ValueError("Either session_id or trigger_id is required for video retrieval.")
+    if alert_id is not None:
+        return str(alert_tmp_video_path(location_id, alert_id, section, filename))
+    raise ValueError("Either session_id, trigger_id, or alert_id is required for video retrieval.")
 
 
 def build_retrieval_job_from_video_asset(db: Session, video_asset_id: int) -> VideoRetrievalQueued:
@@ -4383,6 +4395,11 @@ def build_retrieval_job_from_video_asset(db: Session, video_asset_id: int) -> Vi
         location_id=location_id,
         session_id=session_id,
         trigger_id=int(trigger_id) if trigger_id is not None else None,
+        alert_id=(
+            int(video_asset.get("metadata", {}).get("alert_id"))
+            if isinstance(video_asset.get("metadata"), dict) and video_asset.get("metadata", {}).get("alert_id") is not None
+            else None
+        ),
     )
 
     return VideoRetrievalQueued(
@@ -4641,6 +4658,7 @@ def retrieve_entrance_video_window(
         location_id=location_id,
         session_id=None,
         trigger_id=trigger_id,
+        alert_id=None,
         start_time=start_time,
         end_time=end_time,
     )
@@ -4660,6 +4678,27 @@ def retrieve_kiosk_video_window(
         location_id=location_id,
         session_id=session_id,
         trigger_id=None,
+        alert_id=None,
+        start_time=start_time,
+        end_time=end_time,
+    )
+
+
+def retrieve_alert_kiosk_video_window(
+    db: Session,
+    *,
+    alert_id: int,
+    location_id: int,
+    start_time: datetime,
+    end_time: datetime,
+) -> VideoRetrievalQueued:
+    return _prepare_video_retrieval(
+        db,
+        section="kiosk",
+        location_id=location_id,
+        session_id=None,
+        trigger_id=None,
+        alert_id=alert_id,
         start_time=start_time,
         end_time=end_time,
     )

@@ -136,6 +136,21 @@ class SessionCreate(BaseModel):
     start_time: datetime | None = None
 
 
+class SessionManualCreateRequest(BaseModel):
+    entry_video_asset_id: int
+    exit_video_asset_id: int | None = None
+
+
+class SessionVideoAttachRequest(BaseModel):
+    video_asset_id: int
+    section: str = Field(pattern="^(entry|exit|kiosk)$")
+    sequence_no: int | None = None
+    clip_start_time: datetime | None = None
+    clip_end_time: datetime | None = None
+    is_primary: bool = False
+    metadata: dict[str, Any] | None = None
+
+
 class SessionEndTimeUpdateRequest(BaseModel):
     end_time: datetime
     exit_trigger_id: int | None = None
@@ -402,6 +417,31 @@ class TheftListItem(BaseModel):
     metadata: dict[str, Any] | None = None
     session_customer_id: int
     person_id: int | None = None
+
+
+class ThiefAlertItem(BaseModel):
+    id: int
+    location_id: int
+    method: str
+    detail: str
+    checked: bool
+    created_at: datetime | None = None
+    session_id: int | None = None
+
+
+class ThiefAlertSummary(BaseModel):
+    unchecked_count: int = 0
+
+
+class ThiefAlertCheckResponse(BaseModel):
+    ok: bool = True
+    id: int
+    checked: bool
+
+
+class AlertKioskRetrievalRequest(BaseModel):
+    before_seconds: int = Field(default=60, ge=0)
+    after_seconds: int = Field(default=20, ge=0)
 
 
 class ActiveGalleryResponse(BaseModel):

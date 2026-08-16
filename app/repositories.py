@@ -302,6 +302,176 @@ def list_theft_transactions(db: Session, limit: int = 50) -> list[dict[str, Any]
     return payload
 
 
+def _parse_session_id_from_alert_detail(detail: Any) -> int | None:
+    if detail is None:
+        return None
+    text = str(detail).strip()
+    match = re.search(r"Session\s+(\d+)", text, flags=re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def list_thief_alerts(db: Session, limit: int = 100) -> list[dict[str, Any]]:
+    table_name = _table(settings.thief_alert_table_name)
+    checked_column = _quote_identifier(settings.thief_alert_checked_column)
+    result = db.execute(
+        text(
+            f"""
+            select id,
+                   locationId as location_id,
+                   method,
+                   detail,
+                   {checked_column} as checked,
+                   createdAt as created_at
+            from {table_name}
+            order by createdAt desc, id desc
+            limit :limit
+            """
+        ),
+        {"limit": limit},
+    )
+    rows = _fetch_all_dicts(result)
+    for row in rows:
+        row["checked"] = bool(row.get("checked"))
+        if str(row.get("method") or "").strip().lower() == "tds system":
+            row["session_id"] = _parse_session_id_from_alert_detail(row.get("detail"))
+        else:
+            row["session_id"] = None
+    return rows
+
+
+def get_thief_alert(db: Session, alert_id: int) -> dict[str, Any]:
+    table_name = _table(settings.thief_alert_table_name)
+    checked_column = _quote_identifier(settings.thief_alert_checked_column)
+    result = db.execute(
+        text(
+            f"""
+            select id,
+                   locationId as location_id,
+                   method,
+                   detail,
+                   {checked_column} as checked,
+                   createdAt as created_at
+            from {table_name}
+            where id = :alert_id
+            limit 1
+            """
+        ),
+        {"alert_id": alert_id},
+    )
+    row = _fetch_one_dict(result)
+    row["checked"] = bool(row.get("checked"))
+    if str(row.get("method") or "").strip().lower() == "tds system":
+        row["session_id"] = _parse_session_id_from_alert_detail(row.get("detail"))
+    else:
+        row["session_id"] = None
+    return row
+
+
+def get_unchecked_thief_alert_count(db: Session) -> int:
+    table_name = _table(settings.thief_alert_table_name)
+    checked_column = _quote_identifier(settings.thief_alert_checked_column)
+    result = db.execute(
+        text(
+            f"""
+            select count(*) as alert_count
+            from {table_name}
+            where coalesce({checked_column}, 0) = 0
+            """
+        )
+    )
+    row = result.mappings().first()
+    return int((row or {}).get("alert_count") or 0)
+
+
+def mark_thief_alert_checked(db: Session, alert_id: int) -> dict[str, Any]:
+    table_name = _table(settings.thief_alert_table_name)
+    checked_column = _quote_identifier(settings.thief_alert_checked_column)
+    result = db.execute(
+        text(
+            f"""
+            update {table_name}
+            set {checked_column} = 1
+            where id = :alert_id
+            """
+        ),
+        {"alert_id": alert_id},
+    )
+    db.commit()
+    if result.rowcount == 0:
+        raise ValueError("Thief alert not found.")
+    return get_thief_alert(db, alert_id)
+
+
+def create_thief_alert(
+    db: Session,
+    *,
+    location_id: int,
+    method: str,
+    detail: str,
+) -> int:
+    table_name = _table(settings.thief_alert_table_name)
+    result = db.execute(
+        text(
+            f"""
+            insert into {table_name} (
+                locationId, method, detail, checked, createdAt
+            )
+            values (
+                :location_id, :method, :detail, 0, utc_timestamp()
+            )
+            """
+        ),
+        {
+            "location_id": location_id,
+            "method": method,
+            "detail": detail,
+        },
+    )
+    db.commit()
+    inserted_id = getattr(result, "lastrowid", None)
+    if inserted_id is None:
+        raise ValueError("Failed to create thief alert.")
+    return int(inserted_id)
+
+
+def create_thief_alert_if_missing(
+    db: Session,
+    *,
+    location_id: int,
+    method: str,
+    detail: str,
+) -> int | None:
+    table_name = _table(settings.thief_alert_table_name)
+    checked_column = _quote_identifier(settings.thief_alert_checked_column)
+    existing = db.execute(
+        text(
+            f"""
+            select id
+            from {table_name}
+            where locationId = :location_id
+              and method = :method
+              and detail = :detail
+              and coalesce({checked_column}, 0) = 0
+            order by id desc
+            limit 1
+            """
+        ),
+        {
+            "location_id": location_id,
+            "method": method,
+            "detail": detail,
+        },
+    ).mappings().first()
+    if existing is not None:
+        return int(existing["id"])
+    return create_thief_alert(db, location_id=location_id, method=method, detail=detail)
+
+
 def list_locations(db: Session) -> list[dict[str, Any]]:
     table_name = settings.location_table_name
     id_column = settings.location_id_column
@@ -991,7 +1161,11 @@ def list_pending_video_asset_retrievals(db: Session, limit: int = 50) -> list[di
                    va.analyzed_at,
                    va.created_at,
                    min(sva.session_id) as session_id,
-                   coalesce(te.location_id, min(s.location_id)) as location_id
+                   coalesce(
+                       te.location_id,
+                       min(s.location_id),
+                       cast(json_unquote(json_extract(va.metadata, '$.location_id')) as unsigned)
+                   ) as location_id
             from {video_asset_table} va
             left join {trigger_table} te on te.id = va.trigger_id
             left join {session_video_asset_table} sva on sva.video_asset_id = va.id
@@ -1026,7 +1200,11 @@ def list_running_video_asset_retrievals(db: Session) -> list[dict[str, Any]]:
                    va.retrieved_at,
                    va.analyzed_at,
                    min(sva.session_id) as session_id,
-                   coalesce(te.location_id, min(s.location_id)) as location_id
+                   coalesce(
+                       te.location_id,
+                       min(s.location_id),
+                       cast(json_unquote(json_extract(va.metadata, '$.location_id')) as unsigned)
+                   ) as location_id
             from {video_asset_table} va
             left join {trigger_table} te on te.id = va.trigger_id
             left join {session_video_asset_table} sva on sva.video_asset_id = va.id
@@ -2603,7 +2781,11 @@ def find_video_asset_by_window(
             where va.section = :section
               and va.captured_start_time = :start_time
               and va.captured_end_time = :end_time
-              and coalesce(te.location_id, s.location_id) = :location_id
+              and coalesce(
+                    te.location_id,
+                    s.location_id,
+                    cast(json_unquote(json_extract(va.metadata, '$.location_id')) as unsigned)
+                  ) = :location_id
               and va.status <> 'deleted'
             order by va.id asc
             limit 1
@@ -2684,6 +2866,37 @@ def delete_session_video_asset_links_for_video_asset_except(
         params,
     )
     db.commit()
+
+
+def delete_session_video_asset_link(
+    db: Session,
+    *,
+    session_id: int,
+    video_asset_id: int,
+    section: str | None = None,
+) -> bool:
+    session_video_asset_table = _table("session_video_asset")
+    params: dict[str, Any] = {
+        "session_id": session_id,
+        "video_asset_id": video_asset_id,
+    }
+    where_section = ""
+    if section is not None:
+        where_section = " and section = :section"
+        params["section"] = section
+    result = db.execute(
+        text(
+            f"""
+            delete from {session_video_asset_table}
+            where session_id = :session_id
+              and video_asset_id = :video_asset_id
+              {where_section}
+            """
+        ),
+        params,
+    )
+    db.commit()
+    return bool(result.rowcount)
 
 
 def get_primary_session_id_for_video_asset(db: Session, video_asset_id: int) -> int | None:
@@ -3183,7 +3396,12 @@ def finalize_session_result(
     comparison_items = actual_items if actual_items_brought is not None else kiosk_total_items
     difference = comparison_items - transaction_total_items
 
-    if comparison_items == 0 or comparison_items < transaction_total_items:
+    if actual_items_brought is not None:
+        if abs(difference) <= max(0, int(tolerance)):
+            status = "not_detected"
+        else:
+            status = "detected"
+    elif comparison_items == 0 or comparison_items < transaction_total_items:
         status = "need_review"
     elif abs(difference) <= max(0, int(tolerance)):
         status = "not_detected"
@@ -3198,6 +3416,7 @@ def finalize_session_result(
         "comparison_items": comparison_items,
         "tolerance": max(0, int(tolerance)),
         "decision": status,
+        "manual_review_completed": actual_items_brought is not None,
     }
     if extra_result_summary:
         result_summary.update(dict(extra_result_summary))
@@ -3225,6 +3444,19 @@ def finalize_session_result(
         },
     )
     db.commit()
+
+    if status == "detected":
+        try:
+            session = get_session(db, session_id)
+            create_thief_alert_if_missing(
+                db,
+                location_id=int(session["location_id"]),
+                method="TDS System",
+                detail=f"Session {session_id}",
+            )
+        except Exception:
+            # Alert creation should not block session result finalization.
+            pass
 
     return {
         "session_id": session_id,

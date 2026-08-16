@@ -73,6 +73,8 @@ class Settings(BaseSettings):
     theft_transaction_table_name: str = "transaction"
     theft_transaction_status_column: str = "status"
     theft_transaction_status_value: str = "theft"
+    thief_alert_table_name: str = "tds_thief_alert"
+    thief_alert_checked_column: str = "checked"
     paid_transaction_table_name: str = "transaction"
     paid_transaction_detail_table_name: str = "transactionDetail"
     paid_transaction_location_id_column: str = "locationId"
