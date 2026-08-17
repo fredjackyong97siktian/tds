@@ -14,6 +14,8 @@ PAID_TRANSACTION_DATABASE = "sesamedb"
 
 
 def _table(name: str) -> str:
+    if name.startswith(settings.transactional_table_prefix):
+        return name
     return f"{settings.transactional_table_prefix}{name}"
 
 
