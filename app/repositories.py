@@ -2780,6 +2780,77 @@ def list_paid_transactions_for_session_window(
     return payload
 
 
+def list_non_paid_transactions_for_session_window(
+    db: Session,
+    *,
+    location_id: int,
+    start_time,
+    end_time,
+) -> list[dict[str, Any]]:
+    transaction_table = _qualified_paid_table(settings.paid_transaction_table_name)
+    transaction_id_column = _quote_identifier(PAID_TRANSACTION_ID_COLUMN)
+    location_id_column = _quote_identifier(settings.paid_transaction_location_id_column)
+    transaction_time_column = _quote_identifier(PAID_TRANSACTION_TIME_COLUMN)
+    transaction_status_column = _quote_identifier(settings.paid_transaction_status_column)
+    result = db.execute(
+        text(
+            f"""
+            select t.*
+            from {transaction_table} t
+            where t.{location_id_column} = :location_id
+              and coalesce(t.{transaction_status_column}, '') <> :paid_status
+              and t.{transaction_time_column} between :start_time and :end_time
+            order by t.{transaction_time_column} asc, t.{transaction_id_column} asc
+            """
+        ),
+        {
+            "location_id": location_id,
+            "paid_status": settings.paid_transaction_status_value,
+            "start_time": start_time,
+            "end_time": end_time,
+        },
+    )
+    return _fetch_all_dicts(result)
+
+
+def list_minus_button_alerts_for_window(
+    db: Session,
+    *,
+    location_id: int,
+    start_time,
+    end_time,
+) -> list[dict[str, Any]]:
+    table_name = _table(settings.thief_alert_table_name)
+    checked_column = _quote_identifier(settings.thief_alert_checked_column)
+    result = db.execute(
+        text(
+            f"""
+            select id,
+                   locationId as location_id,
+                   method,
+                   detail,
+                   {checked_column} as checked,
+                   createdAt as created_at
+            from {table_name}
+            where locationId = :location_id
+              and createdAt between :start_time and :end_time
+              and lower(coalesce(method, '')) = 'kiosk'
+              and lower(coalesce(detail, '')) like '%minus%'
+            order by createdAt asc, id asc
+            """
+        ),
+        {
+            "location_id": location_id,
+            "start_time": start_time,
+            "end_time": end_time,
+        },
+    )
+    rows = _fetch_all_dicts(result)
+    for row in rows:
+        row["checked"] = bool(row.get("checked"))
+    return rows
+
+
 def create_trigger(db: Session, payload: Mapping[str, Any]) -> dict[str, Any]:
     trigger_table = _table("trigger_event")
     result = db.execute(

@@ -53,16 +53,13 @@ logger = logging.getLogger("tds.workflow_service")
 KIOSK_OWNERSHIP_MIN_MARGIN_SECONDS = 10.0
 NO_KIOSK_VIDEO_REASON = "No kiosk video was queued because no paid transactions were found inside the session window."
 DEFAULT_FILTER_FACTORS: dict[str, dict[str, Any]] = {
-    "long_time_between_videos": {"enabled": True},
-    "transaction_quantity": {"enabled": True},
-    "transaction_value": {"enabled": True},
-    "transaction_failure_pattern": {"enabled": False},
-    "pending_transaction": {"enabled": False},
-    "carry_something_from_store_score": {"enabled": True},
-    "customer_credibility_history": {"enabled": False},
-    "total_customer_compare_history": {"enabled": True},
-    "yellow_bag_before_after": {"enabled": True},
-    "runpod_credit_budget": {"enabled": False},
+    "long_stay_low_purchase": {"enabled": True},
+    "transaction_issue_low_purchase": {"enabled": True},
+    "multiple_transaction_issues": {"enabled": True},
+    "multiple_minus_button_alert": {"enabled": True},
+    "carry_item_signal": {"enabled": True},
+    "unusual_group_size": {"enabled": True},
+    "customer_risk_history": {"enabled": False},
 }
 
 
@@ -2877,6 +2874,18 @@ def run_theft_confidence_for_grouping_batch(
             start_time=start_time,
             end_time=end_time,
         )
+        issue_transactions = repositories.list_non_paid_transactions_for_session_window(
+            db,
+            location_id=location_id,
+            start_time=start_time,
+            end_time=end_time,
+        )
+        minus_alerts = repositories.list_minus_button_alerts_for_window(
+            db,
+            location_id=location_id,
+            start_time=start_time,
+            end_time=end_time,
+        )
         total_quantity = sum(int(row.get("total_items") or 0) for row in transactions)
         total_value = 0.0
         for row in transactions:
@@ -2891,6 +2900,17 @@ def run_theft_confidence_for_grouping_batch(
         except ValueError:
             carry_score = 0.0
 
+        paid_transaction_count = len(transactions)
+        issue_transaction_count = len(issue_transactions)
+        low_purchase = paid_transaction_count == 0 or total_quantity <= 1 or (0 < total_value <= 1000)
+        long_stay = duration_seconds >= 300
+        carry_signal = (
+            carry_score >= 40
+            or group.get("before_is_yellow_bag") == 0
+            and group.get("after_is_yellow_bag") == 1
+        )
+        total_customer = int(group.get("total_customer") or 0)
+
         reasons: list[str] = []
         factor_details: dict[str, Any] = {}
         triggered_factors: list[str] = []
@@ -2898,105 +2918,86 @@ def run_theft_confidence_for_grouping_batch(
             reasons=reasons,
             factor_details=factor_details,
             factors=factor_settings,
-            factor_code="long_time_between_videos",
-            hit=duration_seconds >= 300 and total_quantity <= 1,
-            reason="long_time_low_quantity",
-            evidence={"duration_seconds": duration_seconds, "total_quantity": total_quantity},
-        ):
-            triggered_factors.append("long_time_between_videos")
-        if _apply_filter_factor(
-            reasons=reasons,
-            factor_details=factor_details,
-            factors=factor_settings,
-            factor_code="transaction_quantity",
-            hit=total_quantity <= 1,
-            reason="low_quantity",
-            evidence={"total_quantity": total_quantity},
-        ):
-            triggered_factors.append("transaction_quantity")
-        if _apply_filter_factor(
-            reasons=reasons,
-            factor_details=factor_details,
-            factors=factor_settings,
-            factor_code="transaction_value",
-            hit=0 < total_value <= 10,
-            reason="low_transaction_value",
-            evidence={"total_value": total_value},
-        ):
-            triggered_factors.append("transaction_value")
-        if _apply_filter_factor(
-            reasons=reasons,
-            factor_details=factor_details,
-            factors=factor_settings,
-            factor_code="transaction_failure_pattern",
-            hit=False,
-            reason="transaction_failure_pattern",
-            evidence={"implemented": False},
-        ):
-            triggered_factors.append("transaction_failure_pattern")
-        if _apply_filter_factor(
-            reasons=reasons,
-            factor_details=factor_details,
-            factors=factor_settings,
-            factor_code="pending_transaction",
-            hit=False,
-            reason="pending_transaction",
-            evidence={"implemented": False},
-        ):
-            triggered_factors.append("pending_transaction")
-        if _apply_filter_factor(
-            reasons=reasons,
-            factor_details=factor_details,
-            factors=factor_settings,
-            factor_code="carry_something_from_store_score",
-            hit=carry_score >= 40,
-            reason="carry_score",
-            evidence={"carry_something_from_store_score": carry_score},
-        ):
-            triggered_factors.append("carry_something_from_store_score")
-        if _apply_filter_factor(
-            reasons=reasons,
-            factor_details=factor_details,
-            factors=factor_settings,
-            factor_code="customer_credibility_history",
-            hit=False,
-            reason="customer_credibility_history",
-            evidence={"implemented": False},
-        ):
-            triggered_factors.append("customer_credibility_history")
-        if _apply_filter_factor(
-            reasons=reasons,
-            factor_details=factor_details,
-            factors=factor_settings,
-            factor_code="total_customer_compare_history",
-            hit=int(group.get("total_customer") or 0) > 2,
-            reason="higher_customer_count",
-            evidence={"total_customer": group.get("total_customer")},
-        ):
-            triggered_factors.append("total_customer_compare_history")
-        if _apply_filter_factor(
-            reasons=reasons,
-            factor_details=factor_details,
-            factors=factor_settings,
-            factor_code="yellow_bag_before_after",
-            hit=group.get("before_is_yellow_bag") == 0 and group.get("after_is_yellow_bag") == 1,
-            reason="yellow_bag_appeared",
+            factor_code="long_stay_low_purchase",
+            hit=long_stay and low_purchase,
+            reason="long_stay_low_purchase",
             evidence={
+                "duration_seconds": duration_seconds,
+                "paid_transaction_count": paid_transaction_count,
+                "total_quantity": total_quantity,
+                "total_value": total_value,
+            },
+        ):
+            triggered_factors.append("long_stay_low_purchase")
+        if _apply_filter_factor(
+            reasons=reasons,
+            factor_details=factor_details,
+            factors=factor_settings,
+            factor_code="transaction_issue_low_purchase",
+            hit=issue_transaction_count > 0 and low_purchase,
+            reason="transaction_issue_low_purchase",
+            evidence={
+                "issue_transaction_count": issue_transaction_count,
+                "paid_transaction_count": paid_transaction_count,
+                "total_quantity": total_quantity,
+                "total_value": total_value,
+            },
+        ):
+            triggered_factors.append("transaction_issue_low_purchase")
+        if _apply_filter_factor(
+            reasons=reasons,
+            factor_details=factor_details,
+            factors=factor_settings,
+            factor_code="multiple_transaction_issues",
+            hit=issue_transaction_count >= 2,
+            reason="multiple_transaction_issues",
+            evidence={"issue_transaction_count": issue_transaction_count},
+        ):
+            triggered_factors.append("multiple_transaction_issues")
+        if _apply_filter_factor(
+            reasons=reasons,
+            factor_details=factor_details,
+            factors=factor_settings,
+            factor_code="multiple_minus_button_alert",
+            hit=len(minus_alerts) > 0,
+            reason="multiple_minus_button_alert",
+            evidence={"alert_count": len(minus_alerts), "alert_ids": [row.get("id") for row in minus_alerts]},
+        ):
+            triggered_factors.append("multiple_minus_button_alert")
+        if _apply_filter_factor(
+            reasons=reasons,
+            factor_details=factor_details,
+            factors=factor_settings,
+            factor_code="carry_item_signal",
+            hit=carry_signal,
+            reason="carry_item_signal",
+            evidence={
+                "carry_something_from_store_score": carry_score,
                 "before_is_yellow_bag": group.get("before_is_yellow_bag"),
                 "after_is_yellow_bag": group.get("after_is_yellow_bag"),
             },
         ):
-            triggered_factors.append("yellow_bag_before_after")
+            triggered_factors.append("carry_item_signal")
         if _apply_filter_factor(
             reasons=reasons,
             factor_details=factor_details,
             factors=factor_settings,
-            factor_code="runpod_credit_budget",
-            hit=False,
-            reason="runpod_credit_budget",
-            evidence={"implemented": False},
+            factor_code="unusual_group_size",
+            hit=total_customer > 2,
+            reason="unusual_group_size",
+            evidence={"total_customer": total_customer},
         ):
-            triggered_factors.append("runpod_credit_budget")
+            triggered_factors.append("unusual_group_size")
+        if _apply_filter_factor(
+            reasons=reasons,
+            factor_details=factor_details,
+            factors=factor_settings,
+            factor_code="customer_risk_history",
+            hit=False,
+            reason="customer_risk_history",
+            evidence={"implemented": False, "message": "Skipped until grouping returns stable customer identity."},
+        ):
+            triggered_factors.append("customer_risk_history")
 
         score = float(len(triggered_factors))
         need_deep_analysis = bool(triggered_factors)
@@ -3011,10 +3012,12 @@ def run_theft_confidence_for_grouping_batch(
             factor_payload={
                 "duration_seconds": duration_seconds,
                 "transaction_count": len(transactions),
+                "issue_transaction_count": issue_transaction_count,
+                "minus_button_alert_count": len(minus_alerts),
                 "total_quantity": total_quantity,
                 "total_value": total_value,
                 "carry_something_from_store_score": carry_score,
-                "total_customer": group.get("total_customer"),
+                "total_customer": total_customer,
                 "trigger_ids": trigger_ids,
                 "factor_settings": factor_settings,
                 "factor_details": factor_details,
