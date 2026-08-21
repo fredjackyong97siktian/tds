@@ -1381,35 +1381,22 @@ def upsert_filter_time_period(db: Session, payload: Mapping[str, Any]) -> dict[s
         "selected": 1 if payload.get("selected") else 0,
         "metadata": _json_dumps(payload.get("metadata")) if payload.get("metadata") is not None else None,
     }
-    existing = db.execute(
+    updated = db.execute(
         text(
             f"""
-            select id
-            from {table_name}
+            update {table_name}
+            set label = :label,
+                start_time = :start_time,
+                end_time = :end_time,
+                selected = :selected,
+                metadata = :metadata
             where ((location_id is null and :location_id is null) or location_id = :location_id)
               and period_code = :period_code
-            order by id asc
-            limit 1
             """
         ),
         params,
-    ).mappings().first()
-    if existing is not None:
-        db.execute(
-            text(
-                f"""
-                update {table_name}
-                set label = :label,
-                    start_time = :start_time,
-                    end_time = :end_time,
-                    selected = :selected,
-                    metadata = :metadata
-                where id = :id
-                """
-            ),
-            {**params, "id": int(existing["id"])},
-        )
-    else:
+    )
+    if not updated.rowcount:
         db.execute(
             text(
                 f"""
@@ -1427,6 +1414,7 @@ def upsert_filter_time_period(db: Session, payload: Mapping[str, Any]) -> dict[s
             from {table_name}
             where ((location_id is null and :location_id is null) or location_id = :location_id)
               and period_code = :period_code
+            order by id asc
             limit 1
             """
         ),
@@ -1466,34 +1454,21 @@ def upsert_filter_factor(db: Session, payload: Mapping[str, Any]) -> dict[str, A
         "weight": payload.get("weight", 1),
         "config": _json_dumps(payload.get("config")) if payload.get("config") is not None else None,
     }
-    existing = db.execute(
+    updated = db.execute(
         text(
             f"""
-            select id
-            from {table_name}
+            update {table_name}
+            set label = :label,
+                enabled = :enabled,
+                weight = :weight,
+                config = :config
             where ((location_id is null and :location_id is null) or location_id = :location_id)
               and factor_code = :factor_code
-            order by id asc
-            limit 1
             """
         ),
         params,
-    ).mappings().first()
-    if existing is not None:
-        db.execute(
-            text(
-                f"""
-                update {table_name}
-                set label = :label,
-                    enabled = :enabled,
-                    weight = :weight,
-                    config = :config
-                where id = :id
-                """
-            ),
-            {**params, "id": int(existing["id"])},
-        )
-    else:
+    )
+    if not updated.rowcount:
         db.execute(
             text(
                 f"""
@@ -1511,6 +1486,7 @@ def upsert_filter_factor(db: Session, payload: Mapping[str, Any]) -> dict[str, A
             from {table_name}
             where ((location_id is null and :location_id is null) or location_id = :location_id)
               and factor_code = :factor_code
+            order by id asc
             limit 1
             """
         ),
