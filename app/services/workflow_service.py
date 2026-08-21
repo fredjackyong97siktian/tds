@@ -2473,7 +2473,7 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
             not_ready = [
                 row
                 for row in trigger_assets
-                if str(row.get("video_asset_status") or "").strip().lower() != "frames_retrieved"
+                if str(row.get("video_asset_status") or "").strip().lower() not in {"frames_retrieved", "10_frames_retrieved"}
             ]
             if not_ready:
                 continue
@@ -5095,7 +5095,7 @@ def _run_trigger_frame_retrieval_job(
             frame_payload.append(frame_record)
 
         ok_frames = [frame for frame in frame_payload if frame.get("status") == "ok"]
-        final_status = "frames_retrieved" if ok_frames else "issue"
+        final_status = "10_frames_retrieved" if ok_frames else "issue"
         metadata = {
             "retrieval_mode": "trigger_frames",
             "frame_count_requested": frame_count,

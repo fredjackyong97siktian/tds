@@ -37,6 +37,7 @@ ALTER TABLE sesamedb.tds_video_asset
         'not_retrieved',
         'retrieving',
         'frames_retrieved',
+        '10_frames_retrieved',
         'full_video_not_retrieved',
         'ready',
         'processing',

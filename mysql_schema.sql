@@ -169,7 +169,7 @@ CREATE TABLE IF NOT EXISTS sesamedb.tds_video_asset (
     retrieved_at DATETIME COMMENT 'When ffmpeg successfully finished retrieving the source clip.',
     analyzed_at DATETIME COMMENT 'When the video finished successful analysis processing.',
     retention_until DATETIME COMMENT 'Delete the stored video file/object and this row after this timestamp; use 3-day retention by default.',
-    status VARCHAR(30) NOT NULL DEFAULT 'not_retrieved' COMMENT 'Video lifecycle: not_retrieved, retrieving, frames_retrieved, full_video_not_retrieved, ready, deleted, or issue.',
+    status VARCHAR(30) NOT NULL DEFAULT 'not_retrieved' COMMENT 'Video lifecycle: not_retrieved, retrieving, 10_frames_retrieved, full_video_not_retrieved, ready, deleted, or issue.',
     metadata JSON,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     KEY idx_video_asset_trigger_id (trigger_id),
@@ -180,7 +180,7 @@ CREATE TABLE IF NOT EXISTS sesamedb.tds_video_asset (
     CONSTRAINT chk_video_asset_section
         CHECK (section IN ('entrance', 'kiosk')),
     CONSTRAINT chk_video_asset_status
-        CHECK (status IN ('not_retrieved', 'retrieving', 'frames_retrieved', 'full_video_not_retrieved', 'ready', 'processing', 'processed', 'deleted', 'issue'))
+        CHECK (status IN ('not_retrieved', 'retrieving', 'frames_retrieved', '10_frames_retrieved', 'full_video_not_retrieved', 'ready', 'processing', 'processed', 'deleted', 'issue'))
 );
 
 CREATE TABLE IF NOT EXISTS sesamedb.tds_worker_control (
