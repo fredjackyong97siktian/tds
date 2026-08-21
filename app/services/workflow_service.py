@@ -52,6 +52,18 @@ SCRIPT_RUN_COMMAND_REDACTED = "[redacted]"
 logger = logging.getLogger("tds.workflow_service")
 KIOSK_OWNERSHIP_MIN_MARGIN_SECONDS = 10.0
 NO_KIOSK_VIDEO_REASON = "No kiosk video was queued because no paid transactions were found inside the session window."
+DEFAULT_FILTER_FACTORS: dict[str, dict[str, Any]] = {
+    "long_time_between_videos": {"enabled": True, "weight": 30.0},
+    "transaction_quantity": {"enabled": True, "weight": 15.0},
+    "transaction_value": {"enabled": True, "weight": 15.0},
+    "transaction_failure_pattern": {"enabled": False, "weight": 15.0},
+    "pending_transaction": {"enabled": False, "weight": 15.0},
+    "carry_something_from_store_score": {"enabled": True, "weight": 25.0},
+    "customer_credibility_history": {"enabled": False, "weight": 20.0},
+    "total_customer_compare_history": {"enabled": True, "weight": 10.0},
+    "yellow_bag_before_after": {"enabled": True, "weight": 10.0},
+    "runpod_credit_budget": {"enabled": False, "weight": 10.0},
+}
 
 
 @dataclass
@@ -2717,6 +2729,54 @@ def _finalize_remote_grouping_script_run(
     return result
 
 
+def _load_filter_factor_settings(db: Session, location_id: int) -> dict[str, dict[str, Any]]:
+    settings_by_code = {code: dict(value) for code, value in DEFAULT_FILTER_FACTORS.items()}
+    rows = repositories.list_filter_factors(db)
+    for row in rows:
+        row_location_id = row.get("location_id")
+        if row_location_id is not None and int(row_location_id) != int(location_id):
+            continue
+        factor_code = str(row.get("factor_code") or "").strip()
+        if not factor_code:
+            continue
+        settings_by_code[factor_code] = {
+            **settings_by_code.get(factor_code, {}),
+            "enabled": row.get("enabled") in (True, 1),
+            "weight": float(row.get("weight") or settings_by_code.get(factor_code, {}).get("weight") or 0),
+            "config": row.get("config"),
+            "location_id": row_location_id,
+        }
+    return settings_by_code
+
+
+def _apply_filter_factor(
+    *,
+    score: float,
+    reasons: list[str],
+    factor_details: dict[str, Any],
+    factors: Mapping[str, Mapping[str, Any]],
+    factor_code: str,
+    hit: bool,
+    reason: str,
+    evidence: Mapping[str, Any] | None = None,
+) -> float:
+    factor = dict(factors.get(factor_code) or DEFAULT_FILTER_FACTORS.get(factor_code) or {})
+    enabled = factor.get("enabled") in (True, 1)
+    weight = float(factor.get("weight") or 0)
+    factor_details[factor_code] = {
+        "enabled": enabled,
+        "weight": weight,
+        "hit": bool(hit),
+        "score_added": weight if enabled and hit else 0,
+        "reason": reason,
+        "evidence": dict(evidence or {}),
+    }
+    if enabled and hit:
+        reasons.append(reason)
+        return score + weight
+    return score
+
+
 def run_theft_confidence_for_grouping_batch(
     db: Session,
     *,
@@ -2734,6 +2794,7 @@ def run_theft_confidence_for_grouping_batch(
     groups = grouping_summary.get("groups") or grouping_summary.get("Groups") or []
     if not isinstance(groups, list):
         raise ValueError(f"Grouping batch {batch_id} result payload does not contain groups.")
+    factor_settings = _load_filter_factor_settings(db, location_id)
     if not groups:
         repositories.upsert_filter_confidence_result(
             db,
@@ -2836,24 +2897,110 @@ def run_theft_confidence_for_grouping_batch(
 
         score = 0.0
         reasons: list[str] = []
-        if duration_seconds >= 300 and total_quantity <= 1:
-            score += 30
-            reasons.append("long_time_low_quantity")
-        if total_quantity <= 1:
-            score += 15
-            reasons.append("low_quantity")
-        if 0 < total_value <= 10:
-            score += 15
-            reasons.append("low_transaction_value")
-        if carry_score >= 40:
-            score += 25
-            reasons.append("carry_score")
-        if int(group.get("total_customer") or 0) > 2:
-            score += 10
-            reasons.append("higher_customer_count")
-        if group.get("before_is_yellow_bag") == 0 and group.get("after_is_yellow_bag") == 1:
-            score += 10
-            reasons.append("yellow_bag_appeared")
+        factor_details: dict[str, Any] = {}
+        score = _apply_filter_factor(
+            score=score,
+            reasons=reasons,
+            factor_details=factor_details,
+            factors=factor_settings,
+            factor_code="long_time_between_videos",
+            hit=duration_seconds >= 300 and total_quantity <= 1,
+            reason="long_time_low_quantity",
+            evidence={"duration_seconds": duration_seconds, "total_quantity": total_quantity},
+        )
+        score = _apply_filter_factor(
+            score=score,
+            reasons=reasons,
+            factor_details=factor_details,
+            factors=factor_settings,
+            factor_code="transaction_quantity",
+            hit=total_quantity <= 1,
+            reason="low_quantity",
+            evidence={"total_quantity": total_quantity},
+        )
+        score = _apply_filter_factor(
+            score=score,
+            reasons=reasons,
+            factor_details=factor_details,
+            factors=factor_settings,
+            factor_code="transaction_value",
+            hit=0 < total_value <= 10,
+            reason="low_transaction_value",
+            evidence={"total_value": total_value},
+        )
+        score = _apply_filter_factor(
+            score=score,
+            reasons=reasons,
+            factor_details=factor_details,
+            factors=factor_settings,
+            factor_code="transaction_failure_pattern",
+            hit=False,
+            reason="transaction_failure_pattern",
+            evidence={"implemented": False},
+        )
+        score = _apply_filter_factor(
+            score=score,
+            reasons=reasons,
+            factor_details=factor_details,
+            factors=factor_settings,
+            factor_code="pending_transaction",
+            hit=False,
+            reason="pending_transaction",
+            evidence={"implemented": False},
+        )
+        score = _apply_filter_factor(
+            score=score,
+            reasons=reasons,
+            factor_details=factor_details,
+            factors=factor_settings,
+            factor_code="carry_something_from_store_score",
+            hit=carry_score >= 40,
+            reason="carry_score",
+            evidence={"carry_something_from_store_score": carry_score},
+        )
+        score = _apply_filter_factor(
+            score=score,
+            reasons=reasons,
+            factor_details=factor_details,
+            factors=factor_settings,
+            factor_code="customer_credibility_history",
+            hit=False,
+            reason="customer_credibility_history",
+            evidence={"implemented": False},
+        )
+        score = _apply_filter_factor(
+            score=score,
+            reasons=reasons,
+            factor_details=factor_details,
+            factors=factor_settings,
+            factor_code="total_customer_compare_history",
+            hit=int(group.get("total_customer") or 0) > 2,
+            reason="higher_customer_count",
+            evidence={"total_customer": group.get("total_customer")},
+        )
+        score = _apply_filter_factor(
+            score=score,
+            reasons=reasons,
+            factor_details=factor_details,
+            factors=factor_settings,
+            factor_code="yellow_bag_before_after",
+            hit=group.get("before_is_yellow_bag") == 0 and group.get("after_is_yellow_bag") == 1,
+            reason="yellow_bag_appeared",
+            evidence={
+                "before_is_yellow_bag": group.get("before_is_yellow_bag"),
+                "after_is_yellow_bag": group.get("after_is_yellow_bag"),
+            },
+        )
+        score = _apply_filter_factor(
+            score=score,
+            reasons=reasons,
+            factor_details=factor_details,
+            factors=factor_settings,
+            factor_code="runpod_credit_budget",
+            hit=False,
+            reason="runpod_credit_budget",
+            evidence={"implemented": False},
+        )
 
         score = min(100.0, score)
         need_deep_analysis = score >= 50.0
@@ -2873,6 +3020,8 @@ def run_theft_confidence_for_grouping_batch(
                 "carry_something_from_store_score": carry_score,
                 "total_customer": group.get("total_customer"),
                 "trigger_ids": trigger_ids,
+                "factor_settings": factor_settings,
+                "factor_details": factor_details,
             },
         )
         analyzed_count += 1
