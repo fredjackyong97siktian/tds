@@ -1370,14 +1370,26 @@ def list_filter_time_periods(db: Session, *, selected_only: bool = False) -> lis
     return rows
 
 
+def _normalize_mysql_time_value(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    match = re.fullmatch(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", value.strip(), flags=re.IGNORECASE)
+    if match is None:
+        return value
+    hours = int(match.group(1) or 0)
+    minutes = int(match.group(2) or 0)
+    seconds = int(match.group(3) or 0)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
 def upsert_filter_time_period(db: Session, payload: Mapping[str, Any]) -> dict[str, Any]:
     table_name = _table("filter_time_period")
     params = {
         "location_id": payload.get("location_id"),
         "period_code": payload.get("period_code"),
         "label": payload.get("label"),
-        "start_time": payload.get("start_time"),
-        "end_time": payload.get("end_time"),
+        "start_time": _normalize_mysql_time_value(payload.get("start_time")),
+        "end_time": _normalize_mysql_time_value(payload.get("end_time")),
         "selected": 1 if payload.get("selected") else 0,
         "metadata": _json_dumps(payload.get("metadata")) if payload.get("metadata") is not None else None,
     }
