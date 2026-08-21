@@ -1372,29 +1372,53 @@ def list_filter_time_periods(db: Session, *, selected_only: bool = False) -> lis
 
 def upsert_filter_time_period(db: Session, payload: Mapping[str, Any]) -> dict[str, Any]:
     table_name = _table("filter_time_period")
-    db.execute(
+    params = {
+        "location_id": payload.get("location_id"),
+        "period_code": payload.get("period_code"),
+        "label": payload.get("label"),
+        "start_time": payload.get("start_time"),
+        "end_time": payload.get("end_time"),
+        "selected": 1 if payload.get("selected") else 0,
+        "metadata": _json_dumps(payload.get("metadata")) if payload.get("metadata") is not None else None,
+    }
+    existing = db.execute(
         text(
             f"""
-            insert into {table_name} (location_id, period_code, label, start_time, end_time, selected, metadata)
-            values (:location_id, :period_code, :label, :start_time, :end_time, :selected, :metadata)
-            on duplicate key update
-                label = values(label),
-                start_time = values(start_time),
-                end_time = values(end_time),
-                selected = values(selected),
-                metadata = values(metadata)
+            select id
+            from {table_name}
+            where ((location_id is null and :location_id is null) or location_id = :location_id)
+              and period_code = :period_code
+            order by id asc
+            limit 1
             """
         ),
-        {
-            "location_id": payload.get("location_id"),
-            "period_code": payload.get("period_code"),
-            "label": payload.get("label"),
-            "start_time": payload.get("start_time"),
-            "end_time": payload.get("end_time"),
-            "selected": 1 if payload.get("selected") else 0,
-            "metadata": _json_dumps(payload.get("metadata")) if payload.get("metadata") is not None else None,
-        },
-    )
+        params,
+    ).mappings().first()
+    if existing is not None:
+        db.execute(
+            text(
+                f"""
+                update {table_name}
+                set label = :label,
+                    start_time = :start_time,
+                    end_time = :end_time,
+                    selected = :selected,
+                    metadata = :metadata
+                where id = :id
+                """
+            ),
+            {**params, "id": int(existing["id"])},
+        )
+    else:
+        db.execute(
+            text(
+                f"""
+                insert into {table_name} (location_id, period_code, label, start_time, end_time, selected, metadata)
+                values (:location_id, :period_code, :label, :start_time, :end_time, :selected, :metadata)
+                """
+            ),
+            params,
+        )
     db.commit()
     result = db.execute(
         text(
@@ -1434,27 +1458,51 @@ def list_filter_factors(db: Session) -> list[dict[str, Any]]:
 
 def upsert_filter_factor(db: Session, payload: Mapping[str, Any]) -> dict[str, Any]:
     table_name = _table("filter_factor")
-    db.execute(
+    params = {
+        "location_id": payload.get("location_id"),
+        "factor_code": payload.get("factor_code"),
+        "label": payload.get("label"),
+        "enabled": 1 if payload.get("enabled") else 0,
+        "weight": payload.get("weight", 1),
+        "config": _json_dumps(payload.get("config")) if payload.get("config") is not None else None,
+    }
+    existing = db.execute(
         text(
             f"""
-            insert into {table_name} (location_id, factor_code, label, enabled, weight, config)
-            values (:location_id, :factor_code, :label, :enabled, :weight, :config)
-            on duplicate key update
-                label = values(label),
-                enabled = values(enabled),
-                weight = values(weight),
-                config = values(config)
+            select id
+            from {table_name}
+            where ((location_id is null and :location_id is null) or location_id = :location_id)
+              and factor_code = :factor_code
+            order by id asc
+            limit 1
             """
         ),
-        {
-            "location_id": payload.get("location_id"),
-            "factor_code": payload.get("factor_code"),
-            "label": payload.get("label"),
-            "enabled": 1 if payload.get("enabled") else 0,
-            "weight": payload.get("weight", 1),
-            "config": _json_dumps(payload.get("config")) if payload.get("config") is not None else None,
-        },
-    )
+        params,
+    ).mappings().first()
+    if existing is not None:
+        db.execute(
+            text(
+                f"""
+                update {table_name}
+                set label = :label,
+                    enabled = :enabled,
+                    weight = :weight,
+                    config = :config
+                where id = :id
+                """
+            ),
+            {**params, "id": int(existing["id"])},
+        )
+    else:
+        db.execute(
+            text(
+                f"""
+                insert into {table_name} (location_id, factor_code, label, enabled, weight, config)
+                values (:location_id, :factor_code, :label, :enabled, :weight, :config)
+                """
+            ),
+            params,
+        )
     db.commit()
     result = db.execute(
         text(
