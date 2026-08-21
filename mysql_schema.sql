@@ -169,7 +169,7 @@ CREATE TABLE IF NOT EXISTS sesamedb.tds_video_asset (
     retrieved_at DATETIME COMMENT 'When ffmpeg successfully finished retrieving the source clip.',
     analyzed_at DATETIME COMMENT 'When the video finished successful analysis processing.',
     retention_until DATETIME COMMENT 'Delete the stored video file/object and this row after this timestamp; use 3-day retention by default.',
-    status VARCHAR(30) NOT NULL DEFAULT 'not_retrieved' COMMENT 'Video lifecycle: not_retrieved, retrieving, ready, deleted, or issue.',
+    status VARCHAR(30) NOT NULL DEFAULT 'not_retrieved' COMMENT 'Video lifecycle: not_retrieved, retrieving, frames_retrieved, full_video_not_retrieved, ready, deleted, or issue.',
     metadata JSON,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     KEY idx_video_asset_trigger_id (trigger_id),
@@ -180,7 +180,7 @@ CREATE TABLE IF NOT EXISTS sesamedb.tds_video_asset (
     CONSTRAINT chk_video_asset_section
         CHECK (section IN ('entrance', 'kiosk')),
     CONSTRAINT chk_video_asset_status
-        CHECK (status IN ('not_retrieved', 'retrieving', 'ready', 'processing', 'processed', 'deleted', 'issue'))
+        CHECK (status IN ('not_retrieved', 'retrieving', 'frames_retrieved', 'full_video_not_retrieved', 'ready', 'processing', 'processed', 'deleted', 'issue'))
 );
 
 CREATE TABLE IF NOT EXISTS sesamedb.tds_worker_control (
@@ -193,7 +193,7 @@ CREATE TABLE IF NOT EXISTS sesamedb.tds_worker_control (
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     UNIQUE KEY uq_worker_control_worker_name (worker_name),
     CONSTRAINT chk_worker_control_name
-        CHECK (worker_name IN ('retrieval', 'entrance_analysis', 'kiosk_analysis')),
+        CHECK (worker_name IN ('retrieval', 'grouping', 'theft_confidence_analysis', 'entrance_analysis', 'kiosk_analysis')),
     CONSTRAINT chk_worker_control_paused
         CHECK (paused IN (0, 1))
 );
@@ -244,9 +244,112 @@ CREATE TABLE IF NOT EXISTS sesamedb.tds_script_run (
     CONSTRAINT fk_script_run_trigger
         FOREIGN KEY (trigger_id) REFERENCES tds_trigger_event(id) ON DELETE CASCADE,
     CONSTRAINT chk_script_run_name
-        CHECK (script_name IN ('retrieve_video', 'entry', 'kiosk', 'kiosk_match')),
+        CHECK (script_name IN ('retrieve_video', 'entry', 'kiosk', 'kiosk_match', 'grouping')),
     CONSTRAINT chk_script_run_status
         CHECK (status IN ('pending', 'running', 'success', 'failed'))
+);
+
+CREATE TABLE IF NOT EXISTS sesamedb.tds_filter_time_period (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    location_id BIGINT,
+    period_code VARCHAR(30) NOT NULL,
+    label VARCHAR(100) NOT NULL,
+    start_time TIME NOT NULL,
+    end_time TIME NOT NULL,
+    selected TINYINT(1) NOT NULL DEFAULT 0,
+    metadata JSON,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_filter_time_period_location_code (location_id, period_code),
+    CONSTRAINT chk_filter_time_period_selected
+        CHECK (selected IN (0, 1))
+);
+
+CREATE TABLE IF NOT EXISTS sesamedb.tds_filter_factor (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    location_id BIGINT,
+    factor_code VARCHAR(80) NOT NULL,
+    label VARCHAR(150) NOT NULL,
+    enabled TINYINT(1) NOT NULL DEFAULT 1,
+    weight DECIMAL(8, 4) NOT NULL DEFAULT 1.0000,
+    config JSON,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_filter_factor_location_code (location_id, factor_code),
+    CONSTRAINT chk_filter_factor_enabled
+        CHECK (enabled IN (0, 1))
+);
+
+CREATE TABLE IF NOT EXISTS sesamedb.tds_filter_grouping_batch (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    location_id BIGINT NOT NULL,
+    period_code VARCHAR(30) NOT NULL,
+    window_start DATETIME NOT NULL,
+    window_end DATETIME NOT NULL,
+    script_run_id BIGINT,
+    status VARCHAR(30) NOT NULL DEFAULT 'pending',
+    manifest_url TEXT,
+    manifest_object_key TEXT,
+    result_payload JSON,
+    issue_reason TEXT,
+    started_at DATETIME,
+    finished_at DATETIME,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_filter_grouping_batch_window (location_id, period_code, window_start, window_end),
+    KEY idx_filter_grouping_batch_status (status),
+    KEY idx_filter_grouping_batch_script_run_id (script_run_id),
+    CONSTRAINT fk_filter_grouping_batch_script_run
+        FOREIGN KEY (script_run_id) REFERENCES tds_script_run(id) ON DELETE SET NULL,
+    CONSTRAINT chk_filter_grouping_batch_status
+        CHECK (status IN ('pending', 'running', 'success', 'failed', 'issue'))
+);
+
+CREATE TABLE IF NOT EXISTS sesamedb.tds_filter_grouping_item (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    batch_id BIGINT NOT NULL,
+    trigger_id BIGINT NOT NULL,
+    video_asset_id BIGINT,
+    group_key VARCHAR(100),
+    role VARCHAR(30) NOT NULL DEFAULT 'unknown',
+    status VARCHAR(30) NOT NULL DEFAULT 'pending',
+    score DECIMAL(8, 4),
+    frame_payload JSON,
+    result_payload JSON,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_filter_grouping_item_batch_trigger (batch_id, trigger_id),
+    KEY idx_filter_grouping_item_trigger_id (trigger_id),
+    KEY idx_filter_grouping_item_video_asset_id (video_asset_id),
+    CONSTRAINT fk_filter_grouping_item_batch
+        FOREIGN KEY (batch_id) REFERENCES tds_filter_grouping_batch(id) ON DELETE CASCADE,
+    CONSTRAINT fk_filter_grouping_item_trigger
+        FOREIGN KEY (trigger_id) REFERENCES tds_trigger_event(id) ON DELETE CASCADE,
+    CONSTRAINT fk_filter_grouping_item_video_asset
+        FOREIGN KEY (video_asset_id) REFERENCES tds_video_asset(id) ON DELETE SET NULL,
+    CONSTRAINT chk_filter_grouping_item_role
+        CHECK (role IN ('entry', 'exit', 'unknown')),
+    CONSTRAINT chk_filter_grouping_item_status
+        CHECK (status IN ('pending', 'grouped', 'unknown', 'issue'))
+);
+
+CREATE TABLE IF NOT EXISTS sesamedb.tds_filter_confidence_result (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    batch_id BIGINT NOT NULL,
+    group_key VARCHAR(100) NOT NULL,
+    location_id BIGINT NOT NULL,
+    score DECIMAL(8, 4) NOT NULL DEFAULT 0,
+    need_deep_analysis TINYINT(1) NOT NULL DEFAULT 0,
+    reason TEXT,
+    factor_payload JSON,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_filter_confidence_batch_group (batch_id, group_key),
+    KEY idx_filter_confidence_need_deep_analysis (need_deep_analysis),
+    CONSTRAINT fk_filter_confidence_batch
+        FOREIGN KEY (batch_id) REFERENCES tds_filter_grouping_batch(id) ON DELETE CASCADE,
+    CONSTRAINT chk_filter_confidence_need_deep_analysis
+        CHECK (need_deep_analysis IN (0, 1))
 );
 
 CREATE TABLE IF NOT EXISTS sesamedb.tds_kiosk_video_result (

@@ -256,6 +256,18 @@ class KioskAnalysisQueued:
 
 
 @dataclass
+class GroupingAnalysisQueued:
+    batch_id: int
+    location_id: int
+    period_code: str
+    window_start: datetime
+    window_end: datetime
+    manifest_url: str
+    manifest_object_key: str
+    model_name: str | None = None
+
+
+@dataclass
 class RemoteRunnerResult:
     status: str
     stdout: str
@@ -268,6 +280,7 @@ class RemoteRunnerResult:
     reid_views_summary: dict[str, Any] | None = None
     kiosk_summary: dict[str, Any] | None = None
     transaction_match_summary: dict[str, Any] | None = None
+    grouping_summary: dict[str, Any] | None = None
 
 
 @dataclass
@@ -323,6 +336,7 @@ def _runpod_runner_enabled() -> bool:
             settings.runpod_endpoint_id,
             settings.runpod_entry_endpoint_id,
             settings.runpod_kiosk_endpoint_id,
+            settings.runpod_grouping_endpoint_id,
         )
     )
     return bool(has_endpoint and str(settings.runpod_api_key or "").strip())
@@ -715,6 +729,7 @@ def _remote_runner_result_from_runpod_body(body: dict[str, Any]) -> tuple[str, R
                 reid_views_summary=output.get("reid_views_summary"),
                 kiosk_summary=output.get("kiosk_summary"),
                 transaction_match_summary=output.get("transaction_match_summary"),
+                grouping_summary=output.get("grouping_summary"),
             ),
         )
 
@@ -734,6 +749,7 @@ def _remote_runner_result_from_runpod_body(body: dict[str, Any]) -> tuple[str, R
                 reid_views_summary=output.get("reid_views_summary"),
                 kiosk_summary=output.get("kiosk_summary"),
                 transaction_match_summary=output.get("transaction_match_summary"),
+                grouping_summary=output.get("grouping_summary"),
             ),
         )
     return (
@@ -1655,7 +1671,7 @@ def process_runpod_webhook(
         if not runner_job_id:
             raise ValueError("Runpod webhook is missing runner job id for status fetch.")
         script_name = str(script_run.get("script_name") or normalized_kind or "").strip().lower()
-        if script_name not in {"entry", "kiosk", "kiosk_match"}:
+        if script_name not in {"entry", "kiosk", "kiosk_match", "grouping"}:
             raise ValueError("Unsupported Runpod webhook kind.")
         effective_body = _fetch_runpod_status_with_retries(
             runner_job_id=runner_job_id,
@@ -1687,6 +1703,8 @@ def process_runpod_webhook(
         result = _finalize_remote_kiosk_script_run(db, script_run=script_run, remote_result=remote_result)
     elif normalized_kind == "kiosk_match":
         result = _finalize_remote_kiosk_match_script_run(db, script_run=script_run, remote_result=remote_result)
+    elif normalized_kind == "grouping":
+        result = _finalize_remote_grouping_script_run(db, script_run=script_run, remote_result=remote_result)
     else:
         raise ValueError("Unsupported Runpod webhook kind.")
 
@@ -1752,7 +1770,7 @@ def reconcile_running_remote_analysis_script_runs(db: Session) -> list[dict[str,
     for script_run in repositories.list_running_remote_analysis_script_runs(db):
         job_id = str(script_run.get("runner_job_id") or "").strip()
         script_name = str(script_run.get("script_name") or "").strip().lower()
-        if not job_id or script_name not in {"entry", "kiosk", "kiosk_match"}:
+        if not job_id or script_name not in {"entry", "kiosk", "kiosk_match", "grouping"}:
             continue
         try:
             body = _runpod_request(
@@ -1771,6 +1789,8 @@ def reconcile_running_remote_analysis_script_runs(db: Session) -> list[dict[str,
             result = _finalize_remote_entry_script_run(db, script_run=script_run, remote_result=remote_result)
         elif script_name == "kiosk_match":
             result = _finalize_remote_kiosk_match_script_run(db, script_run=script_run, remote_result=remote_result)
+        elif script_name == "grouping":
+            result = _finalize_remote_grouping_script_run(db, script_run=script_run, remote_result=remote_result)
         else:
             result = _finalize_remote_kiosk_script_run(db, script_run=script_run, remote_result=remote_result)
         reconciled.append(
@@ -1835,6 +1855,8 @@ def _runpod_endpoint_id(kind: str | None = None) -> str:
         endpoint_id = str(settings.runpod_entry_endpoint_id or "").strip()
     elif normalized_kind in {"kiosk", "kiosk_match"}:
         endpoint_id = str(settings.runpod_kiosk_endpoint_id or "").strip()
+    elif normalized_kind == "grouping":
+        endpoint_id = str(settings.runpod_grouping_endpoint_id or "").strip()
     if not endpoint_id:
         endpoint_id = str(settings.runpod_endpoint_id or "").strip()
     if not endpoint_id:
@@ -2361,6 +2383,515 @@ def _queue_kiosk_transaction_match_for_session(
         "runner_job_id": enqueue_result.job_id,
         "manifest_object_key": manifest_object_key,
         "manifest_url": manifest_url,
+    }
+
+
+def _time_value_to_parts(value: Any) -> tuple[int, int, int]:
+    if hasattr(value, "hour") and hasattr(value, "minute"):
+        return int(value.hour), int(value.minute), int(getattr(value, "second", 0) or 0)
+    if isinstance(value, timedelta):
+        total_seconds = int(value.total_seconds())
+        return (total_seconds // 3600) % 24, (total_seconds // 60) % 60, total_seconds % 60
+    text_value = str(value or "00:00:00")
+    parts = [int(part) for part in text_value.split(":")[:3]]
+    while len(parts) < 3:
+        parts.append(0)
+    return parts[0], parts[1], parts[2]
+
+
+def _combine_local_datetime(day: datetime, value: Any) -> datetime:
+    hour, minute, second = _time_value_to_parts(value)
+    return day.replace(hour=hour, minute=minute, second=second, microsecond=0)
+
+
+def _last_completed_period_window(period: Mapping[str, Any], *, now: datetime | None = None) -> tuple[datetime, datetime]:
+    current = (now or datetime.now()).replace(microsecond=0)
+    today = current.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_today = _combine_local_datetime(today, period.get("start_time"))
+    end_today = _combine_local_datetime(today, period.get("end_time"))
+    if end_today <= start_today:
+        end_today += timedelta(days=1)
+    if current >= end_today:
+        return start_today, end_today
+    return start_today - timedelta(days=1), end_today - timedelta(days=1)
+
+
+def _frame_urls_from_video_asset(row: Mapping[str, Any]) -> list[dict[str, Any]]:
+    metadata = row.get("video_asset_metadata")
+    if not isinstance(metadata, Mapping):
+        return []
+    frames = metadata.get("frames")
+    if not isinstance(frames, list):
+        return []
+    payload: list[dict[str, Any]] = []
+    for frame in frames:
+        if not isinstance(frame, Mapping):
+            continue
+        image_url = str(frame.get("image_url") or "").strip()
+        if not image_url:
+            continue
+        payload.append(
+            {
+                "index": frame.get("index"),
+                "sample_time": frame.get("sample_time"),
+                "offset_seconds": frame.get("offset_seconds"),
+                "image_object_key": frame.get("image_object_key"),
+                "image_url": image_url,
+            }
+        )
+    return payload
+
+
+def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
+    periods = repositories.list_filter_time_periods(db, selected_only=True)
+    if not periods:
+        return []
+    locations = repositories.list_locations(db)
+    location_ids = [int(row["id"]) for row in locations if row.get("id") is not None]
+    prepared: list[dict[str, Any]] = []
+    for period in periods:
+        target_location_ids = [int(period["location_id"])] if period.get("location_id") is not None else location_ids
+        window_start, window_end = _last_completed_period_window(period)
+        for location_id in target_location_ids:
+            existing = repositories.get_grouping_batch_by_window(
+                db,
+                location_id=location_id,
+                period_code=str(period.get("period_code") or "period"),
+                window_start=window_start,
+                window_end=window_end,
+            )
+            if existing is not None:
+                continue
+            trigger_assets = repositories.list_trigger_frame_assets_for_window(
+                db,
+                location_id=location_id,
+                window_start=window_start,
+                window_end=window_end,
+            )
+            if not trigger_assets:
+                continue
+            not_ready = [
+                row
+                for row in trigger_assets
+                if str(row.get("video_asset_status") or "").strip().lower() != "frames_retrieved"
+            ]
+            if not_ready:
+                continue
+            batch = repositories.create_grouping_batch(
+                db,
+                location_id=location_id,
+                period_code=str(period.get("period_code") or "period"),
+                window_start=window_start,
+                window_end=window_end,
+            )
+            for row in trigger_assets:
+                repositories.upsert_grouping_item(
+                    db,
+                    batch_id=int(batch["id"]),
+                    trigger_id=int(row["trigger_id"]),
+                    video_asset_id=int(row["video_asset_id"]),
+                    frame_payload={"frames": _frame_urls_from_video_asset(row)},
+                )
+            prepared.append(batch)
+    return prepared
+
+
+def build_grouping_analysis_job_from_batch(db: Session, batch_id: int) -> GroupingAnalysisQueued:
+    batch = repositories.get_grouping_batch(db, batch_id)
+    items = repositories.list_grouping_items(db, batch_id)
+    triggers_payload: list[dict[str, Any]] = []
+    for item in items:
+        trigger = repositories.get_trigger(db, int(item["trigger_id"]))
+        frame_payload = item.get("frame_payload") if isinstance(item.get("frame_payload"), Mapping) else {}
+        triggers_payload.append(
+            {
+                "trigger_id": int(item["trigger_id"]),
+                "video_asset_id": int(item["video_asset_id"]) if item.get("video_asset_id") is not None else None,
+                "phone_entry_id": trigger.get("phone_entry_id"),
+                "credit_card_entry_id": trigger.get("credit_card_entry_id"),
+                "entry_source_type": trigger.get("entry_source_type"),
+                "trigger_time": trigger.get("trigger_time").isoformat() if hasattr(trigger.get("trigger_time"), "isoformat") else trigger.get("trigger_time"),
+                "frames": list(frame_payload.get("frames") or []),
+            }
+        )
+    manifest_payload = {
+        "batch_id": int(batch["id"]),
+        "location_id": int(batch["location_id"]),
+        "period_code": batch.get("period_code"),
+        "window_start": batch.get("window_start").isoformat() if hasattr(batch.get("window_start"), "isoformat") else batch.get("window_start"),
+        "window_end": batch.get("window_end").isoformat() if hasattr(batch.get("window_end"), "isoformat") else batch.get("window_end"),
+        "min_score": 0.74,
+        "min_consecutive_matches": 3,
+        "triggers": triggers_payload,
+    }
+    manifest_path = (
+        tmp_media_root()
+        / "grouping"
+        / f"location_{int(batch['location_id'])}"
+        / f"batch_{int(batch['id'])}"
+        / "grouping_manifest.json"
+    )
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(manifest_payload, indent=2, default=str))
+    manifest_object_key, manifest_url = _upload_runner_input_file(
+        manifest_path,
+        kind="grouping_manifest",
+        location_id=int(batch["location_id"]),
+        session_id=None,
+        trigger_id=None,
+        section="entrance",
+    )
+    repositories.update_grouping_batch(
+        db,
+        int(batch["id"]),
+        {
+            "manifest_object_key": manifest_object_key,
+            "manifest_url": manifest_url,
+        },
+    )
+    return GroupingAnalysisQueued(
+        batch_id=int(batch["id"]),
+        location_id=int(batch["location_id"]),
+        period_code=str(batch.get("period_code") or "period"),
+        window_start=_coerce_datetime_value(batch.get("window_start")) or datetime.now(),
+        window_end=_coerce_datetime_value(batch.get("window_end")) or datetime.now(),
+        manifest_url=manifest_url,
+        manifest_object_key=manifest_object_key,
+        model_name=None,
+    )
+
+
+def start_grouping_analysis_job(job: GroupingAnalysisQueued) -> ScriptExecutionResult:
+    db = TransactionalSessionLocal()
+    try:
+        script_run_id = repositories.create_script_run_started(
+            db,
+            session_id=None,
+            trigger_id=None,
+            script_name="grouping",
+            model_name="runpod_runner",
+            status="running",
+            command=SCRIPT_RUN_COMMAND_REDACTED,
+        )
+        repositories.update_grouping_batch(
+            db,
+            job.batch_id,
+            {
+                "script_run_id": script_run_id,
+                "status": "running",
+                "started_at": datetime.now(UTC),
+                "manifest_url": job.manifest_url,
+                "manifest_object_key": job.manifest_object_key,
+            },
+        )
+        enqueue_result = _enqueue_runpod_runner(
+            kind="grouping",
+            payload={
+                "kind": "grouping",
+                "manifest_url": job.manifest_url,
+                "callback_url": _build_runpod_webhook_url("grouping"),
+                "script_run_id": script_run_id,
+            },
+        )
+        repositories.assign_script_run_runner_job(
+            db,
+            script_run_id,
+            runner_job_id=enqueue_result.job_id,
+            runner_payload={
+                "batch_id": job.batch_id,
+                "location_id": job.location_id,
+                "period_code": job.period_code,
+                "window_start": job.window_start.isoformat(),
+                "window_end": job.window_end.isoformat(),
+                "manifest_object_key": job.manifest_object_key,
+                "manifest_url": job.manifest_url,
+            },
+        )
+        return ScriptExecutionResult(
+            script_run_id=script_run_id,
+            runner_job_id=enqueue_result.job_id,
+            script_name="grouping",
+            model_name="runpod_runner",
+            status="pending",
+            command=["runpod_serverless", "grouping"],
+            stdout="",
+            stderr="",
+        )
+    except Exception as exc:
+        repositories.update_grouping_batch(
+            db,
+            job.batch_id,
+            {
+                "status": "issue",
+                "issue_reason": str(exc),
+                "finished_at": datetime.now(UTC),
+            },
+        )
+        raise
+    finally:
+        db.close()
+
+
+def _finalize_remote_grouping_script_run(
+    db: Session,
+    *,
+    script_run: dict[str, Any],
+    remote_result: RemoteRunnerResult,
+) -> ScriptExecutionResult:
+    script_run_id = int(script_run["id"])
+    runner_payload = dict(script_run.get("runner_payload") or {})
+    batch_id = int(runner_payload["batch_id"]) if runner_payload.get("batch_id") is not None else None
+    remote_status = "success" if remote_result.status == "success" else "failed"
+    repositories.finish_script_run(
+        db,
+        script_run_id,
+        status=remote_status,
+        stdout_log=remote_result.stdout,
+        stderr_log=remote_result.stderr,
+    )
+    result = ScriptExecutionResult(
+        script_run_id=script_run_id,
+        runner_job_id=str(script_run.get("runner_job_id") or ""),
+        script_name="grouping",
+        model_name=script_run.get("model_name"),
+        status=remote_status,
+        command=["runpod_serverless", "grouping"],
+        stdout=remote_result.stdout,
+        stderr=remote_result.stderr,
+    )
+    if batch_id is None:
+        return result
+    grouping_summary = dict(remote_result.grouping_summary or {})
+    repositories.update_grouping_batch(
+        db,
+        batch_id,
+        {
+            "status": remote_status,
+            "result_payload": grouping_summary,
+            "issue_reason": remote_result.stderr if remote_status != "success" else None,
+            "finished_at": datetime.now(UTC),
+        },
+    )
+    if remote_status != "success":
+        return result
+    groups = grouping_summary.get("groups") or grouping_summary.get("Groups") or []
+    for group_index, group in enumerate(groups, start=1):
+        if not isinstance(group, Mapping):
+            continue
+        group_key = str(group.get("group_id") or group.get("id") or group_index)
+        for role in ("entry", "exit"):
+            trigger_ids = group.get(role) or []
+            if not isinstance(trigger_ids, list):
+                continue
+            for trigger_id in trigger_ids:
+                try:
+                    repositories.upsert_grouping_item(
+                        db,
+                        batch_id=batch_id,
+                        trigger_id=int(trigger_id),
+                        video_asset_id=None,
+                        group_key=group_key,
+                        role=role,
+                        status="grouped",
+                        score=float(group.get("score")) if group.get("score") is not None else None,
+                        result_payload=dict(group),
+                    )
+                except Exception:
+                    logger.exception("Could not persist grouping item batch_id=%s trigger_id=%s", batch_id, trigger_id)
+    unknown = grouping_summary.get("unknown") or []
+    if isinstance(unknown, list):
+        for trigger_id in unknown:
+            try:
+                repositories.upsert_grouping_item(
+                    db,
+                    batch_id=batch_id,
+                    trigger_id=int(trigger_id),
+                    video_asset_id=None,
+                    group_key=None,
+                    role="unknown",
+                    status="unknown",
+                    result_payload={"reason": "runner_returned_unknown"},
+                )
+            except Exception:
+                logger.exception("Could not persist unknown grouping item batch_id=%s trigger_id=%s", batch_id, trigger_id)
+    return result
+
+
+def run_theft_confidence_for_grouping_batch(
+    db: Session,
+    *,
+    batch_id: int,
+) -> dict[str, Any]:
+    batch = repositories.get_grouping_batch(db, batch_id)
+    grouping_summary = batch.get("result_payload")
+    if not isinstance(grouping_summary, Mapping):
+        raise ValueError(f"Grouping batch {batch_id} does not have a result payload.")
+    location_id = int(grouping_summary.get("location_id") or 0)
+    if location_id <= 0:
+        location_id = int(batch.get("location_id") or 0)
+    if location_id <= 0:
+        raise ValueError(f"Grouping batch {batch_id} does not have a location_id.")
+    groups = grouping_summary.get("groups") or grouping_summary.get("Groups") or []
+    if not isinstance(groups, list):
+        raise ValueError(f"Grouping batch {batch_id} result payload does not contain groups.")
+    if not groups:
+        repositories.upsert_filter_confidence_result(
+            db,
+            batch_id=batch_id,
+            group_key="__no_groups__",
+            location_id=location_id,
+            score=0,
+            need_deep_analysis=False,
+            reason="no_groups",
+            factor_payload={"message": "Grouping completed but returned no groups."},
+        )
+        return {
+            "ok": True,
+            "batch_id": batch_id,
+            "analyzed_count": 0,
+            "promoted_count": 0,
+        }
+
+    def _trigger_id_list(value: Any) -> list[int]:
+        if isinstance(value, list):
+            raw_values = value
+        elif value is None:
+            raw_values = []
+        else:
+            raw_values = [value]
+        ids: list[int] = []
+        for raw_value in raw_values:
+            try:
+                ids.append(int(raw_value))
+            except (TypeError, ValueError):
+                continue
+        return ids
+
+    analyzed_count = 0
+    promoted_count_total = 0
+    for group_index, group in enumerate(groups, start=1):
+        if not isinstance(group, Mapping):
+            continue
+        group_key = str(group.get("group_id") or group.get("id") or group_index)
+        trigger_ids = _trigger_id_list(group.get("entry")) + _trigger_id_list(group.get("exit"))
+        if not trigger_ids:
+            repositories.upsert_filter_confidence_result(
+                db,
+                batch_id=batch_id,
+                group_key=group_key,
+                location_id=location_id,
+                score=0,
+                need_deep_analysis=False,
+                reason="no_trigger_ids",
+                factor_payload={"group": dict(group)},
+            )
+            analyzed_count += 1
+            continue
+        trigger_rows: list[dict[str, Any]] = []
+        for trigger_id in trigger_ids:
+            try:
+                trigger_rows.append(repositories.get_trigger(db, trigger_id))
+            except Exception:
+                logger.exception("Could not load trigger for confidence analysis trigger_id=%s", trigger_id)
+        trigger_times = [
+            _coerce_datetime_value(row.get("trigger_time"))
+            for row in trigger_rows
+            if row.get("trigger_time") is not None
+        ]
+        trigger_times = [value for value in trigger_times if value is not None]
+        if len(trigger_times) < 2:
+            repositories.upsert_filter_confidence_result(
+                db,
+                batch_id=batch_id,
+                group_key=group_key,
+                location_id=location_id,
+                score=0,
+                need_deep_analysis=False,
+                reason="insufficient_trigger_times",
+                factor_payload={"trigger_ids": trigger_ids},
+            )
+            analyzed_count += 1
+            continue
+        start_time = min(trigger_times)
+        end_time = max(trigger_times)
+        transactions = repositories.list_paid_transactions_for_session_window(
+            db,
+            location_id=location_id,
+            start_time=start_time,
+            end_time=end_time,
+        )
+        total_quantity = sum(int(row.get("total_items") or 0) for row in transactions)
+        total_value = 0.0
+        for row in transactions:
+            try:
+                total_value += float(row.get("total_amount") or 0)
+            except (TypeError, ValueError):
+                pass
+        duration_seconds = max(0.0, (end_time - start_time).total_seconds())
+        carry_score_raw = group.get("carry_something_from_store_score")
+        try:
+            carry_score = float(str(carry_score_raw).replace("%", "")) if carry_score_raw is not None else 0.0
+        except ValueError:
+            carry_score = 0.0
+
+        score = 0.0
+        reasons: list[str] = []
+        if duration_seconds >= 300 and total_quantity <= 1:
+            score += 30
+            reasons.append("long_time_low_quantity")
+        if total_quantity <= 1:
+            score += 15
+            reasons.append("low_quantity")
+        if 0 < total_value <= 10:
+            score += 15
+            reasons.append("low_transaction_value")
+        if carry_score >= 40:
+            score += 25
+            reasons.append("carry_score")
+        if int(group.get("total_customer") or 0) > 2:
+            score += 10
+            reasons.append("higher_customer_count")
+        if group.get("before_is_yellow_bag") == 0 and group.get("after_is_yellow_bag") == 1:
+            score += 10
+            reasons.append("yellow_bag_appeared")
+
+        score = min(100.0, score)
+        need_deep_analysis = score >= 50.0
+        repositories.upsert_filter_confidence_result(
+            db,
+            batch_id=batch_id,
+            group_key=group_key,
+            location_id=location_id,
+            score=score,
+            need_deep_analysis=need_deep_analysis,
+            reason=", ".join(reasons) if reasons else "low_confidence",
+            factor_payload={
+                "duration_seconds": duration_seconds,
+                "transaction_count": len(transactions),
+                "total_quantity": total_quantity,
+                "total_value": total_value,
+                "carry_something_from_store_score": carry_score,
+                "total_customer": group.get("total_customer"),
+                "trigger_ids": trigger_ids,
+            },
+        )
+        analyzed_count += 1
+        if need_deep_analysis:
+            promoted_count = repositories.promote_trigger_video_assets_to_full_retrieval(db, trigger_ids)
+            promoted_count_total += promoted_count
+            logger.info(
+                "Layer 0 confidence promoted group_key=%s batch_id=%s trigger_ids=%s promoted_count=%s score=%.2f",
+                group_key,
+                batch_id,
+                trigger_ids,
+                promoted_count,
+                score,
+            )
+    return {
+        "ok": True,
+        "batch_id": batch_id,
+        "analyzed_count": analyzed_count,
+        "promoted_count": promoted_count_total,
     }
 
 
@@ -4284,6 +4815,9 @@ def _prepare_video_retrieval(
                 },
             },
         )
+    metadata = video_asset.get("metadata") if isinstance(video_asset.get("metadata"), Mapping) else {}
+    claimed_from_status = str(metadata.get("claimed_from_status") or video_asset.get("status") or "retrieving")
+
     return VideoRetrievalQueued(
         video_asset_id=video_asset_id,
         session_id=session_id,
@@ -4418,7 +4952,7 @@ def build_retrieval_job_from_video_asset(db: Session, video_asset_id: int) -> Vi
         dahua_host=dahua_host,
         dahua_username=dahua_username,
         rtsp_port=rtsp_port,
-        status=str(video_asset.get("status") or "retrieving"),
+        status=claimed_from_status,
         video_url=str(video_asset.get("video_url") or f"/api/v1/videos/assets/{video_asset_id}/content"),
     )
 
@@ -4457,6 +4991,166 @@ def build_entrance_analysis_job_from_video_asset(db: Session, video_asset_id: in
         video_path=video_path,
         model_name=None,
     )
+
+
+def _trigger_frame_spaces_key(
+    *,
+    location_id: int,
+    trigger_id: int,
+    section: str,
+    filename: str,
+) -> str:
+    return build_spaces_object_key(
+        f"location_{location_id}",
+        f"trigger_{trigger_id}",
+        section,
+        "frames",
+        filename,
+    )
+
+
+def _build_frame_capture_command(rtsp_url: str, offset_seconds: float, output_path: Path) -> list[str]:
+    return [
+        settings.ffmpeg_bin,
+        "-y",
+        "-rtsp_transport",
+        "tcp",
+        "-i",
+        rtsp_url,
+        "-ss",
+        f"{max(0.0, offset_seconds):.3f}",
+        "-frames:v",
+        "1",
+        "-q:v",
+        "2",
+        str(output_path),
+    ]
+
+
+def _run_trigger_frame_retrieval_job(
+    *,
+    video_asset_id: int,
+    trigger_id: int | None,
+    location_id: int,
+    section: str,
+    start_time: datetime,
+    end_time: datetime,
+    rtsp_url: str,
+    output_path: str,
+) -> None:
+    db = TransactionalSessionLocal()
+    script_run_id = repositories.create_script_run_started(
+        db,
+        session_id=None,
+        trigger_id=trigger_id,
+        script_name="retrieve_video",
+        model_name="dahua_rtsp_playback:trigger_frames",
+        status="running",
+        command=SCRIPT_RUN_COMMAND_REDACTED,
+    )
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
+    try:
+        if trigger_id is None:
+            raise ValueError("Frame retrieval requires a trigger_id.")
+        if not is_spaces_configured():
+            raise RuntimeError("Frame retrieval requires DigitalOcean Spaces.")
+
+        frame_root = Path(output_path).with_suffix("") / "frames"
+        frame_root.mkdir(parents=True, exist_ok=True)
+        duration_seconds = max(0.0, (end_time - start_time).total_seconds())
+        frame_count = max(1, int(settings.trigger_frame_count))
+        gap_seconds = max(0.04, float(settings.trigger_frame_gap) / max(1, int(settings.trigger_frame_fps)))
+        offsets = [
+            max(0.0, duration_seconds - ((frame_count - index) * gap_seconds))
+            for index in range(1, frame_count + 1)
+        ]
+
+        frame_payload: list[dict[str, Any]] = []
+        for index, offset_seconds in enumerate(offsets, start=1):
+            sample_time = start_time + timedelta(seconds=offset_seconds)
+            filename = f"trigger_{trigger_id}_frame_{index:02d}_{sample_time.strftime('%Y%m%d_%H%M%S')}.jpg"
+            local_path = frame_root / filename
+            command = _build_frame_capture_command(rtsp_url, offset_seconds, local_path)
+            completed = subprocess.run(command, capture_output=True, text=True)
+            stdout_parts.append(completed.stdout or "")
+            stderr_parts.append(completed.stderr or "")
+            frame_record: dict[str, Any] = {
+                "index": index,
+                "sample_time": sample_time.isoformat(),
+                "offset_seconds": round(float(offset_seconds), 3),
+                "status": "ok" if completed.returncode == 0 and local_path.exists() else "failed",
+                "stderr": str(completed.stderr or "").strip()[-1000:],
+            }
+            if frame_record["status"] == "ok":
+                object_key = _trigger_frame_spaces_key(
+                    location_id=location_id,
+                    trigger_id=trigger_id,
+                    section=section,
+                    filename=filename,
+                )
+                upload_result = upload_private_file(local_path, object_key, content_type=guess_media_type(str(local_path)))
+                frame_record["image_object_key"] = object_key
+                frame_record["image_url"] = str(upload_result.get("public_url") or _spaces_download_url_for_object_key(object_key))
+            frame_payload.append(frame_record)
+
+        ok_frames = [frame for frame in frame_payload if frame.get("status") == "ok"]
+        final_status = "frames_retrieved" if ok_frames else "issue"
+        metadata = {
+            "retrieval_mode": "trigger_frames",
+            "frame_count_requested": frame_count,
+            "frame_gap": int(settings.trigger_frame_gap),
+            "frame_fps": int(settings.trigger_frame_fps),
+            "frames_retrieved_count": len(ok_frames),
+            "frames": frame_payload,
+        }
+        repositories.update_video_asset(
+            db,
+            video_asset_id,
+            {
+                "video_url": str(ok_frames[-1].get("image_url") if ok_frames else f"/api/v1/videos/assets/{video_asset_id}/content"),
+                "file_path": output_path,
+                "captured_start_time": start_time,
+                "captured_end_time": end_time,
+                "retrieved_at": datetime.now(UTC) if ok_frames else None,
+                "analyzed_at": None,
+                "retention_until": end_time + timedelta(days=3),
+                "status": final_status,
+                "metadata": metadata,
+            },
+        )
+        repositories.finish_script_run(
+            db,
+            script_run_id,
+            status="success" if ok_frames else "failed",
+            stdout_log="\n".join(part for part in stdout_parts if part),
+            stderr_log="\n".join(part for part in stderr_parts if part),
+        )
+    except Exception as exc:
+        repositories.update_video_asset(
+            db,
+            video_asset_id,
+            {
+                "video_url": f"/api/v1/videos/assets/{video_asset_id}/content",
+                "file_path": output_path,
+                "captured_start_time": start_time,
+                "captured_end_time": end_time,
+                "retrieved_at": None,
+                "analyzed_at": None,
+                "retention_until": end_time + timedelta(days=3),
+                "status": "issue",
+                "metadata": {"retrieval_mode": "trigger_frames", "error": str(exc)},
+            },
+        )
+        repositories.finish_script_run(
+            db,
+            script_run_id,
+            status="failed",
+            stdout_log="\n".join(part for part in stdout_parts if part),
+            stderr_log=str(exc),
+        )
+    finally:
+        db.close()
 
 
 def _run_video_retrieval_job(
@@ -4581,6 +5275,18 @@ def _run_video_retrieval_job(
 
 
 def start_video_retrieval_job(job: VideoRetrievalQueued) -> None:
+    if job.status == "not_retrieved" and job.section == "entrance":
+        _run_trigger_frame_retrieval_job(
+            video_asset_id=job.video_asset_id,
+            trigger_id=job.trigger_id,
+            location_id=job.location_id,
+            section=job.section,
+            start_time=job.requested_start_time,
+            end_time=job.requested_end_time,
+            rtsp_url=job.rtsp_url,
+            output_path=job.output_path,
+        )
+        return
     _run_video_retrieval_job(
         video_asset_id=job.video_asset_id,
         session_id=job.session_id,

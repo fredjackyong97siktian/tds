@@ -41,6 +41,32 @@ services:
       - ../session:/app/session
       - ./models:/app/tds/models
 
+  theft-grouping-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: theft-detection-grouping-worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    command: python -m app.workers.grouping_worker
+    volumes:
+      - ../session:/app/session
+      - ./models:/app/tds/models
+
+  theft-confidence-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: theft-detection-confidence-worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    command: python -m app.workers.theft_confidence_worker
+    volumes:
+      - ../session:/app/session
+      - ./models:/app/tds/models
+
   theft-kiosk-analysis-worker:
     build:
       context: .

@@ -179,6 +179,111 @@ def update_analysis_control(payload: WorkerControlRequest, db: Session = Depends
     }
 
 
+@router.get("/grouping-status")
+def get_grouping_status(db: Session = Depends(get_transaction_db)) -> dict:
+    pending_rows = repositories.list_pending_grouping_batches(
+        db,
+        limit=max(settings.grouping_max_global_workers * 50, 500),
+    )
+    running_rows = repositories.list_running_grouping_batches(db)
+
+    per_location: dict[int, dict] = {}
+    for row in pending_rows:
+        location_id = int(row["location_id"])
+        current = per_location.setdefault(
+            location_id,
+            {
+                "location_id": location_id,
+                "queued_count": 0,
+                "running_count": 0,
+                "is_busy": False,
+                "running_batch_ids": [],
+                "queued_batch_ids": [],
+            },
+        )
+        current["queued_count"] += 1
+        current["queued_batch_ids"].append(int(row["id"]))
+
+    for row in running_rows:
+        location_id = int(row["location_id"])
+        current = per_location.setdefault(
+            location_id,
+            {
+                "location_id": location_id,
+                "queued_count": 0,
+                "running_count": 0,
+                "is_busy": False,
+                "running_batch_ids": [],
+                "queued_batch_ids": [],
+            },
+        )
+        current["running_count"] += 1
+        current["is_busy"] = current["running_count"] > 0
+        current["running_batch_ids"].append(int(row["id"]))
+
+    return {
+        "poll_seconds": settings.grouping_poll_seconds,
+        "max_global_workers": settings.grouping_max_global_workers,
+        "queued_count": len(pending_rows),
+        "running_count": len(running_rows),
+        "remote_dispatch_busy": repositories.has_active_remote_analysis_script_run(db, script_names=["grouping"]),
+        "paused": repositories.is_worker_paused(db, "grouping"),
+        "locations": sorted(per_location.values(), key=lambda item: int(item["location_id"])),
+    }
+
+
+@router.post("/grouping-control")
+def update_grouping_control(payload: WorkerControlRequest, db: Session = Depends(get_transaction_db)) -> dict:
+    state = repositories.set_worker_paused(db, "grouping", payload.paused)
+    return {
+        "ok": True,
+        **state,
+    }
+
+
+@router.get("/theft-confidence-status")
+def get_theft_confidence_status(db: Session = Depends(get_transaction_db)) -> dict:
+    pending_rows = repositories.list_pending_theft_confidence_batches(
+        db,
+        limit=max(settings.theft_confidence_max_global_workers * 50, 500),
+    )
+    per_location: dict[int, dict] = {}
+    for row in pending_rows:
+        location_id = int(row["location_id"])
+        current = per_location.setdefault(
+            location_id,
+            {
+                "location_id": location_id,
+                "queued_count": 0,
+                "running_count": 0,
+                "is_busy": False,
+                "running_batch_ids": [],
+                "queued_batch_ids": [],
+            },
+        )
+        current["queued_count"] += 1
+        current["queued_batch_ids"].append(int(row["id"]))
+
+    return {
+        "poll_seconds": settings.theft_confidence_poll_seconds,
+        "max_global_workers": settings.theft_confidence_max_global_workers,
+        "queued_count": len(pending_rows),
+        "running_count": 0,
+        "remote_dispatch_busy": False,
+        "paused": repositories.is_worker_paused(db, "theft_confidence_analysis"),
+        "locations": sorted(per_location.values(), key=lambda item: int(item["location_id"])),
+    }
+
+
+@router.post("/theft-confidence-control")
+def update_theft_confidence_control(payload: WorkerControlRequest, db: Session = Depends(get_transaction_db)) -> dict:
+    state = repositories.set_worker_paused(db, "theft_confidence_analysis", payload.paused)
+    return {
+        "ok": True,
+        **state,
+    }
+
+
 @router.get("/kiosk-analysis-status")
 def get_kiosk_analysis_status(db: Session = Depends(get_transaction_db)) -> dict:
     pending_rows = repositories.list_pending_kiosk_video_asset_analyses(

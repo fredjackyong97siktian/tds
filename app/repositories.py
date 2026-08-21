@@ -1086,7 +1086,13 @@ def get_video_asset(db: Session, video_asset_id: int) -> dict[str, Any]:
         ),
         {"video_asset_id": video_asset_id},
     )
-    return _fetch_one_dict(result)
+    row = _fetch_one_dict(result)
+    if isinstance(row.get("metadata"), str):
+        try:
+            row["metadata"] = json.loads(row["metadata"])
+        except json.JSONDecodeError:
+            pass
+    return row
 
 
 def get_video_asset_by_file_path(db: Session, file_path: str) -> dict[str, Any]:
@@ -1161,6 +1167,7 @@ def list_pending_video_asset_retrievals(db: Session, limit: int = 50) -> list[di
                    va.captured_end_time,
                    va.retrieved_at,
                    va.analyzed_at,
+                   va.status,
                    va.created_at,
                    min(sva.session_id) as session_id,
                    coalesce(
@@ -1172,8 +1179,8 @@ def list_pending_video_asset_retrievals(db: Session, limit: int = 50) -> list[di
             left join {trigger_table} te on te.id = va.trigger_id
             left join {session_video_asset_table} sva on sva.video_asset_id = va.id
             left join {session_table} s on s.id = sva.session_id
-            where va.status = 'not_retrieved'
-            group by va.id, va.trigger_id, va.section, va.file_path, va.captured_start_time, va.captured_end_time, va.retrieved_at, va.analyzed_at, va.created_at, te.location_id
+            where va.status in ('not_retrieved', 'full_video_not_retrieved')
+            group by va.id, va.trigger_id, va.section, va.file_path, va.captured_start_time, va.captured_end_time, va.retrieved_at, va.analyzed_at, va.status, va.created_at, te.location_id
             order by case when va.section = 'entrance' then 0 else 1 end asc,
                      coalesce(va.captured_start_time, va.created_at) asc,
                      va.id asc
@@ -1201,6 +1208,7 @@ def list_running_video_asset_retrievals(db: Session) -> list[dict[str, Any]]:
                    va.captured_end_time,
                    va.retrieved_at,
                    va.analyzed_at,
+                   va.status,
                    min(sva.session_id) as session_id,
                    coalesce(
                        te.location_id,
@@ -1212,7 +1220,7 @@ def list_running_video_asset_retrievals(db: Session) -> list[dict[str, Any]]:
             left join {session_video_asset_table} sva on sva.video_asset_id = va.id
             left join {session_table} s on s.id = sva.session_id
             where va.status = 'retrieving'
-            group by va.id, va.trigger_id, va.section, va.file_path, va.captured_start_time, va.captured_end_time, va.retrieved_at, va.analyzed_at, te.location_id
+            group by va.id, va.trigger_id, va.section, va.file_path, va.captured_start_time, va.captured_end_time, va.retrieved_at, va.analyzed_at, va.status, te.location_id
             order by va.id asc
             """
         )
@@ -1226,14 +1234,579 @@ def claim_video_asset_for_retrieval(db: Session, video_asset_id: int) -> bool:
         text(
             f"""
             update {video_asset_table}
-            set status = 'retrieving'
-            where id = :video_asset_id and status = 'not_retrieved'
+            set metadata = json_set(coalesce(metadata, json_object()), '$.claimed_from_status', status),
+                status = 'retrieving'
+            where id = :video_asset_id and status in ('not_retrieved', 'full_video_not_retrieved')
             """
         ),
         {"video_asset_id": video_asset_id},
     )
     db.commit()
     return bool(result.rowcount)
+
+
+def list_ready_trigger_frame_assets_for_window(
+    db: Session,
+    *,
+    location_id: int,
+    window_start: Any,
+    window_end: Any,
+) -> list[dict[str, Any]]:
+    video_asset_table = _table("video_asset")
+    trigger_table = _table("trigger_event")
+    result = db.execute(
+        text(
+            f"""
+            select te.id as trigger_id,
+                   te.location_id,
+                   te.trigger_time,
+                   te.phone_entry_id,
+                   te.credit_card_entry_id,
+                   te.entry_source_type,
+                   va.id as video_asset_id,
+                   va.status as video_asset_status,
+                   va.metadata as video_asset_metadata,
+                   va.created_at as video_asset_created_at
+            from {trigger_table} te
+            join {video_asset_table} va on va.trigger_id = te.id
+            where te.location_id = :location_id
+              and te.trigger_time >= :window_start
+              and te.trigger_time < :window_end
+              and te.whitelist_hit = 0
+              and te.status <> 'whitelisted'
+              and (te.phone_entry_id is not null or te.credit_card_entry_id is not null)
+              and va.section = 'entrance'
+              and va.status = 'frames_retrieved'
+            order by te.trigger_time asc, te.id asc, va.id asc
+            """
+        ),
+        {
+            "location_id": location_id,
+            "window_start": window_start,
+            "window_end": window_end,
+        },
+    )
+    rows = _fetch_all_dicts(result)
+    for row in rows:
+        if isinstance(row.get("video_asset_metadata"), str):
+            try:
+                row["video_asset_metadata"] = json.loads(row["video_asset_metadata"])
+            except json.JSONDecodeError:
+                pass
+    return rows
+
+
+def list_trigger_frame_assets_for_window(
+    db: Session,
+    *,
+    location_id: int,
+    window_start: Any,
+    window_end: Any,
+) -> list[dict[str, Any]]:
+    video_asset_table = _table("video_asset")
+    trigger_table = _table("trigger_event")
+    result = db.execute(
+        text(
+            f"""
+            select te.id as trigger_id,
+                   te.location_id,
+                   te.trigger_time,
+                   te.phone_entry_id,
+                   te.credit_card_entry_id,
+                   te.entry_source_type,
+                   va.id as video_asset_id,
+                   va.status as video_asset_status,
+                   va.metadata as video_asset_metadata,
+                   va.created_at as video_asset_created_at
+            from {trigger_table} te
+            join {video_asset_table} va on va.trigger_id = te.id
+            where te.location_id = :location_id
+              and te.trigger_time >= :window_start
+              and te.trigger_time < :window_end
+              and te.whitelist_hit = 0
+              and te.status <> 'whitelisted'
+              and (te.phone_entry_id is not null or te.credit_card_entry_id is not null)
+              and va.section = 'entrance'
+              and va.status <> 'deleted'
+            order by te.trigger_time asc, te.id asc, va.id asc
+            """
+        ),
+        {
+            "location_id": location_id,
+            "window_start": window_start,
+            "window_end": window_end,
+        },
+    )
+    rows = _fetch_all_dicts(result)
+    for row in rows:
+        if isinstance(row.get("video_asset_metadata"), str):
+            try:
+                row["video_asset_metadata"] = json.loads(row["video_asset_metadata"])
+            except json.JSONDecodeError:
+                pass
+    return rows
+
+
+def list_filter_time_periods(db: Session, *, selected_only: bool = False) -> list[dict[str, Any]]:
+    table_name = _table("filter_time_period")
+    where_selected = "where selected = 1" if selected_only else ""
+    result = db.execute(
+        text(
+            f"""
+            select id, location_id, period_code, label, start_time, end_time, selected, metadata, created_at, updated_at
+            from {table_name}
+            {where_selected}
+            order by coalesce(location_id, 0) asc, start_time asc, id asc
+            """
+        )
+    )
+    rows = _fetch_all_dicts(result)
+    for row in rows:
+        if isinstance(row.get("metadata"), str):
+            try:
+                row["metadata"] = json.loads(row["metadata"])
+            except json.JSONDecodeError:
+                pass
+    return rows
+
+
+def upsert_filter_time_period(db: Session, payload: Mapping[str, Any]) -> dict[str, Any]:
+    table_name = _table("filter_time_period")
+    db.execute(
+        text(
+            f"""
+            insert into {table_name} (location_id, period_code, label, start_time, end_time, selected, metadata)
+            values (:location_id, :period_code, :label, :start_time, :end_time, :selected, :metadata)
+            on duplicate key update
+                label = values(label),
+                start_time = values(start_time),
+                end_time = values(end_time),
+                selected = values(selected),
+                metadata = values(metadata)
+            """
+        ),
+        {
+            "location_id": payload.get("location_id"),
+            "period_code": payload.get("period_code"),
+            "label": payload.get("label"),
+            "start_time": payload.get("start_time"),
+            "end_time": payload.get("end_time"),
+            "selected": 1 if payload.get("selected") else 0,
+            "metadata": _json_dumps(payload.get("metadata")) if payload.get("metadata") is not None else None,
+        },
+    )
+    db.commit()
+    result = db.execute(
+        text(
+            f"""
+            select id, location_id, period_code, label, start_time, end_time, selected, metadata, created_at, updated_at
+            from {table_name}
+            where ((location_id is null and :location_id is null) or location_id = :location_id)
+              and period_code = :period_code
+            limit 1
+            """
+        ),
+        {"location_id": payload.get("location_id"), "period_code": payload.get("period_code")},
+    )
+    return _fetch_one_dict(result)
+
+
+def list_filter_factors(db: Session) -> list[dict[str, Any]]:
+    table_name = _table("filter_factor")
+    result = db.execute(
+        text(
+            f"""
+            select id, location_id, factor_code, label, enabled, weight, config, created_at, updated_at
+            from {table_name}
+            order by coalesce(location_id, 0) asc, factor_code asc
+            """
+        )
+    )
+    rows = _fetch_all_dicts(result)
+    for row in rows:
+        if isinstance(row.get("config"), str):
+            try:
+                row["config"] = json.loads(row["config"])
+            except json.JSONDecodeError:
+                pass
+    return rows
+
+
+def upsert_filter_factor(db: Session, payload: Mapping[str, Any]) -> dict[str, Any]:
+    table_name = _table("filter_factor")
+    db.execute(
+        text(
+            f"""
+            insert into {table_name} (location_id, factor_code, label, enabled, weight, config)
+            values (:location_id, :factor_code, :label, :enabled, :weight, :config)
+            on duplicate key update
+                label = values(label),
+                enabled = values(enabled),
+                weight = values(weight),
+                config = values(config)
+            """
+        ),
+        {
+            "location_id": payload.get("location_id"),
+            "factor_code": payload.get("factor_code"),
+            "label": payload.get("label"),
+            "enabled": 1 if payload.get("enabled") else 0,
+            "weight": payload.get("weight", 1),
+            "config": _json_dumps(payload.get("config")) if payload.get("config") is not None else None,
+        },
+    )
+    db.commit()
+    result = db.execute(
+        text(
+            f"""
+            select id, location_id, factor_code, label, enabled, weight, config, created_at, updated_at
+            from {table_name}
+            where ((location_id is null and :location_id is null) or location_id = :location_id)
+              and factor_code = :factor_code
+            limit 1
+            """
+        ),
+        {"location_id": payload.get("location_id"), "factor_code": payload.get("factor_code")},
+    )
+    return _fetch_one_dict(result)
+
+
+def get_grouping_batch_by_window(
+    db: Session,
+    *,
+    location_id: int,
+    period_code: str,
+    window_start: Any,
+    window_end: Any,
+) -> dict[str, Any] | None:
+    table_name = _table("filter_grouping_batch")
+    result = db.execute(
+        text(
+            f"""
+            select id, location_id, period_code, window_start, window_end, script_run_id, status,
+                   manifest_url, manifest_object_key, result_payload, issue_reason, started_at, finished_at, created_at, updated_at
+            from {table_name}
+            where location_id = :location_id
+              and period_code = :period_code
+              and window_start = :window_start
+              and window_end = :window_end
+            limit 1
+            """
+        ),
+        {
+            "location_id": location_id,
+            "period_code": period_code,
+            "window_start": window_start,
+            "window_end": window_end,
+        },
+    )
+    row = result.mappings().first()
+    if row is None:
+        return None
+    payload = dict(row)
+    if isinstance(payload.get("result_payload"), str):
+        try:
+            payload["result_payload"] = json.loads(payload["result_payload"])
+        except json.JSONDecodeError:
+            pass
+    return payload
+
+
+def create_grouping_batch(
+    db: Session,
+    *,
+    location_id: int,
+    period_code: str,
+    window_start: Any,
+    window_end: Any,
+    status: str = "pending",
+) -> dict[str, Any]:
+    existing = get_grouping_batch_by_window(
+        db,
+        location_id=location_id,
+        period_code=period_code,
+        window_start=window_start,
+        window_end=window_end,
+    )
+    if existing is not None:
+        return existing
+    table_name = _table("filter_grouping_batch")
+    result = db.execute(
+        text(
+            f"""
+            insert into {table_name} (location_id, period_code, window_start, window_end, status)
+            values (:location_id, :period_code, :window_start, :window_end, :status)
+            """
+        ),
+        {
+            "location_id": location_id,
+            "period_code": period_code,
+            "window_start": window_start,
+            "window_end": window_end,
+            "status": status,
+        },
+    )
+    db.commit()
+    return get_grouping_batch(db, int(result.lastrowid))
+
+
+def get_grouping_batch(db: Session, batch_id: int) -> dict[str, Any]:
+    table_name = _table("filter_grouping_batch")
+    result = db.execute(
+        text(
+            f"""
+            select id, location_id, period_code, window_start, window_end, script_run_id, status,
+                   manifest_url, manifest_object_key, result_payload, issue_reason, started_at, finished_at, created_at, updated_at
+            from {table_name}
+            where id = :batch_id
+            """
+        ),
+        {"batch_id": batch_id},
+    )
+    row = _fetch_one_dict(result)
+    if isinstance(row.get("result_payload"), str):
+        try:
+            row["result_payload"] = json.loads(row["result_payload"])
+        except json.JSONDecodeError:
+            pass
+    return row
+
+
+def update_grouping_batch(db: Session, batch_id: int, payload: Mapping[str, Any]) -> dict[str, Any]:
+    table_name = _table("filter_grouping_batch")
+    db.execute(
+        text(
+            f"""
+            update {table_name}
+            set script_run_id = coalesce(:script_run_id, script_run_id),
+                status = coalesce(:status, status),
+                manifest_url = coalesce(:manifest_url, manifest_url),
+                manifest_object_key = coalesce(:manifest_object_key, manifest_object_key),
+                result_payload = coalesce(:result_payload, result_payload),
+                issue_reason = coalesce(:issue_reason, issue_reason),
+                started_at = coalesce(:started_at, started_at),
+                finished_at = coalesce(:finished_at, finished_at)
+            where id = :batch_id
+            """
+        ),
+        {
+            "batch_id": batch_id,
+            "script_run_id": payload.get("script_run_id"),
+            "status": payload.get("status"),
+            "manifest_url": payload.get("manifest_url"),
+            "manifest_object_key": payload.get("manifest_object_key"),
+            "result_payload": _json_dumps(payload.get("result_payload")) if payload.get("result_payload") is not None else None,
+            "issue_reason": payload.get("issue_reason"),
+            "started_at": payload.get("started_at"),
+            "finished_at": payload.get("finished_at"),
+        },
+    )
+    db.commit()
+    return get_grouping_batch(db, batch_id)
+
+
+def upsert_grouping_item(
+    db: Session,
+    *,
+    batch_id: int,
+    trigger_id: int,
+    video_asset_id: int | None,
+    group_key: str | None = None,
+    role: str = "unknown",
+    status: str = "pending",
+    score: float | None = None,
+    frame_payload: Mapping[str, Any] | None = None,
+    result_payload: Mapping[str, Any] | None = None,
+) -> None:
+    table_name = _table("filter_grouping_item")
+    db.execute(
+        text(
+            f"""
+            insert into {table_name} (
+                batch_id, trigger_id, video_asset_id, group_key, role, status, score, frame_payload, result_payload
+            )
+            values (
+                :batch_id, :trigger_id, :video_asset_id, :group_key, :role, :status, :score, :frame_payload, :result_payload
+            )
+            on duplicate key update
+                video_asset_id = coalesce(values(video_asset_id), video_asset_id),
+                group_key = values(group_key),
+                role = values(role),
+                status = values(status),
+                score = values(score),
+                frame_payload = values(frame_payload),
+                result_payload = values(result_payload)
+            """
+        ),
+        {
+            "batch_id": batch_id,
+            "trigger_id": trigger_id,
+            "video_asset_id": video_asset_id,
+            "group_key": group_key,
+            "role": role,
+            "status": status,
+            "score": score,
+            "frame_payload": _json_dumps(frame_payload) if frame_payload is not None else None,
+            "result_payload": _json_dumps(result_payload) if result_payload is not None else None,
+        },
+    )
+    db.commit()
+
+
+def list_pending_grouping_batches(db: Session, limit: int = 50) -> list[dict[str, Any]]:
+    table_name = _table("filter_grouping_batch")
+    result = db.execute(
+        text(
+            f"""
+            select id, location_id, period_code, window_start, window_end, script_run_id, status,
+                   manifest_url, manifest_object_key, result_payload, issue_reason, started_at, finished_at, created_at, updated_at
+            from {table_name}
+            where status = 'pending'
+            order by window_start asc, id asc
+            limit :limit
+            """
+        ),
+        {"limit": limit},
+    )
+    return _fetch_all_dicts(result)
+
+
+def list_running_grouping_batches(db: Session) -> list[dict[str, Any]]:
+    table_name = _table("filter_grouping_batch")
+    result = db.execute(
+        text(
+            f"""
+            select id, location_id, period_code, window_start, window_end, script_run_id, status,
+                   manifest_url, manifest_object_key, result_payload, issue_reason, started_at, finished_at, created_at, updated_at
+            from {table_name}
+            where status = 'running'
+            order by started_at asc, id asc
+            """
+        )
+    )
+    return _fetch_all_dicts(result)
+
+
+def list_grouping_items(db: Session, batch_id: int) -> list[dict[str, Any]]:
+    table_name = _table("filter_grouping_item")
+    result = db.execute(
+        text(
+            f"""
+            select id, batch_id, trigger_id, video_asset_id, group_key, role, status, score,
+                   frame_payload, result_payload, created_at, updated_at
+            from {table_name}
+            where batch_id = :batch_id
+            order by trigger_id asc, id asc
+            """
+        ),
+        {"batch_id": batch_id},
+    )
+    rows = _fetch_all_dicts(result)
+    for row in rows:
+        for key in ("frame_payload", "result_payload"):
+            if isinstance(row.get(key), str):
+                try:
+                    row[key] = json.loads(row[key])
+                except json.JSONDecodeError:
+                    pass
+    return rows
+
+
+def list_pending_theft_confidence_batches(db: Session, limit: int = 50) -> list[dict[str, Any]]:
+    batch_table = _table("filter_grouping_batch")
+    confidence_table = _table("filter_confidence_result")
+    result = db.execute(
+        text(
+            f"""
+            select b.id, b.location_id, b.period_code, b.window_start, b.window_end, b.script_run_id,
+                   b.status, b.manifest_url, b.manifest_object_key, b.result_payload, b.issue_reason,
+                   b.started_at, b.finished_at, b.created_at, b.updated_at
+            from {batch_table} b
+            where b.status = 'success'
+              and b.result_payload is not null
+              and not exists (
+                  select 1
+                  from {confidence_table} c
+                  where c.batch_id = b.id
+              )
+            order by b.finished_at asc, b.id asc
+            limit :limit
+            """
+        ),
+        {"limit": limit},
+    )
+    rows = _fetch_all_dicts(result)
+    for row in rows:
+        if isinstance(row.get("result_payload"), str):
+            try:
+                row["result_payload"] = json.loads(row["result_payload"])
+            except json.JSONDecodeError:
+                pass
+    return rows
+
+
+def upsert_filter_confidence_result(
+    db: Session,
+    *,
+    batch_id: int,
+    group_key: str,
+    location_id: int,
+    score: float,
+    need_deep_analysis: bool,
+    reason: str,
+    factor_payload: Mapping[str, Any],
+) -> None:
+    table_name = _table("filter_confidence_result")
+    db.execute(
+        text(
+            f"""
+            insert into {table_name} (
+                batch_id, group_key, location_id, score, need_deep_analysis, reason, factor_payload
+            )
+            values (
+                :batch_id, :group_key, :location_id, :score, :need_deep_analysis, :reason, :factor_payload
+            )
+            on duplicate key update
+                location_id = values(location_id),
+                score = values(score),
+                need_deep_analysis = values(need_deep_analysis),
+                reason = values(reason),
+                factor_payload = values(factor_payload)
+            """
+        ),
+        {
+            "batch_id": batch_id,
+            "group_key": group_key,
+            "location_id": location_id,
+            "score": score,
+            "need_deep_analysis": 1 if need_deep_analysis else 0,
+            "reason": reason,
+            "factor_payload": _json_dumps(dict(factor_payload)),
+        },
+    )
+    db.commit()
+
+
+def promote_trigger_video_assets_to_full_retrieval(db: Session, trigger_ids: list[int]) -> int:
+    normalized_ids = sorted({int(trigger_id) for trigger_id in trigger_ids if trigger_id is not None})
+    if not normalized_ids:
+        return 0
+    video_asset_table = _table("video_asset")
+    result = db.execute(
+        text(
+            f"""
+            update {video_asset_table}
+            set status = 'full_video_not_retrieved',
+                metadata = json_set(coalesce(metadata, json_object()), '$.promoted_from_layer0', true)
+            where trigger_id in :trigger_ids
+              and section = 'entrance'
+              and status = 'frames_retrieved'
+            """
+        ).bindparams(bindparam("trigger_ids", expanding=True)),
+        {"trigger_ids": normalized_ids},
+    )
+    db.commit()
+    return int(result.rowcount or 0)
 
 
 def list_pending_video_asset_analyses(db: Session, limit: int = 50) -> list[dict[str, Any]]:
@@ -3303,7 +3876,7 @@ def has_active_remote_analysis_script_run(
         if str(script_name or "").strip()
     ]
     params: dict[str, Any] = {}
-    name_clause = "script_name in ('entry', 'kiosk', 'kiosk_match')"
+    name_clause = "script_name in ('entry', 'kiosk', 'kiosk_match', 'grouping')"
     if normalized_names:
         placeholders: list[str] = []
         for index, script_name in enumerate(normalized_names):
@@ -3335,7 +3908,7 @@ def list_running_remote_analysis_script_runs(db: Session) -> list[dict[str, Any]
             select id, session_id, trigger_id, script_name, model_name, runner_job_id, runner_payload,
                    status, command, stdout_log, stderr_log, started_at, finished_at
             from {script_run_table}
-            where script_name in ('entry', 'kiosk', 'kiosk_match')
+            where script_name in ('entry', 'kiosk', 'kiosk_match', 'grouping')
               and status = 'running'
               and runner_job_id is not null
             order by id asc
