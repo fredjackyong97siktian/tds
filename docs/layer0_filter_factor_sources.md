@@ -10,9 +10,7 @@ This file records the agreed source of truth for each Layer 0 filter factor.
 | Long stay + low purchase | Paid transaction count | MySQL `transaction.status = paid`, group by `receiptNumber` |
 | Long stay + low purchase | Total transaction value | MySQL `transaction.status = paid`, group by `receiptNumber` |
 | Long stay + low purchase | Total transaction quantity | MySQL `transactionDetail.quantity`, group by `receiptNumber` |
-| Transaction issue + low purchase | Failed / pending / non-paid transaction count | MySQL `transaction.status != paid` |
-| Transaction issue + low purchase | Issue timestamp | MySQL `transaction.createdAt` |
-| Transaction issue + low purchase | Paid value | MySQL `transaction.status = paid`, group by `receiptNumber` |
+| Transaction issue + low purchase | Failed/pending transaction followed by a low final paid receipt | MySQL transaction status, `createdAt`, `receiptNumber`, and `transactionDetail.quantity` |
 | Multiple transaction issues | Failed / pending / non-paid transaction count | MySQL `transaction.status != paid` |
 | Multiple transaction issues | Transaction issue timestamps | MySQL `transaction.createdAt` |
 | Multiple transaction issues | Related alert matching | Compare MySQL `tds_thief_alert.createdAt/locationId` with transaction `createdAt/locationId` |
