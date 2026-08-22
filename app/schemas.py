@@ -357,6 +357,30 @@ class RetrievalAcceptedResponse(BaseModel):
     requested_end_time: datetime
 
 
+class TriggerFrameItem(BaseModel):
+    id: int
+    frame_asset_id: int
+    trigger_id: int
+    frame_index: int
+    sample_time: datetime | None = None
+    image_url: str | None = None
+    status: str
+    created_at: datetime
+
+
+class TriggerFrameAssetListItem(BaseModel):
+    id: int
+    trigger_id: int
+    location_id: int
+    start_time: datetime
+    end_time: datetime
+    status: str
+    error: str | None = None
+    created_at: datetime
+    updated_at: datetime
+    frames: list[TriggerFrameItem] = Field(default_factory=list)
+
+
 class SessionFinalizeRequest(BaseModel):
     kiosk_total_items: int = Field(ge=0)
     actual_items_brought: int | None = Field(default=None, ge=0)

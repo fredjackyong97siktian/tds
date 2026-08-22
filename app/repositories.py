@@ -1087,6 +1087,47 @@ def _issue_video_retry_status(
     return "not_retrieved"
 
 
+def list_trigger_frame_assets(db: Session, limit: int = 100) -> list[dict[str, Any]]:
+    frame_asset_table = _table("trigger_frame_asset")
+    frame_table = _table("trigger_frame")
+    result = db.execute(
+        text(
+            f"""
+            select id, trigger_id, location_id, start_time, end_time, status, error, created_at, updated_at
+            from {frame_asset_table}
+            where status <> 'deleted'
+            order by created_at desc, id desc
+            limit :limit
+            """
+        ),
+        {"limit": limit},
+    )
+    assets = _fetch_all_dicts(result)
+    if not assets:
+        return []
+
+    asset_ids = [int(asset["id"]) for asset in assets]
+    frame_result = db.execute(
+        text(
+            f"""
+            select id, frame_asset_id, trigger_id, frame_index, sample_time, image_url, status, created_at
+            from {frame_table}
+            where frame_asset_id in :asset_ids
+              and status <> 'deleted'
+            order by frame_asset_id asc, frame_index asc, id asc
+            """
+        ).bindparams(bindparam("asset_ids", expanding=True)),
+        {"asset_ids": asset_ids},
+    )
+    frames_by_asset: dict[int, list[dict[str, Any]]] = {}
+    for frame in _fetch_all_dicts(frame_result):
+        frames_by_asset.setdefault(int(frame["frame_asset_id"]), []).append(frame)
+
+    for asset in assets:
+        asset["frames"] = frames_by_asset.get(int(asset["id"]), [])
+    return assets
+
+
 def get_video_asset(db: Session, video_asset_id: int) -> dict[str, Any]:
     video_asset_table = _table("video_asset")
     result = db.execute(

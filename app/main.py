@@ -4,6 +4,7 @@ from .config import settings
 from .routers.alerts import router as alerts_router
 from .routers.cctv import router as cctv_router
 from .routers.filtering import router as filtering_router
+from .routers.frames import router as frames_router
 from .routers.health import router as health_router
 from .routers.locations import router as locations_router
 from .routers.runpod import router as runpod_router
@@ -27,6 +28,7 @@ app.include_router(health_router)
 app.include_router(alerts_router)
 app.include_router(cctv_router)
 app.include_router(filtering_router)
+app.include_router(frames_router)
 app.include_router(locations_router)
 app.include_router(runpod_router)
 app.include_router(whitelist_router)
