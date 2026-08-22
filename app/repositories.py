@@ -948,6 +948,13 @@ def list_triggers(db: Session, limit: int = 50) -> list[dict[str, Any]]:
                        order by coalesce(va.captured_start_time, va.created_at) desc, va.id desc
                        limit 1
                    ) as latest_video_status,
+                   (
+                       select va.metadata
+                       from {video_asset_table} va
+                       where va.trigger_id = te.id
+                       order by coalesce(va.captured_start_time, va.created_at) desc, va.id desc
+                       limit 1
+                   ) as latest_video_metadata,
                    exists(
                        select 1
                        from {video_asset_table} issue_va
@@ -991,6 +998,14 @@ def list_triggers(db: Session, limit: int = 50) -> list[dict[str, Any]]:
     )
     rows = _fetch_all_dicts(result)
     for row in rows:
+        metadata = row.pop("latest_video_metadata", None)
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except json.JSONDecodeError:
+                metadata = None
+        frames = metadata.get("frames") if isinstance(metadata, Mapping) else None
+        row["trigger_frames"] = frames if isinstance(frames, list) else []
         label, value = _resolve_trigger_entry_identity(
             db,
             phone_entry_id=row.get("phone_entry_id"),

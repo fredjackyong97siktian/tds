@@ -123,6 +123,7 @@ class TriggerListItem(TriggerResponse):
     latest_error_log: str | None = None
     latest_video_asset_id: int | None = None
     latest_video_status: str | None = None
+    trigger_frames: list[dict[str, Any]] = Field(default_factory=list)
     can_retry: bool = False
     retry_to_status: str | None = None
     created_at: datetime
