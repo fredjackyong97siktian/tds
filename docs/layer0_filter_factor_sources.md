@@ -25,3 +25,17 @@ This file records the agreed source of truth for each Layer 0 filter factor.
 | Customer credibility history | Previous detection result | MySQL `tds_session.status` / `tds_kiosk_video_result` |
 | Analysis cost | Estimated script cost | MySQL `tds_script_run.estimated_cost` |
 | Analysis cost | Cost currency | MySQL `tds_script_run.cost_currency` |
+
+## Implemented Decision Rules
+
+The current Layer 0 confidence logic uses an any-hit rule: if any enabled factor hits, the grouped triggers are promoted to full-video retrieval for deeper analysis.
+
+| Factor | Hit Condition |
+|---|---|
+| Long stay + low purchase | Duration between entry and exit is at least `THEFT_API_FILTER_LONG_STAY_SECONDS` and the paid receipt count/value/quantity is low. |
+| Transaction issue + low purchase | At least one failed/pending transaction happened before the final paid receipt, and the final paid receipt quantity/value is low. |
+| Multiple transaction issues | At least two non-paid transactions happened within `THEFT_API_FILTER_TRANSACTION_ISSUE_SHORT_PERIOD_SECONDS` between entry and exit. |
+| Multiple minus button alert | A MySQL `tds_thief_alert` row exists in the entry/exit window where `method = Kiosk` and `detail` contains `minus`. |
+| Carry item signal | Gemini carry score is at least `THEFT_API_FILTER_CARRY_SCORE_THRESHOLD`, or yellow bag is absent before and present after. |
+| Unusual group size | RunPod grouping `total_customer` is greater than `THEFT_API_FILTER_UNUSUAL_GROUP_SIZE`. |
+| Customer credibility history | Visible in settings but intentionally disabled until identity history is implemented. |

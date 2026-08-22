@@ -2770,6 +2770,124 @@ def _apply_filter_factor(
     return triggered
 
 
+def _read_group_value(group: Mapping[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in group and group[key] is not None:
+            return group[key]
+    for container_key in ("gemini", "gemini_result", "result", "group", "summary"):
+        container = group.get(container_key)
+        if not isinstance(container, Mapping):
+            continue
+        for key in keys:
+            if key in container and container[key] is not None:
+                return container[key]
+    return None
+
+
+def _coerce_number(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    try:
+        return float(str(value).replace("%", "").replace(",", "").strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(float(str(value).replace(",", "").strip()))
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_boolish(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _transaction_event_time(row: Mapping[str, Any]) -> datetime | None:
+    return (
+        _coerce_datetime_value(row.get("created_at"))
+        or _coerce_datetime_value(row.get("createdAt"))
+        or _coerce_datetime_value(row.get("transaction_time"))
+    )
+
+
+def _seconds_between(left: datetime, right: datetime) -> float:
+    if left.tzinfo is not None and right.tzinfo is None:
+        right = right.replace(tzinfo=left.tzinfo)
+    elif left.tzinfo is None and right.tzinfo is not None:
+        left = left.replace(tzinfo=right.tzinfo)
+    return (left - right).total_seconds()
+
+
+def _transaction_summary(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    payload: list[dict[str, Any]] = []
+    for row in rows:
+        payload.append(
+            {
+                "receipt_number": row.get("receipt_number"),
+                "status": row.get("status"),
+                "created_at": row.get("created_at"),
+                "transaction_time": row.get("transaction_time"),
+                "total_amount": row.get("total_amount"),
+                "total_items": row.get("total_items"),
+            }
+        )
+    return payload
+
+
+def _has_short_period_transaction_issues(rows: list[dict[str, Any]], threshold_seconds: int) -> tuple[bool, dict[str, Any]]:
+    issue_times = sorted(
+        event_time for row in rows if (event_time := _transaction_event_time(row)) is not None
+    )
+    if len(issue_times) < 2:
+        return False, {"issue_count": len(rows), "matched_window_seconds": None}
+    best_window: tuple[datetime, datetime] | None = None
+    best_seconds: float | None = None
+    for previous_time, current_time in zip(issue_times, issue_times[1:]):
+        seconds = abs(_seconds_between(current_time, previous_time))
+        if best_seconds is None or seconds < best_seconds:
+            best_seconds = seconds
+            best_window = (previous_time, current_time)
+    hit = best_seconds is not None and best_seconds <= threshold_seconds
+    return hit, {
+        "issue_count": len(rows),
+        "short_period_seconds": threshold_seconds,
+        "matched_window_seconds": best_seconds,
+        "matched_start": best_window[0].isoformat() if best_window else None,
+        "matched_end": best_window[1].isoformat() if best_window else None,
+    }
+
+
+def _match_alert_ids_near_transactions(
+    alerts: list[dict[str, Any]],
+    transactions: list[dict[str, Any]],
+    threshold_seconds: int,
+) -> list[int]:
+    transaction_times = [
+        event_time for row in transactions if (event_time := _transaction_event_time(row)) is not None
+    ]
+    matched_ids: list[int] = []
+    for alert in alerts:
+        alert_time = _coerce_datetime_value(alert.get("created_at") or alert.get("createdAt"))
+        if alert_time is None:
+            continue
+        for transaction_time in transaction_times:
+            if abs(_seconds_between(alert_time, transaction_time)) <= threshold_seconds:
+                try:
+                    matched_ids.append(int(alert["id"]))
+                except (KeyError, TypeError, ValueError):
+                    pass
+                break
+    return sorted(set(matched_ids))
+
+
 def run_theft_confidence_for_grouping_batch(
     db: Session,
     *,
@@ -2886,30 +3004,62 @@ def run_theft_confidence_for_grouping_batch(
             start_time=start_time,
             end_time=end_time,
         )
-        total_quantity = sum(int(row.get("total_items") or 0) for row in transactions)
+        total_quantity = sum(_coerce_int(row.get("total_items")) for row in transactions)
         total_value = 0.0
         for row in transactions:
-            try:
-                total_value += float(row.get("total_amount") or 0)
-            except (TypeError, ValueError):
-                pass
+            total_value += _coerce_number(row.get("total_amount"), 0.0)
         duration_seconds = max(0.0, (end_time - start_time).total_seconds())
-        carry_score_raw = group.get("carry_something_from_store_score")
-        try:
-            carry_score = float(str(carry_score_raw).replace("%", "")) if carry_score_raw is not None else 0.0
-        except ValueError:
-            carry_score = 0.0
+        carry_score = _coerce_number(
+            _read_group_value(group, "carry_something_from_store_score", "carry_score"),
+            0.0,
+        )
+        before_is_yellow_bag = _read_group_value(group, "before_is_yellow_bag")
+        after_is_yellow_bag = _read_group_value(group, "after_is_yellow_bag")
 
         paid_transaction_count = len(transactions)
         issue_transaction_count = len(issue_transactions)
-        low_purchase = paid_transaction_count == 0 or total_quantity <= 1 or (0 < total_value <= 1000)
-        long_stay = duration_seconds >= 300
-        carry_signal = (
-            carry_score >= 40
-            or group.get("before_is_yellow_bag") == 0
-            and group.get("after_is_yellow_bag") == 1
+        low_purchase = (
+            paid_transaction_count == 0
+            or total_quantity <= settings.filter_low_purchase_quantity
+            or (0 < total_value <= settings.filter_low_purchase_value)
         )
-        total_customer = int(group.get("total_customer") or 0)
+        final_paid_receipt = transactions[-1] if transactions else None
+        final_paid_time = _transaction_event_time(final_paid_receipt) if final_paid_receipt else None
+        final_paid_is_low = bool(
+            final_paid_receipt
+            and (
+                _coerce_int(final_paid_receipt.get("total_items")) <= settings.filter_low_purchase_quantity
+                or (
+                    0
+                    < _coerce_number(final_paid_receipt.get("total_amount"), 0.0)
+                    <= settings.filter_low_purchase_value
+                )
+            )
+        )
+        issue_before_final_paid = bool(
+            final_paid_time
+            and any(
+                _seconds_between(final_paid_time, issue_time) >= 0
+                for row in issue_transactions
+                if (issue_time := _transaction_event_time(row)) is not None
+            )
+        )
+        multiple_issue_hit, multiple_issue_evidence = _has_short_period_transaction_issues(
+            issue_transactions,
+            settings.filter_transaction_issue_short_period_seconds,
+        )
+        related_minus_alert_ids = _match_alert_ids_near_transactions(
+            minus_alerts,
+            issue_transactions,
+            settings.filter_transaction_issue_short_period_seconds,
+        )
+        long_stay = duration_seconds >= settings.filter_long_stay_seconds
+        carry_signal = (
+            carry_score >= settings.filter_carry_score_threshold
+            or not _as_boolish(before_is_yellow_bag)
+            and _as_boolish(after_is_yellow_bag)
+        )
+        total_customer = _coerce_int(_read_group_value(group, "total_customer", "customer_count"), 0)
 
         reasons: list[str] = []
         factor_details: dict[str, Any] = {}
@@ -2934,13 +3084,15 @@ def run_theft_confidence_for_grouping_batch(
             factor_details=factor_details,
             factors=factor_settings,
             factor_code="transaction_issue_low_purchase",
-            hit=issue_transaction_count > 0 and low_purchase,
+            hit=issue_before_final_paid and final_paid_is_low,
             reason="transaction_issue_low_purchase",
             evidence={
                 "issue_transaction_count": issue_transaction_count,
                 "paid_transaction_count": paid_transaction_count,
                 "total_quantity": total_quantity,
                 "total_value": total_value,
+                "final_paid_receipt": _transaction_summary([final_paid_receipt])[0] if final_paid_receipt else None,
+                "issue_before_final_paid": issue_before_final_paid,
             },
         ):
             triggered_factors.append("transaction_issue_low_purchase")
@@ -2949,9 +3101,13 @@ def run_theft_confidence_for_grouping_batch(
             factor_details=factor_details,
             factors=factor_settings,
             factor_code="multiple_transaction_issues",
-            hit=issue_transaction_count >= 2,
+            hit=multiple_issue_hit,
             reason="multiple_transaction_issues",
-            evidence={"issue_transaction_count": issue_transaction_count},
+            evidence={
+                **multiple_issue_evidence,
+                "related_minus_alert_ids": related_minus_alert_ids,
+                "issue_transactions": _transaction_summary(issue_transactions),
+            },
         ):
             triggered_factors.append("multiple_transaction_issues")
         if _apply_filter_factor(
@@ -2973,8 +3129,8 @@ def run_theft_confidence_for_grouping_batch(
             reason="carry_item_signal",
             evidence={
                 "carry_something_from_store_score": carry_score,
-                "before_is_yellow_bag": group.get("before_is_yellow_bag"),
-                "after_is_yellow_bag": group.get("after_is_yellow_bag"),
+                "before_is_yellow_bag": before_is_yellow_bag,
+                "after_is_yellow_bag": after_is_yellow_bag,
             },
         ):
             triggered_factors.append("carry_item_signal")
@@ -2983,7 +3139,7 @@ def run_theft_confidence_for_grouping_batch(
             factor_details=factor_details,
             factors=factor_settings,
             factor_code="unusual_group_size",
-            hit=total_customer > 2,
+            hit=total_customer > settings.filter_unusual_group_size,
             reason="unusual_group_size",
             evidence={"total_customer": total_customer},
         ):
@@ -3016,8 +3172,24 @@ def run_theft_confidence_for_grouping_batch(
                 "minus_button_alert_count": len(minus_alerts),
                 "total_quantity": total_quantity,
                 "total_value": total_value,
+                "low_purchase": low_purchase,
+                "final_paid_is_low": final_paid_is_low,
+                "issue_before_final_paid": issue_before_final_paid,
                 "carry_something_from_store_score": carry_score,
+                "before_is_yellow_bag": before_is_yellow_bag,
+                "after_is_yellow_bag": after_is_yellow_bag,
                 "total_customer": total_customer,
+                "transactions": _transaction_summary(transactions),
+                "issue_transactions": _transaction_summary(issue_transactions),
+                "minus_alerts": [
+                    {
+                        "id": row.get("id"),
+                        "method": row.get("method"),
+                        "detail": row.get("detail"),
+                        "created_at": row.get("created_at"),
+                    }
+                    for row in minus_alerts
+                ],
                 "trigger_ids": trigger_ids,
                 "factor_settings": factor_settings,
                 "factor_details": factor_details,

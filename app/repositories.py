@@ -2678,10 +2678,8 @@ def list_paid_transactions_for_session_window(
     transaction_status_column = _quote_identifier(settings.paid_transaction_status_column)
     receipt_column = _quote_identifier(settings.paid_transaction_receipt_column)
     total_amount_column = _quote_identifier(settings.paid_transaction_total_amount_column)
-    detail_transaction_id_name = settings.paid_transaction_receipt_column
+    detail_transaction_id_name = settings.paid_transaction_detail_transaction_id_column
     detail_transaction_id_column = _quote_identifier(detail_transaction_id_name)
-    detail_quantity_column = _quote_identifier(settings.paid_transaction_detail_quantity_column)
-    detail_item_name_column = _quote_identifier(settings.paid_transaction_detail_item_name_column)
 
     txn_result = db.execute(
         text(
@@ -2727,11 +2725,12 @@ def list_paid_transactions_for_session_window(
             txn_id = row.get(detail_transaction_id_name)
             details_by_transaction_id.setdefault(txn_id, []).append(row)
 
-    payload: list[dict[str, Any]] = []
+    payload_by_receipt: dict[Any, dict[str, Any]] = {}
     for row in transactions:
         txn_id = row.get(PAID_TRANSACTION_ID_COLUMN)
         details = details_by_transaction_id.get(txn_id, [])
         total_items = 0
+        total_subtotal = 0.0
         normalized_details: list[dict[str, Any]] = []
         for detail in details:
             try:
@@ -2739,6 +2738,13 @@ def list_paid_transactions_for_session_window(
             except (TypeError, ValueError):
                 quantity = 0
             total_items += max(0, quantity)
+            subtotal_value = _pick_first(detail, "subtotal", "subTotal", "total", "line_total", "lineTotal")
+            try:
+                subtotal = float(subtotal_value) if subtotal_value is not None else None
+            except (TypeError, ValueError):
+                subtotal = None
+            if subtotal is not None:
+                total_subtotal += subtotal
             normalized_details.append(
                 {
                     "quantity": max(0, quantity),
@@ -2761,23 +2767,42 @@ def list_paid_transactions_for_session_window(
                         "sellingPrice",
                         "priceAmount",
                     ),
-                    "subtotal": _pick_first(detail, "subtotal", "subTotal", "total", "line_total", "lineTotal"),
+                    "subtotal": subtotal_value,
                     "raw_payload": detail,
                 }
             )
-        payload.append(
-            {
+        receipt_number = row.get(settings.paid_transaction_receipt_column) or txn_id
+        total_amount_value = row.get(settings.paid_transaction_total_amount_column)
+        try:
+            total_amount = float(total_amount_value) if total_amount_value is not None else total_subtotal
+        except (TypeError, ValueError):
+            total_amount = total_subtotal
+        existing = payload_by_receipt.get(receipt_number)
+        if existing is None:
+            payload_by_receipt[receipt_number] = {
                 "transaction_id": txn_id,
-                "receipt_number": row.get(settings.paid_transaction_receipt_column),
+                "receipt_number": receipt_number,
                 "transaction_time": row.get(PAID_TRANSACTION_TIME_COLUMN),
+                "created_at": _pick_first(row, "createdAt", "created_at", PAID_TRANSACTION_TIME_COLUMN),
                 "location_id": row.get(settings.paid_transaction_location_id_column),
-                "total_amount": row.get(settings.paid_transaction_total_amount_column),
+                "status": row.get(settings.paid_transaction_status_column),
+                "total_amount": total_amount,
                 "total_items": total_items,
                 "raw_payload": row,
                 "details": normalized_details,
             }
-        )
-    return payload
+            continue
+        if _pick_first(row, "createdAt", "created_at", PAID_TRANSACTION_TIME_COLUMN):
+            existing["created_at"] = _pick_first(row, "createdAt", "created_at", PAID_TRANSACTION_TIME_COLUMN)
+        if row.get(PAID_TRANSACTION_TIME_COLUMN):
+            existing["transaction_time"] = row.get(PAID_TRANSACTION_TIME_COLUMN)
+        try:
+            existing_amount = float(existing.get("total_amount") or 0)
+        except (TypeError, ValueError):
+            existing_amount = 0.0
+        if total_amount > existing_amount:
+            existing["total_amount"] = total_amount
+    return list(payload_by_receipt.values())
 
 
 def list_non_paid_transactions_for_session_window(
@@ -2810,7 +2835,22 @@ def list_non_paid_transactions_for_session_window(
             "end_time": end_time,
         },
     )
-    return _fetch_all_dicts(result)
+    rows = _fetch_all_dicts(result)
+    payload: list[dict[str, Any]] = []
+    for row in rows:
+        payload.append(
+            {
+                "transaction_id": row.get(PAID_TRANSACTION_ID_COLUMN),
+                "receipt_number": row.get(settings.paid_transaction_receipt_column),
+                "transaction_time": row.get(PAID_TRANSACTION_TIME_COLUMN),
+                "created_at": _pick_first(row, "createdAt", "created_at", PAID_TRANSACTION_TIME_COLUMN),
+                "location_id": row.get(settings.paid_transaction_location_id_column),
+                "status": row.get(settings.paid_transaction_status_column),
+                "total_amount": row.get(settings.paid_transaction_total_amount_column),
+                "raw_payload": row,
+            }
+        )
+    return payload
 
 
 def list_minus_button_alerts_for_window(

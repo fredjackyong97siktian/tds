@@ -57,6 +57,12 @@ class Settings(BaseSettings):
     grouping_max_global_workers: int = 1
     theft_confidence_poll_seconds: int = 30
     theft_confidence_max_global_workers: int = 1
+    filter_long_stay_seconds: int = 300
+    filter_low_purchase_quantity: int = 1
+    filter_low_purchase_value: int = 1000
+    filter_transaction_issue_short_period_seconds: int = 120
+    filter_carry_score_threshold: float = 40
+    filter_unusual_group_size: int = 2
     analysis_poll_seconds: int = 10
     analysis_max_global_workers: int = 1
     analysis_cooldown_seconds: int = 10
