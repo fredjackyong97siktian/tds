@@ -1,6 +1,10 @@
+from datetime import datetime, timedelta
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
+from .. import repositories
+from ..config import settings
 from ..db import get_transaction_db
 from ..schemas import (
     EntryRunRequest,
@@ -152,16 +156,30 @@ def retrieve_kiosk_video(
 @router.post("/triggers/{trigger_id}/retrieve-entrance-video", response_model=RetrievalAcceptedResponse, status_code=status.HTTP_202_ACCEPTED)
 def retrieve_entrance_video(
     trigger_id: int,
-    payload: RetrievalRequest,
+    payload: RetrievalRequest | None = None,
     db: Session = Depends(get_transaction_db),
 ) -> RetrievalAcceptedResponse:
     try:
+        if payload is None:
+            trigger = repositories.get_trigger(db, trigger_id)
+            trigger_time = trigger.get("trigger_time")
+            if isinstance(trigger_time, str):
+                trigger_time = datetime.fromisoformat(trigger_time)
+            if not isinstance(trigger_time, datetime):
+                raise ValueError(f"Trigger {trigger_id} does not have a valid trigger_time.")
+            location_id = int(trigger["location_id"])
+            start_time = trigger_time - timedelta(seconds=int(settings.entrance_trigger_extra_before_seconds))
+            end_time = trigger_time + timedelta(seconds=int(settings.entrance_trigger_extra_after_seconds))
+        else:
+            location_id = payload.location_id
+            start_time = payload.start_time
+            end_time = payload.end_time
         result = workflow_service.retrieve_entrance_video_window(
             db,
             trigger_id=trigger_id,
-            location_id=payload.location_id,
-            start_time=payload.start_time,
-            end_time=payload.end_time,
+            location_id=location_id,
+            start_time=start_time,
+            end_time=end_time,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
