@@ -5426,7 +5426,14 @@ def _trigger_frame_spaces_key(
     )
 
 
-def _build_frame_capture_command(rtsp_url: str, offset_seconds: float, output_path: Path) -> list[str]:
+def _build_frame_batch_capture_command(
+    rtsp_url: str,
+    *,
+    start_offset_seconds: float,
+    gap_seconds: float,
+    frame_count: int,
+    output_pattern: Path,
+) -> list[str]:
     return [
         settings.ffmpeg_bin,
         "-y",
@@ -5435,12 +5442,14 @@ def _build_frame_capture_command(rtsp_url: str, offset_seconds: float, output_pa
         "-i",
         rtsp_url,
         "-ss",
-        f"{max(0.0, offset_seconds):.3f}",
+        f"{max(0.0, start_offset_seconds):.3f}",
+        "-vf",
+        f"fps={1 / max(0.04, gap_seconds):.6f}",
         "-frames:v",
-        "1",
+        str(max(1, frame_count)),
         "-q:v",
         "2",
-        str(output_path),
+        str(output_pattern),
     ]
 
 
@@ -5483,41 +5492,43 @@ def _run_trigger_frame_retrieval_job(
             for index in range(1, frame_count + 1)
         ]
 
+        output_pattern = frame_root / f"trigger_{trigger_id}_frame_%02d.jpg"
+        command = _build_frame_batch_capture_command(
+            rtsp_url,
+            start_offset_seconds=offsets[0] if offsets else 0.0,
+            gap_seconds=gap_seconds,
+            frame_count=frame_count,
+            output_pattern=output_pattern,
+        )
+        completed_returncode = 1
+        completed_stderr = ""
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=max(1, int(settings.retrieval_ffmpeg_timeout_seconds)),
+            )
+            completed_returncode = completed.returncode
+            stdout_parts.append(completed.stdout or "")
+            stderr_parts.append(completed.stderr or "")
+            completed_stderr = str(completed.stderr or "").strip()
+        except subprocess.TimeoutExpired as exc:
+            completed_stderr = str(exc.stderr or f"ffmpeg timed out after {settings.retrieval_ffmpeg_timeout_seconds}s")
+            stdout_parts.append(str(exc.stdout or ""))
+            stderr_parts.append(completed_stderr)
+
         frame_payload: list[dict[str, Any]] = []
         for index, offset_seconds in enumerate(offsets, start=1):
             sample_time = start_time + timedelta(seconds=offset_seconds)
             filename = f"trigger_{trigger_id}_frame_{index:02d}_{sample_time.strftime('%Y%m%d_%H%M%S')}.jpg"
-            local_path = frame_root / filename
-            command = _build_frame_capture_command(rtsp_url, offset_seconds, local_path)
-            try:
-                completed = subprocess.run(
-                    command,
-                    capture_output=True,
-                    text=True,
-                    timeout=max(1, int(settings.retrieval_ffmpeg_timeout_seconds)),
-                )
-            except subprocess.TimeoutExpired as exc:
-                timeout_stderr = str(exc.stderr or f"ffmpeg timed out after {settings.retrieval_ffmpeg_timeout_seconds}s")
-                stdout_parts.append(str(exc.stdout or ""))
-                stderr_parts.append(timeout_stderr)
-                frame_payload.append(
-                    {
-                        "index": index,
-                        "sample_time": sample_time.isoformat(),
-                        "offset_seconds": round(float(offset_seconds), 3),
-                        "status": "failed",
-                        "stderr": timeout_stderr[-1000:],
-                    }
-                )
-                continue
-            stdout_parts.append(completed.stdout or "")
-            stderr_parts.append(completed.stderr or "")
+            local_path = frame_root / f"trigger_{trigger_id}_frame_{index:02d}.jpg"
             frame_record: dict[str, Any] = {
                 "index": index,
                 "sample_time": sample_time.isoformat(),
                 "offset_seconds": round(float(offset_seconds), 3),
-                "status": "ok" if completed.returncode == 0 and local_path.exists() else "failed",
-                "stderr": str(completed.stderr or "").strip()[-1000:],
+                "status": "ok" if completed_returncode == 0 and local_path.exists() else "failed",
+                "stderr": completed_stderr[-1000:],
             }
             if frame_record["status"] == "ok":
                 object_key = _trigger_frame_spaces_key(
@@ -5744,43 +5755,44 @@ def start_trigger_frame_asset_retrieval_job(job: TriggerFrameAssetRetrievalQueue
             for index in range(1, frame_count + 1)
         ]
 
+        output_pattern = output_dir / f"trigger_{job.trigger_id}_asset_{job.frame_asset_id}_frame_%02d.jpg"
+        command = _build_frame_batch_capture_command(
+            job.rtsp_url,
+            start_offset_seconds=offsets[0] if offsets else 0.0,
+            gap_seconds=gap_seconds,
+            frame_count=frame_count,
+            output_pattern=output_pattern,
+        )
+        completed_returncode = 1
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=max(1, int(settings.retrieval_ffmpeg_timeout_seconds)),
+            )
+            completed_returncode = completed.returncode
+            stdout_parts.append(completed.stdout or "")
+            stderr_parts.append(completed.stderr or "")
+        except subprocess.TimeoutExpired as exc:
+            stdout_parts.append(str(exc.stdout or ""))
+            stderr_parts.append(str(exc.stderr or f"ffmpeg timed out after {settings.retrieval_ffmpeg_timeout_seconds}s"))
+
         frame_rows: list[dict[str, Any]] = []
         for index, offset_seconds in enumerate(offsets, start=1):
             sample_time = job.requested_start_time + timedelta(seconds=offset_seconds)
+            local_path = output_dir / f"trigger_{job.trigger_id}_asset_{job.frame_asset_id}_frame_{index:02d}.jpg"
             filename = (
                 f"trigger_{job.trigger_id}_asset_{job.frame_asset_id}_"
                 f"frame_{index:02d}_{sample_time.strftime('%Y%m%d_%H%M%S')}.jpg"
             )
-            local_path = output_dir / filename
-            command = _build_frame_capture_command(job.rtsp_url, offset_seconds, local_path)
-            try:
-                completed = subprocess.run(
-                    command,
-                    capture_output=True,
-                    text=True,
-                    timeout=max(1, int(settings.retrieval_ffmpeg_timeout_seconds)),
-                )
-            except subprocess.TimeoutExpired as exc:
-                stdout_parts.append(str(exc.stdout or ""))
-                stderr_parts.append(str(exc.stderr or f"ffmpeg timed out after {settings.retrieval_ffmpeg_timeout_seconds}s"))
-                frame_rows.append(
-                    {
-                        "frame_index": index,
-                        "sample_time": sample_time,
-                        "image_url": None,
-                        "status": "failed",
-                    }
-                )
-                continue
-            stdout_parts.append(completed.stdout or "")
-            stderr_parts.append(completed.stderr or "")
             row: dict[str, Any] = {
                 "frame_index": index,
                 "sample_time": sample_time,
                 "image_url": None,
                 "status": "failed",
             }
-            if completed.returncode == 0 and local_path.exists():
+            if completed_returncode == 0 and local_path.exists():
                 object_key = _trigger_frame_spaces_key(
                     location_id=job.location_id,
                     trigger_id=job.trigger_id,
