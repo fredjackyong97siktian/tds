@@ -16,11 +16,18 @@ class WorkerControlRequest(BaseModel):
 
 @router.get("/retrieval-status")
 def get_retrieval_status(db: Session = Depends(get_transaction_db)) -> dict:
-    pending_rows = repositories.list_pending_video_asset_retrievals(
+    pending_video_rows = repositories.list_pending_video_asset_retrievals(
         db,
         limit=max(settings.retrieval_max_global_workers * 50, 500),
     )
-    running_rows = repositories.list_running_video_asset_retrievals(db)
+    pending_frame_rows = repositories.list_pending_trigger_frame_asset_retrievals(
+        db,
+        limit=max(settings.retrieval_max_global_workers * 50, 500),
+    )
+    running_video_rows = repositories.list_running_video_asset_retrievals(db)
+    running_frame_rows = repositories.list_running_trigger_frame_asset_retrievals(db)
+    pending_rows = [*pending_frame_rows, *pending_video_rows]
+    running_rows = [*running_frame_rows, *running_video_rows]
 
     per_location: dict[int, dict] = {}
 
@@ -38,10 +45,15 @@ def get_retrieval_status(db: Session = Depends(get_transaction_db)) -> dict:
                 "is_busy": False,
                 "running_video_asset_ids": [],
                 "queued_video_asset_ids": [],
+                "running_frame_asset_ids": [],
+                "queued_frame_asset_ids": [],
             },
         )
         current["queued_count"] += 1
-        current["queued_video_asset_ids"].append(int(row["id"]))
+        if row in pending_frame_rows:
+            current["queued_frame_asset_ids"].append(int(row["id"]))
+        else:
+            current["queued_video_asset_ids"].append(int(row["id"]))
 
     for row in running_rows:
         location_id = row.get("location_id")
@@ -57,11 +69,16 @@ def get_retrieval_status(db: Session = Depends(get_transaction_db)) -> dict:
                 "is_busy": False,
                 "running_video_asset_ids": [],
                 "queued_video_asset_ids": [],
+                "running_frame_asset_ids": [],
+                "queued_frame_asset_ids": [],
             },
         )
         current["running_count"] += 1
         current["is_busy"] = current["running_count"] > 0
-        current["running_video_asset_ids"].append(int(row["id"]))
+        if row in running_frame_rows:
+            current["running_frame_asset_ids"].append(int(row["id"]))
+        else:
+            current["running_video_asset_ids"].append(int(row["id"]))
 
     locations = sorted(per_location.values(), key=lambda item: int(item["location_id"]))
 

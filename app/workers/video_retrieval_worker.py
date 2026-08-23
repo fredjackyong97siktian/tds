@@ -19,13 +19,14 @@ logger = logging.getLogger("tds.video_retrieval_worker")
 class RunningJob:
     future: Future[None]
     location_id: int
-    video_asset_id: int
+    asset_id: int
+    asset_kind: str
 
 
 class VideoRetrievalWorker:
     def __init__(self) -> None:
         self._executor = ThreadPoolExecutor(max_workers=max(1, settings.retrieval_max_global_workers))
-        self._running: dict[int, RunningJob] = {}
+        self._running: dict[str, RunningJob] = {}
         self._lock = Lock()
 
     def run_forever(self) -> None:
@@ -45,23 +46,28 @@ class VideoRetrievalWorker:
             time.sleep(poll_seconds)
 
     def _reap_finished_jobs(self) -> None:
-        finished_ids: list[int] = []
+        finished_ids: list[str] = []
         with self._lock:
             items = list(self._running.items())
-        for video_asset_id, job in items:
+        for running_key, job in items:
             if not job.future.done():
                 continue
             try:
                 job.future.result()
-                logger.info("Retrieval job completed for video_asset_id=%s location_id=%s", job.video_asset_id, job.location_id)
+                logger.info(
+                    "Retrieval job completed for %s_id=%s location_id=%s",
+                    job.asset_kind,
+                    job.asset_id,
+                    job.location_id,
+                )
             except Exception:
-                logger.exception("Retrieval job crashed for video_asset_id=%s", job.video_asset_id)
-            finished_ids.append(video_asset_id)
+                logger.exception("Retrieval job crashed for %s_id=%s", job.asset_kind, job.asset_id)
+            finished_ids.append(running_key)
         if not finished_ids:
             return
         with self._lock:
-            for video_asset_id in finished_ids:
-                self._running.pop(video_asset_id, None)
+            for running_key in finished_ids:
+                self._running.pop(running_key, None)
 
     def _fill_available_slots(self) -> None:
         with self._lock:
@@ -87,12 +93,67 @@ class VideoRetrievalWorker:
                     running_by_location.get(int(location_id), 0),
                     1,
                 )
+            for row in repositories.list_running_trigger_frame_asset_retrievals(db):
+                location_id = row.get("location_id")
+                if location_id is None:
+                    continue
+                running_by_location[int(location_id)] = max(
+                    running_by_location.get(int(location_id), 0),
+                    1,
+                )
 
-            candidates = repositories.list_pending_video_asset_retrievals(
+            frame_candidates = repositories.list_pending_trigger_frame_asset_retrievals(
                 db,
                 limit=max(settings.retrieval_max_global_workers * 10, 20),
             )
-            for candidate in candidates:
+            for candidate in frame_candidates:
+                if available_slots <= 0:
+                    break
+                location_id = candidate.get("location_id")
+                if location_id is None:
+                    continue
+                location_id = int(location_id)
+                if running_by_location.get(location_id, 0) >= max(1, settings.retrieval_max_per_location):
+                    continue
+                frame_asset_id = int(candidate["id"])
+                claimed = repositories.claim_trigger_frame_asset_for_retrieval(db, frame_asset_id)
+                if not claimed:
+                    continue
+                try:
+                    job = workflow_service.build_retrieval_job_from_trigger_frame_asset(db, frame_asset_id)
+                except Exception as exc:
+                    logger.exception("Could not build frame retrieval job for frame_asset_id=%s", frame_asset_id)
+                    repositories.update_trigger_frame_asset_status(db, frame_asset_id, "issue", error=str(exc))
+                    repositories.create_script_run(
+                        db,
+                        session_id=None,
+                        trigger_id=int(candidate["trigger_id"]) if candidate.get("trigger_id") is not None else None,
+                        script_name="retrieve_video",
+                        model_name="worker_build_frame_job",
+                        status="failed",
+                        command="worker_build_frame_job",
+                        stdout_log="",
+                        stderr_log=str(exc),
+                    )
+                    continue
+
+                future = self._executor.submit(workflow_service.start_trigger_frame_asset_retrieval_job, job)
+                with self._lock:
+                    self._running[f"frame:{frame_asset_id}"] = RunningJob(
+                        future=future,
+                        location_id=location_id,
+                        asset_id=frame_asset_id,
+                        asset_kind="frame_asset",
+                    )
+                running_by_location[location_id] = running_by_location.get(location_id, 0) + 1
+                available_slots -= 1
+                logger.info("Claimed frame retrieval job frame_asset_id=%s location_id=%s", frame_asset_id, location_id)
+
+            video_candidates = repositories.list_pending_video_asset_retrievals(
+                db,
+                limit=max(settings.retrieval_max_global_workers * 10, 20),
+            )
+            for candidate in video_candidates:
                 if available_slots <= 0:
                     break
                 location_id = candidate.get("location_id")
@@ -125,10 +186,11 @@ class VideoRetrievalWorker:
 
                 future = self._executor.submit(workflow_service.start_video_retrieval_job, job)
                 with self._lock:
-                    self._running[video_asset_id] = RunningJob(
+                    self._running[f"video:{video_asset_id}"] = RunningJob(
                         future=future,
                         location_id=location_id,
-                        video_asset_id=video_asset_id,
+                        asset_id=video_asset_id,
+                        asset_kind="video_asset",
                     )
                 running_by_location[location_id] = running_by_location.get(location_id, 0) + 1
                 available_slots -= 1

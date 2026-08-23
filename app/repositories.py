@@ -1128,6 +1128,133 @@ def list_trigger_frame_assets(db: Session, limit: int = 100) -> list[dict[str, A
     return assets
 
 
+def get_trigger_frame_asset(db: Session, frame_asset_id: int) -> dict[str, Any]:
+    frame_asset_table = _table("trigger_frame_asset")
+    result = db.execute(
+        text(
+            f"""
+            select id, trigger_id, location_id, start_time, end_time, status, error, created_at, updated_at
+            from {frame_asset_table}
+            where id = :frame_asset_id
+            """
+        ),
+        {"frame_asset_id": frame_asset_id},
+    )
+    return _fetch_one_dict(result)
+
+
+def list_pending_trigger_frame_asset_retrievals(db: Session, limit: int = 50) -> list[dict[str, Any]]:
+    frame_asset_table = _table("trigger_frame_asset")
+    result = db.execute(
+        text(
+            f"""
+            select id, trigger_id, location_id, start_time, end_time, status, error, created_at, updated_at
+            from {frame_asset_table}
+            where status = 'not_retrieved'
+            order by start_time asc, id asc
+            limit :limit
+            """
+        ),
+        {"limit": limit},
+    )
+    return _fetch_all_dicts(result)
+
+
+def list_running_trigger_frame_asset_retrievals(db: Session) -> list[dict[str, Any]]:
+    frame_asset_table = _table("trigger_frame_asset")
+    result = db.execute(
+        text(
+            f"""
+            select id, trigger_id, location_id, start_time, end_time, status, error, created_at, updated_at
+            from {frame_asset_table}
+            where status = 'retrieving'
+            order by id asc
+            """
+        )
+    )
+    return _fetch_all_dicts(result)
+
+
+def claim_trigger_frame_asset_for_retrieval(db: Session, frame_asset_id: int) -> bool:
+    frame_asset_table = _table("trigger_frame_asset")
+    result = db.execute(
+        text(
+            f"""
+            update {frame_asset_table}
+            set status = 'retrieving',
+                error = null,
+                updated_at = now()
+            where id = :frame_asset_id and status = 'not_retrieved'
+            """
+        ),
+        {"frame_asset_id": frame_asset_id},
+    )
+    db.commit()
+    return bool(result.rowcount)
+
+
+def update_trigger_frame_asset_status(
+    db: Session,
+    frame_asset_id: int,
+    status: str,
+    *,
+    error: str | None = None,
+) -> None:
+    frame_asset_table = _table("trigger_frame_asset")
+    db.execute(
+        text(
+            f"""
+            update {frame_asset_table}
+            set status = :status,
+                error = :error,
+                updated_at = now()
+            where id = :frame_asset_id
+            """
+        ),
+        {"frame_asset_id": frame_asset_id, "status": status, "error": error},
+    )
+    db.commit()
+
+
+def replace_trigger_frame_rows(
+    db: Session,
+    *,
+    frame_asset_id: int,
+    trigger_id: int,
+    frames: list[Mapping[str, Any]],
+) -> None:
+    frame_table = _table("trigger_frame")
+    db.execute(
+        text(f"delete from {frame_table} where frame_asset_id = :frame_asset_id"),
+        {"frame_asset_id": frame_asset_id},
+    )
+    if frames:
+        db.execute(
+            text(
+                f"""
+                insert into {frame_table} (
+                    frame_asset_id, trigger_id, frame_index, sample_time, image_url, status
+                )
+                values (
+                    :frame_asset_id, :trigger_id, :frame_index, :sample_time, :image_url, :status
+                )
+                """
+            ),
+            [
+                {
+                    "frame_asset_id": frame_asset_id,
+                    "trigger_id": trigger_id,
+                    "frame_index": frame.get("frame_index"),
+                    "sample_time": frame.get("sample_time"),
+                    "image_url": frame.get("image_url"),
+                    "status": frame.get("status"),
+                }
+                for frame in frames
+            ],
+        )
+    db.commit()
+
+
 def get_video_asset(db: Session, video_asset_id: int) -> dict[str, Any]:
     video_asset_table = _table("video_asset")
     result = db.execute(
@@ -1308,7 +1435,8 @@ def list_ready_trigger_frame_assets_for_window(
     window_start: Any,
     window_end: Any,
 ) -> list[dict[str, Any]]:
-    video_asset_table = _table("video_asset")
+    frame_asset_table = _table("trigger_frame_asset")
+    frame_table = _table("trigger_frame")
     trigger_table = _table("trigger_event")
     result = db.execute(
         text(
@@ -1319,21 +1447,19 @@ def list_ready_trigger_frame_assets_for_window(
                    te.phone_entry_id,
                    te.credit_card_entry_id,
                    te.entry_source_type,
-                   va.id as video_asset_id,
-                   va.status as video_asset_status,
-                   va.metadata as video_asset_metadata,
-                   va.created_at as video_asset_created_at
+                   fa.id as frame_asset_id,
+                   fa.status as frame_asset_status,
+                   fa.created_at as frame_asset_created_at
             from {trigger_table} te
-            join {video_asset_table} va on va.trigger_id = te.id
+            join {frame_asset_table} fa on fa.trigger_id = te.id
             where te.location_id = :location_id
               and te.trigger_time >= :window_start
               and te.trigger_time < :window_end
               and te.whitelist_hit = 0
               and te.status <> 'whitelisted'
               and (te.phone_entry_id is not null or te.credit_card_entry_id is not null)
-              and va.section = 'entrance'
-              and va.status in ('frames_retrieved', '10_frames_retrieved')
-            order by te.trigger_time asc, te.id asc, va.id asc
+              and fa.status = 'retrieved'
+            order by te.trigger_time asc, te.id asc, fa.id asc
             """
         ),
         {
@@ -1343,12 +1469,25 @@ def list_ready_trigger_frame_assets_for_window(
         },
     )
     rows = _fetch_all_dicts(result)
+    frame_asset_ids = [int(row["frame_asset_id"]) for row in rows if row.get("frame_asset_id") is not None]
+    frames_by_asset: dict[int, list[dict[str, Any]]] = {}
+    if frame_asset_ids:
+        frame_result = db.execute(
+            text(
+                f"""
+                select id, frame_asset_id, trigger_id, frame_index, sample_time, image_url, status, created_at
+                from {frame_table}
+                where frame_asset_id in :frame_asset_ids
+                  and status <> 'deleted'
+                order by frame_asset_id asc, frame_index asc, id asc
+                """
+            ).bindparams(bindparam("frame_asset_ids", expanding=True)),
+            {"frame_asset_ids": frame_asset_ids},
+        )
+        for frame in _fetch_all_dicts(frame_result):
+            frames_by_asset.setdefault(int(frame["frame_asset_id"]), []).append(frame)
     for row in rows:
-        if isinstance(row.get("video_asset_metadata"), str):
-            try:
-                row["video_asset_metadata"] = json.loads(row["video_asset_metadata"])
-            except json.JSONDecodeError:
-                pass
+        row["trigger_frames"] = frames_by_asset.get(int(row["frame_asset_id"]), [])
     return rows
 
 
@@ -1359,7 +1498,8 @@ def list_trigger_frame_assets_for_window(
     window_start: Any,
     window_end: Any,
 ) -> list[dict[str, Any]]:
-    video_asset_table = _table("video_asset")
+    frame_asset_table = _table("trigger_frame_asset")
+    frame_table = _table("trigger_frame")
     trigger_table = _table("trigger_event")
     result = db.execute(
         text(
@@ -1370,21 +1510,19 @@ def list_trigger_frame_assets_for_window(
                    te.phone_entry_id,
                    te.credit_card_entry_id,
                    te.entry_source_type,
-                   va.id as video_asset_id,
-                   va.status as video_asset_status,
-                   va.metadata as video_asset_metadata,
-                   va.created_at as video_asset_created_at
+                   fa.id as frame_asset_id,
+                   fa.status as frame_asset_status,
+                   fa.created_at as frame_asset_created_at
             from {trigger_table} te
-            join {video_asset_table} va on va.trigger_id = te.id
+            join {frame_asset_table} fa on fa.trigger_id = te.id
             where te.location_id = :location_id
               and te.trigger_time >= :window_start
               and te.trigger_time < :window_end
               and te.whitelist_hit = 0
               and te.status <> 'whitelisted'
               and (te.phone_entry_id is not null or te.credit_card_entry_id is not null)
-              and va.section = 'entrance'
-              and va.status <> 'deleted'
-            order by te.trigger_time asc, te.id asc, va.id asc
+              and fa.status <> 'deleted'
+            order by te.trigger_time asc, te.id asc, fa.id asc
             """
         ),
         {
@@ -1394,12 +1532,25 @@ def list_trigger_frame_assets_for_window(
         },
     )
     rows = _fetch_all_dicts(result)
+    frame_asset_ids = [int(row["frame_asset_id"]) for row in rows if row.get("frame_asset_id") is not None]
+    frames_by_asset: dict[int, list[dict[str, Any]]] = {}
+    if frame_asset_ids:
+        frame_result = db.execute(
+            text(
+                f"""
+                select id, frame_asset_id, trigger_id, frame_index, sample_time, image_url, status, created_at
+                from {frame_table}
+                where frame_asset_id in :frame_asset_ids
+                  and status <> 'deleted'
+                order by frame_asset_id asc, frame_index asc, id asc
+                """
+            ).bindparams(bindparam("frame_asset_ids", expanding=True)),
+            {"frame_asset_ids": frame_asset_ids},
+        )
+        for frame in _fetch_all_dicts(frame_result):
+            frames_by_asset.setdefault(int(frame["frame_asset_id"]), []).append(frame)
     for row in rows:
-        if isinstance(row.get("video_asset_metadata"), str):
-            try:
-                row["video_asset_metadata"] = json.loads(row["video_asset_metadata"])
-            except json.JSONDecodeError:
-                pass
+        row["trigger_frames"] = frames_by_asset.get(int(row["frame_asset_id"]), [])
     return rows
 
 

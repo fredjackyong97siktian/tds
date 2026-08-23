@@ -247,6 +247,20 @@ class VideoRetrievalQueued:
 
 
 @dataclass
+class TriggerFrameAssetRetrievalQueued:
+    frame_asset_id: int
+    trigger_id: int
+    location_id: int
+    section: str
+    requested_start_time: datetime
+    requested_end_time: datetime
+    adjusted_start_time: datetime
+    adjusted_end_time: datetime
+    output_dir: str
+    rtsp_url: str
+
+
+@dataclass
 class EntranceAnalysisQueued:
     video_asset_id: int
     trigger_id: int
@@ -2452,6 +2466,27 @@ def _frame_urls_from_video_asset(row: Mapping[str, Any]) -> list[dict[str, Any]]
     return payload
 
 
+def _frame_urls_from_trigger_frame_asset(row: Mapping[str, Any]) -> list[dict[str, Any]]:
+    frames = row.get("trigger_frames")
+    if not isinstance(frames, list):
+        return []
+    payload: list[dict[str, Any]] = []
+    for frame in frames:
+        if not isinstance(frame, Mapping):
+            continue
+        image_url = str(frame.get("image_url") or "").strip()
+        if not image_url:
+            continue
+        payload.append(
+            {
+                "index": frame.get("frame_index"),
+                "sample_time": frame.get("sample_time"),
+                "image_url": image_url,
+            }
+        )
+    return payload
+
+
 def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
     periods = repositories.list_filter_time_periods(db, selected_only=True)
     if not periods:
@@ -2483,7 +2518,7 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
             not_ready = [
                 row
                 for row in trigger_assets
-                if str(row.get("video_asset_status") or "").strip().lower() not in {"frames_retrieved", "10_frames_retrieved"}
+                if str(row.get("frame_asset_status") or "").strip().lower() != "retrieved"
             ]
             if not_ready:
                 continue
@@ -2499,8 +2534,8 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
                     db,
                     batch_id=int(batch["id"]),
                     trigger_id=int(row["trigger_id"]),
-                    video_asset_id=int(row["video_asset_id"]),
-                    frame_payload={"frames": _frame_urls_from_video_asset(row)},
+                    video_asset_id=None,
+                    frame_payload={"frames": _frame_urls_from_trigger_frame_asset(row)},
                 )
             prepared.append(batch)
     return prepared
@@ -5281,6 +5316,64 @@ def build_retrieval_job_from_video_asset(db: Session, video_asset_id: int) -> Vi
     )
 
 
+def build_retrieval_job_from_trigger_frame_asset(db: Session, frame_asset_id: int) -> TriggerFrameAssetRetrievalQueued:
+    frame_asset = repositories.get_trigger_frame_asset(db, frame_asset_id)
+    trigger_id = int(frame_asset["trigger_id"])
+    location_id = int(frame_asset["location_id"])
+    start_time = frame_asset.get("start_time")
+    end_time = frame_asset.get("end_time")
+    if start_time is None or end_time is None:
+        raise ValueError(f"Frame asset {frame_asset_id} is missing capture timestamps.")
+
+    section = "entrance"
+    cctv = repositories.get_cctv_by_location_section(db, location_id=location_id, section=section)
+    location = repositories.get_location_endpoint(db, location_id)
+    channel = str(cctv.get("recorder_channel") or "").strip()
+    if not channel:
+        raise ValueError("Entrance CCTV record does not have a recorder_channel.")
+    dahua_host = str(location.get("dahua_host") or "").strip()
+    dahua_username = str(location.get("dahua_username") or "").strip()
+    dahua_password_encrypted = str(location.get("dahua_password_encrypted") or "").strip()
+    if not dahua_host or not dahua_username or not dahua_password_encrypted:
+        raise ValueError(f"Location {location_id} does not have complete Dahua host credentials configured.")
+    dahua_password = decrypt_secret(dahua_password_encrypted)
+    rtsp_port = int(location.get("rtsp_port") or settings.dahua_rtsp_port)
+    delayed_seconds = int(cctv.get("delayed_seconds") or 0)
+    adjusted_start_time = start_time - timedelta(seconds=delayed_seconds)
+    adjusted_end_time = end_time - timedelta(seconds=delayed_seconds)
+    rtsp_url = _build_dahua_rtsp_playback_url(
+        host=dahua_host,
+        username=dahua_username,
+        password=dahua_password,
+        rtsp_port=rtsp_port,
+        channel=channel,
+        start_time=adjusted_start_time,
+        end_time=adjusted_end_time,
+    )
+    output_dir = (
+        tmp_media_root()
+        / f"location_{location_id}"
+        / f"trigger_{trigger_id}"
+        / section
+        / "frames"
+        / f"frame_asset_{frame_asset_id}"
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    return TriggerFrameAssetRetrievalQueued(
+        frame_asset_id=frame_asset_id,
+        trigger_id=trigger_id,
+        location_id=location_id,
+        section=section,
+        requested_start_time=start_time,
+        requested_end_time=end_time,
+        adjusted_start_time=adjusted_start_time,
+        adjusted_end_time=adjusted_end_time,
+        output_dir=str(output_dir),
+        rtsp_url=rtsp_url,
+    )
+
+
 def build_entrance_analysis_job_from_video_asset(db: Session, video_asset_id: int) -> EntranceAnalysisQueued:
     video_asset = repositories.get_video_asset(db, video_asset_id)
     trigger_id = video_asset.get("trigger_id")
@@ -5593,6 +5686,99 @@ def _run_video_retrieval_job(
             status="failed",
             stdout_log="",
             stderr_log=str(exc),
+        )
+    finally:
+        db.close()
+
+
+def start_trigger_frame_asset_retrieval_job(job: TriggerFrameAssetRetrievalQueued) -> None:
+    db = TransactionalSessionLocal()
+    script_run_id = repositories.create_script_run_started(
+        db,
+        session_id=None,
+        trigger_id=job.trigger_id,
+        script_name="retrieve_video",
+        model_name="dahua_rtsp_playback:trigger_frame_asset",
+        status="running",
+        command=SCRIPT_RUN_COMMAND_REDACTED,
+        runner_payload={
+            "frame_asset_id": job.frame_asset_id,
+            "location_id": job.location_id,
+            "start_time": job.requested_start_time.isoformat(),
+            "end_time": job.requested_end_time.isoformat(),
+        },
+    )
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
+    try:
+        if not is_spaces_configured():
+            raise RuntimeError("Frame retrieval requires DigitalOcean Spaces.")
+
+        output_dir = Path(job.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        duration_seconds = max(0.0, (job.requested_end_time - job.requested_start_time).total_seconds())
+        frame_count = max(1, int(settings.trigger_frame_count))
+        gap_seconds = max(0.04, float(settings.trigger_frame_gap) / max(1, int(settings.trigger_frame_fps)))
+        offsets = [
+            max(0.0, duration_seconds - ((frame_count - index) * gap_seconds))
+            for index in range(1, frame_count + 1)
+        ]
+
+        frame_rows: list[dict[str, Any]] = []
+        for index, offset_seconds in enumerate(offsets, start=1):
+            sample_time = job.requested_start_time + timedelta(seconds=offset_seconds)
+            filename = (
+                f"trigger_{job.trigger_id}_asset_{job.frame_asset_id}_"
+                f"frame_{index:02d}_{sample_time.strftime('%Y%m%d_%H%M%S')}.jpg"
+            )
+            local_path = output_dir / filename
+            command = _build_frame_capture_command(job.rtsp_url, offset_seconds, local_path)
+            completed = subprocess.run(command, capture_output=True, text=True)
+            stdout_parts.append(completed.stdout or "")
+            stderr_parts.append(completed.stderr or "")
+            row: dict[str, Any] = {
+                "frame_index": index,
+                "sample_time": sample_time,
+                "image_url": None,
+                "status": "failed",
+            }
+            if completed.returncode == 0 and local_path.exists():
+                object_key = _trigger_frame_spaces_key(
+                    location_id=job.location_id,
+                    trigger_id=job.trigger_id,
+                    section=job.section,
+                    filename=filename,
+                )
+                upload_result = upload_private_file(local_path, object_key, content_type=guess_media_type(str(local_path)))
+                row["image_url"] = str(upload_result.get("public_url") or _spaces_download_url_for_object_key(object_key))
+                row["status"] = "ok"
+            frame_rows.append(row)
+
+        repositories.replace_trigger_frame_rows(
+            db,
+            frame_asset_id=job.frame_asset_id,
+            trigger_id=job.trigger_id,
+            frames=frame_rows,
+        )
+        ok_count = sum(1 for row in frame_rows if row.get("status") == "ok")
+        final_status = "retrieved" if ok_count else "issue"
+        error = None if ok_count else "No trigger frames were retrieved."
+        repositories.update_trigger_frame_asset_status(db, job.frame_asset_id, final_status, error=error)
+        repositories.finish_script_run(
+            db,
+            script_run_id,
+            status="success" if ok_count else "failed",
+            stdout_log="\n".join(part for part in stdout_parts if part),
+            stderr_log="\n".join(part for part in stderr_parts if part),
+        )
+    except Exception as exc:
+        repositories.update_trigger_frame_asset_status(db, job.frame_asset_id, "issue", error=str(exc))
+        repositories.finish_script_run(
+            db,
+            script_run_id,
+            status="failed",
+            stdout_log="\n".join(part for part in stdout_parts if part),
+            stderr_log="\n".join(part for part in stderr_parts if part) or str(exc),
         )
     finally:
         db.close()
