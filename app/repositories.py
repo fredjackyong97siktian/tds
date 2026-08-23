@@ -2078,6 +2078,27 @@ def list_grouping_items(db: Session, batch_id: int) -> list[dict[str, Any]]:
     return rows
 
 
+def mark_grouping_batch_frame_assets_processed(db: Session, batch_id: int) -> int:
+    grouping_item_table = _table("filter_grouping_item")
+    frame_asset_table = _table("trigger_frame_asset")
+    result = db.execute(
+        text(
+            f"""
+            update {frame_asset_table} fa
+            join {grouping_item_table} gi on gi.trigger_id = fa.trigger_id
+            set fa.status = 'processed',
+                fa.error = null,
+                fa.updated_at = now()
+            where gi.batch_id = :batch_id
+              and fa.status in ('retrieved', 'processing')
+            """
+        ),
+        {"batch_id": batch_id},
+    )
+    db.commit()
+    return int(result.rowcount or 0)
+
+
 def list_script_runs(db: Session, limit: int = 100) -> list[dict[str, Any]]:
     script_run_table = _table("script_run")
     result = db.execute(

@@ -2955,6 +2955,11 @@ def _finalize_remote_grouping_script_run(
                 )
             except Exception:
                 logger.exception("Could not persist unknown grouping item batch_id=%s trigger_id=%s", batch_id, trigger_id)
+    try:
+        processed_count = repositories.mark_grouping_batch_frame_assets_processed(db, batch_id)
+        logger.info("Marked grouping frame assets processed batch_id=%s count=%s", batch_id, processed_count)
+    except Exception:
+        logger.exception("Could not mark grouping frame assets processed batch_id=%s", batch_id)
     return result
 
 
