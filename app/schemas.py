@@ -303,6 +303,9 @@ class ScriptRunDetailResponse(BaseModel):
     stdout: str
     stderr: str
     runner_payload: dict[str, Any] = Field(default_factory=dict)
+    cost_amount: float | str | None = None
+    cost_currency: str | None = None
+    cost_source: str | None = None
     log_object_key: str | None = None
     log_url: str | None = None
     started_at: datetime | None = None
