@@ -1235,7 +1235,7 @@ def list_pending_video_asset_retrievals(db: Session, limit: int = 50) -> list[di
             left join {trigger_table} te on te.id = va.trigger_id
             left join {session_video_asset_table} sva on sva.video_asset_id = va.id
             left join {session_table} s on s.id = sva.session_id
-            where va.status in ('not_retrieved', 'full_video_not_retrieved')
+            where va.status = 'not_retrieved'
             group by va.id, va.trigger_id, va.section, va.file_path, va.captured_start_time, va.captured_end_time, va.retrieved_at, va.analyzed_at, va.status, va.created_at, te.location_id
             order by case when va.section = 'entrance' then 0 else 1 end asc,
                      coalesce(va.captured_start_time, va.created_at) asc,
@@ -1292,7 +1292,7 @@ def claim_video_asset_for_retrieval(db: Session, video_asset_id: int) -> bool:
             update {video_asset_table}
             set metadata = json_set(coalesce(metadata, json_object()), '$.claimed_from_status', status),
                 status = 'retrieving'
-            where id = :video_asset_id and status in ('not_retrieved', 'full_video_not_retrieved')
+            where id = :video_asset_id and status = 'not_retrieved'
             """
         ),
         {"video_asset_id": video_asset_id},
@@ -1888,8 +1888,14 @@ def promote_trigger_video_assets_to_full_retrieval(db: Session, trigger_ids: lis
         text(
             f"""
             update {video_asset_table}
-            set status = 'full_video_not_retrieved',
-                metadata = json_set(coalesce(metadata, json_object()), '$.promoted_from_layer0', true)
+            set status = 'not_retrieved',
+                metadata = json_set(
+                    coalesce(metadata, json_object()),
+                    '$.promoted_from_layer0',
+                    true,
+                    '$.retrieval_mode',
+                    'full_video'
+                )
             where trigger_id in :trigger_ids
               and section = 'entrance'
               and status in ('frames_retrieved', '10_frames_retrieved')

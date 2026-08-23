@@ -243,6 +243,7 @@ class VideoRetrievalQueued:
     rtsp_port: int
     status: str
     video_url: str
+    retrieval_mode: str | None = None
 
 
 @dataclass
@@ -5137,9 +5138,6 @@ def _prepare_video_retrieval(
                 },
             },
         )
-    metadata = video_asset.get("metadata") if isinstance(video_asset.get("metadata"), Mapping) else {}
-    claimed_from_status = str(metadata.get("claimed_from_status") or video_asset.get("status") or "retrieving")
-
     return VideoRetrievalQueued(
         video_asset_id=video_asset_id,
         session_id=session_id,
@@ -5257,6 +5255,9 @@ def build_retrieval_job_from_video_asset(db: Session, video_asset_id: int) -> Vi
             else None
         ),
     )
+    metadata = video_asset.get("metadata") if isinstance(video_asset.get("metadata"), Mapping) else {}
+    claimed_from_status = str(metadata.get("claimed_from_status") or video_asset.get("status") or "retrieving")
+    retrieval_mode = str(metadata.get("retrieval_mode") or "").strip().lower() or None
 
     return VideoRetrievalQueued(
         video_asset_id=video_asset_id,
@@ -5276,6 +5277,7 @@ def build_retrieval_job_from_video_asset(db: Session, video_asset_id: int) -> Vi
         rtsp_port=rtsp_port,
         status=claimed_from_status,
         video_url=str(video_asset.get("video_url") or f"/api/v1/videos/assets/{video_asset_id}/content"),
+        retrieval_mode=retrieval_mode,
     )
 
 
@@ -5597,7 +5599,7 @@ def _run_video_retrieval_job(
 
 
 def start_video_retrieval_job(job: VideoRetrievalQueued) -> None:
-    if job.status == "not_retrieved" and job.section == "entrance":
+    if job.status == "not_retrieved" and job.section == "entrance" and job.retrieval_mode != "full_video":
         _run_trigger_frame_retrieval_job(
             video_asset_id=job.video_asset_id,
             trigger_id=job.trigger_id,
