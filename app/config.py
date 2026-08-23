@@ -52,7 +52,7 @@ class Settings(BaseSettings):
     retrieval_max_per_location: int = 1
     retrieval_ffmpeg_timeout_seconds: int = 60
     retrieval_stale_seconds: int = 900
-    trigger_frame_count: int = 10
+    trigger_frame_count: int = 20
     trigger_frame_gap: int = 12
     trigger_frame_fps: int = 25
     grouping_poll_seconds: int = 30
