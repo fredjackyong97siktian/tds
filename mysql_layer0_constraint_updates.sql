@@ -28,6 +28,11 @@ ALTER TABLE sesamedb.tds_script_run
         'grouping'
     ));
 
+ALTER TABLE sesamedb.tds_script_run
+    ADD COLUMN cost_amount DECIMAL(12,6) NULL,
+    ADD COLUMN cost_currency VARCHAR(10) NOT NULL DEFAULT 'USD',
+    ADD COLUMN cost_source VARCHAR(50) NULL;
+
 ALTER TABLE sesamedb.tds_video_asset
     DROP CHECK chk_video_asset_status;
 

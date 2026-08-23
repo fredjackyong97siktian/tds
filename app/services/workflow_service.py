@@ -204,6 +204,9 @@ def _build_script_run_details(record: Mapping[str, Any]) -> dict[str, Any]:
         "stdout": str(record.get("stdout_log") or ""),
         "stderr": str(record.get("stderr_log") or ""),
         "runner_payload": runner_payload,
+        "cost_amount": record.get("cost_amount"),
+        "cost_currency": record.get("cost_currency") or "USD",
+        "cost_source": record.get("cost_source"),
         "log_object_key": runner_payload.get("log_object_key"),
         "log_url": runner_payload.get("log_url"),
         "started_at": record.get("started_at"),
@@ -309,6 +312,7 @@ class RemoteRunnerResult:
     kiosk_summary: dict[str, Any] | None = None
     transaction_match_summary: dict[str, Any] | None = None
     grouping_summary: dict[str, Any] | None = None
+    meta: dict[str, Any] | None = None
 
 
 @dataclass
@@ -758,6 +762,7 @@ def _remote_runner_result_from_runpod_body(body: dict[str, Any]) -> tuple[str, R
                 kiosk_summary=output.get("kiosk_summary"),
                 transaction_match_summary=output.get("transaction_match_summary"),
                 grouping_summary=output.get("grouping_summary"),
+                meta=output.get("meta") if isinstance(output.get("meta"), dict) else None,
             ),
         )
 
@@ -778,6 +783,7 @@ def _remote_runner_result_from_runpod_body(body: dict[str, Any]) -> tuple[str, R
                 kiosk_summary=output.get("kiosk_summary"),
                 transaction_match_summary=output.get("transaction_match_summary"),
                 grouping_summary=output.get("grouping_summary"),
+                meta=output.get("meta") if isinstance(output.get("meta"), dict) else None,
             ),
         )
     return (
@@ -790,6 +796,133 @@ def _remote_runner_result_from_runpod_body(body: dict[str, Any]) -> tuple[str, R
             processed_video_url=None,
         ),
     )
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _positive_float(value: Any) -> float | None:
+    parsed = _safe_float(value)
+    if parsed is None or parsed <= 0:
+        return None
+    return parsed
+
+
+def _remote_runner_cost(remote_result: RemoteRunnerResult) -> tuple[float | None, str | None]:
+    meta = remote_result.meta if isinstance(remote_result.meta, Mapping) else {}
+    for key in ("cost_amount", "cost_usd", "runpod_cost_usd", "estimated_cost_usd"):
+        amount = _positive_float(meta.get(key))
+        if amount is not None:
+            return amount, "runpod_returned"
+
+    duration_seconds = None
+    for key in ("duration_seconds", "job_seconds", "runtime_seconds", "execution_seconds"):
+        duration_seconds = _positive_float(meta.get(key))
+        if duration_seconds is not None:
+            break
+    cost_per_second = _positive_float(settings.runpod_cost_per_second_usd)
+    if duration_seconds is None or cost_per_second is None:
+        return None, None
+    return duration_seconds * cost_per_second, "runpod_estimate"
+
+
+def _record_remote_runner_cost(db: Session, script_run_id: int, remote_result: RemoteRunnerResult) -> None:
+    amount, source = _remote_runner_cost(remote_result)
+    repositories.add_script_run_cost(
+        db,
+        script_run_id,
+        cost_amount=amount,
+        cost_currency="USD",
+        cost_source=source,
+    )
+
+
+def _gemini_usage_cost(gemini_meta: Mapping[str, Any]) -> tuple[float | None, dict[str, Any]]:
+    raw_usage = gemini_meta.get("raw_usage") if isinstance(gemini_meta.get("raw_usage"), Mapping) else {}
+    usage = gemini_meta.get("usage") if isinstance(gemini_meta.get("usage"), Mapping) else {}
+    input_tokens = (
+        _positive_float(raw_usage.get("promptTokenCount"))
+        or _positive_float(usage.get("input_tokens"))
+        or 0.0
+    )
+    output_tokens = (
+        _positive_float(raw_usage.get("candidatesTokenCount"))
+        or _positive_float(usage.get("output_tokens"))
+        or 0.0
+    )
+    cached_input_tokens = (
+        _positive_float(raw_usage.get("cachedContentTokenCount"))
+        or _positive_float(usage.get("cached_input_tokens"))
+        or 0.0
+    )
+    input_rate = _positive_float(settings.gemini_input_cost_per_1m_tokens_usd) or 0.0
+    output_rate = _positive_float(settings.gemini_output_cost_per_1m_tokens_usd) or 0.0
+    cached_rate = _positive_float(settings.gemini_cached_input_cost_per_1m_tokens_usd)
+    billable_input_tokens = max(0.0, input_tokens - cached_input_tokens)
+    amount = (billable_input_tokens * input_rate + output_tokens * output_rate) / 1_000_000
+    if cached_rate is not None:
+        amount += cached_input_tokens * cached_rate / 1_000_000
+    detail = {
+        "input_tokens": int(input_tokens),
+        "output_tokens": int(output_tokens),
+        "cached_input_tokens": int(cached_input_tokens),
+        "input_cost_per_1m_tokens_usd": input_rate,
+        "output_cost_per_1m_tokens_usd": output_rate,
+        "cached_input_cost_per_1m_tokens_usd": cached_rate,
+        "estimated_cost_usd": amount,
+    }
+    if amount <= 0:
+        return None, detail
+    return amount, detail
+
+
+def _record_gemini_cost(db: Session, script_run_id: int, gemini_meta: Mapping[str, Any]) -> dict[str, Any]:
+    amount, detail = _gemini_usage_cost(gemini_meta)
+    repositories.add_script_run_cost(
+        db,
+        script_run_id,
+        cost_amount=amount,
+        cost_currency="USD",
+        cost_source="gemini_estimate",
+    )
+    return detail
+
+
+def _record_gemini_log_cost(db: Session, script_run_id: int, gemini_log: Mapping[str, Any]) -> dict[str, Any]:
+    cost_details: list[dict[str, Any]] = []
+    total_amount = 0.0
+    groups = gemini_log.get("groups") if isinstance(gemini_log.get("groups"), list) else []
+    for group in groups:
+        if not isinstance(group, Mapping):
+            continue
+        meta = group.get("meta") if isinstance(group.get("meta"), Mapping) else None
+        if not meta:
+            continue
+        amount, detail = _gemini_usage_cost(meta)
+        detail["group_id"] = group.get("group_id")
+        cost_details.append(detail)
+        if amount is not None:
+            total_amount += amount
+    if total_amount > 0:
+        repositories.add_script_run_cost(
+            db,
+            script_run_id,
+            cost_amount=total_amount,
+            cost_currency="USD",
+            cost_source="gemini_estimate",
+        )
+    return {
+        "source": "gemini_estimate",
+        "currency": "USD",
+        "amount": total_amount,
+        "groups": cost_details,
+    }
 
 
 def _extract_json_object(text_value: str) -> dict[str, Any]:
@@ -1092,6 +1225,7 @@ def _finalize_remote_entry_script_run(
         stdout_log=remote_result.stdout,
         stderr_log=remote_result.stderr,
     )
+    _record_remote_runner_cost(db, script_run_id, remote_result)
     result = ScriptExecutionResult(
         script_run_id=script_run_id,
         runner_job_id=str(script_run.get("runner_job_id") or ""),
@@ -1320,6 +1454,7 @@ def _finalize_remote_kiosk_script_run(
         stdout_log=remote_result.stdout,
         stderr_log=remote_result.stderr,
     )
+    _record_remote_runner_cost(db, script_run_id, remote_result)
     result = ScriptExecutionResult(
         script_run_id=script_run_id,
         runner_job_id=str(script_run.get("runner_job_id") or ""),
@@ -1417,10 +1552,12 @@ def _finalize_remote_kiosk_script_run(
     try:
         completed_kiosk_summary, gemini_log = _complete_kiosk_summary_with_tds_gemini(remote_result.kiosk_summary)
         gemini_status = str(gemini_log.get("status") or "success")
+        gemini_cost = _record_gemini_log_cost(db, result.script_run_id, gemini_log)
         persist_gemini_log(
             {
                 "gemini_log": {
                     "status": gemini_status,
+                    "cost": gemini_cost,
                     **{key: value for key, value in gemini_log.items() if key != "status"},
                 }
             }
@@ -1547,6 +1684,7 @@ def _finalize_remote_kiosk_match_script_run(
         stdout_log=remote_result.stdout,
         stderr_log=remote_result.stderr,
     )
+    _record_remote_runner_cost(db, script_run_id, remote_result)
     result = ScriptExecutionResult(
         script_run_id=script_run_id,
         runner_job_id=str(script_run.get("runner_job_id") or ""),
@@ -2746,6 +2884,7 @@ def _finalize_remote_grouping_script_run(
         stdout_log=remote_result.stdout,
         stderr_log=remote_result.stderr,
     )
+    _record_remote_runner_cost(db, script_run_id, remote_result)
     result = ScriptExecutionResult(
         script_run_id=script_run_id,
         runner_job_id=str(script_run.get("runner_job_id") or ""),

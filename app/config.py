@@ -47,6 +47,7 @@ class Settings(BaseSettings):
     runpod_api_key: str | None = None
     runpod_webhook_base_url: str | None = None
     runpod_webhook_secret: str | None = None
+    runpod_cost_per_second_usd: float = 0.0
     retrieval_poll_seconds: int = 10
     retrieval_max_global_workers: int = 2
     retrieval_max_per_location: int = 1
@@ -105,6 +106,9 @@ class Settings(BaseSettings):
     kiosk_gemini_model: str = "gemini-3-flash-preview"
     kiosk_gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
     kiosk_gemini_timeout_seconds: int = 180
+    gemini_input_cost_per_1m_tokens_usd: float = 0.0
+    gemini_output_cost_per_1m_tokens_usd: float = 0.0
+    gemini_cached_input_cost_per_1m_tokens_usd: float = 0.0
 
     model_config = SettingsConfigDict(
         env_prefix="THEFT_API_",

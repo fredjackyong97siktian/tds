@@ -2084,7 +2084,7 @@ def list_script_runs(db: Session, limit: int = 100) -> list[dict[str, Any]]:
         text(
             f"""
             select id, session_id, trigger_id, script_name, model_name, runner_job_id, runner_payload,
-                   status, command, stdout_log, stderr_log, started_at, finished_at
+                   status, command, stdout_log, stderr_log, cost_amount, cost_currency, cost_source, started_at, finished_at
             from {script_run_table}
             order by started_at desc, id desc
             limit :limit
@@ -4148,6 +4148,9 @@ def finish_script_run(
     status: str,
     stdout_log: str,
     stderr_log: str,
+    cost_amount: float | None = None,
+    cost_currency: str | None = None,
+    cost_source: str | None = None,
 ) -> None:
     script_run_table = _table("script_run")
     db.execute(
@@ -4157,6 +4160,9 @@ def finish_script_run(
             set status = :status,
                 stdout_log = :stdout_log,
                 stderr_log = :stderr_log,
+                cost_amount = coalesce(:cost_amount, cost_amount),
+                cost_currency = coalesce(:cost_currency, cost_currency),
+                cost_source = coalesce(:cost_source, cost_source),
                 finished_at = now()
             where id = :script_run_id
             """
@@ -4166,6 +4172,76 @@ def finish_script_run(
             "status": status,
             "stdout_log": stdout_log,
             "stderr_log": stderr_log,
+            "cost_amount": cost_amount,
+            "cost_currency": cost_currency,
+            "cost_source": cost_source,
+        },
+    )
+    db.commit()
+
+
+def update_script_run_cost(
+    db: Session,
+    script_run_id: int,
+    *,
+    cost_amount: float | None,
+    cost_currency: str = "USD",
+    cost_source: str | None,
+) -> None:
+    if cost_amount is None:
+        return
+    script_run_table = _table("script_run")
+    db.execute(
+        text(
+            f"""
+            update {script_run_table}
+            set cost_amount = :cost_amount,
+                cost_currency = :cost_currency,
+                cost_source = :cost_source
+            where id = :script_run_id
+            """
+        ),
+        {
+            "script_run_id": script_run_id,
+            "cost_amount": cost_amount,
+            "cost_currency": cost_currency,
+            "cost_source": cost_source,
+        },
+    )
+    db.commit()
+
+
+def add_script_run_cost(
+    db: Session,
+    script_run_id: int,
+    *,
+    cost_amount: float | None,
+    cost_currency: str = "USD",
+    cost_source: str | None,
+) -> None:
+    if cost_amount is None or cost_amount <= 0:
+        return
+    script_run_table = _table("script_run")
+    db.execute(
+        text(
+            f"""
+            update {script_run_table}
+            set cost_amount = coalesce(cost_amount, 0) + :cost_amount,
+                cost_currency = :cost_currency,
+                cost_source = case
+                    when cost_source is null or cost_source = '' then :cost_source
+                    when :cost_source is null or :cost_source = '' then cost_source
+                    when instr(cost_source, :cost_source) > 0 then cost_source
+                    else concat(cost_source, '+', :cost_source)
+                end
+            where id = :script_run_id
+            """
+        ),
+        {
+            "script_run_id": script_run_id,
+            "cost_amount": cost_amount,
+            "cost_currency": cost_currency,
+            "cost_source": cost_source,
         },
     )
     db.commit()
@@ -4233,7 +4309,7 @@ def get_script_run(db: Session, script_run_id: int) -> dict[str, Any]:
         text(
             f"""
             select id, session_id, trigger_id, script_name, model_name, runner_job_id, runner_payload,
-                   status, command, stdout_log, stderr_log, started_at, finished_at
+                   status, command, stdout_log, stderr_log, cost_amount, cost_currency, cost_source, started_at, finished_at
             from {script_run_table}
             where id = :script_run_id
             limit 1
@@ -4256,7 +4332,7 @@ def get_script_run_by_runner_job_id(db: Session, runner_job_id: str) -> dict[str
         text(
             f"""
             select id, session_id, trigger_id, script_name, model_name, runner_job_id, runner_payload,
-                   status, command, stdout_log, stderr_log, started_at, finished_at
+                   status, command, stdout_log, stderr_log, cost_amount, cost_currency, cost_source, started_at, finished_at
             from {script_run_table}
             where runner_job_id = :runner_job_id
             limit 1
@@ -4289,7 +4365,7 @@ def get_latest_script_run_for_session(
         text(
             f"""
             select id, session_id, trigger_id, script_name, model_name, runner_job_id, runner_payload,
-                   status, command, stdout_log, stderr_log, started_at, finished_at
+                   status, command, stdout_log, stderr_log, cost_amount, cost_currency, cost_source, started_at, finished_at
             from {script_run_table}
             where {" and ".join(filters)}
             order by id desc
@@ -4323,7 +4399,7 @@ def get_latest_script_run_for_trigger(
         text(
             f"""
             select id, session_id, trigger_id, script_name, model_name, runner_job_id, runner_payload,
-                   status, command, stdout_log, stderr_log, started_at, finished_at
+                   status, command, stdout_log, stderr_log, cost_amount, cost_currency, cost_source, started_at, finished_at
             from {script_run_table}
             where {" and ".join(filters)}
             order by id desc
@@ -4350,7 +4426,7 @@ def get_latest_script_run_for_video_asset(db: Session, video_asset_id: int) -> d
         text(
             f"""
             select id, session_id, trigger_id, script_name, model_name, runner_job_id, runner_payload,
-                   status, command, stdout_log, stderr_log, started_at, finished_at
+                   status, command, stdout_log, stderr_log, cost_amount, cost_currency, cost_source, started_at, finished_at
             from {script_run_table}
             where cast(json_unquote(json_extract(runner_payload, '$.video_asset_id')) as unsigned) = :video_asset_id
             order by id desc
@@ -4413,7 +4489,7 @@ def list_running_remote_analysis_script_runs(db: Session) -> list[dict[str, Any]
         text(
             f"""
             select id, session_id, trigger_id, script_name, model_name, runner_job_id, runner_payload,
-                   status, command, stdout_log, stderr_log, started_at, finished_at
+                   status, command, stdout_log, stderr_log, cost_amount, cost_currency, cost_source, started_at, finished_at
             from {script_run_table}
             where script_name in ('entry', 'kiosk', 'kiosk_match', 'grouping')
               and status = 'running'
