@@ -2869,6 +2869,44 @@ def start_grouping_analysis_job(job: GroupingAnalysisQueued) -> ScriptExecutionR
         db.close()
 
 
+def retry_grouping_batch_now(db: Session, *, batch_id: int) -> dict[str, Any]:
+    batch = repositories.get_grouping_batch(db, batch_id)
+    status = str(batch.get("status") or "").strip().lower()
+    if status not in {"failed", "issue"}:
+        raise ValueError(f"Grouping batch {batch_id} is {status or 'unknown'} and cannot be retried.")
+    if repositories.has_active_remote_analysis_script_run(db, script_names=["grouping"]):
+        raise ValueError("Grouping is already dispatching or running.")
+
+    repositories.mark_grouping_batch_frame_assets_retrieved(
+        db,
+        batch_id,
+        error="Retry queued after failed/canceled grouping run.",
+    )
+    repositories.reset_grouping_batch_for_retry(db, batch_id)
+    if not repositories.claim_grouping_batch_for_dispatch(db, batch_id):
+        raise ValueError(f"Grouping batch {batch_id} could not be claimed for retry.")
+    try:
+        job = build_grouping_analysis_job_from_batch(db, batch_id)
+        result = start_grouping_analysis_job(job)
+    except Exception as exc:
+        repositories.update_grouping_batch(
+            db,
+            batch_id,
+            {
+                "status": "issue",
+                "issue_reason": str(exc),
+            },
+        )
+        raise
+    return {
+        "ok": True,
+        "batch_id": batch_id,
+        "script_run_id": result.script_run_id,
+        "runner_job_id": result.runner_job_id,
+        "status": result.status,
+    }
+
+
 def _finalize_remote_grouping_script_run(
     db: Session,
     *,

@@ -135,3 +135,11 @@ def run_grouping_now(db: Session = Depends(get_transaction_db)) -> dict[str, Any
         "dispatched": False,
         "message": "No retrieved, ungrouped trigger frames are ready for manual grouping.",
     }
+
+
+@router.post("/grouping-batches/{batch_id}/retry")
+def retry_grouping_batch(batch_id: int, db: Session = Depends(get_transaction_db)) -> dict[str, Any]:
+    try:
+        return workflow_service.retry_grouping_batch_now(db, batch_id=batch_id)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

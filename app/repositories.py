@@ -1930,6 +1930,28 @@ def update_grouping_batch(db: Session, batch_id: int, payload: Mapping[str, Any]
     return get_grouping_batch(db, batch_id)
 
 
+def reset_grouping_batch_for_retry(db: Session, batch_id: int) -> dict[str, Any]:
+    table_name = _table("filter_grouping_batch")
+    db.execute(
+        text(
+            f"""
+            update {table_name}
+            set status = 'pending',
+                issue_reason = null,
+                result_payload = null,
+                started_at = null,
+                finished_at = null,
+                updated_at = now()
+            where id = :batch_id
+              and status in ('failed', 'issue')
+            """
+        ),
+        {"batch_id": batch_id},
+    )
+    db.commit()
+    return get_grouping_batch(db, batch_id)
+
+
 def upsert_grouping_item(
     db: Session,
     *,
