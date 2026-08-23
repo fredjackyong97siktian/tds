@@ -5887,7 +5887,15 @@ def start_trigger_frame_asset_retrieval_job(job: TriggerFrameAssetRetrievalQueue
         )
         ok_count = sum(1 for row in frame_rows if row.get("status") == "ok")
         final_status = "retrieved" if ok_count else "issue"
-        error = None if ok_count else "No trigger frames were retrieved."
+        if ok_count >= frame_count:
+            error = None
+        elif ok_count:
+            error = (
+                f"Retrieved {ok_count}/{frame_count} trigger frames. "
+                "Check the retrieve_video script log for missing-frame ffmpeg errors."
+            )
+        else:
+            error = "No trigger frames were retrieved."
         repositories.update_trigger_frame_asset_status(db, job.frame_asset_id, final_status, error=error)
         repositories.finish_script_run(
             db,
