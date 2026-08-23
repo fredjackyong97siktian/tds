@@ -90,3 +90,47 @@ def prepare_grouping_batches(db: Session = Depends(get_transaction_db)) -> dict[
         "prepared_count": len(batches),
         "batches": batches,
     }
+
+
+@router.post("/grouping-batches/run-now")
+def run_grouping_now(db: Session = Depends(get_transaction_db)) -> dict[str, Any]:
+    try:
+        prepared_batches = workflow_service.prepare_due_grouping_batches(db)
+        if repositories.has_active_remote_analysis_script_run(db, script_names=["grouping"]):
+            raise HTTPException(status_code=409, detail="Grouping is already dispatching or running.")
+        pending_batches = repositories.list_pending_grouping_batches(db, limit=20)
+        for batch in pending_batches:
+            batch_id = int(batch["id"])
+            if not repositories.claim_grouping_batch_for_dispatch(db, batch_id):
+                continue
+            try:
+                job = workflow_service.build_grouping_analysis_job_from_batch(db, batch_id)
+                result = workflow_service.start_grouping_analysis_job(job)
+            except Exception as exc:
+                repositories.update_grouping_batch(
+                    db,
+                    batch_id,
+                    {
+                        "status": "issue",
+                        "issue_reason": str(exc),
+                    },
+                )
+                raise
+            return {
+                "ok": True,
+                "prepared_count": len(prepared_batches),
+                "dispatched": True,
+                "batch_id": batch_id,
+                "script_run_id": result.script_run_id,
+                "runner_job_id": result.runner_job_id,
+            }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "prepared_count": len(prepared_batches),
+        "dispatched": False,
+        "message": "No pending grouping batch is ready to dispatch.",
+    }

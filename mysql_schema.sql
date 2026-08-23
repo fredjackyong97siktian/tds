@@ -340,7 +340,7 @@ CREATE TABLE IF NOT EXISTS sesamedb.tds_filter_grouping_batch (
     CONSTRAINT fk_filter_grouping_batch_script_run
         FOREIGN KEY (script_run_id) REFERENCES tds_script_run(id) ON DELETE SET NULL,
     CONSTRAINT chk_filter_grouping_batch_status
-        CHECK (status IN ('pending', 'running', 'success', 'failed', 'issue'))
+        CHECK (status IN ('pending', 'dispatching', 'running', 'success', 'failed', 'issue'))
 );
 
 CREATE TABLE IF NOT EXISTS sesamedb.tds_filter_grouping_item (

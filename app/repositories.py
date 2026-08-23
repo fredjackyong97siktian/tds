@@ -1933,6 +1933,22 @@ def list_pending_grouping_batches(db: Session, limit: int = 50) -> list[dict[str
     return _fetch_all_dicts(result)
 
 
+def claim_grouping_batch_for_dispatch(db: Session, batch_id: int) -> bool:
+    table_name = _table("filter_grouping_batch")
+    result = db.execute(
+        text(
+            f"""
+            update {table_name}
+            set status = 'dispatching'
+            where id = :batch_id and status = 'pending'
+            """
+        ),
+        {"batch_id": batch_id},
+    )
+    db.commit()
+    return int(result.rowcount or 0) > 0
+
+
 def list_running_grouping_batches(db: Session) -> list[dict[str, Any]]:
     table_name = _table("filter_grouping_batch")
     result = db.execute(
@@ -1941,7 +1957,7 @@ def list_running_grouping_batches(db: Session) -> list[dict[str, Any]]:
             select id, location_id, period_code, window_start, window_end, script_run_id, status,
                    manifest_url, manifest_object_key, result_payload, issue_reason, started_at, finished_at, created_at, updated_at
             from {table_name}
-            where status = 'running'
+            where status in ('dispatching', 'running')
             order by started_at asc, id asc
             """
         )

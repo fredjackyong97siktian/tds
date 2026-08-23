@@ -45,6 +45,20 @@ ALTER TABLE sesamedb.tds_video_asset
         'issue'
     ));
 
+ALTER TABLE sesamedb.tds_filter_grouping_batch
+    DROP CHECK chk_filter_grouping_batch_status;
+
+ALTER TABLE sesamedb.tds_filter_grouping_batch
+    ADD CONSTRAINT chk_filter_grouping_batch_status
+    CHECK (status IN (
+        'pending',
+        'dispatching',
+        'running',
+        'success',
+        'failed',
+        'issue'
+    ));
+
 CREATE TABLE IF NOT EXISTS sesamedb.tds_trigger_frame_asset (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     trigger_id BIGINT NOT NULL,

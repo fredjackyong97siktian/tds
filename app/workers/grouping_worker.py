@@ -100,6 +100,8 @@ class GroupingWorker:
                 if available_slots <= 0:
                     break
                 batch_id = int(candidate["id"])
+                if not repositories.claim_grouping_batch_for_dispatch(db, batch_id):
+                    continue
                 try:
                     job = workflow_service.build_grouping_analysis_job_from_batch(db, batch_id)
                     future = self._executor.submit(workflow_service.start_grouping_analysis_job, job)
