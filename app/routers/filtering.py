@@ -95,7 +95,7 @@ def prepare_grouping_batches(db: Session = Depends(get_transaction_db)) -> dict[
 @router.post("/grouping-batches/run-now")
 def run_grouping_now(db: Session = Depends(get_transaction_db)) -> dict[str, Any]:
     try:
-        prepared_batches = workflow_service.prepare_due_grouping_batches(db)
+        prepared_batches = workflow_service.prepare_manual_grouping_batches(db)
         if repositories.has_active_remote_analysis_script_run(db, script_names=["grouping"]):
             raise HTTPException(status_code=409, detail="Grouping is already dispatching or running.")
         pending_batches = repositories.list_pending_grouping_batches(db, limit=20)
@@ -132,5 +132,5 @@ def run_grouping_now(db: Session = Depends(get_transaction_db)) -> dict[str, Any
         "ok": True,
         "prepared_count": len(prepared_batches),
         "dispatched": False,
-        "message": "No pending grouping batch is ready to dispatch.",
+        "message": "No retrieved, ungrouped trigger frames are ready for manual grouping.",
     }

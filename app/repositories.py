@@ -1573,6 +1573,66 @@ def list_trigger_frame_assets_for_window(
     return rows
 
 
+def list_manual_grouping_ready_trigger_frame_assets(
+    db: Session,
+    *,
+    location_id: int,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    frame_asset_table = _table("trigger_frame_asset")
+    frame_table = _table("trigger_frame")
+    trigger_table = _table("trigger_event")
+    grouping_item_table = _table("filter_grouping_item")
+    result = db.execute(
+        text(
+            f"""
+            select te.id as trigger_id,
+                   te.location_id,
+                   te.trigger_time,
+                   te.phone_entry_id,
+                   te.credit_card_entry_id,
+                   te.entry_source_type,
+                   fa.id as frame_asset_id,
+                   fa.status as frame_asset_status,
+                   fa.created_at as frame_asset_created_at
+            from {trigger_table} te
+            join {frame_asset_table} fa on fa.trigger_id = te.id
+            left join {grouping_item_table} gi on gi.trigger_id = te.id
+            where te.location_id = :location_id
+              and te.whitelist_hit = 0
+              and te.status <> 'whitelisted'
+              and (te.phone_entry_id is not null or te.credit_card_entry_id is not null)
+              and fa.status = 'retrieved'
+              and gi.id is null
+            order by te.trigger_time asc, te.id asc, fa.id asc
+            limit :limit
+            """
+        ),
+        {"location_id": location_id, "limit": limit},
+    )
+    rows = _fetch_all_dicts(result)
+    frame_asset_ids = [int(row["frame_asset_id"]) for row in rows if row.get("frame_asset_id") is not None]
+    frames_by_asset: dict[int, list[dict[str, Any]]] = {}
+    if frame_asset_ids:
+        frame_result = db.execute(
+            text(
+                f"""
+                select id, frame_asset_id, trigger_id, frame_index, sample_time, image_url, status, created_at
+                from {frame_table}
+                where frame_asset_id in :frame_asset_ids
+                  and status <> 'deleted'
+                order by frame_asset_id asc, frame_index asc, id asc
+                """
+            ).bindparams(bindparam("frame_asset_ids", expanding=True)),
+            {"frame_asset_ids": frame_asset_ids},
+        )
+        for frame in _fetch_all_dicts(frame_result):
+            frames_by_asset.setdefault(int(frame["frame_asset_id"]), []).append(frame)
+    for row in rows:
+        row["trigger_frames"] = frames_by_asset.get(int(row["frame_asset_id"]), [])
+    return rows
+
+
 def list_filter_time_periods(db: Session, *, selected_only: bool = False) -> list[dict[str, Any]]:
     table_name = _table("filter_time_period")
     where_selected = "where selected = 1" if selected_only else ""

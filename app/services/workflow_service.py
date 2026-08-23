@@ -2541,6 +2541,45 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
     return prepared
 
 
+def prepare_manual_grouping_batches(db: Session) -> list[dict[str, Any]]:
+    locations = repositories.list_locations(db)
+    prepared: list[dict[str, Any]] = []
+    for location in locations:
+        location_id = int(location["id"])
+        trigger_assets = repositories.list_manual_grouping_ready_trigger_frame_assets(
+            db,
+            location_id=location_id,
+            limit=200,
+        )
+        if not trigger_assets:
+            continue
+        window_start = min(
+            _coerce_datetime_value(row.get("trigger_time")) or datetime.now()
+            for row in trigger_assets
+        )
+        window_end = max(
+            _coerce_datetime_value(row.get("trigger_time")) or datetime.now()
+            for row in trigger_assets
+        ) + timedelta(seconds=1)
+        batch = repositories.create_grouping_batch(
+            db,
+            location_id=location_id,
+            period_code="manual",
+            window_start=window_start,
+            window_end=window_end,
+        )
+        for row in trigger_assets:
+            repositories.upsert_grouping_item(
+                db,
+                batch_id=int(batch["id"]),
+                trigger_id=int(row["trigger_id"]),
+                video_asset_id=None,
+                frame_payload={"frames": _frame_urls_from_trigger_frame_asset(row)},
+            )
+        prepared.append(batch)
+    return prepared
+
+
 def build_grouping_analysis_job_from_batch(db: Session, batch_id: int) -> GroupingAnalysisQueued:
     batch = repositories.get_grouping_batch(db, batch_id)
     items = repositories.list_grouping_items(db, batch_id)
