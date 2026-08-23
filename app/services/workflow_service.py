@@ -5489,7 +5489,27 @@ def _run_trigger_frame_retrieval_job(
             filename = f"trigger_{trigger_id}_frame_{index:02d}_{sample_time.strftime('%Y%m%d_%H%M%S')}.jpg"
             local_path = frame_root / filename
             command = _build_frame_capture_command(rtsp_url, offset_seconds, local_path)
-            completed = subprocess.run(command, capture_output=True, text=True)
+            try:
+                completed = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=max(1, int(settings.retrieval_ffmpeg_timeout_seconds)),
+                )
+            except subprocess.TimeoutExpired as exc:
+                timeout_stderr = str(exc.stderr or f"ffmpeg timed out after {settings.retrieval_ffmpeg_timeout_seconds}s")
+                stdout_parts.append(str(exc.stdout or ""))
+                stderr_parts.append(timeout_stderr)
+                frame_payload.append(
+                    {
+                        "index": index,
+                        "sample_time": sample_time.isoformat(),
+                        "offset_seconds": round(float(offset_seconds), 3),
+                        "status": "failed",
+                        "stderr": timeout_stderr[-1000:],
+                    }
+                )
+                continue
             stdout_parts.append(completed.stdout or "")
             stderr_parts.append(completed.stderr or "")
             frame_record: dict[str, Any] = {
@@ -5733,7 +5753,25 @@ def start_trigger_frame_asset_retrieval_job(job: TriggerFrameAssetRetrievalQueue
             )
             local_path = output_dir / filename
             command = _build_frame_capture_command(job.rtsp_url, offset_seconds, local_path)
-            completed = subprocess.run(command, capture_output=True, text=True)
+            try:
+                completed = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=max(1, int(settings.retrieval_ffmpeg_timeout_seconds)),
+                )
+            except subprocess.TimeoutExpired as exc:
+                stdout_parts.append(str(exc.stdout or ""))
+                stderr_parts.append(str(exc.stderr or f"ffmpeg timed out after {settings.retrieval_ffmpeg_timeout_seconds}s"))
+                frame_rows.append(
+                    {
+                        "frame_index": index,
+                        "sample_time": sample_time,
+                        "image_url": None,
+                        "status": "failed",
+                    }
+                )
+                continue
             stdout_parts.append(completed.stdout or "")
             stderr_parts.append(completed.stderr or "")
             row: dict[str, Any] = {

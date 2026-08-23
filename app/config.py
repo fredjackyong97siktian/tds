@@ -50,6 +50,8 @@ class Settings(BaseSettings):
     retrieval_poll_seconds: int = 10
     retrieval_max_global_workers: int = 2
     retrieval_max_per_location: int = 1
+    retrieval_ffmpeg_timeout_seconds: int = 60
+    retrieval_stale_seconds: int = 900
     trigger_frame_count: int = 10
     trigger_frame_gap: int = 12
     trigger_frame_fps: int = 25

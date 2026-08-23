@@ -1175,6 +1175,25 @@ def list_running_trigger_frame_asset_retrievals(db: Session) -> list[dict[str, A
     return _fetch_all_dicts(result)
 
 
+def reset_stale_trigger_frame_asset_retrievals(db: Session, stale_seconds: int) -> int:
+    frame_asset_table = _table("trigger_frame_asset")
+    result = db.execute(
+        text(
+            f"""
+            update {frame_asset_table}
+            set status = 'not_retrieved',
+                error = concat('Reset stale retrieval after ', :stale_seconds, ' seconds.'),
+                updated_at = now()
+            where status = 'retrieving'
+              and timestampdiff(second, updated_at, now()) > :stale_seconds
+            """
+        ),
+        {"stale_seconds": max(1, int(stale_seconds))},
+    )
+    db.commit()
+    return int(result.rowcount or 0)
+
+
 def claim_trigger_frame_asset_for_retrieval(db: Session, frame_asset_id: int) -> bool:
     frame_asset_table = _table("trigger_frame_asset")
     result = db.execute(
