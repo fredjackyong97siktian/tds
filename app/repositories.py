@@ -1605,7 +1605,6 @@ def list_manual_grouping_ready_trigger_frame_assets(
             where te.location_id = :location_id
               and te.whitelist_hit = 0
               and te.status <> 'whitelisted'
-              and (te.phone_entry_id is not null or te.credit_card_entry_id is not null)
               and fa.status = 'retrieved'
               and gb.id is null
             order by te.trigger_time asc, te.id asc, fa.id asc
