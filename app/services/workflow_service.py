@@ -2568,6 +2568,15 @@ def prepare_manual_grouping_batches(db: Session) -> list[dict[str, Any]]:
             window_start=window_start,
             window_end=window_end,
         )
+        if str(batch.get("status") or "").strip().lower() in {"failed", "issue"}:
+            batch = repositories.update_grouping_batch(
+                db,
+                int(batch["id"]),
+                {
+                    "status": "pending",
+                    "issue_reason": "Manual grouping retry queued.",
+                },
+            )
         for row in trigger_assets:
             repositories.upsert_grouping_item(
                 db,

@@ -1583,6 +1583,7 @@ def list_manual_grouping_ready_trigger_frame_assets(
     frame_table = _table("trigger_frame")
     trigger_table = _table("trigger_event")
     grouping_item_table = _table("filter_grouping_item")
+    grouping_batch_table = _table("filter_grouping_batch")
     result = db.execute(
         text(
             f"""
@@ -1598,12 +1599,15 @@ def list_manual_grouping_ready_trigger_frame_assets(
             from {trigger_table} te
             join {frame_asset_table} fa on fa.trigger_id = te.id
             left join {grouping_item_table} gi on gi.trigger_id = te.id
+            left join {grouping_batch_table} gb
+                   on gb.id = gi.batch_id
+                  and gb.status in ('pending', 'dispatching', 'running', 'success')
             where te.location_id = :location_id
               and te.whitelist_hit = 0
               and te.status <> 'whitelisted'
               and (te.phone_entry_id is not null or te.credit_card_entry_id is not null)
               and fa.status = 'retrieved'
-              and gi.id is null
+              and gb.id is null
             order by te.trigger_time asc, te.id asc, fa.id asc
             limit :limit
             """
