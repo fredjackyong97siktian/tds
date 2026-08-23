@@ -5453,6 +5453,24 @@ def _build_frame_batch_capture_command(
     ]
 
 
+def _build_frame_capture_command(rtsp_url: str, offset_seconds: float, output_path: Path) -> list[str]:
+    return [
+        settings.ffmpeg_bin,
+        "-y",
+        "-rtsp_transport",
+        "tcp",
+        "-i",
+        rtsp_url,
+        "-ss",
+        f"{max(0.0, offset_seconds):.3f}",
+        "-frames:v",
+        "1",
+        "-q:v",
+        "2",
+        str(output_path),
+    ]
+
+
 def _run_trigger_frame_retrieval_job(
     *,
     video_asset_id: int,
@@ -5500,7 +5518,6 @@ def _run_trigger_frame_retrieval_job(
             frame_count=frame_count,
             output_pattern=output_pattern,
         )
-        completed_returncode = 1
         completed_stderr = ""
         try:
             completed = subprocess.run(
@@ -5509,7 +5526,6 @@ def _run_trigger_frame_retrieval_job(
                 text=True,
                 timeout=max(1, int(settings.retrieval_ffmpeg_timeout_seconds)),
             )
-            completed_returncode = completed.returncode
             stdout_parts.append(completed.stdout or "")
             stderr_parts.append(completed.stderr or "")
             completed_stderr = str(completed.stderr or "").strip()
@@ -5517,6 +5533,28 @@ def _run_trigger_frame_retrieval_job(
             completed_stderr = str(exc.stderr or f"ffmpeg timed out after {settings.retrieval_ffmpeg_timeout_seconds}s")
             stdout_parts.append(str(exc.stdout or ""))
             stderr_parts.append(completed_stderr)
+
+        batch_paths = [
+            frame_root / f"trigger_{trigger_id}_frame_{index:02d}.jpg"
+            for index in range(1, frame_count + 1)
+        ]
+        if not any(path.exists() for path in batch_paths):
+            stderr_parts.append("Batch frame capture produced no images; falling back to per-frame capture.")
+            for index, offset_seconds in enumerate(offsets, start=1):
+                local_path = frame_root / f"trigger_{trigger_id}_frame_{index:02d}.jpg"
+                fallback_command = _build_frame_capture_command(rtsp_url, offset_seconds, local_path)
+                try:
+                    completed = subprocess.run(
+                        fallback_command,
+                        capture_output=True,
+                        text=True,
+                        timeout=max(1, int(settings.retrieval_ffmpeg_timeout_seconds)),
+                    )
+                    stdout_parts.append(completed.stdout or "")
+                    stderr_parts.append(completed.stderr or "")
+                except subprocess.TimeoutExpired as exc:
+                    stdout_parts.append(str(exc.stdout or ""))
+                    stderr_parts.append(str(exc.stderr or f"ffmpeg timed out after {settings.retrieval_ffmpeg_timeout_seconds}s"))
 
         frame_payload: list[dict[str, Any]] = []
         for index, offset_seconds in enumerate(offsets, start=1):
@@ -5527,7 +5565,7 @@ def _run_trigger_frame_retrieval_job(
                 "index": index,
                 "sample_time": sample_time.isoformat(),
                 "offset_seconds": round(float(offset_seconds), 3),
-                "status": "ok" if completed_returncode == 0 and local_path.exists() else "failed",
+                "status": "ok" if local_path.exists() else "failed",
                 "stderr": completed_stderr[-1000:],
             }
             if frame_record["status"] == "ok":
@@ -5763,7 +5801,6 @@ def start_trigger_frame_asset_retrieval_job(job: TriggerFrameAssetRetrievalQueue
             frame_count=frame_count,
             output_pattern=output_pattern,
         )
-        completed_returncode = 1
         try:
             completed = subprocess.run(
                 command,
@@ -5771,12 +5808,33 @@ def start_trigger_frame_asset_retrieval_job(job: TriggerFrameAssetRetrievalQueue
                 text=True,
                 timeout=max(1, int(settings.retrieval_ffmpeg_timeout_seconds)),
             )
-            completed_returncode = completed.returncode
             stdout_parts.append(completed.stdout or "")
             stderr_parts.append(completed.stderr or "")
         except subprocess.TimeoutExpired as exc:
             stdout_parts.append(str(exc.stdout or ""))
             stderr_parts.append(str(exc.stderr or f"ffmpeg timed out after {settings.retrieval_ffmpeg_timeout_seconds}s"))
+
+        batch_paths = [
+            output_dir / f"trigger_{job.trigger_id}_asset_{job.frame_asset_id}_frame_{index:02d}.jpg"
+            for index in range(1, frame_count + 1)
+        ]
+        if not any(path.exists() for path in batch_paths):
+            stderr_parts.append("Batch frame capture produced no images; falling back to per-frame capture.")
+            for index, offset_seconds in enumerate(offsets, start=1):
+                local_path = output_dir / f"trigger_{job.trigger_id}_asset_{job.frame_asset_id}_frame_{index:02d}.jpg"
+                fallback_command = _build_frame_capture_command(job.rtsp_url, offset_seconds, local_path)
+                try:
+                    completed = subprocess.run(
+                        fallback_command,
+                        capture_output=True,
+                        text=True,
+                        timeout=max(1, int(settings.retrieval_ffmpeg_timeout_seconds)),
+                    )
+                    stdout_parts.append(completed.stdout or "")
+                    stderr_parts.append(completed.stderr or "")
+                except subprocess.TimeoutExpired as exc:
+                    stdout_parts.append(str(exc.stdout or ""))
+                    stderr_parts.append(str(exc.stderr or f"ffmpeg timed out after {settings.retrieval_ffmpeg_timeout_seconds}s"))
 
         frame_rows: list[dict[str, Any]] = []
         for index, offset_seconds in enumerate(offsets, start=1):
@@ -5792,7 +5850,7 @@ def start_trigger_frame_asset_retrieval_job(job: TriggerFrameAssetRetrievalQueue
                 "image_url": None,
                 "status": "failed",
             }
-            if completed_returncode == 0 and local_path.exists():
+            if local_path.exists():
                 object_key = _trigger_frame_spaces_key(
                     location_id=job.location_id,
                     trigger_id=job.trigger_id,
