@@ -76,6 +76,7 @@ def list_grouping_batches(db: Session = Depends(get_transaction_db)) -> dict[str
     return {
         "pending": repositories.list_pending_grouping_batches(db, limit=200),
         "running": repositories.list_running_grouping_batches(db),
+        "recent": repositories.list_recent_grouping_batches(db, limit=100),
     }
 
 

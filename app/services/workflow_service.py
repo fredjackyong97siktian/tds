@@ -96,6 +96,10 @@ def get_script_run_details_by_runner_job_id(db: Session, runner_job_id: str) -> 
     return _build_script_run_details(record)
 
 
+def list_script_run_details(db: Session, limit: int = 100) -> list[dict[str, Any]]:
+    return [_build_script_run_details(record) for record in repositories.list_script_runs(db, limit=limit)]
+
+
 def get_latest_script_run_details_for_session(
     db: Session,
     session_id: int,

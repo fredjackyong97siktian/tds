@@ -57,6 +57,15 @@ def run_kiosk(
     return ScriptRunResponse(**result.__dict__)
 
 
+@router.get("/script-runs", response_model=list[ScriptRunDetailResponse])
+def list_script_runs(
+    limit: int = 100,
+    db: Session = Depends(get_transaction_db),
+) -> list[ScriptRunDetailResponse]:
+    rows = workflow_service.list_script_run_details(db, limit=max(1, min(limit, 500)))
+    return [ScriptRunDetailResponse(**row) for row in rows]
+
+
 @router.get("/script-runs/{script_run_id}", response_model=ScriptRunDetailResponse)
 def get_script_run(
     script_run_id: int,

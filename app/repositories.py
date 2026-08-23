@@ -2028,6 +2028,31 @@ def list_running_grouping_batches(db: Session) -> list[dict[str, Any]]:
     return _fetch_all_dicts(result)
 
 
+def list_recent_grouping_batches(db: Session, limit: int = 50) -> list[dict[str, Any]]:
+    table_name = _table("filter_grouping_batch")
+    result = db.execute(
+        text(
+            f"""
+            select id, location_id, period_code, window_start, window_end, script_run_id, status,
+                   manifest_url, manifest_object_key, result_payload, issue_reason, started_at, finished_at, created_at, updated_at
+            from {table_name}
+            where status in ('success', 'failed', 'issue')
+            order by coalesce(finished_at, updated_at, created_at) desc, id desc
+            limit :limit
+            """
+        ),
+        {"limit": limit},
+    )
+    rows = _fetch_all_dicts(result)
+    for row in rows:
+        if isinstance(row.get("result_payload"), str):
+            try:
+                row["result_payload"] = json.loads(row["result_payload"])
+            except json.JSONDecodeError:
+                pass
+    return rows
+
+
 def list_grouping_items(db: Session, batch_id: int) -> list[dict[str, Any]]:
     table_name = _table("filter_grouping_item")
     result = db.execute(
@@ -2050,6 +2075,30 @@ def list_grouping_items(db: Session, batch_id: int) -> list[dict[str, Any]]:
                     row[key] = json.loads(row[key])
                 except json.JSONDecodeError:
                     pass
+    return rows
+
+
+def list_script_runs(db: Session, limit: int = 100) -> list[dict[str, Any]]:
+    script_run_table = _table("script_run")
+    result = db.execute(
+        text(
+            f"""
+            select id, session_id, trigger_id, script_name, model_name, runner_job_id, runner_payload,
+                   status, command, stdout_log, stderr_log, started_at, finished_at
+            from {script_run_table}
+            order by started_at desc, id desc
+            limit :limit
+            """
+        ),
+        {"limit": limit},
+    )
+    rows = _fetch_all_dicts(result)
+    for row in rows:
+        if isinstance(row.get("runner_payload"), str):
+            try:
+                row["runner_payload"] = json.loads(row["runner_payload"])
+            except json.JSONDecodeError:
+                pass
     return rows
 
 
