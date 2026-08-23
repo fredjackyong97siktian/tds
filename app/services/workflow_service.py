@@ -5471,6 +5471,15 @@ def _build_frame_capture_command(rtsp_url: str, offset_seconds: float, output_pa
     ]
 
 
+def _trigger_frame_offsets(duration_seconds: float, frame_count: int) -> list[float]:
+    frame_count = max(1, int(frame_count))
+    duration_seconds = max(0.0, float(duration_seconds))
+    if frame_count == 1 or duration_seconds <= 0:
+        return [0.0 for _ in range(frame_count)]
+    step_seconds = duration_seconds / max(1, frame_count - 1)
+    return [min(duration_seconds, index * step_seconds) for index in range(frame_count)]
+
+
 def _run_trigger_frame_retrieval_job(
     *,
     video_asset_id: int,
@@ -5504,11 +5513,8 @@ def _run_trigger_frame_retrieval_job(
         frame_root.mkdir(parents=True, exist_ok=True)
         duration_seconds = max(0.0, (end_time - start_time).total_seconds())
         frame_count = max(1, int(settings.trigger_frame_count))
-        gap_seconds = max(0.04, float(settings.trigger_frame_gap) / max(1, int(settings.trigger_frame_fps)))
-        offsets = [
-            max(0.0, duration_seconds - ((frame_count - index) * gap_seconds))
-            for index in range(1, frame_count + 1)
-        ]
+        offsets = _trigger_frame_offsets(duration_seconds, frame_count)
+        gap_seconds = max(0.04, offsets[1] - offsets[0] if len(offsets) > 1 else duration_seconds or 1.0)
 
         output_pattern = frame_root / f"trigger_{trigger_id}_frame_%02d.jpg"
         command = _build_frame_batch_capture_command(
@@ -5591,9 +5597,9 @@ def _run_trigger_frame_retrieval_job(
         final_status = "10_frames_retrieved" if ok_frames else "issue"
         metadata = {
             "retrieval_mode": "trigger_frames",
+            "sampling_strategy": "even_window",
             "frame_count_requested": frame_count,
-            "frame_gap": int(settings.trigger_frame_gap),
-            "frame_fps": int(settings.trigger_frame_fps),
+            "frame_gap_seconds": round(float(gap_seconds), 3),
             "frames_retrieved_count": len(ok_frames),
             "frames": frame_payload,
         }
@@ -5794,11 +5800,8 @@ def start_trigger_frame_asset_retrieval_job(job: TriggerFrameAssetRetrievalQueue
         output_dir.mkdir(parents=True, exist_ok=True)
         duration_seconds = max(0.0, (job.requested_end_time - job.requested_start_time).total_seconds())
         frame_count = max(1, int(settings.trigger_frame_count))
-        gap_seconds = max(0.04, float(settings.trigger_frame_gap) / max(1, int(settings.trigger_frame_fps)))
-        offsets = [
-            max(0.0, duration_seconds - ((frame_count - index) * gap_seconds))
-            for index in range(1, frame_count + 1)
-        ]
+        offsets = _trigger_frame_offsets(duration_seconds, frame_count)
+        gap_seconds = max(0.04, offsets[1] - offsets[0] if len(offsets) > 1 else duration_seconds or 1.0)
 
         output_pattern = output_dir / f"trigger_{job.trigger_id}_asset_{job.frame_asset_id}_frame_%02d.jpg"
         command = _build_frame_batch_capture_command(
