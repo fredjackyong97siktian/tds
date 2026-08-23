@@ -5538,10 +5538,17 @@ def _run_trigger_frame_retrieval_job(
             frame_root / f"trigger_{trigger_id}_frame_{index:02d}.jpg"
             for index in range(1, frame_count + 1)
         ]
-        if not any(path.exists() for path in batch_paths):
-            stderr_parts.append("Batch frame capture produced no images; falling back to per-frame capture.")
-            for index, offset_seconds in enumerate(offsets, start=1):
-                local_path = frame_root / f"trigger_{trigger_id}_frame_{index:02d}.jpg"
+        missing_batch_paths = [
+            (index, offsets[index - 1], path)
+            for index, path in enumerate(batch_paths, start=1)
+            if not path.exists()
+        ]
+        if missing_batch_paths:
+            stderr_parts.append(
+                f"Batch frame capture produced {frame_count - len(missing_batch_paths)}/{frame_count} images; "
+                "falling back to per-frame capture for missing images."
+            )
+            for index, offset_seconds, local_path in missing_batch_paths:
                 fallback_command = _build_frame_capture_command(rtsp_url, offset_seconds, local_path)
                 try:
                     completed = subprocess.run(
@@ -5818,10 +5825,17 @@ def start_trigger_frame_asset_retrieval_job(job: TriggerFrameAssetRetrievalQueue
             output_dir / f"trigger_{job.trigger_id}_asset_{job.frame_asset_id}_frame_{index:02d}.jpg"
             for index in range(1, frame_count + 1)
         ]
-        if not any(path.exists() for path in batch_paths):
-            stderr_parts.append("Batch frame capture produced no images; falling back to per-frame capture.")
-            for index, offset_seconds in enumerate(offsets, start=1):
-                local_path = output_dir / f"trigger_{job.trigger_id}_asset_{job.frame_asset_id}_frame_{index:02d}.jpg"
+        missing_batch_paths = [
+            (index, offsets[index - 1], path)
+            for index, path in enumerate(batch_paths, start=1)
+            if not path.exists()
+        ]
+        if missing_batch_paths:
+            stderr_parts.append(
+                f"Batch frame capture produced {frame_count - len(missing_batch_paths)}/{frame_count} images; "
+                "falling back to per-frame capture for missing images."
+            )
+            for index, offset_seconds, local_path in missing_batch_paths:
                 fallback_command = _build_frame_capture_command(job.rtsp_url, offset_seconds, local_path)
                 try:
                     completed = subprocess.run(
