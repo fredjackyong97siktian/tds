@@ -2099,6 +2099,48 @@ def mark_grouping_batch_frame_assets_processed(db: Session, batch_id: int) -> in
     return int(result.rowcount or 0)
 
 
+def mark_grouping_batch_frame_assets_processing(db: Session, batch_id: int) -> int:
+    grouping_item_table = _table("filter_grouping_item")
+    frame_asset_table = _table("trigger_frame_asset")
+    result = db.execute(
+        text(
+            f"""
+            update {frame_asset_table} fa
+            join {grouping_item_table} gi on gi.trigger_id = fa.trigger_id
+            set fa.status = 'processing',
+                fa.error = null,
+                fa.updated_at = now()
+            where gi.batch_id = :batch_id
+              and fa.status = 'retrieved'
+            """
+        ),
+        {"batch_id": batch_id},
+    )
+    db.commit()
+    return int(result.rowcount or 0)
+
+
+def mark_grouping_batch_frame_assets_retrieved(db: Session, batch_id: int, *, error: str | None = None) -> int:
+    grouping_item_table = _table("filter_grouping_item")
+    frame_asset_table = _table("trigger_frame_asset")
+    result = db.execute(
+        text(
+            f"""
+            update {frame_asset_table} fa
+            join {grouping_item_table} gi on gi.trigger_id = fa.trigger_id
+            set fa.status = 'retrieved',
+                fa.error = :error,
+                fa.updated_at = now()
+            where gi.batch_id = :batch_id
+              and fa.status = 'processing'
+            """
+        ),
+        {"batch_id": batch_id, "error": error},
+    )
+    db.commit()
+    return int(result.rowcount or 0)
+
+
 def list_script_runs(db: Session, limit: int = 100) -> list[dict[str, Any]]:
     script_run_table = _table("script_run")
     result = db.execute(

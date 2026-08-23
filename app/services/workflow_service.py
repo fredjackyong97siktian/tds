@@ -2828,6 +2828,8 @@ def start_grouping_analysis_job(job: GroupingAnalysisQueued) -> ScriptExecutionR
                 "script_run_id": script_run_id,
             },
         )
+        processing_count = repositories.mark_grouping_batch_frame_assets_processing(db, job.batch_id)
+        logger.info("Marked grouping frame assets processing batch_id=%s count=%s", job.batch_id, processing_count)
         repositories.assign_script_run_runner_job(
             db,
             script_run_id,
@@ -2909,6 +2911,15 @@ def _finalize_remote_grouping_script_run(
         },
     )
     if remote_status != "success":
+        try:
+            restored_count = repositories.mark_grouping_batch_frame_assets_retrieved(
+                db,
+                batch_id,
+                error=remote_result.stderr or "Grouping RunPod job failed.",
+            )
+            logger.info("Restored grouping frame assets after failure batch_id=%s count=%s", batch_id, restored_count)
+        except Exception:
+            logger.exception("Could not restore grouping frame assets after failure batch_id=%s", batch_id)
         return result
     groups = grouping_summary.get("groups") or grouping_summary.get("Groups") or []
     grouped_trigger_ids: set[int] = set()
