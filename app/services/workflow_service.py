@@ -2772,6 +2772,7 @@ def _finalize_remote_grouping_script_run(
     if remote_status != "success":
         return result
     groups = grouping_summary.get("groups") or grouping_summary.get("Groups") or []
+    grouped_trigger_ids: set[int] = set()
     for group_index, group in enumerate(groups, start=1):
         if not isinstance(group, Mapping):
             continue
@@ -2782,6 +2783,7 @@ def _finalize_remote_grouping_script_run(
                 continue
             for trigger_id in trigger_ids:
                 try:
+                    grouped_trigger_ids.add(int(trigger_id))
                     repositories.upsert_grouping_item(
                         db,
                         batch_id=batch_id,
@@ -2799,10 +2801,13 @@ def _finalize_remote_grouping_script_run(
     if isinstance(unknown, list):
         for trigger_id in unknown:
             try:
+                normalized_trigger_id = int(trigger_id)
+                if normalized_trigger_id in grouped_trigger_ids:
+                    continue
                 repositories.upsert_grouping_item(
                     db,
                     batch_id=batch_id,
-                    trigger_id=int(trigger_id),
+                    trigger_id=normalized_trigger_id,
                     video_asset_id=None,
                     group_key=None,
                     role="unknown",
