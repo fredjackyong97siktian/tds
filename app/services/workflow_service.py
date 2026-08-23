@@ -1885,7 +1885,7 @@ def process_runpod_webhook(
 
 def _is_runpod_terminal_status(status: str) -> bool:
     normalized = str(status or "").strip().upper()
-    return normalized in {"COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT", "ABORTED"}
+    return normalized in {"COMPLETED", "FAILED", "CANCELLED", "CANCELED", "TIMED_OUT", "ABORTED"}
 
 
 def _fetch_runpod_status_with_retries(
