@@ -2078,7 +2078,9 @@ def _person_frame_urls_by_trigger(grouping_summary: Mapping[str, Any]) -> dict[i
 def _repair_grouping_with_gemini(
     db: Session,
     *,
-    script_run_id: int | None,
+    parent_script_run_id: int | None,
+    batch_id: int | None = None,
+    location_id: int | None = None,
     grouping_summary: dict[str, Any],
 ) -> dict[str, Any]:
     existing_repair = grouping_summary.get("gemini_repair")
@@ -2138,6 +2140,24 @@ def _repair_grouping_with_gemini(
         }
         return grouping_summary
 
+    repair_script_run_id = repositories.create_script_run_started(
+        db,
+        session_id=None,
+        trigger_id=None,
+        script_name="grouping",
+        model_name="gemini_grouping_repair",
+        runner_payload={
+            "batch_id": batch_id,
+            "location_id": location_id,
+            "parent_script_run_id": parent_script_run_id,
+            "candidate_trigger_ids": candidate_trigger_ids,
+            "image_count": len(image_urls),
+        },
+        status="running",
+        command=SCRIPT_RUN_COMMAND_REDACTED,
+        stdout_log="",
+        stderr_log="",
+    )
     prompt = (
         "You are repairing retail entrance/exit grouping. Each trigger is a door event. "
         "A group should identify the same person across triggers. A trigger must never be both entry and exit in the same group. "
@@ -2152,10 +2172,26 @@ def _repair_grouping_with_gemini(
     )
     try:
         repair_result, repair_meta = _call_kiosk_gemini_summary(prompt=prompt, image_urls=image_urls)
-        repair_cost = _record_gemini_cost(db, script_run_id, repair_meta) if script_run_id is not None else {}
+        repair_cost = _record_gemini_cost(db, repair_script_run_id, repair_meta)
     except Exception as exc:
+        repositories.finish_script_run(
+            db,
+            repair_script_run_id,
+            status="failed",
+            stdout_log=json.dumps(
+                {
+                    "candidate_trigger_ids": candidate_trigger_ids,
+                    "image_count": len(image_urls),
+                    "image_mapping": image_notes,
+                },
+                indent=2,
+                default=str,
+            ),
+            stderr_log=str(exc),
+        )
         grouping_summary["gemini_repair"] = {
             "status": "failed",
+            "script_run_id": repair_script_run_id,
             "error": str(exc),
             "candidate_trigger_ids": candidate_trigger_ids,
             "image_urls": image_urls,
@@ -2192,6 +2228,29 @@ def _repair_grouping_with_gemini(
         consumed_trigger_ids.update(entry_ids)
         consumed_trigger_ids.update(exit_ids[:1])
 
+    repositories.finish_script_run(
+        db,
+        repair_script_run_id,
+        status="success",
+        stdout_log=json.dumps(
+            {
+                "candidate_trigger_ids": candidate_trigger_ids,
+                "image_mapping": image_notes,
+                "result": repair_result,
+                "applied_groups": repaired_groups,
+                "remaining_unknown": sorted(
+                    {
+                        trigger_id
+                        for trigger_id in candidate_trigger_ids + unknown_trigger_ids
+                        if trigger_id not in consumed_trigger_ids
+                    }
+                ),
+            },
+            indent=2,
+            default=str,
+        ),
+        stderr_log="",
+    )
     remaining_open_groups = [
         group
         for group in open_groups
@@ -2210,6 +2269,7 @@ def _repair_grouping_with_gemini(
     grouping_summary["unknown"] = remaining_unknown
     grouping_summary["gemini_repair"] = {
         "status": "success",
+        "script_run_id": repair_script_run_id,
         "input": {
             "open_groups": open_groups,
             "unknown": unknown_trigger_ids,
@@ -3708,7 +3768,9 @@ def run_theft_confidence_for_grouping_batch(
     grouping_summary_before_repair = json.dumps(grouping_summary, sort_keys=True, default=str)
     repaired_grouping_summary = _repair_grouping_with_gemini(
         db,
-        script_run_id=int(batch["script_run_id"]) if batch.get("script_run_id") is not None else None,
+        parent_script_run_id=int(batch["script_run_id"]) if batch.get("script_run_id") is not None else None,
+        batch_id=batch_id,
+        location_id=int(batch.get("location_id") or 0) or None,
         grouping_summary=grouping_summary,
     )
     grouping_summary_after_repair = json.dumps(repaired_grouping_summary, sort_keys=True, default=str)
