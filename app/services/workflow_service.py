@@ -97,8 +97,24 @@ def get_script_run_details_by_runner_job_id(db: Session, runner_job_id: str) -> 
     return _build_script_run_details(record)
 
 
-def list_script_run_details(db: Session, limit: int = 100) -> list[dict[str, Any]]:
-    return [_build_script_run_details(record) for record in repositories.list_script_runs(db, limit=limit)]
+def list_script_run_details(
+    db: Session,
+    limit: int = 100,
+    *,
+    script_name: str | None = None,
+    script_type: str | None = None,
+    model_name: str | None = None,
+) -> list[dict[str, Any]]:
+    return [
+        _build_script_run_details(record)
+        for record in repositories.list_script_runs(
+            db,
+            limit=limit,
+            script_name=script_name,
+            script_type=script_type,
+            model_name=model_name,
+        )
+    ]
 
 
 def get_latest_script_run_details_for_session(
@@ -895,6 +911,29 @@ def _record_gemini_cost(db: Session, script_run_id: int, gemini_meta: Mapping[st
     return detail
 
 
+def _create_gemini_script_run(
+    db: Session,
+    *,
+    session_id: int | None,
+    trigger_id: int | None,
+    script_name: str,
+    model_name: str,
+    runner_payload: Mapping[str, Any],
+) -> int:
+    return repositories.create_script_run_started(
+        db,
+        session_id=session_id,
+        trigger_id=trigger_id,
+        script_name=script_name,
+        model_name=model_name,
+        runner_payload=runner_payload,
+        status="running",
+        command=SCRIPT_RUN_COMMAND_REDACTED,
+        stdout_log="",
+        stderr_log="",
+    )
+
+
 def _record_gemini_log_cost(db: Session, script_run_id: int, gemini_log: Mapping[str, Any]) -> dict[str, Any]:
     cost_details: list[dict[str, Any]] = []
     total_amount = 0.0
@@ -1173,6 +1212,31 @@ def _complete_kiosk_summary_with_tds_gemini(
             or "Gemini skipped because the kiosk runner did not produce usable evidence groups."
         )
     return completed_summary, diagnostics
+
+
+def _kiosk_summary_requires_tds_gemini(kiosk_summary: Mapping[str, Any] | None) -> bool:
+    if not isinstance(kiosk_summary, Mapping):
+        return False
+    groups = kiosk_summary.get("groups")
+    if not isinstance(groups, list):
+        return False
+    for group in groups:
+        if not isinstance(group, Mapping):
+            continue
+        prompt = str(group.get("vlm_prompt") or "").strip()
+        image_urls = [
+            str(url).strip()
+            for url in (group.get("llm_input_image_urls") or [])
+            if str(url).strip()
+        ]
+        image_uploads = [
+            upload
+            for upload in (group.get("llm_input_image_uploads") or [])
+            if isinstance(upload, Mapping) and str(upload.get("object_key") or "").strip()
+        ]
+        if group.get("vlm_pending") and prompt and (image_urls or image_uploads):
+            return True
+    return False
 
 
 def _finalize_remote_entry_script_run(
@@ -1550,13 +1614,41 @@ def _finalize_remote_kiosk_script_run(
             stdout=result.stdout,
             stderr=stderr,
         )
+    gemini_script_run_id: int | None = None
+    if _kiosk_summary_requires_tds_gemini(remote_result.kiosk_summary):
+        gemini_script_run_id = _create_gemini_script_run(
+            db,
+            session_id=int(session_id) if session_id is not None else None,
+            trigger_id=None,
+            script_name="kiosk",
+            model_name="gemini_kiosk_summary",
+            runner_payload={
+                "parent_script_run_id": result.script_run_id,
+                "video_asset_id": video_asset_id,
+                "session_id": int(session_id) if session_id is not None else None,
+                "source": "tds_api_kiosk_enrichment",
+            },
+        )
     try:
         completed_kiosk_summary, gemini_log = _complete_kiosk_summary_with_tds_gemini(remote_result.kiosk_summary)
         gemini_status = str(gemini_log.get("status") or "success")
-        gemini_cost = _record_gemini_log_cost(db, result.script_run_id, gemini_log)
+        gemini_cost = (
+            _record_gemini_log_cost(db, gemini_script_run_id, gemini_log)
+            if gemini_script_run_id is not None
+            else {}
+        )
+        if gemini_script_run_id is not None:
+            repositories.finish_script_run(
+                db,
+                gemini_script_run_id,
+                status="success" if gemini_status != "failed" else "failed",
+                stdout_log=json.dumps(gemini_log, indent=2, default=str),
+                stderr_log="" if gemini_status != "failed" else str(gemini_log.get("error") or "Gemini kiosk summary failed."),
+            )
         persist_gemini_log(
             {
                 "gemini_log": {
+                    "script_run_id": gemini_script_run_id,
                     "status": gemini_status,
                     "cost": gemini_cost,
                     **{key: value for key, value in gemini_log.items() if key != "status"},
@@ -1564,9 +1656,18 @@ def _finalize_remote_kiosk_script_run(
             }
         )
     except GeminiKioskSummaryError as exc:
+        if gemini_script_run_id is not None:
+            repositories.finish_script_run(
+                db,
+                gemini_script_run_id,
+                status="failed",
+                stdout_log=json.dumps(dict(exc.diagnostics or {}), indent=2, default=str),
+                stderr_log=str(exc),
+            )
         persist_gemini_log(
             {
                 "gemini_log": {
+                    "script_run_id": gemini_script_run_id,
                     "status": "failed",
                     "error": str(exc),
                     **dict(exc.diagnostics or {}),
@@ -1600,9 +1701,18 @@ def _finalize_remote_kiosk_script_run(
             stderr=stderr,
         )
     except Exception as exc:
+        if gemini_script_run_id is not None:
+            repositories.finish_script_run(
+                db,
+                gemini_script_run_id,
+                status="failed",
+                stdout_log="",
+                stderr_log=str(exc),
+            )
         persist_gemini_log(
             {
                 "gemini_log": {
+                    "script_run_id": gemini_script_run_id,
                     "status": "failed",
                     "error": str(exc),
                 }
@@ -2140,7 +2250,7 @@ def _repair_grouping_with_gemini(
         }
         return grouping_summary
 
-    repair_script_run_id = repositories.create_script_run_started(
+    repair_script_run_id = _create_gemini_script_run(
         db,
         session_id=None,
         trigger_id=None,
@@ -2153,10 +2263,6 @@ def _repair_grouping_with_gemini(
             "candidate_trigger_ids": candidate_trigger_ids,
             "image_count": len(image_urls),
         },
-        status="running",
-        command=SCRIPT_RUN_COMMAND_REDACTED,
-        stdout_log="",
-        stderr_log="",
     )
     prompt = (
         "You are repairing retail entrance/exit grouping. Each trigger is a door event. "

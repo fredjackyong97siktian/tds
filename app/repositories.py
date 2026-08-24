@@ -2203,20 +2203,42 @@ def mark_grouping_batch_frame_assets_retrieved(db: Session, batch_id: int, *, er
     return int(result.rowcount or 0)
 
 
-def list_script_runs(db: Session, limit: int = 100) -> list[dict[str, Any]]:
+def list_script_runs(
+    db: Session,
+    limit: int = 100,
+    *,
+    script_name: str | None = None,
+    script_type: str | None = None,
+    model_name: str | None = None,
+) -> list[dict[str, Any]]:
     script_run_table = _table("script_run")
     cost_select = _script_run_cost_select(db, script_run_table)
+    filters: list[str] = []
+    params: dict[str, Any] = {"limit": limit}
+    if script_name:
+        filters.append("script_name = :script_name")
+        params["script_name"] = script_name
+    if model_name:
+        filters.append("model_name = :model_name")
+        params["model_name"] = model_name
+    normalized_type = str(script_type or "").strip().lower()
+    if normalized_type == "gemini":
+        filters.append("model_name like 'gemini_%'")
+    elif normalized_type == "runpod":
+        filters.append("(model_name = 'runpod_runner' or runner_job_id is not null)")
+    where_clause = f"where {' and '.join(filters)}" if filters else ""
     result = db.execute(
         text(
             f"""
             select id, session_id, trigger_id, script_name, model_name, runner_job_id, runner_payload,
                    status, command, stdout_log, stderr_log, {cost_select}, started_at, finished_at
             from {script_run_table}
+            {where_clause}
             order by started_at desc, id desc
             limit :limit
             """
         ),
-        {"limit": limit},
+        params,
     )
     rows = _fetch_all_dicts(result)
     for row in rows:
