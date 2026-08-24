@@ -3513,6 +3513,41 @@ def run_theft_confidence_for_grouping_batch(
     }
 
 
+def run_pending_theft_confidence_batches(db: Session, *, limit: int = 10) -> dict[str, Any]:
+    candidates = repositories.list_pending_theft_confidence_batches(db, limit=max(1, min(limit, 50)))
+    results: list[dict[str, Any]] = []
+    for candidate in candidates:
+        batch_id = int(candidate["id"])
+        try:
+            result = run_theft_confidence_for_grouping_batch(db, batch_id=batch_id)
+            results.append({"batch_id": batch_id, "status": "success", **result})
+        except Exception as exc:
+            logger.exception("Manual theft confidence failed for batch_id=%s", batch_id)
+            try:
+                repositories.upsert_filter_confidence_result(
+                    db,
+                    batch_id=batch_id,
+                    group_key="__error__",
+                    location_id=int(candidate.get("location_id") or 0),
+                    score=0,
+                    need_deep_analysis=False,
+                    reason="confidence_error",
+                    factor_payload={"error": str(exc)},
+                )
+            except Exception:
+                logger.exception("Could not persist theft confidence error for batch_id=%s", batch_id)
+            results.append({"batch_id": batch_id, "status": "failed", "error": str(exc)})
+    return {
+        "ok": True,
+        "requested_limit": limit,
+        "queued_count": len(candidates),
+        "processed_count": len(results),
+        "success_count": sum(1 for item in results if item.get("status") == "success"),
+        "failed_count": sum(1 for item in results if item.get("status") == "failed"),
+        "results": results,
+    }
+
+
 def _prepare_session_kiosk_pipeline(
     db: Session,
     *,
