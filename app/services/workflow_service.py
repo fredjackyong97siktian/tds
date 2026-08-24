@@ -9,6 +9,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from os.path import basename, splitext
 from pathlib import Path
 from typing import Any, Mapping
@@ -18,6 +19,7 @@ from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy.orm import Session
+from PIL import Image
 
 from ..config import settings
 from ..crypto import decrypt_secret
@@ -985,13 +987,26 @@ def _extract_json_object(text_value: str) -> dict[str, Any]:
     raise ValueError("Gemini response did not contain a JSON object.")
 
 
-def _download_image_for_gemini(image_url: str) -> dict[str, Any]:
+def _download_image_for_gemini(image_url: str, *, resize_scale: float | None = None) -> dict[str, Any]:
     with urlopen(image_url, timeout=settings.kiosk_gemini_timeout_seconds) as response:
         payload = response.read()
         content_type = response.headers.get_content_type()
     if not content_type or content_type == "application/octet-stream":
         guessed, _ = mimetypes.guess_type(image_url)
         content_type = guessed or "image/jpeg"
+    scale = _coerce_number(resize_scale, 1.0) if resize_scale is not None else 1.0
+    if 0 < scale < 1:
+        try:
+            with Image.open(BytesIO(payload)) as image:
+                width, height = image.size
+                resized_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+                resized = image.convert("RGB").resize(resized_size, Image.Resampling.LANCZOS)
+                output = BytesIO()
+                resized.save(output, format="JPEG", quality=85, optimize=True)
+                payload = output.getvalue()
+                content_type = "image/jpeg"
+        except Exception:
+            logger.exception("Could not resize Gemini image before sending url=%s", image_url)
     return {
         "inline_data": {
             "mime_type": content_type,
@@ -1000,7 +1015,13 @@ def _download_image_for_gemini(image_url: str) -> dict[str, Any]:
     }
 
 
-def _call_kiosk_gemini_summary(*, prompt: str, image_urls: list[str]) -> tuple[dict[str, Any], dict[str, Any]]:
+def _call_kiosk_gemini_summary(
+    *,
+    prompt: str,
+    image_urls: list[str],
+    model_name: str | None = None,
+    image_resize_scale: float | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     api_key = str(settings.gemini_api_key or os.environ.get("GEMINI_API_KEY") or "").strip()
     if not api_key:
         raise RuntimeError("Gemini API key is not configured in tds_api. Set THEFT_API_GEMINI_API_KEY.")
@@ -1009,15 +1030,16 @@ def _call_kiosk_gemini_summary(*, prompt: str, image_urls: list[str]) -> tuple[d
 
     parts: list[dict[str, Any]] = [{"text": prompt}]
     for image_url in image_urls:
-        parts.append(_download_image_for_gemini(image_url))
+        parts.append(_download_image_for_gemini(image_url, resize_scale=image_resize_scale))
 
+    selected_model = str(model_name or settings.kiosk_gemini_model).strip()
     request_body = {
         "contents": [{"role": "user", "parts": parts}],
         "generationConfig": {"response_mime_type": "application/json"},
     }
     url = (
         f"{str(settings.kiosk_gemini_base_url).rstrip('/')}/models/"
-        f"{settings.kiosk_gemini_model}:generateContent?key={quote(api_key)}"
+        f"{selected_model}:generateContent?key={quote(api_key)}"
     )
     request = Request(
         url,
@@ -1039,8 +1061,9 @@ def _call_kiosk_gemini_summary(*, prompt: str, image_urls: list[str]) -> tuple[d
     result = _extract_json_object("\n".join(text_parts))
     return result, {
         "provider": "tds_api_gemini",
-        "model": settings.kiosk_gemini_model,
+        "model": selected_model,
         "image_count": len(image_urls),
+        "image_resize_scale": image_resize_scale,
         "prompt": prompt,
         "image_urls": image_urls,
         "raw_response": parsed,
@@ -3163,7 +3186,22 @@ def _frame_urls_from_trigger_frame_asset(row: Mapping[str, Any]) -> list[dict[st
     return payload
 
 
-def _first_trigger_frame_payload(frames: list[dict[str, Any]], limit: int = 6) -> list[dict[str, Any]]:
+def _grouping_frames_per_trigger() -> int:
+    return max(1, int(settings.grouping_gemini_frames_per_trigger or 5))
+
+
+def _grouping_gemini_max_images_per_request() -> int:
+    return max(1, int(settings.grouping_gemini_max_images_per_request or 90))
+
+
+def _grouping_gemini_resize_scale() -> float | None:
+    scale = _coerce_number(settings.grouping_gemini_image_scale, 1.0)
+    return scale if 0 < scale < 1 else None
+
+
+def _first_trigger_frame_payload(frames: list[dict[str, Any]], limit: int | None = None) -> list[dict[str, Any]]:
+    if limit is None:
+        limit = _grouping_frames_per_trigger()
     return frames[: max(1, int(limit))]
 
 
@@ -3227,7 +3265,7 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
                         batch_id=int(batch["id"]),
                         trigger_id=int(row["trigger_id"]),
                         video_asset_id=None,
-                        frame_payload={"frames": _first_trigger_frame_payload(_frame_urls_from_trigger_frame_asset(row), 6)},
+                        frame_payload={"frames": _first_trigger_frame_payload(_frame_urls_from_trigger_frame_asset(row))},
                     )
                 prepared.append(batch)
                 logger.info(
@@ -3284,7 +3322,7 @@ def prepare_manual_grouping_batches(db: Session) -> list[dict[str, Any]]:
                 batch_id=int(batch["id"]),
                 trigger_id=int(row["trigger_id"]),
                 video_asset_id=None,
-                frame_payload={"frames": _first_trigger_frame_payload(_frame_urls_from_trigger_frame_asset(row), 6)},
+                frame_payload={"frames": _first_trigger_frame_payload(_frame_urls_from_trigger_frame_asset(row))},
             )
         prepared.append(batch)
     return prepared
@@ -3305,7 +3343,7 @@ def build_grouping_analysis_job_from_batch(db: Session, batch_id: int) -> Groupi
                 "credit_card_entry_id": trigger.get("credit_card_entry_id"),
                 "entry_source_type": trigger.get("entry_source_type"),
                 "trigger_time": trigger.get("trigger_time").isoformat() if hasattr(trigger.get("trigger_time"), "isoformat") else trigger.get("trigger_time"),
-                "frames": _first_trigger_frame_payload(list(frame_payload.get("frames") or []), 6),
+                "frames": _first_trigger_frame_payload(list(frame_payload.get("frames") or [])),
             }
         )
     manifest_payload = {
@@ -3358,91 +3396,152 @@ def build_grouping_analysis_job_from_batch(db: Session, batch_id: int) -> Groupi
 def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id: int) -> tuple[dict[str, Any], dict[str, Any]]:
     batch = repositories.get_grouping_batch(db, batch_id)
     items = repositories.list_grouping_items(db, batch_id)
-    trigger_notes: list[dict[str, Any]] = []
-    image_urls: list[str] = []
-    image_mapping: list[dict[str, Any]] = []
-
+    trigger_inputs: list[dict[str, Any]] = []
     for item in items:
         trigger = repositories.get_trigger(db, int(item["trigger_id"]))
         frame_payload = item.get("frame_payload") if isinstance(item.get("frame_payload"), Mapping) else {}
-        frames = _first_trigger_frame_payload(list(frame_payload.get("frames") or []), 6)
-        note = {
-            "trigger_id": int(item["trigger_id"]),
-            "trigger_time": trigger.get("trigger_time").isoformat() if hasattr(trigger.get("trigger_time"), "isoformat") else trigger.get("trigger_time"),
-            "phone_entry_id": trigger.get("phone_entry_id"),
-            "credit_card_entry_id": trigger.get("credit_card_entry_id"),
-            "entry_source_type": trigger.get("entry_source_type"),
-            "image_numbers": [],
-        }
-        for frame in frames:
-            if not isinstance(frame, Mapping):
-                continue
-            image_url = str(frame.get("image_url") or "").strip()
-            if not image_url or image_url in image_urls:
-                continue
-            image_urls.append(image_url)
-            image_number = len(image_urls)
-            note["image_numbers"].append(image_number)
-            image_mapping.append(
-                {
-                    "image_number": image_number,
-                    "trigger_id": int(item["trigger_id"]),
-                    "frame_index": frame.get("index"),
-                    "sample_time": frame.get("sample_time"),
-                }
-            )
-        trigger_notes.append(note)
+        frames = _first_trigger_frame_payload(list(frame_payload.get("frames") or []))
+        trigger_inputs.append(
+            {
+                "trigger_id": int(item["trigger_id"]),
+                "trigger_time": trigger.get("trigger_time").isoformat() if hasattr(trigger.get("trigger_time"), "isoformat") else trigger.get("trigger_time"),
+                "phone_entry_id": trigger.get("phone_entry_id"),
+                "credit_card_entry_id": trigger.get("credit_card_entry_id"),
+                "entry_source_type": trigger.get("entry_source_type"),
+                "frames": frames,
+            }
+        )
 
-    if not image_urls:
+    if not any(trigger.get("frames") for trigger in trigger_inputs):
         raise RuntimeError("No trigger frame images are available for Gemini grouping.")
 
-    prompt = (
-        "You are grouping retail door triggers into customer sessions using CCTV frame images. "
-        "Each trigger is a door opening event. Compare visible people across trigger images by clothing, body shape, bags, "
-        "walking direction, and timestamp order. A trigger must never be both entry and exit in the same group. "
-        "A trigger with phone_entry_id or credit_card_entry_id can still be an exit trigger; do not force it to entry. "
-        "Use only the image-number mapping below. Unknown means the trigger cannot be grouped with any other trigger. "
-        "Return strict JSON only with schema: "
-        '{"groups":[{"entry":[integer],"exit":[integer],"confidence":number,"reason":string}],'
-        '"unknown":[integer],"notes":[string]}. '
-        f"Batch: {json.dumps({'batch_id': batch_id, 'location_id': batch.get('location_id'), 'period_code': batch.get('period_code'), 'window_start': batch.get('window_start'), 'window_end': batch.get('window_end')}, default=str)}. "
-        f"Triggers: {json.dumps(trigger_notes, default=str)}. "
-        f"Image mapping: {json.dumps(image_mapping, default=str)}."
-    )
-    gemini_result, gemini_meta = _call_kiosk_gemini_summary(prompt=prompt, image_urls=image_urls)
-    cost = _record_gemini_cost(db, script_run_id, gemini_meta)
-    groups = gemini_result.get("groups") if isinstance(gemini_result.get("groups"), list) else []
-    unknown = gemini_result.get("unknown") if isinstance(gemini_result.get("unknown"), list) else []
+    max_images = _grouping_gemini_max_images_per_request()
+    chunks: list[list[dict[str, Any]]] = []
+    current_chunk: list[dict[str, Any]] = []
+    current_image_count = 0
+    for trigger_input in trigger_inputs:
+        frame_count = len(trigger_input.get("frames") or [])
+        if current_chunk and current_image_count + frame_count > max_images:
+            chunks.append(current_chunk)
+            current_chunk = []
+            current_image_count = 0
+        current_chunk.append(trigger_input)
+        current_image_count += frame_count
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    model_name = str(settings.grouping_gemini_model or "gemini-2.5-flash-lite").strip()
+    resize_scale = _grouping_gemini_resize_scale()
     normalized_groups: list[dict[str, Any]] = []
     grouped_trigger_ids: set[int] = set()
-    for index, group in enumerate(groups, start=1):
-        if not isinstance(group, Mapping):
+    normalized_unknown: set[int] = set()
+    notes: list[str] = []
+    chunk_results: list[dict[str, Any]] = []
+    raw_metas: list[dict[str, Any]] = []
+    next_group_id = 1
+
+    for chunk_index, chunk in enumerate(chunks, start=1):
+        trigger_notes: list[dict[str, Any]] = []
+        image_urls: list[str] = []
+        image_mapping: list[dict[str, Any]] = []
+        for trigger_input in chunk:
+            note = {
+                "trigger_id": trigger_input["trigger_id"],
+                "trigger_time": trigger_input.get("trigger_time"),
+                "phone_entry_id": trigger_input.get("phone_entry_id"),
+                "credit_card_entry_id": trigger_input.get("credit_card_entry_id"),
+                "entry_source_type": trigger_input.get("entry_source_type"),
+                "image_numbers": [],
+            }
+            for frame in trigger_input.get("frames") or []:
+                if not isinstance(frame, Mapping):
+                    continue
+                image_url = str(frame.get("image_url") or "").strip()
+                if not image_url or image_url in image_urls:
+                    continue
+                image_urls.append(image_url)
+                image_number = len(image_urls)
+                note["image_numbers"].append(image_number)
+                image_mapping.append(
+                    {
+                        "image_number": image_number,
+                        "trigger_id": int(trigger_input["trigger_id"]),
+                        "frame_index": frame.get("index"),
+                        "sample_time": frame.get("sample_time"),
+                    }
+                )
+            trigger_notes.append(note)
+        if not image_urls:
             continue
-        entry_ids = _group_trigger_id_list(group.get("entry"))
-        exit_ids = [trigger_id for trigger_id in _group_trigger_id_list(group.get("exit")) if trigger_id not in entry_ids]
-        if not entry_ids:
-            continue
-        grouped_trigger_ids.update(entry_ids)
-        grouped_trigger_ids.update(exit_ids)
-        normalized_groups.append(
+        prompt = (
+            "You are grouping retail door triggers into customer sessions using CCTV frame images. "
+            "Each trigger is a door opening event. Compare visible people across trigger images by clothing, body shape, bags, "
+            "walking direction, and timestamp order. A trigger must never be both entry and exit in the same group. "
+            "A trigger with phone_entry_id or credit_card_entry_id can still be an exit trigger; do not force it to entry. "
+            "Use only the image-number mapping below. Unknown means the trigger cannot be grouped with any other trigger. "
+            "Return strict JSON only with schema: "
+            '{"groups":[{"entry":[integer],"exit":[integer],"confidence":number,"reason":string}],'
+            '"unknown":[integer],"notes":[string]}. '
+            f"Batch: {json.dumps({'batch_id': batch_id, 'location_id': batch.get('location_id'), 'period_code': batch.get('period_code'), 'window_start': batch.get('window_start'), 'window_end': batch.get('window_end'), 'chunk': chunk_index, 'chunk_count': len(chunks)}, default=str)}. "
+            f"Triggers: {json.dumps(trigger_notes, default=str)}. "
+            f"Image mapping: {json.dumps(image_mapping, default=str)}."
+        )
+        gemini_result, gemini_meta = _call_kiosk_gemini_summary(
+            prompt=prompt,
+            image_urls=image_urls,
+            model_name=model_name,
+            image_resize_scale=resize_scale,
+        )
+        _record_gemini_cost(db, script_run_id, gemini_meta)
+        raw_metas.append(gemini_meta)
+        chunk_groups = gemini_result.get("groups") if isinstance(gemini_result.get("groups"), list) else []
+        chunk_unknown = gemini_result.get("unknown") if isinstance(gemini_result.get("unknown"), list) else []
+        chunk_grouped_trigger_ids: set[int] = set()
+        for group in chunk_groups:
+            if not isinstance(group, Mapping):
+                continue
+            entry_ids = _group_trigger_id_list(group.get("entry"))
+            exit_ids = [trigger_id for trigger_id in _group_trigger_id_list(group.get("exit")) if trigger_id not in entry_ids]
+            if not entry_ids:
+                continue
+            chunk_grouped_trigger_ids.update(entry_ids)
+            chunk_grouped_trigger_ids.update(exit_ids)
+            grouped_trigger_ids.update(entry_ids)
+            grouped_trigger_ids.update(exit_ids)
+            normalized_groups.append(
+                {
+                    "group_id": next_group_id,
+                    "entry": entry_ids,
+                    "exit": exit_ids,
+                    "score": _coerce_number(group.get("confidence"), 0.0),
+                    "reason": str(group.get("reason") or "gemini_grouping_direct"),
+                    "source": "gemini_grouping_direct",
+                    "chunk": chunk_index,
+                }
+            )
+            next_group_id += 1
+        normalized_unknown.update(_group_trigger_id_list(chunk_unknown))
+        if isinstance(gemini_result.get("notes"), list):
+            notes.extend(str(note) for note in gemini_result.get("notes") or [])
+        chunk_results.append(
             {
-                "group_id": index,
-                "entry": entry_ids,
-                "exit": exit_ids,
-                "score": _coerce_number(group.get("confidence"), 0.0),
-                "reason": str(group.get("reason") or "gemini_grouping_direct"),
-                "source": "gemini_grouping_direct",
+                "chunk": chunk_index,
+                "trigger_ids": [int(trigger["trigger_id"]) for trigger in chunk],
+                "image_count": len(image_urls),
+                "image_mapping": image_mapping,
+                "raw_result": gemini_result,
+                "grouped_trigger_ids": sorted(chunk_grouped_trigger_ids),
             }
         )
 
     all_trigger_ids = [int(item["trigger_id"]) for item in items if item.get("trigger_id") is not None]
-    normalized_unknown = sorted(
-        {
-            trigger_id
-            for trigger_id in (_group_trigger_id_list(unknown) + all_trigger_ids)
-            if trigger_id not in grouped_trigger_ids
-        }
-    )
+    normalized_unknown = {
+        trigger_id
+        for trigger_id in (list(normalized_unknown) + all_trigger_ids)
+        if trigger_id not in grouped_trigger_ids
+    }
+    total_image_count = sum(len(trigger.get("frames") or []) for trigger in trigger_inputs)
+    cost_details = [_gemini_usage_cost(meta)[1] for meta in raw_metas]
     grouping_summary = {
         "batch_id": batch_id,
         "location_id": int(batch["location_id"]),
@@ -3450,20 +3549,30 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
         "window_start": batch.get("window_start").isoformat() if hasattr(batch.get("window_start"), "isoformat") else batch.get("window_start"),
         "window_end": batch.get("window_end").isoformat() if hasattr(batch.get("window_end"), "isoformat") else batch.get("window_end"),
         "groups": normalized_groups,
-        "unknown": normalized_unknown,
-        "notes": gemini_result.get("notes") if isinstance(gemini_result.get("notes"), list) else [],
+        "unknown": sorted(normalized_unknown),
+        "notes": notes,
         "diagnostics": {
             "mode": "gemini_grouping_direct",
             "temporary_runpod_grouping_disabled": True,
-            "max_frames_per_trigger": 6,
+            "model": model_name,
+            "image_resize_scale": resize_scale,
+            "max_frames_per_trigger": _grouping_frames_per_trigger(),
+            "max_images_per_request": max_images,
+            "chunk_count": len(chunks),
             "trigger_count": len(all_trigger_ids),
-            "image_count": len(image_urls),
-            "image_mapping": image_mapping,
-            "raw_result": gemini_result,
-            "cost": cost,
+            "image_count": total_image_count,
+            "chunks": chunk_results,
+            "cost_details": cost_details,
         },
     }
-    return grouping_summary, gemini_meta
+    return grouping_summary, {
+        "provider": "tds_api_gemini",
+        "model": model_name,
+        "image_resize_scale": resize_scale,
+        "chunk_count": len(chunks),
+        "image_count": total_image_count,
+        "chunks": raw_metas,
+    }
 
 
 def start_grouping_analysis_job(job: GroupingAnalysisQueued) -> ScriptExecutionResult:
@@ -3518,7 +3627,7 @@ def start_grouping_analysis_job(job: GroupingAnalysisQueued) -> ScriptExecutionR
                 "manifest_object_key": job.manifest_object_key,
                 "manifest_url": job.manifest_url,
                 "provider": "tds_api_gemini",
-                "model": settings.kiosk_gemini_model,
+                "model": settings.grouping_gemini_model,
                 "mode": "gemini_grouping_direct",
             },
         )
