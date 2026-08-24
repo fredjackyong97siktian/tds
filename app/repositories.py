@@ -2326,6 +2326,44 @@ def list_filter_confidence_results(db: Session, limit: int = 100) -> list[dict[s
     return rows
 
 
+def retry_filter_confidence_result(db: Session, confidence_result_id: int) -> dict[str, Any]:
+    confidence_table = _table("filter_confidence_result")
+    result = db.execute(
+        text(
+            f"""
+            select id, batch_id, group_key, reason
+            from {confidence_table}
+            where id = :confidence_result_id
+            limit 1
+            """
+        ),
+        {"confidence_result_id": confidence_result_id},
+    )
+    row = result.mappings().first()
+    if row is None:
+        raise ValueError(f"Confidence result {confidence_result_id} was not found.")
+    payload = dict(row)
+    group_key = str(payload.get("group_key") or "")
+    reason = str(payload.get("reason") or "")
+    if group_key != "__error__" and reason != "confidence_error":
+        raise ValueError("Only issue confidence results can be retried.")
+    db.execute(
+        text(
+            f"""
+            delete from {confidence_table}
+            where id = :confidence_result_id
+            """
+        ),
+        {"confidence_result_id": confidence_result_id},
+    )
+    db.commit()
+    return {
+        "ok": True,
+        "confidence_result_id": confidence_result_id,
+        "batch_id": int(payload["batch_id"]),
+    }
+
+
 def promote_trigger_video_assets_to_full_retrieval(db: Session, trigger_ids: list[int]) -> int:
     normalized_ids = sorted({int(trigger_id) for trigger_id in trigger_ids if trigger_id is not None})
     if not normalized_ids:

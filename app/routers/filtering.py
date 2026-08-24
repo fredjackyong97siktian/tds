@@ -85,6 +85,14 @@ def list_confidence_results(limit: int = 100, db: Session = Depends(get_transact
     return repositories.list_filter_confidence_results(db, limit=max(1, min(limit, 500)))
 
 
+@router.post("/confidence-results/{confidence_result_id}/retry")
+def retry_confidence_result(confidence_result_id: int, db: Session = Depends(get_transaction_db)) -> dict[str, Any]:
+    try:
+        return repositories.retry_filter_confidence_result(db, confidence_result_id)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.post("/grouping-batches/prepare")
 def prepare_grouping_batches(db: Session = Depends(get_transaction_db)) -> dict[str, Any]:
     try:
