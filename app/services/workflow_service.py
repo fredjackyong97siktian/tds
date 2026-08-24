@@ -3009,6 +3009,16 @@ def _finalize_remote_grouping_script_run(
         logger.info("Marked grouping frame assets processed batch_id=%s count=%s", batch_id, processed_count)
     except Exception:
         logger.exception("Could not mark grouping frame assets processed batch_id=%s", batch_id)
+    try:
+        confidence_result = run_theft_confidence_for_grouping_batch(db, batch_id=batch_id)
+        logger.info(
+            "Theft confidence completed after grouping batch_id=%s analyzed=%s promoted=%s",
+            batch_id,
+            confidence_result.get("analyzed_count"),
+            confidence_result.get("promoted_count"),
+        )
+    except Exception:
+        logger.exception("Could not run theft confidence after grouping batch_id=%s", batch_id)
     return result
 
 
