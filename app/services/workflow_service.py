@@ -2582,6 +2582,37 @@ def _last_completed_period_window(period: Mapping[str, Any], *, now: datetime | 
     return start_today - timedelta(days=1), end_today - timedelta(days=1)
 
 
+def _period_window_for_datetime(period: Mapping[str, Any], value: datetime) -> tuple[datetime, datetime] | None:
+    current = value.replace(microsecond=0)
+    day = current.replace(hour=0, minute=0, second=0, microsecond=0)
+    window_start = _combine_local_datetime(day, period.get("start_time"))
+    window_end = _combine_local_datetime(day, period.get("end_time"))
+    if window_end <= window_start:
+        if current < window_end:
+            window_start -= timedelta(days=1)
+        else:
+            window_end += timedelta(days=1)
+    if window_start <= current < window_end:
+        return window_start, window_end
+    return None
+
+
+def _period_code_for_datetime(db: Session, location_id: int, value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    periods = repositories.list_filter_time_periods(db, selected_only=False)
+    scoped_periods = [
+        period
+        for period in periods
+        if period.get("location_id") is None or int(period["location_id"]) == int(location_id)
+    ]
+    scoped_periods.sort(key=lambda period: 0 if period.get("location_id") is not None else 1)
+    for period in scoped_periods:
+        if _period_window_for_datetime(period, value) is not None:
+            return str(period.get("period_code") or "period")
+    return None
+
+
 def _frame_urls_from_video_asset(row: Mapping[str, Any]) -> list[dict[str, Any]]:
     metadata = row.get("video_asset_metadata")
     if not isinstance(metadata, Mapping):
@@ -2636,50 +2667,87 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
     locations = repositories.list_locations(db)
     location_ids = [int(row["id"]) for row in locations if row.get("id") is not None]
     prepared: list[dict[str, Any]] = []
+    current = datetime.now().replace(microsecond=0)
     for period in periods:
         target_location_ids = [int(period["location_id"])] if period.get("location_id") is not None else location_ids
-        window_start, window_end = _last_completed_period_window(period)
         for location_id in target_location_ids:
-            existing = repositories.get_grouping_batch_by_window(
+            ready_assets = repositories.list_manual_grouping_ready_trigger_frame_assets(
                 db,
                 location_id=location_id,
-                period_code=str(period.get("period_code") or "period"),
-                window_start=window_start,
-                window_end=window_end,
+                limit=1000,
             )
-            if existing is not None:
-                continue
-            trigger_assets = repositories.list_trigger_frame_assets_for_window(
-                db,
-                location_id=location_id,
-                window_start=window_start,
-                window_end=window_end,
-            )
-            if not trigger_assets:
-                continue
-            not_ready = [
-                row
-                for row in trigger_assets
-                if str(row.get("frame_asset_status") or "").strip().lower() != "retrieved"
-            ]
-            if not_ready:
-                continue
-            batch = repositories.create_grouping_batch(
-                db,
-                location_id=location_id,
-                period_code=str(period.get("period_code") or "period"),
-                window_start=window_start,
-                window_end=window_end,
-            )
-            for row in trigger_assets:
-                repositories.upsert_grouping_item(
+            assets_by_window: dict[tuple[datetime, datetime], list[dict[str, Any]]] = {}
+            for row in ready_assets:
+                trigger_time = _coerce_datetime_value(row.get("trigger_time"))
+                if trigger_time is None:
+                    continue
+                window = _period_window_for_datetime(period, trigger_time)
+                if window is None:
+                    continue
+                window_start, window_end = window
+                if window_end > current:
+                    continue
+                assets_by_window.setdefault(window, []).append(row)
+
+            for (window_start, window_end), _ready_rows in sorted(assets_by_window.items()):
+                period_code = str(period.get("period_code") or "period")
+                existing = repositories.get_grouping_batch_by_window(
                     db,
-                    batch_id=int(batch["id"]),
-                    trigger_id=int(row["trigger_id"]),
-                    video_asset_id=None,
-                    frame_payload={"frames": _frame_urls_from_trigger_frame_asset(row)},
+                    location_id=location_id,
+                    period_code=period_code,
+                    window_start=window_start,
+                    window_end=window_end,
                 )
-            prepared.append(batch)
+                if existing is not None:
+                    continue
+                trigger_assets = repositories.list_trigger_frame_assets_for_window(
+                    db,
+                    location_id=location_id,
+                    window_start=window_start,
+                    window_end=window_end,
+                )
+                if not trigger_assets:
+                    continue
+                not_ready = [
+                    row
+                    for row in trigger_assets
+                    if str(row.get("frame_asset_status") or "").strip().lower() != "retrieved"
+                ]
+                if not_ready:
+                    logger.info(
+                        "Skipping grouping catch-up window because some trigger frames are not ready location_id=%s period_code=%s window_start=%s window_end=%s not_ready=%s",
+                        location_id,
+                        period_code,
+                        window_start,
+                        window_end,
+                        len(not_ready),
+                    )
+                    continue
+                batch = repositories.create_grouping_batch(
+                    db,
+                    location_id=location_id,
+                    period_code=period_code,
+                    window_start=window_start,
+                    window_end=window_end,
+                )
+                for row in trigger_assets:
+                    repositories.upsert_grouping_item(
+                        db,
+                        batch_id=int(batch["id"]),
+                        trigger_id=int(row["trigger_id"]),
+                        video_asset_id=None,
+                        frame_payload={"frames": _frame_urls_from_trigger_frame_asset(row)},
+                    )
+                prepared.append(batch)
+                logger.info(
+                    "Prepared grouping catch-up batch location_id=%s period_code=%s window_start=%s window_end=%s trigger_count=%s batch_id=%s",
+                    location_id,
+                    period_code,
+                    window_start,
+                    window_end,
+                    len(trigger_assets),
+                    batch.get("id"),
+                )
     return prepared
 
 
@@ -4185,7 +4253,12 @@ def _canonicalize_session_customer_for_person(
     return canonical_row
 
 
-def _build_cross_state_from_active_gallery(location_id: int) -> dict[str, Any]:
+def _build_cross_state_from_active_gallery(
+    location_id: int,
+    *,
+    gallery_date: Any | None = None,
+    period_code: str | None = None,
+) -> dict[str, Any]:
     vector_db = VectorSessionLocal()
     transactional_db = TransactionalSessionLocal()
     try:
@@ -4200,6 +4273,8 @@ def _build_cross_state_from_active_gallery(location_id: int) -> dict[str, Any]:
         active_rows = vector_repositories.list_active_gallery_records(
             vector_db,
             location_id=location_id,
+            gallery_date=gallery_date,
+            period_code=period_code,
             limit=5000,
         )
         persistent_gallery: dict[int, dict[str, Any]] = {}
@@ -4287,8 +4362,10 @@ def _build_cross_state_from_active_gallery(location_id: int) -> dict[str, Any]:
             hydrated_rows += 1
 
         logger.info(
-            "Hydrated entrance persistent gallery from tds_active_gallery location_id=%s active_rows=%s hydrated_rows=%s skipped_rows=%s persistent_ids=%s",
+            "Hydrated entrance persistent gallery from tds_active_gallery location_id=%s gallery_date=%s period_code=%s active_rows=%s hydrated_rows=%s skipped_rows=%s persistent_ids=%s",
             location_id,
+            gallery_date,
+            period_code,
             len(active_rows),
             hydrated_rows,
             skipped_rows,
@@ -4305,8 +4382,18 @@ def _build_cross_state_from_active_gallery(location_id: int) -> dict[str, Any]:
         transactional_db.close()
 
 
-def _hydrate_gallery_state_from_active_gallery(location_id: int, gallery_state_path: Path) -> None:
-    cross_state = _build_cross_state_from_active_gallery(location_id)
+def _hydrate_gallery_state_from_active_gallery(
+    location_id: int,
+    gallery_state_path: Path,
+    *,
+    gallery_date: Any | None = None,
+    period_code: str | None = None,
+) -> None:
+    cross_state = _build_cross_state_from_active_gallery(
+        location_id,
+        gallery_date=gallery_date,
+        period_code=period_code,
+    )
     _write_cross_state_pickle(gallery_state_path, cross_state)
 
 
@@ -4689,6 +4776,11 @@ def _sync_gallery_state_after_entry(
         can_create_entry_session = _trigger_has_required_entry_identity(trigger_row)
         allowed_video_link_section = "entry" if can_create_entry_session else "exit"
         entrance_mode = allowed_video_link_section == "entry"
+        gallery_scope_time = (
+            _coerce_datetime_value(trigger_row.get("trigger_time")) if trigger_row else None
+        ) or captured_start_time
+        gallery_date = gallery_scope_time.date() if gallery_scope_time is not None else None
+        gallery_period_code = _period_code_for_datetime(transactional_db, location_id, gallery_scope_time)
         current_entry_session_id = session_id
         sessions_to_close: set[int] = set()
         linked_session_video_keys: set[tuple[int, str]] = set()
@@ -5258,6 +5350,8 @@ def _sync_gallery_state_after_entry(
                     "group_id": customer.get("group_id"),
                     "entered": bool(customer.get("entered")),
                     "exited": False,
+                    "gallery_date": gallery_date.isoformat() if gallery_date is not None else None,
+                    "period_code": gallery_period_code,
                 }
                 if view_rows:
                     for index, view_row in enumerate(view_rows):
@@ -5269,6 +5363,8 @@ def _sync_gallery_state_after_entry(
                             person_id=active_person_id,
                             image_url=view_row.get("image_url"),
                             image_kind=str(view_row.get("image_kind") or "reid_view"),
+                            gallery_date=gallery_date,
+                            period_code=gallery_period_code,
                             embedding_osnet=view_row.get("embedding_osnet"),
                             embedding_fashion=view_row.get("embedding_fashion"),
                             metadata={**active_metadata, "view_index": index},
@@ -5295,6 +5391,8 @@ def _sync_gallery_state_after_entry(
                             person_id=active_person_id,
                             image_url=image_url,
                             image_kind="reid_view",
+                            gallery_date=gallery_date,
+                            period_code=gallery_period_code,
                             embedding_osnet=_tensor_like_to_float_list(osnet_view),
                             embedding_fashion=fashion_embedding,
                             metadata={**active_metadata, "view_index": index},
@@ -5319,6 +5417,8 @@ def _sync_gallery_state_after_entry(
                         person_id=active_person_id,
                         image_url=canonical_image_url,
                         image_kind="fashion_view",
+                        gallery_date=gallery_date,
+                        period_code=gallery_period_code,
                         embedding_osnet=None,
                         embedding_fashion=fashion_embedding,
                         metadata=active_metadata,
@@ -6735,7 +6835,15 @@ def run_entry_for_trigger(
             "Runpod entry analysis is not configured. Set THEFT_API_RUNPOD_ENTRY_ENDPOINT_ID "
             "and THEFT_API_RUNPOD_API_KEY in the API environment."
         )
-    _hydrate_gallery_state_from_active_gallery(location_id, resolved_gallery_state)
+    trigger_time = _coerce_datetime_value(trigger.get("trigger_time"))
+    gallery_date = trigger_time.date() if trigger_time is not None else None
+    gallery_period_code = _period_code_for_datetime(db, location_id, trigger_time)
+    _hydrate_gallery_state_from_active_gallery(
+        location_id,
+        resolved_gallery_state,
+        gallery_date=gallery_date,
+        period_code=gallery_period_code,
+    )
     video_asset_row = _lookup_video_asset_by_file_path(db, video_path)
     if video_asset_row is None:
         raise RuntimeError("Runpod entry analysis requires a matching video_asset row for the source video.")

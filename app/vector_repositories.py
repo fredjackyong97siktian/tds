@@ -226,6 +226,8 @@ def create_active_gallery_record(
     person_id: int | None,
     image_url: str | None = None,
     image_kind: str = "reid_view",
+    gallery_date: Any | None = None,
+    period_code: str | None = None,
     embedding_osnet: list[float] | None = None,
     embedding_fashion: list[float] | None = None,
     metadata: Mapping[str, Any] | None = None,
@@ -235,14 +237,14 @@ def create_active_gallery_record(
             """
             insert into tds_active_gallery (
                 location_id, session_id, session_customer_id, person_id, image_url, image_kind,
-                embedding_osnet, embedding_fashion, metadata
+                gallery_date, period_code, embedding_osnet, embedding_fashion, metadata
             )
             values (
                 :location_id, :session_id, :session_customer_id, :person_id, :image_url, :image_kind,
-                cast(:embedding_osnet as jsonb), cast(:embedding_fashion as jsonb), cast(:metadata as jsonb)
+                :gallery_date, :period_code, cast(:embedding_osnet as jsonb), cast(:embedding_fashion as jsonb), cast(:metadata as jsonb)
             )
             returning id, location_id, session_id, session_customer_id, person_id, image_url, image_kind,
-                      embedding_osnet, embedding_fashion, metadata, created_at, updated_at
+                      gallery_date, period_code, embedding_osnet, embedding_fashion, metadata, created_at, updated_at
             """
         ),
         {
@@ -252,6 +254,8 @@ def create_active_gallery_record(
             "person_id": person_id,
             "image_url": image_url,
             "image_kind": image_kind,
+            "gallery_date": gallery_date,
+            "period_code": period_code,
             "embedding_osnet": _json_dumps(embedding_osnet) if embedding_osnet is not None else None,
             "embedding_fashion": _json_dumps(embedding_fashion) if embedding_fashion is not None else None,
             "metadata": _json_dumps(dict(metadata)) if metadata is not None else None,
@@ -333,7 +337,7 @@ def get_active_gallery(
         text(
             """
             select id, location_id, session_id, session_customer_id, person_id, image_url, image_kind,
-                   embedding_osnet, embedding_fashion, metadata, created_at, updated_at
+                   gallery_date, period_code, embedding_osnet, embedding_fashion, metadata, created_at, updated_at
             from tds_active_gallery
             where location_id = :location_id and session_customer_id = :session_customer_id and id = :active_gallery_id
             """
@@ -348,7 +352,7 @@ def get_active_gallery_record(db: Session, gallery_id: int) -> dict[str, Any]:
         text(
             """
             select id, location_id, session_id, session_customer_id, person_id, image_url, image_kind,
-                   embedding_osnet, embedding_fashion, metadata, created_at, updated_at
+                   gallery_date, period_code, embedding_osnet, embedding_fashion, metadata, created_at, updated_at
             from tds_active_gallery
             where id = :gallery_id
             """
@@ -628,35 +632,36 @@ def list_active_gallery_records(
     db: Session,
     *,
     location_id: int | None = None,
+    gallery_date: Any | None = None,
+    period_code: str | None = None,
     limit: int = 100,
 ) -> list[dict[str, Any]]:
-    if location_id is None:
-        result = db.execute(
-            text(
-                """
-                select id, location_id, session_id, session_customer_id, person_id, image_url, image_kind,
-                       embedding_osnet, embedding_fashion, metadata, created_at, updated_at
-                from tds_active_gallery
-                order by updated_at desc, id desc
-                limit :limit
-                """
-            ),
-            {"limit": limit},
-        )
-        return _fetch_all_dicts(result)
-
+    clauses: list[str] = []
+    params: dict[str, Any] = {
+        "gallery_date": gallery_date,
+        "period_code": period_code,
+        "limit": limit,
+    }
+    if location_id is not None:
+        clauses.append("location_id = :location_id")
+        params["location_id"] = location_id
+    if gallery_date is not None:
+        clauses.append("gallery_date = :gallery_date")
+    if period_code is not None:
+        clauses.append("period_code = :period_code")
+    where_sql = f"where {' and '.join(clauses)}" if clauses else ""
     result = db.execute(
         text(
-            """
+            f"""
             select id, location_id, session_id, session_customer_id, person_id, image_url, image_kind,
-                   embedding_osnet, embedding_fashion, metadata, created_at, updated_at
+                   gallery_date, period_code, embedding_osnet, embedding_fashion, metadata, created_at, updated_at
             from tds_active_gallery
-            where location_id = :location_id
+            {where_sql}
             order by updated_at desc, id desc
             limit :limit
             """
         ),
-        {"location_id": location_id, "limit": limit},
+        params,
     )
     return _fetch_all_dicts(result)
 
@@ -692,7 +697,8 @@ def list_history_gallery_records(
         text(
             f"""
             select id, active_gallery_id, location_id, session_id, session_customer_id, person_id, image_url, image_kind,
-                   embedding_osnet, embedding_fashion, metadata, archived_reason, archived_at, created_at, updated_at
+                   gallery_date, period_code, embedding_osnet, embedding_fashion, metadata,
+                   archived_reason, archived_at, created_at, updated_at
             from tds_history_gallery
             {where_sql}
             order by updated_at desc nulls last, archived_at desc nulls last, id desc
@@ -714,6 +720,8 @@ def create_history_gallery_record(
     person_id: int | None,
     image_url: str | None = None,
     image_kind: str = "reid_view",
+    gallery_date: Any | None = None,
+    period_code: str | None = None,
     embedding_osnet: list[float] | None = None,
     embedding_fashion: list[float] | None = None,
     metadata: Mapping[str, Any] | None = None,
@@ -726,15 +734,18 @@ def create_history_gallery_record(
             """
             insert into tds_history_gallery (
                 active_gallery_id, location_id, session_id, session_customer_id, person_id, image_url, image_kind,
-                embedding_osnet, embedding_fashion, metadata, archived_reason, created_at, updated_at
+                gallery_date, period_code, embedding_osnet, embedding_fashion, metadata,
+                archived_reason, created_at, updated_at
             )
             values (
                 :active_gallery_id, :location_id, :session_id, :session_customer_id, :person_id, :image_url, :image_kind,
-                cast(:embedding_osnet as jsonb), cast(:embedding_fashion as jsonb), cast(:metadata as jsonb), :archived_reason,
+                :gallery_date, :period_code, cast(:embedding_osnet as jsonb), cast(:embedding_fashion as jsonb),
+                cast(:metadata as jsonb), :archived_reason,
                 :created_at, :updated_at
             )
             returning id, active_gallery_id, location_id, session_id, session_customer_id, person_id, image_url, image_kind,
-                      embedding_osnet, embedding_fashion, metadata, archived_reason, archived_at, created_at, updated_at
+                      gallery_date, period_code, embedding_osnet, embedding_fashion, metadata,
+                      archived_reason, archived_at, created_at, updated_at
             """
         ),
         {
@@ -745,6 +756,8 @@ def create_history_gallery_record(
             "person_id": person_id,
             "image_url": image_url,
             "image_kind": image_kind,
+            "gallery_date": gallery_date,
+            "period_code": period_code,
             "embedding_osnet": _json_dumps(embedding_osnet) if embedding_osnet is not None else None,
             "embedding_fashion": _json_dumps(embedding_fashion) if embedding_fashion is not None else None,
             "metadata": _json_dumps(dict(metadata)) if metadata is not None else None,
@@ -786,7 +799,7 @@ def archive_active_gallery_by_aliases(
             text(
                 f"""
                 select id, location_id, session_id, session_customer_id, person_id, image_url, image_kind,
-                       embedding_osnet, embedding_fashion, metadata, created_at, updated_at
+                       gallery_date, period_code, embedding_osnet, embedding_fashion, metadata, created_at, updated_at
                 from tds_active_gallery
                 where location_id = :location_id
                   and ({' or '.join(clauses)})
@@ -810,6 +823,8 @@ def archive_active_gallery_by_aliases(
                 person_id=int(row["person_id"]) if row.get("person_id") is not None else None,
                 image_url=row.get("image_url"),
                 image_kind=str(row.get("image_kind") or "reid_view"),
+                gallery_date=row.get("gallery_date"),
+                period_code=row.get("period_code"),
                 embedding_osnet=row.get("embedding_osnet"),
                 embedding_fashion=row.get("embedding_fashion"),
                 metadata=_merge_metadata(

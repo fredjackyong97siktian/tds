@@ -85,6 +85,8 @@ create table if not exists tds_active_gallery (
     person_id integer,
     image_url text,
     image_kind varchar(50) not null default 'reid_view',
+    gallery_date date,
+    period_code varchar(30),
     embedding_osnet jsonb,
     embedding_fashion jsonb,
     metadata jsonb,
@@ -110,6 +112,9 @@ create index if not exists idx_active_gallery_person_id
 create index if not exists idx_active_gallery_image_kind
     on tds_active_gallery(image_kind);
 
+create index if not exists idx_active_gallery_location_period_date
+    on tds_active_gallery(location_id, gallery_date, period_code);
+
 create table if not exists tds_history_gallery (
     id bigserial primary key,
     active_gallery_id bigint,
@@ -119,6 +124,8 @@ create table if not exists tds_history_gallery (
     person_id integer,
     image_url text,
     image_kind varchar(50) not null default 'reid_view',
+    gallery_date date,
+    period_code varchar(30),
     embedding_osnet jsonb,
     embedding_fashion jsonb,
     metadata jsonb,
@@ -142,6 +149,9 @@ create index if not exists idx_history_gallery_person_id
 
 create index if not exists idx_history_gallery_archived_at
     on tds_history_gallery(archived_at desc);
+
+create index if not exists idx_history_gallery_location_period_date
+    on tds_history_gallery(location_id, gallery_date, period_code);
 
 comment on column tds_customer_gallery.location_id is
     'Store/location partition key copied from MySQL so embeddings can be isolated by location.';
@@ -176,8 +186,20 @@ comment on column tds_active_gallery.embedding_osnet is
 comment on column tds_active_gallery.embedding_fashion is
     'Fashion embedding for one active ReID view that should be compared against the next video.';
 
+comment on column tds_active_gallery.gallery_date is
+    'Local trigger date used to scope active matching so only same-date embeddings are loaded.';
+
+comment on column tds_active_gallery.period_code is
+    'Configured time-period code used to scope active matching inside the same store and date.';
+
 comment on column tds_history_gallery.active_gallery_id is
     'Original tds_active_gallery.id before the row was archived out of the active set.';
 
 comment on column tds_history_gallery.archived_reason is
     'Why the row left the active gallery, for example customer_exited.';
+
+comment on column tds_history_gallery.gallery_date is
+    'Copied local trigger date from tds_active_gallery for history/audit matching scope.';
+
+comment on column tds_history_gallery.period_code is
+    'Copied configured time-period code from tds_active_gallery for history/audit matching scope.';
