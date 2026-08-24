@@ -2613,6 +2613,22 @@ def _period_code_for_datetime(db: Session, location_id: int, value: datetime | N
     return None
 
 
+def _selected_grouping_periods_for_location(periods: list[dict[str, Any]], location_id: int) -> list[dict[str, Any]]:
+    local_periods = [
+        period
+        for period in periods
+        if period.get("location_id") is not None and int(period["location_id"]) == int(location_id)
+    ]
+    candidate_periods = local_periods if local_periods else [
+        period for period in periods if period.get("location_id") is None
+    ]
+    return [
+        period
+        for period in candidate_periods
+        if bool(period.get("selected"))
+    ]
+
+
 def _frame_urls_from_video_asset(row: Mapping[str, Any]) -> list[dict[str, Any]]:
     metadata = row.get("video_asset_metadata")
     if not isinstance(metadata, Mapping):
@@ -2661,21 +2677,25 @@ def _frame_urls_from_trigger_frame_asset(row: Mapping[str, Any]) -> list[dict[st
 
 
 def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
-    periods = repositories.list_filter_time_periods(db, selected_only=True)
+    periods = repositories.list_filter_time_periods(db, selected_only=False)
     if not periods:
         return []
     locations = repositories.list_locations(db)
     location_ids = [int(row["id"]) for row in locations if row.get("id") is not None]
     prepared: list[dict[str, Any]] = []
     current = datetime.now().replace(microsecond=0)
-    for period in periods:
-        target_location_ids = [int(period["location_id"])] if period.get("location_id") is not None else location_ids
-        for location_id in target_location_ids:
-            ready_assets = repositories.list_manual_grouping_ready_trigger_frame_assets(
-                db,
-                location_id=location_id,
-                limit=1000,
-            )
+    for location_id in location_ids:
+        selected_periods = _selected_grouping_periods_for_location(periods, location_id)
+        if not selected_periods:
+            continue
+        ready_assets = repositories.list_manual_grouping_ready_trigger_frame_assets(
+            db,
+            location_id=location_id,
+            limit=1000,
+        )
+        if not ready_assets:
+            continue
+        for period in selected_periods:
             assets_by_window: dict[tuple[datetime, datetime], list[dict[str, Any]]] = {}
             for row in ready_assets:
                 trigger_time = _coerce_datetime_value(row.get("trigger_time"))
@@ -2700,12 +2720,20 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
                 )
                 if existing is not None:
                     continue
-                trigger_assets = repositories.list_trigger_frame_assets_for_window(
+                all_window_assets = repositories.list_trigger_frame_assets_for_window(
                     db,
                     location_id=location_id,
                     window_start=window_start,
                     window_end=window_end,
                 )
+                trigger_assets = [
+                    row
+                    for row in all_window_assets
+                    if (
+                        trigger_time := _coerce_datetime_value(row.get("trigger_time"))
+                    ) is not None
+                    and _period_window_for_datetime(period, trigger_time) == (window_start, window_end)
+                ]
                 if not trigger_assets:
                     continue
                 not_ready = [
