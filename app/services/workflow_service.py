@@ -2588,7 +2588,7 @@ def _time_period_now() -> datetime:
 
 def _to_time_period_local_naive(value: datetime) -> datetime:
     if value.tzinfo is None:
-        return value.replace(tzinfo=UTC).astimezone(_time_period_zoneinfo()).replace(tzinfo=None, microsecond=0)
+        return value.replace(tzinfo=None, microsecond=0)
     return value.astimezone(_time_period_zoneinfo()).replace(tzinfo=None, microsecond=0)
 
 
