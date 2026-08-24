@@ -2588,8 +2588,12 @@ def _time_period_now() -> datetime:
 
 def _to_time_period_local_naive(value: datetime) -> datetime:
     if value.tzinfo is None:
-        return value.replace(tzinfo=None, microsecond=0)
+        return value.replace(tzinfo=UTC).astimezone(_time_period_zoneinfo()).replace(tzinfo=None, microsecond=0)
     return value.astimezone(_time_period_zoneinfo()).replace(tzinfo=None, microsecond=0)
+
+
+def _time_period_local_to_utc_naive(value: datetime) -> datetime:
+    return value.replace(tzinfo=_time_period_zoneinfo()).astimezone(UTC).replace(tzinfo=None, microsecond=0)
 
 
 def _last_completed_period_window(period: Mapping[str, Any], *, now: datetime | None = None) -> tuple[datetime, datetime]:
@@ -2733,20 +2737,22 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
 
             for (window_start, window_end), _ready_rows in sorted(assets_by_window.items()):
                 period_code = str(period.get("period_code") or "period")
+                db_window_start = _time_period_local_to_utc_naive(window_start)
+                db_window_end = _time_period_local_to_utc_naive(window_end)
                 existing = repositories.get_grouping_batch_by_window(
                     db,
                     location_id=location_id,
                     period_code=period_code,
-                    window_start=window_start,
-                    window_end=window_end,
+                    window_start=db_window_start,
+                    window_end=db_window_end,
                 )
                 if existing is not None:
                     continue
                 all_window_assets = repositories.list_trigger_frame_assets_for_window(
                     db,
                     location_id=location_id,
-                    window_start=window_start,
-                    window_end=window_end,
+                    window_start=db_window_start,
+                    window_end=db_window_end,
                 )
                 trigger_assets = [
                     row
@@ -2777,8 +2783,8 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
                     db,
                     location_id=location_id,
                     period_code=period_code,
-                    window_start=window_start,
-                    window_end=window_end,
+                    window_start=db_window_start,
+                    window_end=db_window_end,
                 )
                 for row in trigger_assets:
                     repositories.upsert_grouping_item(
@@ -2793,8 +2799,8 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
                     "Prepared grouping catch-up batch location_id=%s period_code=%s window_start=%s window_end=%s trigger_count=%s batch_id=%s",
                     location_id,
                     period_code,
-                    window_start,
-                    window_end,
+                    db_window_start,
+                    db_window_end,
                     len(trigger_assets),
                     batch.get("id"),
                 )
@@ -4829,7 +4835,7 @@ def _sync_gallery_state_after_entry(
         gallery_scope_time = (
             _coerce_datetime_value(trigger_row.get("trigger_time")) if trigger_row else None
         ) or captured_start_time
-        gallery_date = gallery_scope_time.date() if gallery_scope_time is not None else None
+        gallery_date = _to_time_period_local_naive(gallery_scope_time).date() if gallery_scope_time is not None else None
         gallery_period_code = _period_code_for_datetime(transactional_db, location_id, gallery_scope_time)
         current_entry_session_id = session_id
         sessions_to_close: set[int] = set()
@@ -6886,7 +6892,7 @@ def run_entry_for_trigger(
             "and THEFT_API_RUNPOD_API_KEY in the API environment."
         )
     trigger_time = _coerce_datetime_value(trigger.get("trigger_time"))
-    gallery_date = trigger_time.date() if trigger_time is not None else None
+    gallery_date = _to_time_period_local_naive(trigger_time).date() if trigger_time is not None else None
     gallery_period_code = _period_code_for_datetime(db, location_id, trigger_time)
     _hydrate_gallery_state_from_active_gallery(
         location_id,
