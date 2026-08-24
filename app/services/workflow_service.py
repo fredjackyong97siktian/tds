@@ -2592,10 +2592,6 @@ def _to_time_period_local_naive(value: datetime) -> datetime:
     return value.astimezone(_time_period_zoneinfo()).replace(tzinfo=None, microsecond=0)
 
 
-def _time_period_local_to_utc_naive(value: datetime) -> datetime:
-    return value.replace(tzinfo=_time_period_zoneinfo()).astimezone(UTC).replace(tzinfo=None, microsecond=0)
-
-
 def _last_completed_period_window(period: Mapping[str, Any], *, now: datetime | None = None) -> tuple[datetime, datetime]:
     current = _to_time_period_local_naive(now) if now is not None else _time_period_now()
     today = current.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -2660,12 +2656,12 @@ def _selected_grouping_periods_for_location(periods: list[dict[str, Any]], locat
 
 
 def _grouping_time_from_trigger_frame_asset(row: Mapping[str, Any]) -> datetime | None:
-    frame_start_time = _coerce_datetime_value(row.get("frame_asset_start_time"))
-    if frame_start_time is not None:
-        # Frame assets are created from the store playback window; use that wall-clock window for period grouping.
-        return frame_start_time.replace(tzinfo=None, microsecond=0)
     trigger_time = _coerce_datetime_value(row.get("trigger_time"))
-    return _to_time_period_local_naive(trigger_time) if trigger_time is not None else None
+    if trigger_time is not None:
+        # trigger_event.trigger_time is the store event time used for period grouping.
+        return trigger_time.replace(tzinfo=None, microsecond=0)
+    frame_start_time = _coerce_datetime_value(row.get("frame_asset_start_time"))
+    return frame_start_time.replace(tzinfo=None, microsecond=0) if frame_start_time is not None else None
 
 
 def _frame_urls_from_video_asset(row: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -2750,14 +2746,12 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
 
             for (window_start, window_end), _ready_rows in sorted(assets_by_window.items()):
                 period_code = str(period.get("period_code") or "period")
-                db_window_start = _time_period_local_to_utc_naive(window_start)
-                db_window_end = _time_period_local_to_utc_naive(window_end)
                 existing = repositories.get_grouping_batch_by_window(
                     db,
                     location_id=location_id,
                     period_code=period_code,
-                    window_start=db_window_start,
-                    window_end=db_window_end,
+                    window_start=window_start,
+                    window_end=window_end,
                 )
                 if existing is not None:
                     continue
@@ -2768,8 +2762,8 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
                     db,
                     location_id=location_id,
                     period_code=period_code,
-                    window_start=db_window_start,
-                    window_end=db_window_end,
+                    window_start=window_start,
+                    window_end=window_end,
                 )
                 for row in trigger_assets:
                     repositories.upsert_grouping_item(
@@ -2784,8 +2778,8 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
                     "Prepared grouping catch-up batch location_id=%s period_code=%s window_start=%s window_end=%s trigger_count=%s batch_id=%s",
                     location_id,
                     period_code,
-                    db_window_start,
-                    db_window_end,
+                    window_start,
+                    window_end,
                     len(trigger_assets),
                     batch.get("id"),
                 )
