@@ -2675,7 +2675,7 @@ def list_video_assets(db: Session, limit: int = 50) -> list[dict[str, Any]]:
             group by va.id, va.trigger_id, va.section, va.sequence_no, va.video_url, va.file_path,
                      va.captured_start_time, va.captured_end_time, va.retrieved_at, va.analyzed_at, va.retention_until, va.status,
                      va.metadata, va.created_at, te.location_id
-            order by va.created_at desc, va.id desc
+            order by coalesce(va.captured_start_time, va.created_at) desc, va.id desc
             limit :limit
             """
         ),

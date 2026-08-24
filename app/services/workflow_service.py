@@ -3263,28 +3263,38 @@ def _queue_l1_entrance_video_for_trigger(
     trigger_id = int(trigger["id"])
     start_time = trigger_time - timedelta(seconds=40)
     end_time = trigger_time + timedelta(seconds=10)
-    try:
-        queued = _prepare_video_retrieval(
-            db,
-            section="entrance",
-            location_id=location_id,
-            session_id=session_id,
-            trigger_id=trigger_id,
-            alert_id=None,
-            start_time=start_time,
-            end_time=end_time,
-        )
-    except Exception:
-        logger.exception(
-            "Could not create Layer 1 entrance video asset session_id=%s trigger_id=%s",
-            session_id,
-            trigger_id,
-        )
-        return None
-
+    filename = f"entrance_playback_{_format_dahua_playback_time(start_time)}_{_format_dahua_playback_time(end_time)}.mp4"
+    output_path = session_tmp_video_path(location_id, session_id, "entrance", filename)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    video_asset_id = repositories.create_video_asset(
+        db,
+        {
+            "trigger_id": trigger_id,
+            "section": "entrance",
+            "sequence_no": None,
+            "video_url": "",
+            "file_path": str(output_path),
+            "captured_start_time": start_time,
+            "captured_end_time": end_time,
+            "retrieved_at": None,
+            "analyzed_at": None,
+            "retention_until": end_time + timedelta(days=3),
+            "status": "not_retrieved",
+            "metadata": {
+                "location_id": location_id,
+                "retrieval_source": "layer0_deep_analysis",
+                "promoted_from_layer0": True,
+                "retrieval_mode": "full_video",
+                "full_video_window_source": "trigger_time",
+                "full_video_before_seconds": 40,
+                "full_video_after_seconds": 10,
+            },
+        },
+    )
+    repositories.update_video_asset_url(db, video_asset_id, f"/api/v1/videos/assets/{video_asset_id}/content")
     repositories.update_video_asset_status(
         db,
-        queued.video_asset_id,
+        video_asset_id,
         "not_retrieved",
         metadata={
             "location_id": location_id,
@@ -3299,7 +3309,7 @@ def _queue_l1_entrance_video_for_trigger(
     repositories.create_session_video_asset_link(
         db,
         session_id,
-        queued.video_asset_id,
+        video_asset_id,
         {
             "section": "entry",
             "sequence_no": None,
@@ -3312,7 +3322,7 @@ def _queue_l1_entrance_video_for_trigger(
             },
         },
     )
-    return queued.video_asset_id
+    return video_asset_id
 
 
 def run_theft_confidence_for_grouping_batch(
