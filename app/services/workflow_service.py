@@ -3250,27 +3250,33 @@ def _ensure_session_for_confidence_group(
     return session
 
 
-def _queue_l1_entrance_video_for_trigger(
+def _queue_l1_video_for_trigger(
     db: Session,
     *,
     session_id: int,
     location_id: int,
     trigger: Mapping[str, Any],
+    video_section: str,
+    link_section: str,
 ) -> int | None:
+    normalized_video_section = video_section.strip().lower()
+    normalized_link_section = link_section.strip().lower()
+    if normalized_video_section not in {"entrance", "exit"} or normalized_link_section not in {"entry", "exit"}:
+        return None
     trigger_time = _coerce_datetime_value(trigger.get("trigger_time"))
     if trigger_time is None:
         return None
     trigger_id = int(trigger["id"])
     start_time = trigger_time - timedelta(seconds=40)
     end_time = trigger_time + timedelta(seconds=10)
-    filename = f"entrance_playback_{_format_dahua_playback_time(start_time)}_{_format_dahua_playback_time(end_time)}.mp4"
-    output_path = session_tmp_video_path(location_id, session_id, "entrance", filename)
+    filename = f"{normalized_video_section}_playback_{_format_dahua_playback_time(start_time)}_{_format_dahua_playback_time(end_time)}.mp4"
+    output_path = session_tmp_video_path(location_id, session_id, normalized_video_section, filename)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     video_asset_id = repositories.create_video_asset(
         db,
         {
             "trigger_id": trigger_id,
-            "section": "entrance",
+            "section": normalized_video_section,
             "sequence_no": None,
             "video_url": "",
             "file_path": str(output_path),
@@ -3311,14 +3317,15 @@ def _queue_l1_entrance_video_for_trigger(
         session_id,
         video_asset_id,
         {
-            "section": "entry",
+            "section": normalized_link_section,
             "sequence_no": None,
             "clip_start_time": start_time,
             "clip_end_time": end_time,
-            "is_primary": True,
+            "is_primary": normalized_link_section == "entry",
             "metadata": {
                 "source": "layer0_deep_analysis",
                 "trigger_id": trigger_id,
+                "video_section": normalized_video_section,
             },
         },
     )
@@ -3658,11 +3665,27 @@ def run_theft_confidence_for_grouping_batch(
                     trigger = next((row for row in trigger_rows if int(row.get("id") or 0) == trigger_id), None)
                     if trigger is None:
                         continue
-                    video_asset_id = _queue_l1_entrance_video_for_trigger(
+                    video_asset_id = _queue_l1_video_for_trigger(
                         db,
                         session_id=session_id,
                         location_id=location_id,
                         trigger=trigger,
+                        video_section="entrance",
+                        link_section="entry",
+                    )
+                    if video_asset_id is not None:
+                        queued_video_asset_ids.add(video_asset_id)
+                for trigger_id in exit_trigger_ids:
+                    trigger = next((row for row in trigger_rows if int(row.get("id") or 0) == trigger_id), None)
+                    if trigger is None:
+                        continue
+                    video_asset_id = _queue_l1_video_for_trigger(
+                        db,
+                        session_id=session_id,
+                        location_id=location_id,
+                        trigger=trigger,
+                        video_section="exit",
+                        link_section="exit",
                     )
                     if video_asset_id is not None:
                         queued_video_asset_ids.add(video_asset_id)
