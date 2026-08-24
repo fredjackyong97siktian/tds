@@ -2078,9 +2078,12 @@ def _person_frame_urls_by_trigger(grouping_summary: Mapping[str, Any]) -> dict[i
 def _repair_grouping_with_gemini(
     db: Session,
     *,
-    script_run_id: int,
+    script_run_id: int | None,
     grouping_summary: dict[str, Any],
 ) -> dict[str, Any]:
+    existing_repair = grouping_summary.get("gemini_repair")
+    if isinstance(existing_repair, Mapping) and existing_repair.get("status"):
+        return grouping_summary
     groups = grouping_summary.get("groups") or grouping_summary.get("Groups") or []
     if not isinstance(groups, list):
         return grouping_summary
@@ -2149,7 +2152,7 @@ def _repair_grouping_with_gemini(
     )
     try:
         repair_result, repair_meta = _call_kiosk_gemini_summary(prompt=prompt, image_urls=image_urls)
-        repair_cost = _record_gemini_cost(db, script_run_id, repair_meta)
+        repair_cost = _record_gemini_cost(db, script_run_id, repair_meta) if script_run_id is not None else {}
     except Exception as exc:
         grouping_summary["gemini_repair"] = {
             "status": "failed",
@@ -2217,6 +2220,61 @@ def _repair_grouping_with_gemini(
         "applied_group_count": len(repaired_groups),
     }
     return grouping_summary
+
+
+def _persist_grouping_items_from_summary(
+    db: Session,
+    *,
+    batch_id: int,
+    grouping_summary: Mapping[str, Any],
+) -> None:
+    groups = grouping_summary.get("groups") or grouping_summary.get("Groups") or []
+    grouped_trigger_ids: set[int] = set()
+    if isinstance(groups, list):
+        for group_index, group in enumerate(groups, start=1):
+            if not isinstance(group, Mapping):
+                continue
+            group_key = str(group.get("group_id") or group.get("id") or group_index)
+            for role in ("entry", "exit"):
+                trigger_ids = group.get(role) or []
+                if not isinstance(trigger_ids, list):
+                    continue
+                for trigger_id in trigger_ids:
+                    try:
+                        normalized_trigger_id = int(trigger_id)
+                        grouped_trigger_ids.add(normalized_trigger_id)
+                        repositories.upsert_grouping_item(
+                            db,
+                            batch_id=batch_id,
+                            trigger_id=normalized_trigger_id,
+                            video_asset_id=None,
+                            group_key=group_key,
+                            role=role,
+                            status="grouped",
+                            score=float(group.get("score")) if group.get("score") is not None else None,
+                            result_payload=dict(group),
+                        )
+                    except Exception:
+                        logger.exception("Could not persist grouping item batch_id=%s trigger_id=%s", batch_id, trigger_id)
+    unknown = grouping_summary.get("unknown") or []
+    if isinstance(unknown, list):
+        for trigger_id in unknown:
+            try:
+                normalized_trigger_id = int(trigger_id)
+                if normalized_trigger_id in grouped_trigger_ids:
+                    continue
+                repositories.upsert_grouping_item(
+                    db,
+                    batch_id=batch_id,
+                    trigger_id=normalized_trigger_id,
+                    video_asset_id=None,
+                    group_key=None,
+                    role="unknown",
+                    status="unknown",
+                    result_payload={"reason": "runner_or_repair_returned_unknown"},
+                )
+            except Exception:
+                logger.exception("Could not persist unknown grouping item batch_id=%s trigger_id=%s", batch_id, trigger_id)
 
 
 def _invoke_remote_runner(
@@ -3269,12 +3327,6 @@ def _finalize_remote_grouping_script_run(
     if batch_id is None:
         return result
     grouping_summary, grouping_summary_fetch_error = _resolve_grouping_summary_from_remote_result(remote_result)
-    if remote_status == "success":
-        grouping_summary = _repair_grouping_with_gemini(
-            db,
-            script_run_id=script_run_id,
-            grouping_summary=grouping_summary,
-        )
     repositories.update_grouping_batch(
         db,
         batch_id,
@@ -3296,66 +3348,12 @@ def _finalize_remote_grouping_script_run(
         except Exception:
             logger.exception("Could not restore grouping frame assets after failure batch_id=%s", batch_id)
         return result
-    groups = grouping_summary.get("groups") or grouping_summary.get("Groups") or []
-    grouped_trigger_ids: set[int] = set()
-    for group_index, group in enumerate(groups, start=1):
-        if not isinstance(group, Mapping):
-            continue
-        group_key = str(group.get("group_id") or group.get("id") or group_index)
-        for role in ("entry", "exit"):
-            trigger_ids = group.get(role) or []
-            if not isinstance(trigger_ids, list):
-                continue
-            for trigger_id in trigger_ids:
-                try:
-                    grouped_trigger_ids.add(int(trigger_id))
-                    repositories.upsert_grouping_item(
-                        db,
-                        batch_id=batch_id,
-                        trigger_id=int(trigger_id),
-                        video_asset_id=None,
-                        group_key=group_key,
-                        role=role,
-                        status="grouped",
-                        score=float(group.get("score")) if group.get("score") is not None else None,
-                        result_payload=dict(group),
-                    )
-                except Exception:
-                    logger.exception("Could not persist grouping item batch_id=%s trigger_id=%s", batch_id, trigger_id)
-    unknown = grouping_summary.get("unknown") or []
-    if isinstance(unknown, list):
-        for trigger_id in unknown:
-            try:
-                normalized_trigger_id = int(trigger_id)
-                if normalized_trigger_id in grouped_trigger_ids:
-                    continue
-                repositories.upsert_grouping_item(
-                    db,
-                    batch_id=batch_id,
-                    trigger_id=normalized_trigger_id,
-                    video_asset_id=None,
-                    group_key=None,
-                    role="unknown",
-                    status="unknown",
-                    result_payload={"reason": "runner_returned_unknown"},
-                )
-            except Exception:
-                logger.exception("Could not persist unknown grouping item batch_id=%s trigger_id=%s", batch_id, trigger_id)
+    _persist_grouping_items_from_summary(db, batch_id=batch_id, grouping_summary=grouping_summary)
     try:
         processed_count = repositories.mark_grouping_batch_frame_assets_processed(db, batch_id)
         logger.info("Marked grouping frame assets processed batch_id=%s count=%s", batch_id, processed_count)
     except Exception:
         logger.exception("Could not mark grouping frame assets processed batch_id=%s", batch_id)
-    try:
-        confidence_result = run_theft_confidence_for_grouping_batch(db, batch_id=batch_id)
-        logger.info(
-            "Theft confidence completed after grouping batch_id=%s analyzed=%s promoted=%s",
-            batch_id,
-            confidence_result.get("analyzed_count"),
-            confidence_result.get("promoted_count"),
-        )
-    except Exception:
-        logger.exception("Could not run theft confidence after grouping batch_id=%s", batch_id)
     return result
 
 
@@ -3706,6 +3704,25 @@ def run_theft_confidence_for_grouping_batch(
     grouping_summary = batch.get("result_payload")
     if not isinstance(grouping_summary, Mapping):
         raise ValueError(f"Grouping batch {batch_id} does not have a result payload.")
+    grouping_summary = dict(grouping_summary)
+    grouping_summary_before_repair = json.dumps(grouping_summary, sort_keys=True, default=str)
+    repaired_grouping_summary = _repair_grouping_with_gemini(
+        db,
+        script_run_id=int(batch["script_run_id"]) if batch.get("script_run_id") is not None else None,
+        grouping_summary=grouping_summary,
+    )
+    grouping_summary_after_repair = json.dumps(repaired_grouping_summary, sort_keys=True, default=str)
+    if grouping_summary_after_repair != grouping_summary_before_repair:
+        grouping_summary = repaired_grouping_summary
+        repositories.update_grouping_batch(
+            db,
+            batch_id,
+            {
+                "result_payload": grouping_summary,
+                "issue_reason": None,
+            },
+        )
+        _persist_grouping_items_from_summary(db, batch_id=batch_id, grouping_summary=grouping_summary)
     location_id = int(grouping_summary.get("location_id") or 0)
     if location_id <= 0:
         location_id = int(batch.get("location_id") or 0)
