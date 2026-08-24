@@ -2964,6 +2964,35 @@ def update_session_fields(
     return get_session(db, session_id)
 
 
+def update_session_grouping_link(
+    db: Session,
+    *,
+    session_id: int,
+    grouping_batch_id: int,
+    grouping_group_key: str,
+) -> dict[str, Any]:
+    session_table = _table("session")
+    if not _column_exists(db, session_table, "grouping_batch_id") or not _column_exists(db, session_table, "grouping_group_key"):
+        return get_session(db, session_id)
+    db.execute(
+        text(
+            f"""
+            update {session_table}
+            set grouping_batch_id = :grouping_batch_id,
+                grouping_group_key = :grouping_group_key
+            where id = :session_id
+            """
+        ),
+        {
+            "session_id": session_id,
+            "grouping_batch_id": grouping_batch_id,
+            "grouping_group_key": grouping_group_key,
+        },
+    )
+    db.commit()
+    return get_session(db, session_id)
+
+
 def get_session_customer_count(db: Session, session_id: int) -> int:
     session_customer_table = _table("session_customer")
     result = db.execute(
