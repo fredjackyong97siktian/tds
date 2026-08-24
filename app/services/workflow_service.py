@@ -15,6 +15,7 @@ from typing import Any, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy.orm import Session
 
@@ -2570,8 +2571,29 @@ def _combine_local_datetime(day: datetime, value: Any) -> datetime:
     return day.replace(hour=hour, minute=minute, second=second, microsecond=0)
 
 
+def _time_period_zoneinfo() -> ZoneInfo:
+    try:
+        return ZoneInfo(settings.time_period_timezone)
+    except ZoneInfoNotFoundError:
+        logger.warning(
+            "Invalid THEFT_API_TIME_PERIOD_TIMEZONE=%s; falling back to Asia/Kuala_Lumpur",
+            settings.time_period_timezone,
+        )
+        return ZoneInfo("Asia/Kuala_Lumpur")
+
+
+def _time_period_now() -> datetime:
+    return datetime.now(_time_period_zoneinfo()).replace(tzinfo=None, microsecond=0)
+
+
+def _to_time_period_local_naive(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=None, microsecond=0)
+    return value.astimezone(_time_period_zoneinfo()).replace(tzinfo=None, microsecond=0)
+
+
 def _last_completed_period_window(period: Mapping[str, Any], *, now: datetime | None = None) -> tuple[datetime, datetime]:
-    current = (now or datetime.now()).replace(microsecond=0)
+    current = _to_time_period_local_naive(now) if now is not None else _time_period_now()
     today = current.replace(hour=0, minute=0, second=0, microsecond=0)
     start_today = _combine_local_datetime(today, period.get("start_time"))
     end_today = _combine_local_datetime(today, period.get("end_time"))
@@ -2583,7 +2605,7 @@ def _last_completed_period_window(period: Mapping[str, Any], *, now: datetime | 
 
 
 def _period_window_for_datetime(period: Mapping[str, Any], value: datetime) -> tuple[datetime, datetime] | None:
-    current = value.replace(microsecond=0)
+    current = _to_time_period_local_naive(value)
     day = current.replace(hour=0, minute=0, second=0, microsecond=0)
     window_start = _combine_local_datetime(day, period.get("start_time"))
     window_end = _combine_local_datetime(day, period.get("end_time"))
@@ -2683,7 +2705,7 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
     locations = repositories.list_locations(db)
     location_ids = [int(row["id"]) for row in locations if row.get("id") is not None]
     prepared: list[dict[str, Any]] = []
-    current = datetime.now().replace(microsecond=0)
+    current = _time_period_now()
     for location_id in location_ids:
         selected_periods = _selected_grouping_periods_for_location(periods, location_id)
         if not selected_periods:

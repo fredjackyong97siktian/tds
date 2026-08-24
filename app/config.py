@@ -56,6 +56,7 @@ class Settings(BaseSettings):
     trigger_frame_count: int = 20
     trigger_frame_gap: int = 12
     trigger_frame_fps: int = 25
+    time_period_timezone: str = "Asia/Kuala_Lumpur"
     grouping_poll_seconds: int = 30
     grouping_max_global_workers: int = 1
     theft_confidence_poll_seconds: int = 30
