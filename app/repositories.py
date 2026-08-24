@@ -931,7 +931,7 @@ def set_worker_paused(db: Session, worker_name: str, paused: bool) -> dict[str, 
     return get_worker_control(db, worker_name)
 
 
-def list_triggers(db: Session, limit: int = 50) -> list[dict[str, Any]]:
+def list_triggers(db: Session, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
     trigger_table = _table("trigger_event")
     script_run_table = _table("script_run")
     video_asset_table = _table("video_asset")
@@ -1028,9 +1028,10 @@ def list_triggers(db: Session, limit: int = 50) -> list[dict[str, Any]]:
             from {trigger_table} te
             order by trigger_time desc, id desc
             limit :limit
+            offset :offset
             """
         ),
-        {"limit": limit},
+        {"limit": limit, "offset": max(0, offset)},
     )
     rows = _fetch_all_dicts(result)
     for row in rows:

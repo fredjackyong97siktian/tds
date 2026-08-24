@@ -16,8 +16,12 @@ def create_trigger(payload: TriggerCreate, db: Session = Depends(get_transaction
 
 
 @router.get("", response_model=list[TriggerListItem])
-def list_triggers(limit: int = 50, db: Session = Depends(get_transaction_db)) -> list[TriggerListItem]:
-    rows = repositories.list_triggers(db, limit=limit)
+def list_triggers(
+    limit: int = 50,
+    offset: int = 0,
+    db: Session = Depends(get_transaction_db),
+) -> list[TriggerListItem]:
+    rows = repositories.list_triggers(db, limit=max(1, min(limit, 500)), offset=max(0, offset))
     return [TriggerListItem(**row) for row in rows]
 
 
