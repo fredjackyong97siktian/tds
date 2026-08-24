@@ -107,14 +107,13 @@ CREATE TABLE IF NOT EXISTS sesamedb.tds_session (
     status VARCHAR(30) NOT NULL DEFAULT 'pending',
     result_summary JSON,
     issue_reason TEXT,
-    grouping_batch_id BIGINT,
-    grouping_group_key VARCHAR(64),
+    grouping_id BIGINT,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     KEY idx_session_entry_trigger_id (entry_trigger_id),
     KEY idx_session_exit_trigger_id (exit_trigger_id),
     KEY idx_session_location_created (location_id, created_at),
-    KEY idx_session_grouping (grouping_batch_id, grouping_group_key),
+    KEY idx_session_grouping (grouping_id),
     CONSTRAINT fk_session_entry_trigger
         FOREIGN KEY (entry_trigger_id) REFERENCES tds_trigger_event(id),
     CONSTRAINT fk_session_exit_trigger

@@ -3641,8 +3641,7 @@ def run_theft_confidence_for_grouping_batch(
                 session = repositories.update_session_grouping_link(
                     db,
                     session_id=session_id,
-                    grouping_batch_id=batch_id,
-                    grouping_group_key=group_key,
+                    grouping_id=batch_id,
                 )
                 created_session_ids.add(session_id)
                 for trigger_id in entry_trigger_ids:

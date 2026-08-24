@@ -2968,25 +2968,22 @@ def update_session_grouping_link(
     db: Session,
     *,
     session_id: int,
-    grouping_batch_id: int,
-    grouping_group_key: str,
+    grouping_id: int,
 ) -> dict[str, Any]:
     session_table = _table("session")
-    if not _column_exists(db, session_table, "grouping_batch_id") or not _column_exists(db, session_table, "grouping_group_key"):
+    if not _column_exists(db, session_table, "grouping_id"):
         return get_session(db, session_id)
     db.execute(
         text(
             f"""
             update {session_table}
-            set grouping_batch_id = :grouping_batch_id,
-                grouping_group_key = :grouping_group_key
+            set grouping_id = :grouping_id
             where id = :session_id
             """
         ),
         {
             "session_id": session_id,
-            "grouping_batch_id": grouping_batch_id,
-            "grouping_group_key": grouping_group_key,
+            "grouping_id": grouping_id,
         },
     )
     db.commit()
