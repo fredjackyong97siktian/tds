@@ -2374,21 +2374,31 @@ def promote_trigger_video_assets_to_full_retrieval(db: Session, trigger_ids: lis
     if not normalized_ids:
         return 0
     video_asset_table = _table("video_asset")
+    trigger_table = _table("trigger_event")
     result = db.execute(
         text(
             f"""
-            update {video_asset_table}
-            set status = 'not_retrieved',
-                metadata = json_set(
-                    coalesce(metadata, json_object()),
+            update {video_asset_table} va
+            join {trigger_table} te on te.id = va.trigger_id
+            set va.captured_start_time = date_sub(te.trigger_time, interval 40 second),
+                va.captured_end_time = date_add(te.trigger_time, interval 10 second),
+                va.status = 'not_retrieved',
+                va.metadata = json_set(
+                    coalesce(va.metadata, json_object()),
                     '$.promoted_from_layer0',
                     true,
                     '$.retrieval_mode',
-                    'full_video'
+                    'full_video',
+                    '$.full_video_window_source',
+                    'trigger_time',
+                    '$.full_video_before_seconds',
+                    40,
+                    '$.full_video_after_seconds',
+                    10
                 )
-            where trigger_id in :trigger_ids
-              and section = 'entrance'
-              and status in ('frames_retrieved', '10_frames_retrieved')
+            where va.trigger_id in :trigger_ids
+              and va.section = 'entrance'
+              and va.status in ('frames_retrieved', '10_frames_retrieved')
             """
         ).bindparams(bindparam("trigger_ids", expanding=True)),
         {"trigger_ids": normalized_ids},
