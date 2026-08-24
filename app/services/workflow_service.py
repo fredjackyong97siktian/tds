@@ -3731,11 +3731,11 @@ def _resolve_shared_kiosk_video_session(
     return int(best_session_id), details
 
 
-def _coerce_int(value: Any) -> int | None:
+def _coerce_int(value: Any, default: int | None = None) -> int | None:
     try:
-        return int(value)
+        return int(float(str(value).replace(",", "").strip()))
     except (TypeError, ValueError):
-        return None
+        return default
 
 
 def _candidate_gallery_image_paths(
