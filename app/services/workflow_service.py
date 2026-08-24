@@ -3250,6 +3250,71 @@ def _ensure_session_for_confidence_group(
     return session
 
 
+def _queue_l1_entrance_video_for_trigger(
+    db: Session,
+    *,
+    session_id: int,
+    location_id: int,
+    trigger: Mapping[str, Any],
+) -> int | None:
+    trigger_time = _coerce_datetime_value(trigger.get("trigger_time"))
+    if trigger_time is None:
+        return None
+    trigger_id = int(trigger["id"])
+    start_time = trigger_time - timedelta(seconds=40)
+    end_time = trigger_time + timedelta(seconds=10)
+    try:
+        queued = _prepare_video_retrieval(
+            db,
+            section="entrance",
+            location_id=location_id,
+            session_id=session_id,
+            trigger_id=trigger_id,
+            alert_id=None,
+            start_time=start_time,
+            end_time=end_time,
+        )
+    except Exception:
+        logger.exception(
+            "Could not create Layer 1 entrance video asset session_id=%s trigger_id=%s",
+            session_id,
+            trigger_id,
+        )
+        return None
+
+    repositories.update_video_asset_status(
+        db,
+        queued.video_asset_id,
+        "not_retrieved",
+        metadata={
+            "location_id": location_id,
+            "retrieval_source": "layer0_deep_analysis",
+            "promoted_from_layer0": True,
+            "retrieval_mode": "full_video",
+            "full_video_window_source": "trigger_time",
+            "full_video_before_seconds": 40,
+            "full_video_after_seconds": 10,
+        },
+    )
+    repositories.create_session_video_asset_link(
+        db,
+        session_id,
+        queued.video_asset_id,
+        {
+            "section": "entry",
+            "sequence_no": None,
+            "clip_start_time": start_time,
+            "clip_end_time": end_time,
+            "is_primary": True,
+            "metadata": {
+                "source": "layer0_deep_analysis",
+                "trigger_id": trigger_id,
+            },
+        },
+    )
+    return queued.video_asset_id
+
+
 def run_theft_confidence_for_grouping_batch(
     db: Session,
     *,
@@ -3304,6 +3369,7 @@ def run_theft_confidence_for_grouping_batch(
     analyzed_count = 0
     promoted_count_total = 0
     created_session_ids: set[int] = set()
+    queued_video_asset_ids: set[int] = set()
     for group_index, group in enumerate(groups, start=1):
         if not isinstance(group, Mapping):
             continue
@@ -3571,15 +3637,29 @@ def run_theft_confidence_for_grouping_batch(
                 exit_trigger_ids=exit_trigger_ids,
             )
             if session:
-                created_session_ids.add(int(session["id"]))
+                session_id = int(session["id"])
+                created_session_ids.add(session_id)
+                for trigger_id in entry_trigger_ids:
+                    trigger = next((row for row in trigger_rows if int(row.get("id") or 0) == trigger_id), None)
+                    if trigger is None:
+                        continue
+                    video_asset_id = _queue_l1_entrance_video_for_trigger(
+                        db,
+                        session_id=session_id,
+                        location_id=location_id,
+                        trigger=trigger,
+                    )
+                    if video_asset_id is not None:
+                        queued_video_asset_ids.add(video_asset_id)
             promoted_count = repositories.promote_trigger_video_assets_to_full_retrieval(db, trigger_ids)
             promoted_count_total += promoted_count
             logger.info(
-                "Layer 0 confidence promoted group_key=%s batch_id=%s trigger_ids=%s session_id=%s promoted_count=%s score=%.2f",
+                "Layer 0 confidence promoted group_key=%s batch_id=%s trigger_ids=%s session_id=%s queued_video_assets=%s promoted_count=%s score=%.2f",
                 group_key,
                 batch_id,
                 trigger_ids,
                 session.get("id") if session else None,
+                sorted(queued_video_asset_ids),
                 promoted_count,
                 score,
             )
@@ -3590,6 +3670,7 @@ def run_theft_confidence_for_grouping_batch(
         "promoted_count": promoted_count_total,
         "session_count": len(created_session_ids),
         "session_ids": sorted(created_session_ids),
+        "queued_video_asset_ids": sorted(queued_video_asset_ids),
     }
 
 
