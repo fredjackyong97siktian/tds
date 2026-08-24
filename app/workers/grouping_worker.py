@@ -72,8 +72,6 @@ class GroupingWorker:
         with self._lock:
             running_jobs = list(self._running.values())
         available_slots = max(0, settings.grouping_max_global_workers - len(running_jobs))
-        if available_slots <= 0:
-            return
 
         db = TransactionalSessionLocal()
         try:
@@ -87,17 +85,20 @@ class GroupingWorker:
                     item["runpod_status"],
                     item["status"],
                 )
-            confidence_result = workflow_service.run_pending_theft_confidence_batches(
-                db,
-                limit=max(settings.theft_confidence_max_global_workers * 10, 20),
-            )
-            if confidence_result.get("processed_count"):
-                logger.info(
-                    "Auto-ran theft confidence processed=%s success=%s failed=%s",
-                    confidence_result.get("processed_count"),
-                    confidence_result.get("success_count"),
-                    confidence_result.get("failed_count"),
+            if not repositories.is_worker_paused(db, "theft_confidence_analysis"):
+                confidence_result = workflow_service.run_pending_theft_confidence_batches(
+                    db,
+                    limit=max(settings.theft_confidence_max_global_workers * 10, 20),
                 )
+                if confidence_result.get("processed_count"):
+                    logger.info(
+                        "Auto-ran theft confidence processed=%s success=%s failed=%s",
+                        confidence_result.get("processed_count"),
+                        confidence_result.get("success_count"),
+                        confidence_result.get("failed_count"),
+                    )
+            if available_slots <= 0:
+                return
             if repositories.is_worker_paused(db, "grouping"):
                 return
             if repositories.has_active_remote_analysis_script_run(db, script_names=["grouping"]):

@@ -80,6 +80,11 @@ def list_grouping_batches(db: Session = Depends(get_transaction_db)) -> dict[str
     }
 
 
+@router.get("/confidence-results")
+def list_confidence_results(limit: int = 100, db: Session = Depends(get_transaction_db)) -> list[dict[str, Any]]:
+    return repositories.list_filter_confidence_results(db, limit=max(1, min(limit, 500)))
+
+
 @router.post("/grouping-batches/prepare")
 def prepare_grouping_batches(db: Session = Depends(get_transaction_db)) -> dict[str, Any]:
     try:

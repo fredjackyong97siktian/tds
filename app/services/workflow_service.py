@@ -3522,7 +3522,7 @@ def run_pending_theft_confidence_batches(db: Session, *, limit: int = 10) -> dic
             result = run_theft_confidence_for_grouping_batch(db, batch_id=batch_id)
             results.append({"batch_id": batch_id, "status": "success", **result})
         except Exception as exc:
-            logger.exception("Manual theft confidence failed for batch_id=%s", batch_id)
+            logger.exception("Theft confidence failed for batch_id=%s", batch_id)
             try:
                 repositories.upsert_filter_confidence_result(
                     db,

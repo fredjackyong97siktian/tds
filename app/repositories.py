@@ -2299,6 +2299,33 @@ def upsert_filter_confidence_result(
     db.commit()
 
 
+def list_filter_confidence_results(db: Session, limit: int = 100) -> list[dict[str, Any]]:
+    confidence_table = _table("filter_confidence_result")
+    batch_table = _table("filter_grouping_batch")
+    result = db.execute(
+        text(
+            f"""
+            select c.id, c.batch_id, c.group_key, c.location_id, c.score, c.need_deep_analysis,
+                   c.reason, c.factor_payload, c.created_at, c.updated_at,
+                   b.period_code, b.window_start, b.window_end, b.status as batch_status
+            from {confidence_table} c
+            left join {batch_table} b on b.id = c.batch_id
+            order by c.created_at desc, c.id desc
+            limit :limit
+            """
+        ),
+        {"limit": limit},
+    )
+    rows = _fetch_all_dicts(result)
+    for row in rows:
+        if isinstance(row.get("factor_payload"), str):
+            try:
+                row["factor_payload"] = json.loads(row["factor_payload"])
+            except json.JSONDecodeError:
+                pass
+    return rows
+
+
 def promote_trigger_video_assets_to_full_retrieval(db: Session, trigger_ids: list[int]) -> int:
     normalized_ids = sorted({int(trigger_id) for trigger_id in trigger_ids if trigger_id is not None})
     if not normalized_ids:
