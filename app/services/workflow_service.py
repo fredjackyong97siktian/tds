@@ -6818,6 +6818,12 @@ def _trigger_frame_offsets(duration_seconds: float, frame_count: int) -> list[fl
     return [min(duration_seconds, index * step_seconds) for index in range(frame_count)]
 
 
+def _selected_trigger_frame_offsets(duration_seconds: float) -> tuple[list[float], int]:
+    planned_frame_count = max(1, int(settings.trigger_frame_count))
+    selected_frame_count = min(planned_frame_count, _grouping_frames_per_trigger())
+    return _trigger_frame_offsets(duration_seconds, planned_frame_count)[:selected_frame_count], planned_frame_count
+
+
 def _run_trigger_frame_retrieval_job(
     *,
     video_asset_id: int,
@@ -6850,8 +6856,8 @@ def _run_trigger_frame_retrieval_job(
         frame_root = Path(output_path).with_suffix("") / "frames"
         frame_root.mkdir(parents=True, exist_ok=True)
         duration_seconds = max(0.0, (end_time - start_time).total_seconds())
-        frame_count = max(1, int(settings.trigger_frame_count))
-        offsets = _trigger_frame_offsets(duration_seconds, frame_count)
+        offsets, planned_frame_count = _selected_trigger_frame_offsets(duration_seconds)
+        frame_count = len(offsets)
         gap_seconds = max(0.04, offsets[1] - offsets[0] if len(offsets) > 1 else duration_seconds or 1.0)
 
         output_pattern = frame_root / f"trigger_{trigger_id}_frame_%02d.jpg"
@@ -6932,11 +6938,13 @@ def _run_trigger_frame_retrieval_job(
             frame_payload.append(frame_record)
 
         ok_frames = [frame for frame in frame_payload if frame.get("status") == "ok"]
-        final_status = "10_frames_retrieved" if ok_frames else "issue"
+        final_status = "retrieved" if ok_frames else "issue"
         metadata = {
             "retrieval_mode": "trigger_frames",
-            "sampling_strategy": "even_window",
+            "sampling_strategy": "first_n_from_even_window",
+            "planned_frame_count": planned_frame_count,
             "frame_count_requested": frame_count,
+            "first_frame_count_from_planned_window": frame_count,
             "frame_gap_seconds": round(float(gap_seconds), 3),
             "frames_retrieved_count": len(ok_frames),
             "frames": frame_payload,
@@ -7137,8 +7145,8 @@ def start_trigger_frame_asset_retrieval_job(job: TriggerFrameAssetRetrievalQueue
         output_dir = Path(job.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         duration_seconds = max(0.0, (job.requested_end_time - job.requested_start_time).total_seconds())
-        frame_count = max(1, int(settings.trigger_frame_count))
-        offsets = _trigger_frame_offsets(duration_seconds, frame_count)
+        offsets, planned_frame_count = _selected_trigger_frame_offsets(duration_seconds)
+        frame_count = len(offsets)
         gap_seconds = max(0.04, offsets[1] - offsets[0] if len(offsets) > 1 else duration_seconds or 1.0)
 
         output_pattern = output_dir / f"trigger_{job.trigger_id}_asset_{job.frame_asset_id}_frame_%02d.jpg"
@@ -7229,7 +7237,7 @@ def start_trigger_frame_asset_retrieval_job(job: TriggerFrameAssetRetrievalQueue
             error = None
         elif ok_count:
             error = (
-                f"Retrieved {ok_count}/{frame_count} trigger frames. "
+                f"Retrieved {ok_count}/{frame_count} trigger frames from the first {frame_count} of {planned_frame_count} planned samples. "
                 "Check the retrieve_video script log for missing-frame ffmpeg errors."
             )
         else:
