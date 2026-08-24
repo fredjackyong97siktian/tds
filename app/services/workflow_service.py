@@ -3261,7 +3261,7 @@ def _queue_l1_video_for_trigger(
 ) -> int | None:
     normalized_video_section = video_section.strip().lower()
     normalized_link_section = link_section.strip().lower()
-    if normalized_video_section not in {"entrance", "exit"} or normalized_link_section not in {"entry", "exit"}:
+    if normalized_video_section not in {"entrance", "kiosk"} or normalized_link_section not in {"entry", "exit"}:
         return None
     trigger_time = _coerce_datetime_value(trigger.get("trigger_time"))
     if trigger_time is None:
@@ -3269,8 +3269,9 @@ def _queue_l1_video_for_trigger(
     trigger_id = int(trigger["id"])
     start_time = trigger_time - timedelta(seconds=40)
     end_time = trigger_time + timedelta(seconds=10)
-    filename = f"{normalized_video_section}_playback_{_format_dahua_playback_time(start_time)}_{_format_dahua_playback_time(end_time)}.mp4"
-    output_path = session_tmp_video_path(location_id, session_id, normalized_video_section, filename)
+    file_section = "exit" if normalized_link_section == "exit" else normalized_video_section
+    filename = f"{file_section}_playback_{_format_dahua_playback_time(start_time)}_{_format_dahua_playback_time(end_time)}.mp4"
+    output_path = session_tmp_video_path(location_id, session_id, file_section, filename)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     video_asset_id = repositories.create_video_asset(
         db,
@@ -3294,6 +3295,7 @@ def _queue_l1_video_for_trigger(
                 "full_video_window_source": "trigger_time",
                 "full_video_before_seconds": 40,
                 "full_video_after_seconds": 10,
+                "session_link_section": normalized_link_section,
             },
         },
     )
@@ -3310,6 +3312,7 @@ def _queue_l1_video_for_trigger(
             "full_video_window_source": "trigger_time",
             "full_video_before_seconds": 40,
             "full_video_after_seconds": 10,
+            "session_link_section": normalized_link_section,
         },
     )
     repositories.create_session_video_asset_link(
@@ -3684,7 +3687,7 @@ def run_theft_confidence_for_grouping_batch(
                         session_id=session_id,
                         location_id=location_id,
                         trigger=trigger,
-                        video_section="exit",
+                        video_section="entrance",
                         link_section="exit",
                     )
                     if video_asset_id is not None:
