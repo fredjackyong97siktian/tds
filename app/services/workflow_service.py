@@ -1994,6 +1994,46 @@ def _post_remote_runner_json(url: str, payload: dict[str, Any]) -> dict[str, Any
         raise RuntimeError(f"Runner returned invalid JSON: {response_text[:1000]}") from exc
 
 
+def _download_remote_json(url: str) -> dict[str, Any]:
+    request = Request(url, method="GET")
+    with urlopen(request, timeout=settings.runner_timeout_seconds) as response:
+        response_text = response.read().decode("utf-8", errors="replace")
+    payload = json.loads(response_text)
+    if not isinstance(payload, dict):
+        raise RuntimeError("Remote JSON artifact did not contain an object.")
+    return payload
+
+
+def _resolve_grouping_summary_from_remote_result(
+    remote_result: RemoteRunnerResult,
+) -> tuple[dict[str, Any], str | None]:
+    grouping_summary = dict(remote_result.grouping_summary or {})
+    meta = dict(remote_result.meta or {})
+    summary_url = str(meta.get("grouping_summary_url") or "").strip()
+    summary_object_key = str(meta.get("grouping_summary_object_key") or "").strip()
+    if not summary_url and summary_object_key:
+        try:
+            summary_url = generate_public_object_url(summary_object_key)
+        except Exception:
+            logger.exception("Could not build public grouping summary URL for %s", summary_object_key)
+    if not summary_url:
+        return grouping_summary, None
+    try:
+        full_summary = _download_remote_json(summary_url)
+        full_summary.setdefault("artifact_url", summary_url)
+        if summary_object_key:
+            full_summary.setdefault("artifact_object_key", summary_object_key)
+        return full_summary, None
+    except Exception as exc:
+        error = f"Could not load grouping summary artifact: {exc}"
+        logger.exception("Could not load grouping summary artifact url=%s", summary_url)
+        grouping_summary["artifact_url"] = summary_url
+        if summary_object_key:
+            grouping_summary["artifact_object_key"] = summary_object_key
+        grouping_summary["artifact_fetch_error"] = error
+        return grouping_summary, error
+
+
 def _invoke_remote_runner(
     *,
     endpoint: str,
@@ -2012,6 +2052,9 @@ def _invoke_remote_runner(
         tracking_summary=body.get("tracking_summary"),
         reid_views_summary=body.get("reid_views_summary"),
         kiosk_summary=body.get("kiosk_summary"),
+        transaction_match_summary=body.get("transaction_match_summary"),
+        grouping_summary=body.get("grouping_summary"),
+        meta=body.get("meta") if isinstance(body.get("meta"), dict) else None,
     )
 
 
@@ -3040,14 +3083,14 @@ def _finalize_remote_grouping_script_run(
     )
     if batch_id is None:
         return result
-    grouping_summary = dict(remote_result.grouping_summary or {})
+    grouping_summary, grouping_summary_fetch_error = _resolve_grouping_summary_from_remote_result(remote_result)
     repositories.update_grouping_batch(
         db,
         batch_id,
         {
             "status": remote_status,
             "result_payload": grouping_summary,
-            "issue_reason": remote_result.stderr if remote_status != "success" else None,
+            "issue_reason": remote_result.stderr if remote_status != "success" else grouping_summary_fetch_error,
             "finished_at": datetime.now(UTC),
         },
     )
