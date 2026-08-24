@@ -87,6 +87,17 @@ class GroupingWorker:
                     item["runpod_status"],
                     item["status"],
                 )
+            confidence_result = workflow_service.run_pending_theft_confidence_batches(
+                db,
+                limit=max(settings.theft_confidence_max_global_workers * 10, 20),
+            )
+            if confidence_result.get("processed_count"):
+                logger.info(
+                    "Auto-ran theft confidence processed=%s success=%s failed=%s",
+                    confidence_result.get("processed_count"),
+                    confidence_result.get("success_count"),
+                    confidence_result.get("failed_count"),
+                )
             if repositories.is_worker_paused(db, "grouping"):
                 return
             if repositories.has_active_remote_analysis_script_run(db, script_names=["grouping"]):

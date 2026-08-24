@@ -5,7 +5,6 @@ from sqlalchemy.orm import Session
 from ..config import settings
 from ..db import get_transaction_db
 from .. import repositories
-from ..services import workflow_service
 
 
 router = APIRouter(prefix="/api/v1/workers", tags=["workers"])
@@ -300,14 +299,6 @@ def update_theft_confidence_control(payload: WorkerControlRequest, db: Session =
         "ok": True,
         **state,
     }
-
-
-@router.post("/theft-confidence-run-now")
-def run_theft_confidence_now(db: Session = Depends(get_transaction_db)) -> dict:
-    return workflow_service.run_pending_theft_confidence_batches(
-        db,
-        limit=max(settings.theft_confidence_max_global_workers * 10, 20),
-    )
 
 
 @router.get("/kiosk-analysis-status")
