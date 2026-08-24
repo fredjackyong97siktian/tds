@@ -3163,6 +3163,10 @@ def _frame_urls_from_trigger_frame_asset(row: Mapping[str, Any]) -> list[dict[st
     return payload
 
 
+def _first_trigger_frame_payload(frames: list[dict[str, Any]], limit: int = 6) -> list[dict[str, Any]]:
+    return frames[: max(1, int(limit))]
+
+
 def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
     periods = repositories.list_filter_time_periods(db, selected_only=False)
     if not periods:
@@ -3223,7 +3227,7 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
                         batch_id=int(batch["id"]),
                         trigger_id=int(row["trigger_id"]),
                         video_asset_id=None,
-                        frame_payload={"frames": _frame_urls_from_trigger_frame_asset(row)},
+                        frame_payload={"frames": _first_trigger_frame_payload(_frame_urls_from_trigger_frame_asset(row), 6)},
                     )
                 prepared.append(batch)
                 logger.info(
@@ -3280,7 +3284,7 @@ def prepare_manual_grouping_batches(db: Session) -> list[dict[str, Any]]:
                 batch_id=int(batch["id"]),
                 trigger_id=int(row["trigger_id"]),
                 video_asset_id=None,
-                frame_payload={"frames": _frame_urls_from_trigger_frame_asset(row)},
+                frame_payload={"frames": _first_trigger_frame_payload(_frame_urls_from_trigger_frame_asset(row), 6)},
             )
         prepared.append(batch)
     return prepared
@@ -3301,7 +3305,7 @@ def build_grouping_analysis_job_from_batch(db: Session, batch_id: int) -> Groupi
                 "credit_card_entry_id": trigger.get("credit_card_entry_id"),
                 "entry_source_type": trigger.get("entry_source_type"),
                 "trigger_time": trigger.get("trigger_time").isoformat() if hasattr(trigger.get("trigger_time"), "isoformat") else trigger.get("trigger_time"),
-                "frames": list(frame_payload.get("frames") or []),
+                "frames": _first_trigger_frame_payload(list(frame_payload.get("frames") or []), 6),
             }
         )
     manifest_payload = {
@@ -3351,6 +3355,117 @@ def build_grouping_analysis_job_from_batch(db: Session, batch_id: int) -> Groupi
     )
 
 
+def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id: int) -> tuple[dict[str, Any], dict[str, Any]]:
+    batch = repositories.get_grouping_batch(db, batch_id)
+    items = repositories.list_grouping_items(db, batch_id)
+    trigger_notes: list[dict[str, Any]] = []
+    image_urls: list[str] = []
+    image_mapping: list[dict[str, Any]] = []
+
+    for item in items:
+        trigger = repositories.get_trigger(db, int(item["trigger_id"]))
+        frame_payload = item.get("frame_payload") if isinstance(item.get("frame_payload"), Mapping) else {}
+        frames = _first_trigger_frame_payload(list(frame_payload.get("frames") or []), 6)
+        note = {
+            "trigger_id": int(item["trigger_id"]),
+            "trigger_time": trigger.get("trigger_time").isoformat() if hasattr(trigger.get("trigger_time"), "isoformat") else trigger.get("trigger_time"),
+            "phone_entry_id": trigger.get("phone_entry_id"),
+            "credit_card_entry_id": trigger.get("credit_card_entry_id"),
+            "entry_source_type": trigger.get("entry_source_type"),
+            "image_numbers": [],
+        }
+        for frame in frames:
+            if not isinstance(frame, Mapping):
+                continue
+            image_url = str(frame.get("image_url") or "").strip()
+            if not image_url or image_url in image_urls:
+                continue
+            image_urls.append(image_url)
+            image_number = len(image_urls)
+            note["image_numbers"].append(image_number)
+            image_mapping.append(
+                {
+                    "image_number": image_number,
+                    "trigger_id": int(item["trigger_id"]),
+                    "frame_index": frame.get("index"),
+                    "sample_time": frame.get("sample_time"),
+                }
+            )
+        trigger_notes.append(note)
+
+    if not image_urls:
+        raise RuntimeError("No trigger frame images are available for Gemini grouping.")
+
+    prompt = (
+        "You are grouping retail door triggers into customer sessions using CCTV frame images. "
+        "Each trigger is a door opening event. Compare visible people across trigger images by clothing, body shape, bags, "
+        "walking direction, and timestamp order. A trigger must never be both entry and exit in the same group. "
+        "A trigger with phone_entry_id or credit_card_entry_id can still be an exit trigger; do not force it to entry. "
+        "Use only the image-number mapping below. Unknown means the trigger cannot be grouped with any other trigger. "
+        "Return strict JSON only with schema: "
+        '{"groups":[{"entry":[integer],"exit":[integer],"confidence":number,"reason":string}],'
+        '"unknown":[integer],"notes":[string]}. '
+        f"Batch: {json.dumps({'batch_id': batch_id, 'location_id': batch.get('location_id'), 'period_code': batch.get('period_code'), 'window_start': batch.get('window_start'), 'window_end': batch.get('window_end')}, default=str)}. "
+        f"Triggers: {json.dumps(trigger_notes, default=str)}. "
+        f"Image mapping: {json.dumps(image_mapping, default=str)}."
+    )
+    gemini_result, gemini_meta = _call_kiosk_gemini_summary(prompt=prompt, image_urls=image_urls)
+    cost = _record_gemini_cost(db, script_run_id, gemini_meta)
+    groups = gemini_result.get("groups") if isinstance(gemini_result.get("groups"), list) else []
+    unknown = gemini_result.get("unknown") if isinstance(gemini_result.get("unknown"), list) else []
+    normalized_groups: list[dict[str, Any]] = []
+    grouped_trigger_ids: set[int] = set()
+    for index, group in enumerate(groups, start=1):
+        if not isinstance(group, Mapping):
+            continue
+        entry_ids = _group_trigger_id_list(group.get("entry"))
+        exit_ids = [trigger_id for trigger_id in _group_trigger_id_list(group.get("exit")) if trigger_id not in entry_ids]
+        if not entry_ids:
+            continue
+        grouped_trigger_ids.update(entry_ids)
+        grouped_trigger_ids.update(exit_ids)
+        normalized_groups.append(
+            {
+                "group_id": index,
+                "entry": entry_ids,
+                "exit": exit_ids,
+                "score": _coerce_number(group.get("confidence"), 0.0),
+                "reason": str(group.get("reason") or "gemini_grouping_direct"),
+                "source": "gemini_grouping_direct",
+            }
+        )
+
+    all_trigger_ids = [int(item["trigger_id"]) for item in items if item.get("trigger_id") is not None]
+    normalized_unknown = sorted(
+        {
+            trigger_id
+            for trigger_id in (_group_trigger_id_list(unknown) + all_trigger_ids)
+            if trigger_id not in grouped_trigger_ids
+        }
+    )
+    grouping_summary = {
+        "batch_id": batch_id,
+        "location_id": int(batch["location_id"]),
+        "period_code": batch.get("period_code"),
+        "window_start": batch.get("window_start").isoformat() if hasattr(batch.get("window_start"), "isoformat") else batch.get("window_start"),
+        "window_end": batch.get("window_end").isoformat() if hasattr(batch.get("window_end"), "isoformat") else batch.get("window_end"),
+        "groups": normalized_groups,
+        "unknown": normalized_unknown,
+        "notes": gemini_result.get("notes") if isinstance(gemini_result.get("notes"), list) else [],
+        "diagnostics": {
+            "mode": "gemini_grouping_direct",
+            "temporary_runpod_grouping_disabled": True,
+            "max_frames_per_trigger": 6,
+            "trigger_count": len(all_trigger_ids),
+            "image_count": len(image_urls),
+            "image_mapping": image_mapping,
+            "raw_result": gemini_result,
+            "cost": cost,
+        },
+    }
+    return grouping_summary, gemini_meta
+
+
 def start_grouping_analysis_job(job: GroupingAnalysisQueued) -> ScriptExecutionResult:
     db = TransactionalSessionLocal()
     try:
@@ -3359,7 +3474,7 @@ def start_grouping_analysis_job(job: GroupingAnalysisQueued) -> ScriptExecutionR
             session_id=None,
             trigger_id=None,
             script_name="grouping",
-            model_name="runpod_runner",
+            model_name="gemini_grouping_direct",
             status="running",
             command=SCRIPT_RUN_COMMAND_REDACTED,
         )
@@ -3374,21 +3489,26 @@ def start_grouping_analysis_job(job: GroupingAnalysisQueued) -> ScriptExecutionR
                 "manifest_object_key": job.manifest_object_key,
             },
         )
-        enqueue_result = _enqueue_runpod_runner(
-            kind="grouping",
-            payload={
-                "kind": "grouping",
-                "manifest_url": job.manifest_url,
-                "callback_url": _build_runpod_webhook_url("grouping"),
-                "script_run_id": script_run_id,
-            },
-        )
         processing_count = repositories.mark_grouping_batch_frame_assets_processing(db, job.batch_id)
         logger.info("Marked grouping frame assets processing batch_id=%s count=%s", job.batch_id, processing_count)
+        grouping_summary, gemini_meta = _run_gemini_grouping_for_batch(db, batch_id=job.batch_id, script_run_id=script_run_id)
+        _persist_grouping_items_from_summary(db, batch_id=job.batch_id, grouping_summary=grouping_summary)
+        processed_count = repositories.mark_grouping_batch_frame_assets_processed(db, job.batch_id)
+        logger.info("Marked grouping frame assets processed batch_id=%s count=%s", job.batch_id, processed_count)
+        repositories.update_grouping_batch(
+            db,
+            job.batch_id,
+            {
+                "status": "success",
+                "result_payload": grouping_summary,
+                "issue_reason": None,
+                "finished_at": datetime.now(UTC),
+            },
+        )
         repositories.assign_script_run_runner_job(
             db,
             script_run_id,
-            runner_job_id=enqueue_result.job_id,
+            runner_job_id=None,
             runner_payload={
                 "batch_id": job.batch_id,
                 "location_id": job.location_id,
@@ -3397,19 +3517,52 @@ def start_grouping_analysis_job(job: GroupingAnalysisQueued) -> ScriptExecutionR
                 "window_end": job.window_end.isoformat(),
                 "manifest_object_key": job.manifest_object_key,
                 "manifest_url": job.manifest_url,
+                "provider": "tds_api_gemini",
+                "model": settings.kiosk_gemini_model,
+                "mode": "gemini_grouping_direct",
             },
+        )
+        repositories.finish_script_run(
+            db,
+            script_run_id,
+            status="success",
+            stdout_log=json.dumps(
+                {
+                    "grouping_summary": grouping_summary,
+                    "gemini_meta": gemini_meta,
+                },
+                indent=2,
+                default=str,
+            ),
+            stderr_log="",
         )
         return ScriptExecutionResult(
             script_run_id=script_run_id,
-            runner_job_id=enqueue_result.job_id,
+            runner_job_id=None,
             script_name="grouping",
-            model_name="runpod_runner",
-            status="pending",
-            command=["runpod_serverless", "grouping"],
-            stdout="",
+            model_name="gemini_grouping_direct",
+            status="success",
+            command=["tds_api_gemini", "grouping"],
+            stdout=json.dumps(grouping_summary, default=str),
             stderr="",
         )
     except Exception as exc:
+        try:
+            repositories.mark_grouping_batch_frame_assets_retrieved(
+                db,
+                job.batch_id,
+                error=f"Gemini grouping failed: {exc}",
+            )
+        except Exception:
+            logger.exception("Could not restore grouping frame assets after Gemini failure batch_id=%s", job.batch_id)
+        if "script_run_id" in locals():
+            repositories.finish_script_run(
+                db,
+                script_run_id,
+                status="failed",
+                stdout_log="",
+                stderr_log=str(exc),
+            )
         repositories.update_grouping_batch(
             db,
             job.batch_id,
