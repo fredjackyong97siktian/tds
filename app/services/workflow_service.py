@@ -3184,6 +3184,72 @@ def _match_alert_ids_near_transactions(
     return sorted(set(matched_ids))
 
 
+def _ensure_session_for_confidence_group(
+    db: Session,
+    *,
+    location_id: int,
+    entry_trigger_ids: list[int],
+    exit_trigger_ids: list[int],
+) -> dict[str, Any] | None:
+    trigger_rows: dict[int, dict[str, Any]] = {}
+    for trigger_id in sorted(set(entry_trigger_ids + exit_trigger_ids)):
+        try:
+            trigger_rows[trigger_id] = repositories.get_trigger(db, trigger_id)
+        except Exception:
+            logger.exception("Could not load trigger while creating confidence session trigger_id=%s", trigger_id)
+
+    entry_candidates = [
+        row
+        for trigger_id in entry_trigger_ids
+        if (row := trigger_rows.get(trigger_id)) is not None
+        and int(row.get("location_id") or 0) == location_id
+        and _trigger_has_required_entry_identity(row)
+    ]
+    if not entry_candidates:
+        logger.info(
+            "Layer 0 confidence could not create session because no entry trigger has phone/credit identity "
+            "location_id=%s entry_trigger_ids=%s exit_trigger_ids=%s",
+            location_id,
+            entry_trigger_ids,
+            exit_trigger_ids,
+        )
+        return None
+
+    def _trigger_time(row: Mapping[str, Any]) -> datetime | None:
+        return _coerce_datetime_value(row.get("trigger_time"))
+
+    def _trigger_time_sort_value(row: Mapping[str, Any], default: float) -> float:
+        value = _trigger_time(row)
+        return value.timestamp() if value is not None else default
+
+    entry_trigger = min(entry_candidates, key=lambda row: _trigger_time_sort_value(row, float("inf")))
+    session, _created = _get_or_create_session_for_entry_trigger(
+        db,
+        entry_trigger_id=int(entry_trigger["id"]),
+        location_id=location_id,
+        start_time=_trigger_time(entry_trigger),
+    )
+
+    exit_candidates = [
+        row
+        for trigger_id in exit_trigger_ids
+        if (row := trigger_rows.get(trigger_id)) is not None
+        and int(row.get("location_id") or 0) == location_id
+    ]
+    if exit_candidates:
+        exit_trigger = max(exit_candidates, key=lambda row: _trigger_time_sort_value(row, float("-inf")))
+        exit_time = _trigger_time(exit_trigger)
+        if exit_time is not None:
+            session = repositories.close_session(
+                db,
+                int(session["id"]),
+                exit_time,
+                exit_trigger_id=int(exit_trigger["id"]),
+            )
+
+    return session
+
+
 def run_theft_confidence_for_grouping_batch(
     db: Session,
     *,
@@ -3237,11 +3303,14 @@ def run_theft_confidence_for_grouping_batch(
 
     analyzed_count = 0
     promoted_count_total = 0
+    created_session_ids: set[int] = set()
     for group_index, group in enumerate(groups, start=1):
         if not isinstance(group, Mapping):
             continue
         group_key = str(group.get("group_id") or group.get("id") or group_index)
-        trigger_ids = _trigger_id_list(group.get("entry")) + _trigger_id_list(group.get("exit"))
+        entry_trigger_ids = _trigger_id_list(group.get("entry"))
+        exit_trigger_ids = _trigger_id_list(group.get("exit"))
+        trigger_ids = entry_trigger_ids + exit_trigger_ids
         if not trigger_ids:
             repositories.upsert_filter_confidence_result(
                 db,
@@ -3495,13 +3564,22 @@ def run_theft_confidence_for_grouping_batch(
         )
         analyzed_count += 1
         if need_deep_analysis:
+            session = _ensure_session_for_confidence_group(
+                db,
+                location_id=location_id,
+                entry_trigger_ids=entry_trigger_ids,
+                exit_trigger_ids=exit_trigger_ids,
+            )
+            if session:
+                created_session_ids.add(int(session["id"]))
             promoted_count = repositories.promote_trigger_video_assets_to_full_retrieval(db, trigger_ids)
             promoted_count_total += promoted_count
             logger.info(
-                "Layer 0 confidence promoted group_key=%s batch_id=%s trigger_ids=%s promoted_count=%s score=%.2f",
+                "Layer 0 confidence promoted group_key=%s batch_id=%s trigger_ids=%s session_id=%s promoted_count=%s score=%.2f",
                 group_key,
                 batch_id,
                 trigger_ids,
+                session.get("id") if session else None,
                 promoted_count,
                 score,
             )
@@ -3510,6 +3588,8 @@ def run_theft_confidence_for_grouping_batch(
         "batch_id": batch_id,
         "analyzed_count": analyzed_count,
         "promoted_count": promoted_count_total,
+        "session_count": len(created_session_ids),
+        "session_ids": sorted(created_session_ids),
     }
 
 

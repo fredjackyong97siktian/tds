@@ -2302,14 +2302,19 @@ def upsert_filter_confidence_result(
 def list_filter_confidence_results(db: Session, limit: int = 100) -> list[dict[str, Any]]:
     confidence_table = _table("filter_confidence_result")
     batch_table = _table("filter_grouping_batch")
+    location_table = settings.location_table_name
+    location_id_column = settings.location_id_column
+    location_name_column = settings.location_name_column
     result = db.execute(
         text(
             f"""
             select c.id, c.batch_id, c.group_key, c.location_id, c.score, c.need_deep_analysis,
                    c.reason, c.factor_payload, c.created_at, c.updated_at,
-                   b.period_code, b.window_start, b.window_end, b.status as batch_status
+                   b.period_code, b.window_start, b.window_end, b.status as batch_status,
+                   l.{location_name_column} as location_name
             from {confidence_table} c
             left join {batch_table} b on b.id = c.batch_id
+            left join {location_table} l on l.{location_id_column} = c.location_id
             order by c.created_at desc, c.id desc
             limit :limit
             """
