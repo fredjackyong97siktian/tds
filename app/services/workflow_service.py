@@ -2034,6 +2034,191 @@ def _resolve_grouping_summary_from_remote_result(
         return grouping_summary, error
 
 
+def _group_trigger_id_list(value: Any) -> list[int]:
+    raw_values = value if isinstance(value, list) else ([] if value is None else [value])
+    trigger_ids: list[int] = []
+    for raw_value in raw_values:
+        try:
+            trigger_id = int(raw_value)
+        except (TypeError, ValueError):
+            continue
+        if trigger_id not in trigger_ids:
+            trigger_ids.append(trigger_id)
+    return trigger_ids
+
+
+def _person_frame_urls_by_trigger(grouping_summary: Mapping[str, Any]) -> dict[int, list[str]]:
+    frames_by_trigger: dict[int, list[str]] = {}
+    diagnostics = grouping_summary.get("diagnostics")
+    if not isinstance(diagnostics, list):
+        return frames_by_trigger
+    for diagnostic in diagnostics:
+        if not isinstance(diagnostic, Mapping):
+            continue
+        try:
+            trigger_id = int(diagnostic.get("trigger_id"))
+        except (TypeError, ValueError):
+            continue
+        frame_urls: list[str] = []
+        for sample in diagnostic.get("samples") or []:
+            if not isinstance(sample, Mapping):
+                continue
+            try:
+                person_count = int(sample.get("person_count") or 0)
+            except (TypeError, ValueError):
+                person_count = 0
+            image_url = str(sample.get("image_url") or "").strip()
+            if person_count > 0 and image_url and image_url not in frame_urls:
+                frame_urls.append(image_url)
+        if frame_urls:
+            frames_by_trigger[trigger_id] = frame_urls[:6]
+    return frames_by_trigger
+
+
+def _repair_grouping_with_gemini(
+    db: Session,
+    *,
+    script_run_id: int,
+    grouping_summary: dict[str, Any],
+) -> dict[str, Any]:
+    groups = grouping_summary.get("groups") or grouping_summary.get("Groups") or []
+    if not isinstance(groups, list):
+        return grouping_summary
+    unknown_trigger_ids = _group_trigger_id_list(grouping_summary.get("unknown"))
+    completed_groups: list[dict[str, Any]] = []
+    open_groups: list[dict[str, Any]] = []
+    for index, group in enumerate(groups, start=1):
+        if not isinstance(group, Mapping):
+            continue
+        normalized_group = dict(group)
+        normalized_group.setdefault("group_id", index)
+        entry_ids = _group_trigger_id_list(normalized_group.get("entry"))
+        exit_ids = _group_trigger_id_list(normalized_group.get("exit"))
+        if entry_ids and exit_ids:
+            completed_groups.append(normalized_group)
+        elif entry_ids:
+            open_groups.append(normalized_group)
+
+    if not open_groups and not unknown_trigger_ids:
+        return grouping_summary
+
+    frames_by_trigger = _person_frame_urls_by_trigger(grouping_summary)
+    candidate_trigger_ids: list[int] = []
+    for group in open_groups:
+        for trigger_id in _group_trigger_id_list(group.get("entry")):
+            if trigger_id not in candidate_trigger_ids:
+                candidate_trigger_ids.append(trigger_id)
+    for trigger_id in unknown_trigger_ids:
+        if trigger_id not in candidate_trigger_ids:
+            candidate_trigger_ids.append(trigger_id)
+
+    image_urls: list[str] = []
+    image_notes: list[dict[str, Any]] = []
+    for trigger_id in candidate_trigger_ids:
+        for image_url in frames_by_trigger.get(trigger_id, [])[:4]:
+            if image_url in image_urls:
+                continue
+            image_urls.append(image_url)
+            image_notes.append(
+                {
+                    "image_number": len(image_urls),
+                    "trigger_id": trigger_id,
+                    "role_hint": "open_entry" if any(trigger_id in _group_trigger_id_list(group.get("entry")) for group in open_groups) else "unknown",
+                }
+            )
+
+    if len(candidate_trigger_ids) < 2 or not image_urls:
+        grouping_summary["gemini_repair"] = {
+            "status": "skipped",
+            "reason": "not_enough_problematic_person_frames",
+            "candidate_trigger_ids": candidate_trigger_ids,
+        }
+        return grouping_summary
+
+    prompt = (
+        "You are repairing retail entrance/exit grouping. Each trigger is a door event. "
+        "A group should identify the same person across triggers. A trigger must never be both entry and exit in the same group. "
+        "Use the image-number mapping to compare people by clothing, body shape, bags, and direction. "
+        "Return strict JSON only with schema: "
+        '{"groups":[{"entry":[integer],"exit":[integer],"confidence":number,"reason":string}],'
+        '"unknown":[integer],"notes":[string]}. '
+        f"Open entry groups needing exit: {json.dumps([{'group_id': group.get('group_id'), 'entry': _group_trigger_id_list(group.get('entry'))} for group in open_groups])}. "
+        f"Unknown triggers: {json.dumps(unknown_trigger_ids)}. "
+        f"Image mapping: {json.dumps(image_notes)}. "
+        "Only create an exit match if the same person is clearly visible. If unsure, leave the trigger in unknown."
+    )
+    try:
+        repair_result, repair_meta = _call_kiosk_gemini_summary(prompt=prompt, image_urls=image_urls)
+        repair_cost = _record_gemini_cost(db, script_run_id, repair_meta)
+    except Exception as exc:
+        grouping_summary["gemini_repair"] = {
+            "status": "failed",
+            "error": str(exc),
+            "candidate_trigger_ids": candidate_trigger_ids,
+            "image_urls": image_urls,
+        }
+        logger.exception("Gemini grouping repair failed")
+        return grouping_summary
+
+    repaired_groups: list[dict[str, Any]] = []
+    consumed_trigger_ids: set[int] = set()
+    next_group_id = len(completed_groups) + 1
+    for repaired in repair_result.get("groups") or []:
+        if not isinstance(repaired, Mapping):
+            continue
+        entry_ids = _group_trigger_id_list(repaired.get("entry"))
+        exit_ids = _group_trigger_id_list(repaired.get("exit"))
+        if not entry_ids:
+            continue
+        exit_ids = [trigger_id for trigger_id in exit_ids if trigger_id not in entry_ids]
+        if not exit_ids:
+            continue
+        confidence = _coerce_number(repaired.get("confidence"), 0.0)
+        if confidence < 0.75:
+            continue
+        group_payload = {
+            "group_id": next_group_id,
+            "entry": entry_ids,
+            "exit": exit_ids[:1],
+            "score": confidence,
+            "repair_source": "gemini",
+            "reason": str(repaired.get("reason") or "gemini_grouping_repair"),
+        }
+        next_group_id += 1
+        repaired_groups.append(group_payload)
+        consumed_trigger_ids.update(entry_ids)
+        consumed_trigger_ids.update(exit_ids[:1])
+
+    remaining_open_groups = [
+        group
+        for group in open_groups
+        if not any(trigger_id in consumed_trigger_ids for trigger_id in _group_trigger_id_list(group.get("entry")))
+    ]
+    repaired_unknown = set(_group_trigger_id_list(repair_result.get("unknown")))
+    remaining_unknown = sorted(
+        {
+            trigger_id
+            for trigger_id in candidate_trigger_ids + unknown_trigger_ids
+            if trigger_id not in consumed_trigger_ids
+        }
+        | {trigger_id for trigger_id in repaired_unknown if trigger_id not in consumed_trigger_ids}
+    )
+    grouping_summary["groups"] = completed_groups + repaired_groups + remaining_open_groups
+    grouping_summary["unknown"] = remaining_unknown
+    grouping_summary["gemini_repair"] = {
+        "status": "success",
+        "input": {
+            "open_groups": open_groups,
+            "unknown": unknown_trigger_ids,
+            "image_mapping": image_notes,
+        },
+        "result": repair_result,
+        "cost": repair_cost,
+        "applied_group_count": len(repaired_groups),
+    }
+    return grouping_summary
+
+
 def _invoke_remote_runner(
     *,
     endpoint: str,
@@ -3084,6 +3269,12 @@ def _finalize_remote_grouping_script_run(
     if batch_id is None:
         return result
     grouping_summary, grouping_summary_fetch_error = _resolve_grouping_summary_from_remote_result(remote_result)
+    if remote_status == "success":
+        grouping_summary = _repair_grouping_with_gemini(
+            db,
+            script_run_id=script_run_id,
+            grouping_summary=grouping_summary,
+        )
     repositories.update_grouping_batch(
         db,
         batch_id,
