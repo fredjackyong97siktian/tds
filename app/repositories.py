@@ -1503,6 +1503,8 @@ def list_ready_trigger_frame_assets_for_window(
                    te.credit_card_entry_id,
                    te.entry_source_type,
                    fa.id as frame_asset_id,
+                   fa.start_time as frame_asset_start_time,
+                   fa.end_time as frame_asset_end_time,
                    fa.status as frame_asset_status,
                    fa.created_at as frame_asset_created_at
             from {trigger_table} te
@@ -1566,6 +1568,8 @@ def list_trigger_frame_assets_for_window(
                    te.credit_card_entry_id,
                    te.entry_source_type,
                    fa.id as frame_asset_id,
+                   fa.start_time as frame_asset_start_time,
+                   fa.end_time as frame_asset_end_time,
                    fa.status as frame_asset_status,
                    fa.created_at as frame_asset_created_at
             from {trigger_table} te
@@ -1630,6 +1634,8 @@ def list_manual_grouping_ready_trigger_frame_assets(
                    te.credit_card_entry_id,
                    te.entry_source_type,
                    fa.id as frame_asset_id,
+                   fa.start_time as frame_asset_start_time,
+                   fa.end_time as frame_asset_end_time,
                    fa.status as frame_asset_status,
                    fa.created_at as frame_asset_created_at
             from {trigger_table} te
@@ -1641,6 +1647,7 @@ def list_manual_grouping_ready_trigger_frame_assets(
             where te.location_id = :location_id
               and te.whitelist_hit = 0
               and te.status <> 'whitelisted'
+              and (te.phone_entry_id is not null or te.credit_card_entry_id is not null)
               and fa.status = 'retrieved'
               and gb.id is null
             order by te.trigger_time asc, te.id asc, fa.id asc

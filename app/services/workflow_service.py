@@ -2608,8 +2608,8 @@ def _last_completed_period_window(period: Mapping[str, Any], *, now: datetime | 
     return start_today - timedelta(days=1), end_today - timedelta(days=1)
 
 
-def _period_window_for_datetime(period: Mapping[str, Any], value: datetime) -> tuple[datetime, datetime] | None:
-    current = _to_time_period_local_naive(value)
+def _period_window_for_local_datetime(period: Mapping[str, Any], value: datetime) -> tuple[datetime, datetime] | None:
+    current = value.replace(tzinfo=None, microsecond=0)
     day = current.replace(hour=0, minute=0, second=0, microsecond=0)
     window_start = _combine_local_datetime(day, period.get("start_time"))
     window_end = _combine_local_datetime(day, period.get("end_time"))
@@ -2621,6 +2621,10 @@ def _period_window_for_datetime(period: Mapping[str, Any], value: datetime) -> t
     if window_start <= current < window_end:
         return window_start, window_end
     return None
+
+
+def _period_window_for_datetime(period: Mapping[str, Any], value: datetime) -> tuple[datetime, datetime] | None:
+    return _period_window_for_local_datetime(period, _to_time_period_local_naive(value))
 
 
 def _period_code_for_datetime(db: Session, location_id: int, value: datetime | None) -> str | None:
@@ -2653,6 +2657,15 @@ def _selected_grouping_periods_for_location(periods: list[dict[str, Any]], locat
         for period in candidate_periods
         if bool(period.get("selected"))
     ]
+
+
+def _grouping_time_from_trigger_frame_asset(row: Mapping[str, Any]) -> datetime | None:
+    frame_start_time = _coerce_datetime_value(row.get("frame_asset_start_time"))
+    if frame_start_time is not None:
+        # Frame assets are created from the store playback window; use that wall-clock window for period grouping.
+        return frame_start_time.replace(tzinfo=None, microsecond=0)
+    trigger_time = _coerce_datetime_value(row.get("trigger_time"))
+    return _to_time_period_local_naive(trigger_time) if trigger_time is not None else None
 
 
 def _frame_urls_from_video_asset(row: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -2724,10 +2737,10 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
         for period in selected_periods:
             assets_by_window: dict[tuple[datetime, datetime], list[dict[str, Any]]] = {}
             for row in ready_assets:
-                trigger_time = _coerce_datetime_value(row.get("trigger_time"))
-                if trigger_time is None:
+                grouping_time = _grouping_time_from_trigger_frame_asset(row)
+                if grouping_time is None:
                     continue
-                window = _period_window_for_datetime(period, trigger_time)
+                window = _period_window_for_local_datetime(period, grouping_time)
                 if window is None:
                     continue
                 window_start, window_end = window
@@ -2748,36 +2761,8 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
                 )
                 if existing is not None:
                     continue
-                all_window_assets = repositories.list_trigger_frame_assets_for_window(
-                    db,
-                    location_id=location_id,
-                    window_start=db_window_start,
-                    window_end=db_window_end,
-                )
-                trigger_assets = [
-                    row
-                    for row in all_window_assets
-                    if (
-                        trigger_time := _coerce_datetime_value(row.get("trigger_time"))
-                    ) is not None
-                    and _period_window_for_datetime(period, trigger_time) == (window_start, window_end)
-                ]
+                trigger_assets = _ready_rows
                 if not trigger_assets:
-                    continue
-                not_ready = [
-                    row
-                    for row in trigger_assets
-                    if str(row.get("frame_asset_status") or "").strip().lower() != "retrieved"
-                ]
-                if not_ready:
-                    logger.info(
-                        "Skipping grouping catch-up window because some trigger frames are not ready location_id=%s period_code=%s window_start=%s window_end=%s not_ready=%s",
-                        location_id,
-                        period_code,
-                        window_start,
-                        window_end,
-                        len(not_ready),
-                    )
                     continue
                 batch = repositories.create_grouping_batch(
                     db,
