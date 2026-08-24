@@ -3223,6 +3223,28 @@ def _ensure_session_for_confidence_group(
         return value.timestamp() if value is not None else default
 
     entry_trigger = min(entry_candidates, key=lambda row: _trigger_time_sort_value(row, float("inf")))
+    exit_candidates = [
+        row
+        for trigger_id in exit_trigger_ids
+        if (row := trigger_rows.get(trigger_id)) is not None
+        and int(row.get("location_id") or 0) == location_id
+    ]
+    exit_trigger = (
+        max(exit_candidates, key=lambda row: _trigger_time_sort_value(row, float("-inf")))
+        if exit_candidates
+        else None
+    )
+
+    if exit_trigger is not None:
+        try:
+            return repositories.get_session_by_trigger_pair(
+                db,
+                entry_trigger_id=int(entry_trigger["id"]),
+                exit_trigger_id=int(exit_trigger["id"]),
+            )
+        except ValueError:
+            pass
+
     session, _created = _get_or_create_session_for_entry_trigger(
         db,
         entry_trigger_id=int(entry_trigger["id"]),
@@ -3230,14 +3252,7 @@ def _ensure_session_for_confidence_group(
         start_time=_trigger_time(entry_trigger),
     )
 
-    exit_candidates = [
-        row
-        for trigger_id in exit_trigger_ids
-        if (row := trigger_rows.get(trigger_id)) is not None
-        and int(row.get("location_id") or 0) == location_id
-    ]
-    if exit_candidates:
-        exit_trigger = max(exit_candidates, key=lambda row: _trigger_time_sort_value(row, float("-inf")))
+    if exit_trigger is not None:
         exit_time = _trigger_time(exit_trigger)
         if exit_time is not None:
             session = repositories.close_session(
@@ -3273,33 +3288,43 @@ def _queue_l1_video_for_trigger(
     filename = f"{file_section}_playback_{_format_dahua_playback_time(start_time)}_{_format_dahua_playback_time(end_time)}.mp4"
     output_path = session_tmp_video_path(location_id, session_id, file_section, filename)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    video_asset_id = repositories.create_video_asset(
+    existing_asset = repositories.find_video_asset_by_window(
         db,
-        {
-            "trigger_id": trigger_id,
-            "section": normalized_video_section,
-            "sequence_no": None,
-            "video_url": "",
-            "file_path": str(output_path),
-            "captured_start_time": start_time,
-            "captured_end_time": end_time,
-            "retrieved_at": None,
-            "analyzed_at": None,
-            "retention_until": end_time + timedelta(days=3),
-            "status": "not_retrieved",
-            "metadata": {
-                "location_id": location_id,
-                "retrieval_source": "layer0_deep_analysis",
-                "promoted_from_layer0": True,
-                "retrieval_mode": "full_video",
-                "full_video_window_source": "trigger_time",
-                "full_video_before_seconds": 40,
-                "full_video_after_seconds": 10,
-                "session_link_section": normalized_link_section,
-            },
-        },
+        section=normalized_video_section,
+        location_id=location_id,
+        start_time=start_time,
+        end_time=end_time,
     )
-    repositories.update_video_asset_url(db, video_asset_id, f"/api/v1/videos/assets/{video_asset_id}/content")
+    if existing_asset is not None:
+        video_asset_id = int(existing_asset["id"])
+    else:
+        video_asset_id = repositories.create_video_asset(
+            db,
+            {
+                "trigger_id": trigger_id,
+                "section": normalized_video_section,
+                "sequence_no": None,
+                "video_url": "",
+                "file_path": str(output_path),
+                "captured_start_time": start_time,
+                "captured_end_time": end_time,
+                "retrieved_at": None,
+                "analyzed_at": None,
+                "retention_until": end_time + timedelta(days=3),
+                "status": "not_retrieved",
+                "metadata": {
+                    "location_id": location_id,
+                    "retrieval_source": "layer0_deep_analysis",
+                    "promoted_from_layer0": True,
+                    "retrieval_mode": "full_video",
+                    "full_video_window_source": "trigger_time",
+                    "full_video_before_seconds": 40,
+                    "full_video_after_seconds": 10,
+                    "session_link_section": normalized_link_section,
+                },
+            },
+        )
+        repositories.update_video_asset_url(db, video_asset_id, f"/api/v1/videos/assets/{video_asset_id}/content")
     repositories.update_video_asset_status(
         db,
         video_asset_id,

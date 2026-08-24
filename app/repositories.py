@@ -2862,6 +2862,32 @@ def get_session_by_entry_trigger_id(db: Session, entry_trigger_id: int) -> dict[
     return row
 
 
+def get_session_by_trigger_pair(db: Session, entry_trigger_id: int, exit_trigger_id: int) -> dict[str, Any]:
+    session_table = _table("session")
+    result = db.execute(
+        text(
+            f"""
+            select id, entry_trigger_id, exit_trigger_id, location_id, status, start_time, end_time,
+                   total_item_brought, actual_items_brought, transaction_total_items, total_customer,
+                   result_summary, issue_reason
+            from {session_table}
+            where entry_trigger_id = :entry_trigger_id
+              and exit_trigger_id = :exit_trigger_id
+            order by id asc
+            limit 1
+            """
+        ),
+        {"entry_trigger_id": entry_trigger_id, "exit_trigger_id": exit_trigger_id},
+    )
+    row = _fetch_one_dict(result)
+    if isinstance(row.get("result_summary"), str):
+        try:
+            row["result_summary"] = json.loads(row["result_summary"])
+        except json.JSONDecodeError:
+            pass
+    return row
+
+
 def get_latest_open_session_by_location(db: Session, location_id: int) -> dict[str, Any]:
     session_table = _table("session")
     result = db.execute(
