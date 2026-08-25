@@ -14,7 +14,7 @@ from os.path import basename, splitext
 from pathlib import Path
 from typing import Any, Mapping
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -61,6 +61,7 @@ DEFAULT_FILTER_FACTORS: dict[str, dict[str, Any]] = {
     "multiple_transaction_issues": {"enabled": True},
     "multiple_minus_button_alert": {"enabled": True},
     "carry_item_signal": {"enabled": True},
+    "country_code_check": {"enabled": True},
     "unusual_group_size": {"enabled": True},
     "customer_risk_history": {"enabled": False},
 }
@@ -1062,11 +1063,12 @@ def _call_kiosk_gemini_summary(
     image_urls: list[str],
     model_name: str | None = None,
     image_resize_scale: float | None = None,
+    allow_text_only: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     api_key = str(settings.gemini_api_key or os.environ.get("GEMINI_API_KEY") or "").strip()
     if not api_key:
         raise RuntimeError("Gemini API key is not configured in tds_api. Set THEFT_API_GEMINI_API_KEY.")
-    if not image_urls:
+    if not image_urls and not allow_text_only:
         raise RuntimeError("No kiosk evidence image URLs were returned by the runner.")
 
     parts: list[dict[str, Any]] = [{"text": prompt}]
@@ -3532,11 +3534,17 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
             "If door direction is visually ambiguous, prefer the chronological session pattern: earlier identity trigger opens the session, later same-person trigger closes it. "
             "Visual matching rule: compare people across trigger images using clothing color and pattern, pants/skirt color, shoes, bags or carried items, "
             "body shape and height, walking direction, position relative to the door, and timestamp order. "
+            "Carry observation rule: for every grouped customer, describe what they visibly carry at entry and at exit. "
+            "Count bags, plastic bags, woven/reusable bags, backpacks, boxes, cartons, bottles, and loose items only when visibly held, worn, or moving with the person. "
+            "Record color, type, approximate size, count, and confidence. Use 0 count when the customer appears empty-handed. "
             "Important: Do not create a separate group for every trigger. Only group triggers when they appear to show the same customer across time. "
             "If the same customer appears in trigger 73 and later trigger 74, return entry [73], exit [74]. "
             "If a trigger cannot be confidently matched into a complete entry+exit pair, put it in unknown. "
             "Return strict JSON only with schema: "
-            '{"groups":[{"entry":[integer],"exit":[integer],"confidence":number,"reason":string}],'
+            '{"groups":[{"entry":[integer],"exit":[integer],"confidence":number,"reason":string,'
+            '"entry_carry":{"bag_count":integer,"item_count":integer,"items":[{"type":string,"color":string,"size":string,"count":integer,"confidence":number}],"summary":string},'
+            '"exit_carry":{"bag_count":integer,"item_count":integer,"items":[{"type":string,"color":string,"size":string,"count":integer,"confidence":number}],"summary":string},'
+            '"carry_change_summary":string,"total_customer":integer}],'
             '"unknown":[integer],"notes":[string]}. '
             f"Batch: {json.dumps({'batch_id': batch_id, 'location_id': batch.get('location_id'), 'period_code': batch.get('period_code'), 'window_start': batch.get('window_start'), 'window_end': batch.get('window_end'), 'chunk': chunk_index, 'chunk_count': len(chunks)}, default=str)}. "
             f"Triggers: {json.dumps(trigger_notes, default=str)}. "
@@ -3579,6 +3587,10 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
                     "exit": exit_ids,
                     "score": _coerce_number(group.get("confidence"), 0.0),
                     "reason": str(group.get("reason") or "gemini_grouping_direct"),
+                    "entry_carry": group.get("entry_carry") if isinstance(group.get("entry_carry"), Mapping) else None,
+                    "exit_carry": group.get("exit_carry") if isinstance(group.get("exit_carry"), Mapping) else None,
+                    "carry_change_summary": str(group.get("carry_change_summary") or ""),
+                    "total_customer": _coerce_int(group.get("total_customer"), 0),
                     "source": "gemini_grouping_direct",
                     "chunk": chunk_index,
                 }
@@ -3983,6 +3995,13 @@ def _apply_filter_factor(
     return triggered
 
 
+def _filter_factor_enabled(factors: Mapping[str, Mapping[str, Any]], factor_code: str) -> bool:
+    config = factors.get(factor_code)
+    if not isinstance(config, Mapping):
+        return False
+    return _as_boolish(config.get("enabled"))
+
+
 def _read_group_value(group: Mapping[str, Any], *keys: str) -> Any:
     for key in keys:
         if key in group and group[key] is not None:
@@ -4023,6 +4042,260 @@ def _as_boolish(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _normalize_phone_prefix(value: Any) -> str:
+    return re.sub(r"\D+", "", str(value or ""))
+
+
+def _normalize_country_token(value: Any) -> str:
+    return re.sub(r"[^A-Z0-9]+", "", str(value or "").upper())
+
+
+def _extract_payment_intent_id(value: Any) -> str | None:
+    raw_value = str(value or "").strip()
+    if not raw_value:
+        return None
+    match = re.search(r"(pi_[A-Za-z0-9]+)", raw_value)
+    return match.group(1) if match else None
+
+
+def _extract_stripe_id(value: Any, prefix: str) -> str | None:
+    raw_value = str(value or "").strip()
+    if not raw_value:
+        return None
+    match = re.search(rf"({re.escape(prefix)}_[A-Za-z0-9]+)", raw_value)
+    return match.group(1) if match else None
+
+
+def _nested_get(value: Mapping[str, Any] | None, *path: str) -> Any:
+    current: Any = value
+    for key in path:
+        if not isinstance(current, Mapping):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _stripe_get(path: str, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    secret_key = str(settings.stripe_secret_key or os.environ.get("STRIPE_SECRET_KEY") or "").strip()
+    if not secret_key:
+        raise RuntimeError("Stripe API key is not configured. Set THEFT_API_STRIPE_SECRET_KEY.")
+    base_url = str(settings.stripe_api_base_url or "https://api.stripe.com/v1").rstrip("/")
+    query = f"?{urlencode(params, doseq=True)}" if params else ""
+    request = Request(
+        f"{base_url}/{path.lstrip('/')}{query}",
+        headers={"Authorization": f"Bearer {secret_key}"},
+        method="GET",
+    )
+    try:
+        with urlopen(request, timeout=settings.stripe_lookup_timeout_seconds) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Stripe request failed with HTTP {exc.code}: {error_body}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"Stripe request failed: {exc}") from exc
+
+
+def _card_country_from_stripe_payload(payload: Mapping[str, Any]) -> str | None:
+    return (
+        _nested_get(payload, "card", "country")
+        or _nested_get(payload, "card_present", "country")
+        or _nested_get(payload, "payment_method_details", "card", "country")
+        or _nested_get(payload, "payment_method_details", "card_present", "country")
+        or _nested_get(payload, "latest_charge", "payment_method_details", "card", "country")
+        or _nested_get(payload, "latest_charge", "payment_method_details", "card_present", "country")
+        or _nested_get(payload, "payment_method", "card", "country")
+        or _nested_get(payload, "payment_method", "card_present", "country")
+    )
+
+
+def _resolve_stripe_card_country(identity: Mapping[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(identity, Mapping):
+        return {"country": None, "source": "none", "error": "missing_credit_card_identity"}
+    payment_method_id = _extract_stripe_id(identity.get("payment_method_id"), "pm")
+    charge_id = _extract_stripe_id(identity.get("charge_id"), "ch")
+    payment_intent_id = (
+        _extract_payment_intent_id(identity.get("payment_intent_id"))
+        or _extract_payment_intent_id(identity.get("client_secret"))
+    )
+    attempts: list[dict[str, Any]] = []
+
+    if payment_method_id:
+        try:
+            payload = _stripe_get(f"payment_methods/{quote(payment_method_id, safe='')}")
+            country = _card_country_from_stripe_payload(payload)
+            attempts.append({"source": "payment_method", "id": payment_method_id, "country": country})
+            if country:
+                return {
+                    "country": country,
+                    "source": "stripe_payment_method",
+                    "stripe_id": payment_method_id,
+                    "attempts": attempts,
+                }
+        except Exception as exc:
+            attempts.append({"source": "payment_method", "id": payment_method_id, "error": str(exc)})
+
+    if charge_id:
+        try:
+            payload = _stripe_get(f"charges/{quote(charge_id, safe='')}")
+            country = _card_country_from_stripe_payload(payload)
+            attempts.append({"source": "charge", "id": charge_id, "country": country})
+            if country:
+                return {
+                    "country": country,
+                    "source": "stripe_charge",
+                    "stripe_id": charge_id,
+                    "attempts": attempts,
+                }
+        except Exception as exc:
+            attempts.append({"source": "charge", "id": charge_id, "error": str(exc)})
+
+    if payment_intent_id:
+        try:
+            payload = _stripe_get(
+                f"payment_intents/{quote(payment_intent_id, safe='')}",
+                params={"expand[]": ["latest_charge", "payment_method"]},
+            )
+            country = _card_country_from_stripe_payload(payload)
+            attempts.append({"source": "payment_intent", "id": payment_intent_id, "country": country})
+            if country:
+                return {
+                    "country": country,
+                    "source": "stripe_payment_intent",
+                    "stripe_id": payment_intent_id,
+                    "attempts": attempts,
+                }
+        except Exception as exc:
+            attempts.append({"source": "payment_intent", "id": payment_intent_id, "error": str(exc)})
+
+    return {
+        "country": None,
+        "source": "stripe_lookup_failed" if attempts else "stripe_ids_missing",
+        "attempts": attempts,
+    }
+
+
+def resolve_stripe_card_country_for_identity(identity: Mapping[str, Any] | None) -> dict[str, Any]:
+    return _resolve_stripe_card_country(identity)
+
+
+def _evaluate_country_code_check(
+    db: Session,
+    *,
+    location_id: int,
+    trigger_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    rules = repositories.list_filter_country_code_checks(db, location_id=location_id, enabled_only=True)
+    evidence: dict[str, Any] = {
+        "rules_checked": len(rules),
+        "matches": [],
+        "identities_checked": [],
+        "missing_card_country": [],
+    }
+    if not rules:
+        return {**evidence, "hit": False, "reason": "no_country_rules_configured"}
+
+    phone_rules = [
+        {**rule, "normalized_phone_prefix": _normalize_phone_prefix(rule.get("phone_prefix"))}
+        for rule in rules
+        if _normalize_phone_prefix(rule.get("phone_prefix"))
+    ]
+    card_rules = [
+        {**rule, "normalized_card_country": _normalize_country_token(rule.get("card_country") or rule.get("country_code"))}
+        for rule in rules
+        if _normalize_country_token(rule.get("card_country") or rule.get("country_code"))
+    ]
+
+    seen_identity_keys: set[tuple[str, str]] = set()
+    for trigger in trigger_rows:
+        trigger_id = int(trigger.get("id") or 0)
+        phone_entry_id = trigger.get("phone_entry_id")
+        if phone_entry_id is not None:
+            identity_key = ("phone", str(phone_entry_id))
+            if identity_key not in seen_identity_keys:
+                seen_identity_keys.add(identity_key)
+                identity = repositories.get_phone_entry_identity(db, phone_entry_id)
+                phone_number = identity.get("phone_number") if identity else None
+                normalized_phone = _normalize_phone_prefix(phone_number)
+                identity_evidence = {
+                    "trigger_id": trigger_id,
+                    "type": "phone",
+                    "phone_entry_id": phone_entry_id,
+                    "phone_number": phone_number,
+                }
+                evidence["identities_checked"].append(identity_evidence)
+                for rule in phone_rules:
+                    prefix = rule["normalized_phone_prefix"]
+                    if normalized_phone.startswith(prefix):
+                        evidence["matches"].append(
+                            {
+                                "trigger_id": trigger_id,
+                                "type": "phone",
+                                "phone_entry_id": phone_entry_id,
+                                "phone_number": phone_number,
+                                "matched_value": f"+{prefix}",
+                                "rule_id": rule.get("id"),
+                                "country_code": rule.get("country_code"),
+                                "country_name": rule.get("country_name"),
+                            }
+                        )
+
+        credit_card_entry_id = trigger.get("credit_card_entry_id")
+        if credit_card_entry_id is not None:
+            identity_key = ("credit_card", str(credit_card_entry_id))
+            if identity_key in seen_identity_keys:
+                continue
+            seen_identity_keys.add(identity_key)
+            identity = repositories.get_credit_card_entry_identity(db, credit_card_entry_id)
+            stored_card_country = identity.get("country") if identity else None
+            stripe_lookup = (
+                {"country": stored_card_country, "source": "stored_entrylogs_country"}
+                if stored_card_country
+                else _resolve_stripe_card_country(identity)
+            )
+            card_country = stored_card_country or stripe_lookup.get("country")
+            normalized_card_country = _normalize_country_token(card_country)
+            fingerprint = identity.get("fingerprint") if identity else None
+            identity_evidence = {
+                "trigger_id": trigger_id,
+                "type": "credit_card",
+                "credit_card_entry_id": credit_card_entry_id,
+                "fingerprint": fingerprint,
+                "card_country": card_country,
+                "stored_card_country": stored_card_country,
+                "stripe_country_lookup": stripe_lookup,
+                "payment_method_id": identity.get("payment_method_id") if identity else None,
+                "charge_id": identity.get("charge_id") if identity else None,
+                "payment_intent_id": identity.get("payment_intent_id") if identity else None,
+                "last4": identity.get("last4") if identity else None,
+            }
+            evidence["identities_checked"].append(identity_evidence)
+            if not normalized_card_country:
+                evidence["missing_card_country"].append(identity_evidence)
+                continue
+            for rule in card_rules:
+                if normalized_card_country == rule["normalized_card_country"]:
+                    evidence["matches"].append(
+                        {
+                            "trigger_id": trigger_id,
+                            "type": "credit_card",
+                            "credit_card_entry_id": credit_card_entry_id,
+                            "fingerprint": fingerprint,
+                            "matched_value": card_country,
+                            "country_source": stripe_lookup.get("source"),
+                            "rule_id": rule.get("id"),
+                            "country_code": rule.get("country_code"),
+                            "country_name": rule.get("country_name"),
+                        }
+                    )
+
+    return {
+        **evidence,
+        "hit": bool(evidence["matches"]),
+        "reason": "country_code_match" if evidence["matches"] else "no_country_code_match",
+    }
+
+
 def _transaction_event_time(row: Mapping[str, Any]) -> datetime | None:
     return (
         _coerce_datetime_value(row.get("created_at"))
@@ -4042,6 +4315,7 @@ def _seconds_between(left: datetime, right: datetime) -> float:
 def _transaction_summary(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     payload: list[dict[str, Any]] = []
     for row in rows:
+        details = row.get("details") if isinstance(row.get("details"), list) else []
         payload.append(
             {
                 "receipt_number": row.get("receipt_number"),
@@ -4050,6 +4324,17 @@ def _transaction_summary(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "transaction_time": row.get("transaction_time"),
                 "total_amount": row.get("total_amount"),
                 "total_items": row.get("total_items"),
+                "details": [
+                    {
+                        "item_name": detail.get("item_name"),
+                        "barcode": detail.get("barcode"),
+                        "quantity": detail.get("quantity"),
+                        "price": detail.get("price"),
+                        "subtotal": detail.get("subtotal"),
+                    }
+                    for detail in details
+                    if isinstance(detail, Mapping)
+                ],
             }
         )
     return payload
@@ -4099,6 +4384,128 @@ def _match_alert_ids_near_transactions(
                     pass
                 break
     return sorted(set(matched_ids))
+
+
+def _group_carry_evidence(group: Mapping[str, Any]) -> dict[str, Any]:
+    entry_carry = _read_group_value(group, "entry_carry")
+    exit_carry = _read_group_value(group, "exit_carry")
+    return {
+        "entry_carry": entry_carry if isinstance(entry_carry, Mapping) else None,
+        "exit_carry": exit_carry if isinstance(exit_carry, Mapping) else None,
+        "carry_change_summary": _read_group_value(group, "carry_change_summary"),
+        "legacy_carry_score": _coerce_number(_read_group_value(group, "carry_something_from_store_score", "carry_score"), 0.0),
+        "before_is_yellow_bag": _read_group_value(group, "before_is_yellow_bag"),
+        "after_is_yellow_bag": _read_group_value(group, "after_is_yellow_bag"),
+    }
+
+
+def _evaluate_carry_item_signal_with_ai(
+    db: Session,
+    *,
+    batch_id: int,
+    group_key: str,
+    location_id: int,
+    trigger_ids: list[int],
+    group: Mapping[str, Any],
+    transactions: list[dict[str, Any]],
+    total_quantity: int,
+    total_value: float,
+) -> dict[str, Any]:
+    carry_evidence = _group_carry_evidence(group)
+    legacy_hit = (
+        carry_evidence["legacy_carry_score"] >= settings.filter_carry_score_threshold
+        or not _as_boolish(carry_evidence["before_is_yellow_bag"])
+        and _as_boolish(carry_evidence["after_is_yellow_bag"])
+    )
+    model_name = str(settings.grouping_gemini_model or "gemini-3.5-flash-lite").strip()
+    transaction_payload = _transaction_summary(transactions)
+    runner_payload = {
+        "batch_id": batch_id,
+        "group_key": group_key,
+        "location_id": location_id,
+        "trigger_ids": trigger_ids,
+        "model": model_name,
+        "carry_evidence": carry_evidence,
+        "transactions": transaction_payload,
+        "total_quantity": total_quantity,
+        "total_value": total_value,
+        "transaction_details": transaction_payload,
+    }
+    script_run_id = _create_gemini_script_run(
+        db,
+        session_id=None,
+        trigger_id=trigger_ids[0] if trigger_ids else None,
+        script_name="carry_confidence",
+        model_name=model_name,
+        runner_payload=runner_payload,
+    )
+    prompt = (
+        "You are a retail theft confidence reviewer. Decide whether a customer's exit carrying state is suspicious "
+        "after comparing entry carry evidence, exit carry evidence, and paid receipt item details. "
+        "Flag only when the exit bag/plastic bag/container/items are not reasonably explained by the paid transaction. "
+        "If visual carry evidence is missing or weak, return hit=false and reason='insufficient_visual_carry_evidence' instead of guessing. "
+        "Examples: entry empty-handed then exit with a large red woven bag while receipt has only one small drink = suspicious. "
+        "Entry already carrying the same bag and exit still carrying it = usually not suspicious. "
+        "Exit carrying a normal plastic bag with several paid items that fit inside = usually reasonable. "
+        "Use item names, quantity, likely physical size, and total value. Be conservative when evidence is unclear. "
+        "Return strict JSON only with schema: "
+        '{"hit":true|false,"score":number,"reason":string,"entry_bag_count":integer,'
+        '"exit_bag_count":integer,"reasonable_with_receipt":true|false,'
+        '"evidence_summary":string,"suspicious_objects":[string]}. '
+        f"Input: {json.dumps(runner_payload, default=str)}"
+    )
+    try:
+        result, meta = _call_kiosk_gemini_summary(
+            prompt=prompt,
+            image_urls=[],
+            model_name=model_name,
+            allow_text_only=True,
+        )
+        cost_detail = _record_gemini_cost(db, script_run_id, meta)
+        normalized = {
+            "hit": _as_boolish(result.get("hit")),
+            "score": _coerce_number(result.get("score"), 0.0),
+            "reason": str(result.get("reason") or "carry_ai"),
+            "source": "gemini_carry_confidence",
+            "entry_bag_count": _coerce_int(result.get("entry_bag_count"), 0),
+            "exit_bag_count": _coerce_int(result.get("exit_bag_count"), 0),
+            "reasonable_with_receipt": _as_boolish(result.get("reasonable_with_receipt")),
+            "evidence_summary": result.get("evidence_summary"),
+            "suspicious_objects": result.get("suspicious_objects") if isinstance(result.get("suspicious_objects"), list) else [],
+            "evidence": carry_evidence,
+            "raw_result": result,
+            "cost_detail": cost_detail,
+            "script_run_id": script_run_id,
+            "transactions": transaction_payload,
+            "total_quantity": total_quantity,
+            "total_value": total_value,
+        }
+        repositories.finish_script_run(
+            db,
+            script_run_id,
+            status="success",
+            stdout_log=json.dumps(normalized, indent=2, default=str),
+            stderr_log="",
+        )
+        return normalized
+    except Exception as exc:
+        logger.exception("Carry confidence AI failed batch_id=%s group_key=%s", batch_id, group_key)
+        repositories.finish_script_run(
+            db,
+            script_run_id,
+            status="failed",
+            stdout_log="",
+            stderr_log=str(exc),
+        )
+        return {
+            "hit": legacy_hit,
+            "score": carry_evidence["legacy_carry_score"],
+            "reason": "carry_ai_failed_legacy_fallback" if legacy_hit else "carry_ai_failed",
+            "source": "legacy_carry_fallback",
+            "error": str(exc),
+            "evidence": carry_evidence,
+            "script_run_id": script_run_id,
+        }
 
 
 def _ensure_session_for_confidence_group(
@@ -4467,6 +4874,11 @@ def run_theft_confidence_for_grouping_batch(
             issue_transactions,
             settings.filter_transaction_issue_short_period_seconds,
         )
+        country_code_result = _evaluate_country_code_check(
+            db,
+            location_id=location_id,
+            trigger_rows=trigger_rows,
+        )
         long_stay = duration_seconds >= settings.filter_long_stay_seconds
         carry_signal = (
             carry_score >= settings.filter_carry_score_threshold
@@ -4474,6 +4886,28 @@ def run_theft_confidence_for_grouping_batch(
             and _as_boolish(after_is_yellow_bag)
         )
         total_customer = _coerce_int(_read_group_value(group, "total_customer", "customer_count"), 0)
+        carry_ai_result = (
+            _evaluate_carry_item_signal_with_ai(
+                db,
+                batch_id=batch_id,
+                group_key=group_key,
+                location_id=location_id,
+                trigger_ids=trigger_ids,
+                group=group,
+                transactions=transactions,
+                total_quantity=total_quantity,
+                total_value=total_value,
+            )
+            if _filter_factor_enabled(factor_settings, "carry_item_signal")
+            else {
+                "hit": carry_signal,
+                "score": carry_score,
+                "reason": "carry_item_signal_disabled",
+                "source": "legacy_carry_skipped_disabled",
+                "evidence": _group_carry_evidence(group),
+            }
+        )
+        carry_signal = _as_boolish(carry_ai_result.get("hit"))
 
         reasons: list[str] = []
         factor_details: dict[str, Any] = {}
@@ -4541,13 +4975,19 @@ def run_theft_confidence_for_grouping_batch(
             factor_code="carry_item_signal",
             hit=carry_signal,
             reason="carry_item_signal",
-            evidence={
-                "carry_something_from_store_score": carry_score,
-                "before_is_yellow_bag": before_is_yellow_bag,
-                "after_is_yellow_bag": after_is_yellow_bag,
-            },
+            evidence=carry_ai_result,
         ):
             triggered_factors.append("carry_item_signal")
+        if _apply_filter_factor(
+            reasons=reasons,
+            factor_details=factor_details,
+            factors=factor_settings,
+            factor_code="country_code_check",
+            hit=_as_boolish(country_code_result.get("hit")),
+            reason="country_code_check",
+            evidence=country_code_result,
+        ):
+            triggered_factors.append("country_code_check")
         if _apply_filter_factor(
             reasons=reasons,
             factor_details=factor_details,
@@ -4592,6 +5032,8 @@ def run_theft_confidence_for_grouping_batch(
                 "carry_something_from_store_score": carry_score,
                 "before_is_yellow_bag": before_is_yellow_bag,
                 "after_is_yellow_bag": after_is_yellow_bag,
+                "carry_ai_result": carry_ai_result,
+                "country_code_result": country_code_result,
                 "total_customer": total_customer,
                 "transactions": _transaction_summary(transactions),
                 "issue_transactions": _transaction_summary(issue_transactions),

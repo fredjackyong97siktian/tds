@@ -33,6 +33,16 @@ class FilterFactorPayload(BaseModel):
     config: dict[str, Any] | None = None
 
 
+class CountryCodeCheckPayload(BaseModel):
+    location_id: int | None = None
+    country_code: str
+    country_name: str | None = None
+    phone_prefix: str | None = None
+    card_country: str | None = None
+    enabled: bool = True
+    metadata: dict[str, Any] | None = None
+
+
 @router.get("/time-periods")
 def list_time_periods(db: Session = Depends(get_transaction_db)) -> list[dict[str, Any]]:
     return repositories.list_filter_time_periods(db)
@@ -69,6 +79,43 @@ def upsert_factor(
         return repositories.upsert_filter_factor(db, data)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/country-code-checks")
+def list_country_code_checks(db: Session = Depends(get_transaction_db)) -> list[dict[str, Any]]:
+    return repositories.list_filter_country_code_checks(db)
+
+
+@router.post("/country-code-checks")
+def create_country_code_check(
+    payload: CountryCodeCheckPayload,
+    db: Session = Depends(get_transaction_db),
+) -> dict[str, Any]:
+    try:
+        return repositories.create_filter_country_code_check(db, payload.model_dump())
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.put("/country-code-checks/{rule_id}")
+def update_country_code_check(
+    rule_id: int,
+    payload: CountryCodeCheckPayload,
+    db: Session = Depends(get_transaction_db),
+) -> dict[str, Any]:
+    try:
+        return repositories.update_filter_country_code_check(db, rule_id, payload.model_dump())
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete("/country-code-checks/{rule_id}")
+def delete_country_code_check(rule_id: int, db: Session = Depends(get_transaction_db)) -> dict[str, Any]:
+    try:
+        repositories.delete_filter_country_code_check(db, rule_id)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True}
 
 
 @router.get("/grouping-batches")

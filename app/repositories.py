@@ -151,6 +151,61 @@ def _resolve_entry_source_value(
     return None
 
 
+def _resolve_entry_source_row(
+    db: Session,
+    *,
+    source: Mapping[str, str],
+    entry_id: Any,
+) -> dict[str, Any] | None:
+    row = db.execute(
+        text(
+            f"""
+            select *
+            from {source["table_name"]}
+            where cast({source["value_column"]} as char) = :entry_id
+               or cast({source["id_column"]} as char) = :entry_id
+            limit 1
+            """
+        ),
+        {"entry_id": str(entry_id)},
+    ).mappings().first()
+    return dict(row) if row else None
+
+
+def get_phone_entry_identity(db: Session, phone_entry_id: Any) -> dict[str, Any] | None:
+    source = _whitelist_source_config("qrentry")
+    row = _resolve_entry_source_row(db, source=source, entry_id=phone_entry_id)
+    if row is None:
+        return None
+    return {
+        "id": row.get(source["id_column"]),
+        "entry_id": phone_entry_id,
+        "phone_number": row.get(source["display_column"]) or row.get(source["value_column"]),
+        "raw": dict(row),
+    }
+
+
+def get_credit_card_entry_identity(db: Session, credit_card_entry_id: Any) -> dict[str, Any] | None:
+    source = _whitelist_source_config("entrylogs")
+    row = _resolve_entry_source_row(db, source=source, entry_id=credit_card_entry_id)
+    if row is None:
+        return None
+    country = _pick_first(row, "country", "country_code", "countryCode", "card_country", "issuer_country", "cardCountry")
+    return {
+        "id": row.get(source["id_column"]),
+        "entry_id": credit_card_entry_id,
+        "fingerprint": row.get(source["display_column"]) or row.get(source["value_column"]),
+        "country": country,
+        "payment_method_id": _pick_first(row, "paymentMethodId", "payment_method_id", "paymentMethod"),
+        "charge_id": _pick_first(row, "charge", "chargeId", "charge_id"),
+        "payment_intent_id": _pick_first(row, "paymentIntentId", "payment_intent_id", "payment_intent", "stripId"),
+        "client_secret": _pick_first(row, "clientSecret", "client_secret"),
+        "customer_stripe_id": _pick_first(row, "customerStripeId", "customer_stripe_id"),
+        "last4": _pick_first(row, "last4"),
+        "raw": dict(row),
+    }
+
+
 def _resolve_trigger_entry_identity(
     db: Session,
     *,
@@ -868,6 +923,14 @@ def get_trigger(db: Session, trigger_id: int) -> dict[str, Any]:
     )
     row["resolved_entry_label"] = label
     row["resolved_entry_value"] = value
+    phone_identity = get_phone_entry_identity(db, row.get("phone_entry_id")) if row.get("phone_entry_id") is not None else None
+    card_identity = (
+        get_credit_card_entry_identity(db, row.get("credit_card_entry_id"))
+        if row.get("credit_card_entry_id") is not None
+        else None
+    )
+    row["resolved_phone_number"] = phone_identity.get("phone_number") if phone_identity else None
+    row["resolved_card_fingerprint"] = card_identity.get("fingerprint") if card_identity else None
     return row
 
 
@@ -1835,6 +1898,134 @@ def upsert_filter_factor(db: Session, payload: Mapping[str, Any]) -> dict[str, A
         {"location_id": payload.get("location_id"), "factor_code": payload.get("factor_code")},
     )
     return _fetch_one_dict(result)
+
+
+def list_filter_country_code_checks(
+    db: Session,
+    *,
+    location_id: int | None = None,
+    enabled_only: bool = False,
+) -> list[dict[str, Any]]:
+    table_name = _table("filter_country_code_check")
+    where_clauses = []
+    params: dict[str, Any] = {}
+    if location_id is not None:
+        where_clauses.append("(location_id is null or location_id = :location_id)")
+        params["location_id"] = location_id
+    if enabled_only:
+        where_clauses.append("enabled = 1")
+    where_sql = f"where {' and '.join(where_clauses)}" if where_clauses else ""
+    result = db.execute(
+        text(
+            f"""
+            select id, location_id, country_code, country_name, phone_prefix, card_country, enabled,
+                   metadata, created_at, updated_at
+            from {table_name}
+            {where_sql}
+            order by coalesce(location_id, 0) asc, country_name asc, country_code asc, id asc
+            """
+        ),
+        params,
+    )
+    rows = _fetch_all_dicts(result)
+    for row in rows:
+        if isinstance(row.get("metadata"), str):
+            try:
+                row["metadata"] = json.loads(row["metadata"])
+            except json.JSONDecodeError:
+                pass
+    return rows
+
+
+def create_filter_country_code_check(db: Session, payload: Mapping[str, Any]) -> dict[str, Any]:
+    table_name = _table("filter_country_code_check")
+    params = {
+        "location_id": payload.get("location_id"),
+        "country_code": str(payload.get("country_code") or "").strip().upper(),
+        "country_name": str(payload.get("country_name") or "").strip() or None,
+        "phone_prefix": str(payload.get("phone_prefix") or "").strip() or None,
+        "card_country": str(payload.get("card_country") or "").strip().upper() or None,
+        "enabled": 1 if payload.get("enabled", True) else 0,
+        "metadata": _json_dumps(payload.get("metadata")) if payload.get("metadata") is not None else None,
+    }
+    if not params["country_code"]:
+        raise ValueError("country_code is required.")
+    if not params["phone_prefix"] and not params["card_country"]:
+        raise ValueError("phone_prefix or card_country is required.")
+    result = db.execute(
+        text(
+            f"""
+            insert into {table_name} (location_id, country_code, country_name, phone_prefix, card_country, enabled, metadata)
+            values (:location_id, :country_code, :country_name, :phone_prefix, :card_country, :enabled, :metadata)
+            """
+        ),
+        params,
+    )
+    db.commit()
+    rule_id = int(result.lastrowid)
+    return get_filter_country_code_check(db, rule_id)
+
+
+def get_filter_country_code_check(db: Session, rule_id: int) -> dict[str, Any]:
+    table_name = _table("filter_country_code_check")
+    result = db.execute(
+        text(
+            f"""
+            select id, location_id, country_code, country_name, phone_prefix, card_country, enabled,
+                   metadata, created_at, updated_at
+            from {table_name}
+            where id = :rule_id
+            """
+        ),
+        {"rule_id": rule_id},
+    )
+    row = _fetch_one_dict(result)
+    if isinstance(row.get("metadata"), str):
+        try:
+            row["metadata"] = json.loads(row["metadata"])
+        except json.JSONDecodeError:
+            pass
+    return row
+
+
+def update_filter_country_code_check(db: Session, rule_id: int, payload: Mapping[str, Any]) -> dict[str, Any]:
+    table_name = _table("filter_country_code_check")
+    params = {
+        "rule_id": rule_id,
+        "location_id": payload.get("location_id"),
+        "country_code": str(payload.get("country_code") or "").strip().upper(),
+        "country_name": str(payload.get("country_name") or "").strip() or None,
+        "phone_prefix": str(payload.get("phone_prefix") or "").strip() or None,
+        "card_country": str(payload.get("card_country") or "").strip().upper() or None,
+        "enabled": 1 if payload.get("enabled", True) else 0,
+        "metadata": _json_dumps(payload.get("metadata")) if payload.get("metadata") is not None else None,
+    }
+    if not params["country_code"]:
+        raise ValueError("country_code is required.")
+    db.execute(
+        text(
+            f"""
+            update {table_name}
+            set location_id = :location_id,
+                country_code = :country_code,
+                country_name = :country_name,
+                phone_prefix = :phone_prefix,
+                card_country = :card_country,
+                enabled = :enabled,
+                metadata = :metadata
+            where id = :rule_id
+            """
+        ),
+        params,
+    )
+    db.commit()
+    return get_filter_country_code_check(db, rule_id)
+
+
+def delete_filter_country_code_check(db: Session, rule_id: int) -> None:
+    table_name = _table("filter_country_code_check")
+    db.execute(text(f"delete from {table_name} where id = :rule_id"), {"rule_id": rule_id})
+    db.commit()
 
 
 def get_grouping_batch_by_window(

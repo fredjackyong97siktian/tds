@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 from ..db import get_transaction_db
 from .. import repositories
 from ..schemas import TriggerCreate, TriggerListItem, TriggerResponse
+from ..services import workflow_service
 
 
 router = APIRouter(prefix="/api/v1/triggers", tags=["triggers"])
@@ -43,6 +44,39 @@ def get_trigger(trigger_id: int, db: Session = Depends(get_transaction_db)) -> T
         "retry_to_status": None,
     }
     return TriggerListItem(**payload)
+
+
+@router.get("/{trigger_id}/card-country")
+def get_trigger_card_country(trigger_id: int, db: Session = Depends(get_transaction_db)) -> dict:
+    try:
+        trigger = repositories.get_trigger(db, trigger_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    credit_card_entry_id = trigger.get("credit_card_entry_id")
+    if credit_card_entry_id is None:
+        return {
+            "trigger_id": trigger_id,
+            "credit_card_entry_id": None,
+            "fingerprint": None,
+            "country": None,
+            "source": "no_credit_card_entry",
+        }
+    identity = repositories.get_credit_card_entry_identity(db, credit_card_entry_id)
+    stored_country = identity.get("country") if identity else None
+    lookup = (
+        {"country": stored_country, "source": "stored_entrylogs_country"}
+        if stored_country
+        else workflow_service.resolve_stripe_card_country_for_identity(identity)
+    )
+    return {
+        "trigger_id": trigger_id,
+        "credit_card_entry_id": credit_card_entry_id,
+        "fingerprint": identity.get("fingerprint") if identity else None,
+        "country": lookup.get("country"),
+        "source": lookup.get("source"),
+        "attempts": lookup.get("attempts", []),
+        "error": lookup.get("error"),
+    }
 
 
 @router.post("/{trigger_id}/retry-issue")

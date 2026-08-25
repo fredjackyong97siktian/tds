@@ -104,6 +104,8 @@ class TriggerResponse(BaseModel):
     credit_card_entry_id: int | None = None
     resolved_entry_label: str | None = None
     resolved_entry_value: str | None = None
+    resolved_phone_number: str | None = None
+    resolved_card_fingerprint: str | None = None
     entry_source_type: str = "unknown"
     entry_match_status: str = "pending"
     status: str
