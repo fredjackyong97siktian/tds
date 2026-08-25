@@ -3995,6 +3995,23 @@ def _apply_filter_factor(
     return triggered
 
 
+def _mark_filter_factor_skipped(
+    *,
+    factor_details: dict[str, Any],
+    factors: Mapping[str, Mapping[str, Any]],
+    factor_code: str,
+    reason: str,
+) -> None:
+    factor = dict(factors.get(factor_code) or DEFAULT_FILTER_FACTORS.get(factor_code) or {})
+    factor_details[factor_code] = {
+        "enabled": factor.get("enabled") in (True, 1),
+        "hit": False,
+        "triggered": False,
+        "reason": reason,
+        "evidence": {"skipped": True, "reason": reason},
+    }
+
+
 def _filter_factor_enabled(factors: Mapping[str, Mapping[str, Any]], factor_code: str) -> bool:
     config = factors.get(factor_code)
     if not isinstance(config, Mapping):
@@ -4874,45 +4891,17 @@ def run_theft_confidence_for_grouping_batch(
             issue_transactions,
             settings.filter_transaction_issue_short_period_seconds,
         )
-        country_code_result = _evaluate_country_code_check(
-            db,
-            location_id=location_id,
-            trigger_rows=trigger_rows,
-        )
         long_stay = duration_seconds >= settings.filter_long_stay_seconds
-        carry_signal = (
-            carry_score >= settings.filter_carry_score_threshold
-            or not _as_boolish(before_is_yellow_bag)
-            and _as_boolish(after_is_yellow_bag)
-        )
         total_customer = _coerce_int(_read_group_value(group, "total_customer", "customer_count"), 0)
-        carry_ai_result = (
-            _evaluate_carry_item_signal_with_ai(
-                db,
-                batch_id=batch_id,
-                group_key=group_key,
-                location_id=location_id,
-                trigger_ids=trigger_ids,
-                group=group,
-                transactions=transactions,
-                total_quantity=total_quantity,
-                total_value=total_value,
-            )
-            if _filter_factor_enabled(factor_settings, "carry_item_signal")
-            else {
-                "hit": carry_signal,
-                "score": carry_score,
-                "reason": "carry_item_signal_disabled",
-                "source": "legacy_carry_skipped_disabled",
-                "evidence": _group_carry_evidence(group),
-            }
-        )
-        carry_signal = _as_boolish(carry_ai_result.get("hit"))
+        country_code_result: dict[str, Any] = {"hit": False, "reason": "not_evaluated"}
+        carry_ai_result: dict[str, Any] = {"hit": False, "reason": "not_evaluated"}
 
         reasons: list[str] = []
         factor_details: dict[str, Any] = {}
         triggered_factors: list[str] = []
-        if _apply_filter_factor(
+        should_continue_filtering = True
+
+        if should_continue_filtering and _apply_filter_factor(
             reasons=reasons,
             factor_details=factor_details,
             factors=factor_settings,
@@ -4927,7 +4916,8 @@ def run_theft_confidence_for_grouping_batch(
             },
         ):
             triggered_factors.append("long_stay_low_purchase")
-        if _apply_filter_factor(
+            should_continue_filtering = False
+        if should_continue_filtering and _apply_filter_factor(
             reasons=reasons,
             factor_details=factor_details,
             factors=factor_settings,
@@ -4944,7 +4934,8 @@ def run_theft_confidence_for_grouping_batch(
             },
         ):
             triggered_factors.append("transaction_issue_low_purchase")
-        if _apply_filter_factor(
+            should_continue_filtering = False
+        if should_continue_filtering and _apply_filter_factor(
             reasons=reasons,
             factor_details=factor_details,
             factors=factor_settings,
@@ -4958,7 +4949,8 @@ def run_theft_confidence_for_grouping_batch(
             },
         ):
             triggered_factors.append("multiple_transaction_issues")
-        if _apply_filter_factor(
+            should_continue_filtering = False
+        if should_continue_filtering and _apply_filter_factor(
             reasons=reasons,
             factor_details=factor_details,
             factors=factor_settings,
@@ -4968,27 +4960,8 @@ def run_theft_confidence_for_grouping_batch(
             evidence={"alert_count": len(minus_alerts), "alert_ids": [row.get("id") for row in minus_alerts]},
         ):
             triggered_factors.append("multiple_minus_button_alert")
-        if _apply_filter_factor(
-            reasons=reasons,
-            factor_details=factor_details,
-            factors=factor_settings,
-            factor_code="carry_item_signal",
-            hit=carry_signal,
-            reason="carry_item_signal",
-            evidence=carry_ai_result,
-        ):
-            triggered_factors.append("carry_item_signal")
-        if _apply_filter_factor(
-            reasons=reasons,
-            factor_details=factor_details,
-            factors=factor_settings,
-            factor_code="country_code_check",
-            hit=_as_boolish(country_code_result.get("hit")),
-            reason="country_code_check",
-            evidence=country_code_result,
-        ):
-            triggered_factors.append("country_code_check")
-        if _apply_filter_factor(
+            should_continue_filtering = False
+        if should_continue_filtering and _apply_filter_factor(
             reasons=reasons,
             factor_details=factor_details,
             factors=factor_settings,
@@ -4998,7 +4971,8 @@ def run_theft_confidence_for_grouping_batch(
             evidence={"total_customer": total_customer},
         ):
             triggered_factors.append("unusual_group_size")
-        if _apply_filter_factor(
+            should_continue_filtering = False
+        if should_continue_filtering and _apply_filter_factor(
             reasons=reasons,
             factor_details=factor_details,
             factors=factor_settings,
@@ -5008,6 +4982,77 @@ def run_theft_confidence_for_grouping_batch(
             evidence={"implemented": False, "message": "Skipped until grouping returns stable customer identity."},
         ):
             triggered_factors.append("customer_risk_history")
+            should_continue_filtering = False
+
+        if should_continue_filtering and _filter_factor_enabled(factor_settings, "country_code_check"):
+            country_code_result = _evaluate_country_code_check(
+                db,
+                location_id=location_id,
+                trigger_rows=trigger_rows,
+            )
+        elif not should_continue_filtering:
+            _mark_filter_factor_skipped(
+                factor_details=factor_details,
+                factors=factor_settings,
+                factor_code="country_code_check",
+                reason="skipped_after_previous_factor_hit",
+            )
+        if should_continue_filtering and _apply_filter_factor(
+            reasons=reasons,
+            factor_details=factor_details,
+            factors=factor_settings,
+            factor_code="country_code_check",
+            hit=_as_boolish(country_code_result.get("hit")),
+            reason="country_code_check",
+            evidence=country_code_result,
+        ):
+            triggered_factors.append("country_code_check")
+            should_continue_filtering = False
+
+        if should_continue_filtering:
+            carry_signal = (
+                carry_score >= settings.filter_carry_score_threshold
+                or not _as_boolish(before_is_yellow_bag)
+                and _as_boolish(after_is_yellow_bag)
+            )
+            carry_ai_result = (
+                _evaluate_carry_item_signal_with_ai(
+                    db,
+                    batch_id=batch_id,
+                    group_key=group_key,
+                    location_id=location_id,
+                    trigger_ids=trigger_ids,
+                    group=group,
+                    transactions=transactions,
+                    total_quantity=total_quantity,
+                    total_value=total_value,
+                )
+                if _filter_factor_enabled(factor_settings, "carry_item_signal")
+                else {
+                    "hit": carry_signal,
+                    "score": carry_score,
+                    "reason": "carry_item_signal_disabled",
+                    "source": "legacy_carry_skipped_disabled",
+                    "evidence": _group_carry_evidence(group),
+                }
+            )
+        else:
+            _mark_filter_factor_skipped(
+                factor_details=factor_details,
+                factors=factor_settings,
+                factor_code="carry_item_signal",
+                reason="skipped_after_previous_factor_hit",
+            )
+        if should_continue_filtering and _apply_filter_factor(
+            reasons=reasons,
+            factor_details=factor_details,
+            factors=factor_settings,
+            factor_code="carry_item_signal",
+            hit=_as_boolish(carry_ai_result.get("hit")),
+            reason="carry_item_signal",
+            evidence=carry_ai_result,
+        ):
+            triggered_factors.append("carry_item_signal")
 
         score = float(len(triggered_factors))
         need_deep_analysis = bool(triggered_factors)
