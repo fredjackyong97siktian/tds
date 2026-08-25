@@ -3514,19 +3514,9 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
         raise RuntimeError("No trigger frame images are available for Gemini grouping.")
 
     max_images = _grouping_gemini_max_images_per_request()
+    pending_triggers: list[dict[str, Any]] = list(trigger_inputs)
+    carry_forward_entries: dict[int, dict[str, Any]] = {}
     chunks: list[list[dict[str, Any]]] = []
-    current_chunk: list[dict[str, Any]] = []
-    current_image_count = 0
-    for trigger_input in trigger_inputs:
-        frame_count = len(trigger_input.get("frames") or [])
-        if current_chunk and current_image_count + frame_count > max_images:
-            chunks.append(current_chunk)
-            current_chunk = []
-            current_image_count = 0
-        current_chunk.append(trigger_input)
-        current_image_count += frame_count
-    if current_chunk:
-        chunks.append(current_chunk)
 
     model_name = str(settings.grouping_gemini_model or "gemini-3.5-flash-lite").strip()
     resize_scale = _grouping_gemini_resize_scale()
@@ -3543,7 +3533,32 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
     raw_metas: list[dict[str, Any]] = []
     next_group_id = 1
 
-    for chunk_index, chunk in enumerate(chunks, start=1):
+    chunk_index = 0
+    while pending_triggers:
+        chunk_index += 1
+        # Reserve enough budget for at least one unseen trigger so a pile-up of
+        # carried-forward open entries can never starve the loop of new triggers
+        # to compare against (which would otherwise never terminate).
+        next_frame_count = len(pending_triggers[0].get("frames") or [])
+        carry_budget = max(max_images - next_frame_count, 0)
+        chunk: list[dict[str, Any]] = []
+        carry_image_count = 0
+        for trigger_id in sorted(carry_forward_entries):
+            trigger_input = carry_forward_entries[trigger_id]
+            frame_count = len(trigger_input.get("frames") or [])
+            if chunk and carry_image_count + frame_count > carry_budget:
+                continue
+            chunk.append(trigger_input)
+            carry_image_count += frame_count
+        current_image_count = carry_image_count
+        while pending_triggers:
+            frame_count = len(pending_triggers[0].get("frames") or [])
+            if chunk and current_image_count + frame_count > max_images:
+                break
+            chunk.append(pending_triggers.pop(0))
+            current_image_count += frame_count
+        chunks.append(chunk)
+
         trigger_notes: list[dict[str, Any]] = []
         image_urls: list[str] = []
         image_mapping: list[dict[str, Any]] = []
@@ -3580,6 +3595,17 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
             "You are grouping retail door trigger events into customer sessions. "
             "The trigger list is in chronological order from earliest to latest. "
             "Each trigger is a door-opening event. A trigger may be an entry or an exit. Do not assume every door-opening trigger is an entry. "
+            "Primary actor rule: a trigger's images can contain more than one person, for example a bystander walking past on the sidewalk, or a different "
+            "customer from another trigger crossing through the background. For each trigger, identify the primary actor: the person who is directly interacting "
+            "with the door, card reader, or QR scanner, or who is clearly the one passing through the doorway during that trigger's own frame sequence. Only the "
+            "primary actor determines this trigger's entry/exit label and identity. A person who merely appears somewhere in the background of this trigger's "
+            "images, without interacting with the door themselves, is not this trigger's subject even if you recognize them from another trigger; if you recognize "
+            "a background person as the subject of a different trigger, use that observation only to help label that other trigger, not this one. "
+            "Scene-consistency guard: before closing an entry with a candidate exit, check that the exit trigger's scene is actually consistent with the same "
+            "single customer, matching clothing, build, and carried items, and not a visibly different number of people or a different group entirely. "
+            "If the candidate exit shows a different number of people, unrelated new people, or no visible match to the entry customer's specific clothing, do not "
+            "force the pairing. Leave the entry in open_entries and the exit trigger in unknown instead of guessing. Never invent or assume clothing, color, or "
+            "item details that are not clearly visible in the specific images for that trigger. "
             "Identity matching is the gate for grouping: two triggers may only be placed in the same group if you can visually confirm they show the same physical "
             "person. Compare clothing color and pattern, pants/skirt color, shoes, bags or carried items, body shape and height, hair, and any other distinguishing "
             "visual detail across the trigger images before deciding two triggers belong together. "
@@ -3615,7 +3641,7 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
             '"exit_carry":{"bag_count":integer,"item_count":integer,"items":[{"type":string,"color":string,"size":string,"count":integer,"confidence":number}],"summary":string},'
             '"carry_change_summary":string,"total_customer":integer}],'
             '"open_entries":[integer],"unknown":[integer],"notes":[string]}. '
-            f"Batch: {json.dumps({'batch_id': batch_id, 'location_id': batch.get('location_id'), 'period_code': batch.get('period_code'), 'window_start': batch.get('window_start'), 'window_end': batch.get('window_end'), 'chunk': chunk_index, 'chunk_count': len(chunks)}, default=str)}. "
+            f"Batch: {json.dumps({'batch_id': batch_id, 'location_id': batch.get('location_id'), 'period_code': batch.get('period_code'), 'window_start': batch.get('window_start'), 'window_end': batch.get('window_end'), 'chunk': chunk_index}, default=str)}. "
             f"Triggers: {json.dumps(trigger_notes, default=str)}. "
             f"Image mapping: {json.dumps(image_mapping, default=str)}."
         )
@@ -3651,6 +3677,12 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
             chunk_grouped_trigger_ids.update(exit_ids)
             grouped_trigger_ids.update(entry_ids)
             grouped_trigger_ids.update(exit_ids)
+            # An entry carried forward from an earlier chunk may only now be closing;
+            # drop it from open/unknown so it doesn't also linger in those buckets.
+            normalized_open_entries.difference_update(entry_ids)
+            normalized_open_entries.difference_update(exit_ids)
+            normalized_unknown.difference_update(entry_ids)
+            normalized_unknown.difference_update(exit_ids)
             normalized_groups.append(
                 {
                     "group_id": next_group_id,
@@ -3687,6 +3719,17 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
                 "grouped_trigger_ids": sorted(chunk_grouped_trigger_ids),
             }
         )
+
+        # Only triggers the model just reconfirmed as open_entries get another look in
+        # a later chunk; anything grouped or marked unknown this round is final and is
+        # dropped from the carry-forward set (an "all unknown" chunk simply stops there
+        # instead of being retried).
+        chunk_trigger_by_id = {int(trigger_input["trigger_id"]): trigger_input for trigger_input in chunk}
+        for trigger_id in chunk_trigger_by_id:
+            if trigger_id in normalized_open_entries:
+                carry_forward_entries[trigger_id] = chunk_trigger_by_id[trigger_id]
+            else:
+                carry_forward_entries.pop(trigger_id, None)
 
     all_trigger_ids = [int(item["trigger_id"]) for item in items if item.get("trigger_id") is not None]
     normalized_unknown = {
