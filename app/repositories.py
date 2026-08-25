@@ -2490,6 +2490,83 @@ def list_pending_theft_confidence_batches(db: Session, limit: int = 50) -> list[
     return rows
 
 
+def list_identity_group_size_history(
+    db: Session,
+    *,
+    location_id: int,
+    phone_numbers: list[str] | None = None,
+    card_fingerprints: list[str] | None = None,
+    exclude_batch_id: int | None = None,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    phone_values = [str(value).strip() for value in (phone_numbers or []) if str(value).strip()]
+    card_values = [str(value).strip() for value in (card_fingerprints or []) if str(value).strip()]
+    if not phone_values and not card_values:
+        return []
+
+    confidence_table = _table("filter_confidence_result")
+    batch_table = _table("filter_grouping_batch")
+    grouping_item_table = _table("filter_grouping_item")
+    trigger_table = _table("trigger_event")
+    qrentry = _whitelist_source_config("qrentry")
+    entrylogs = _whitelist_source_config("entrylogs")
+
+    identity_clauses: list[str] = []
+    params: dict[str, Any] = {
+        "location_id": location_id,
+        "exclude_batch_id": exclude_batch_id,
+        "limit": limit,
+    }
+    bind_params = []
+    if phone_values:
+        identity_clauses.append(f"cast(q.{qrentry['display_column']} as char) in :phone_values")
+        params["phone_values"] = phone_values
+        bind_params.append(bindparam("phone_values", expanding=True))
+    if card_values:
+        identity_clauses.append(f"cast(e.{entrylogs['display_column']} as char) in :card_values")
+        params["card_values"] = card_values
+        bind_params.append(bindparam("card_values", expanding=True))
+
+    statement = text(
+        f"""
+        select distinct
+               c.id as confidence_result_id,
+               c.batch_id,
+               c.group_key,
+               b.window_start,
+               b.window_end,
+               cast(json_unquote(json_extract(c.factor_payload, '$.total_customer')) as unsigned) as total_customer
+        from {confidence_table} c
+        join {batch_table} b on b.id = c.batch_id
+        join {grouping_item_table} gi on gi.batch_id = b.id and gi.group_key = c.group_key and gi.role = 'entry'
+        join {trigger_table} te on te.id = gi.trigger_id
+        left join {qrentry['table_name']} q
+               on te.phone_entry_id is not null
+              and (
+                  cast(q.{qrentry['id_column']} as char) = cast(te.phone_entry_id as char)
+                  or cast(q.{qrentry['display_column']} as char) = cast(te.phone_entry_id as char)
+              )
+        left join {entrylogs['table_name']} e
+               on te.credit_card_entry_id is not null
+              and (
+                  cast(e.{entrylogs['id_column']} as char) = cast(te.credit_card_entry_id as char)
+                  or cast(e.{entrylogs['display_column']} as char) = cast(te.credit_card_entry_id as char)
+              )
+        where b.location_id = :location_id
+          and (:exclude_batch_id is null or b.id <> :exclude_batch_id)
+          and c.group_key not in ('__error__', '__no_groups__')
+          and json_extract(c.factor_payload, '$.total_customer') is not null
+          and ({' or '.join(identity_clauses)})
+        order by b.window_start desc, c.id desc
+        limit :limit
+        """
+    )
+    if bind_params:
+        statement = statement.bindparams(*bind_params)
+    result = db.execute(statement, params)
+    return _fetch_all_dicts(result)
+
+
 def upsert_filter_confidence_result(
     db: Session,
     *,

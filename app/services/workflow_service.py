@@ -4313,6 +4313,118 @@ def _evaluate_country_code_check(
     }
 
 
+def _group_entry_identity_values(
+    db: Session,
+    *,
+    trigger_rows: list[dict[str, Any]],
+    entry_trigger_ids: list[int],
+) -> dict[str, list[str]]:
+    entry_id_set = {int(trigger_id) for trigger_id in entry_trigger_ids}
+    candidate_rows = [
+        row
+        for row in trigger_rows
+        if not entry_id_set or int(row.get("id") or 0) in entry_id_set
+    ]
+    phone_numbers: list[str] = []
+    card_fingerprints: list[str] = []
+
+    for trigger in candidate_rows:
+        phone_entry_id = trigger.get("phone_entry_id")
+        if phone_entry_id is not None:
+            identity = repositories.get_phone_entry_identity(db, phone_entry_id)
+            value = str((identity or {}).get("phone_number") or "").strip()
+            if value and value not in phone_numbers:
+                phone_numbers.append(value)
+
+        credit_card_entry_id = trigger.get("credit_card_entry_id")
+        if credit_card_entry_id is not None:
+            identity = repositories.get_credit_card_entry_identity(db, credit_card_entry_id)
+            value = str((identity or {}).get("fingerprint") or "").strip()
+            if value and value not in card_fingerprints:
+                card_fingerprints.append(value)
+
+    return {
+        "phone_numbers": phone_numbers,
+        "card_fingerprints": card_fingerprints,
+    }
+
+
+def _evaluate_unusual_group_size(
+    db: Session,
+    *,
+    batch_id: int,
+    location_id: int,
+    trigger_rows: list[dict[str, Any]],
+    entry_trigger_ids: list[int],
+    total_customer: int,
+) -> dict[str, Any]:
+    identities = _group_entry_identity_values(
+        db,
+        trigger_rows=trigger_rows,
+        entry_trigger_ids=entry_trigger_ids,
+    )
+    evidence: dict[str, Any] = {
+        "current_total_customer": total_customer,
+        "identities_checked": identities,
+        "history": [],
+        "history_count": 0,
+        "historical_average": None,
+        "historical_max": None,
+        "min_history": settings.filter_unusual_group_size_min_history,
+        "delta_threshold": settings.filter_unusual_group_size_delta,
+    }
+    if total_customer <= 0:
+        return {**evidence, "hit": False, "reason": "missing_current_group_size"}
+    if not identities["phone_numbers"] and not identities["card_fingerprints"]:
+        return {**evidence, "hit": False, "reason": "missing_entry_identity"}
+
+    history_rows = repositories.list_identity_group_size_history(
+        db,
+        location_id=location_id,
+        phone_numbers=identities["phone_numbers"],
+        card_fingerprints=identities["card_fingerprints"],
+        exclude_batch_id=batch_id,
+        limit=20,
+    )
+    history_sizes = [
+        int(size)
+        for row in history_rows
+        if (size := _coerce_int(row.get("total_customer"), 0)) and int(size) > 0
+    ]
+    evidence["history"] = [
+        {
+            "batch_id": row.get("batch_id"),
+            "group_key": row.get("group_key"),
+            "window_start": row.get("window_start"),
+            "window_end": row.get("window_end"),
+            "total_customer": row.get("total_customer"),
+        }
+        for row in history_rows
+    ]
+    evidence["history_count"] = len(history_sizes)
+    if not history_sizes:
+        return {**evidence, "hit": False, "reason": "no_identity_group_size_history"}
+
+    historical_average = sum(history_sizes) / len(history_sizes)
+    historical_max = max(history_sizes)
+    evidence["historical_average"] = round(historical_average, 2)
+    evidence["historical_max"] = historical_max
+
+    min_history = max(1, int(settings.filter_unusual_group_size_min_history or 1))
+    if len(history_sizes) < min_history:
+        return {**evidence, "hit": False, "reason": "insufficient_identity_group_size_history"}
+
+    delta_threshold = max(1, int(settings.filter_unusual_group_size_delta or 1))
+    hit = total_customer >= historical_max + delta_threshold
+    evidence["increase_from_historical_max"] = total_customer - historical_max
+    evidence["increase_from_historical_average"] = round(total_customer - historical_average, 2)
+    return {
+        **evidence,
+        "hit": hit,
+        "reason": "identity_group_size_unusual" if hit else "identity_group_size_within_history",
+    }
+
+
 def _transaction_event_time(row: Mapping[str, Any]) -> datetime | None:
     return (
         _coerce_datetime_value(row.get("created_at"))
@@ -4893,6 +5005,18 @@ def run_theft_confidence_for_grouping_batch(
         )
         long_stay = duration_seconds >= settings.filter_long_stay_seconds
         total_customer = _coerce_int(_read_group_value(group, "total_customer", "customer_count"), 0)
+        unusual_group_size_result = (
+            _evaluate_unusual_group_size(
+                db,
+                batch_id=batch_id,
+                location_id=location_id,
+                trigger_rows=trigger_rows,
+                entry_trigger_ids=entry_trigger_ids,
+                total_customer=total_customer,
+            )
+            if _filter_factor_enabled(factor_settings, "unusual_group_size")
+            else {"hit": False, "reason": "unusual_group_size_disabled", "current_total_customer": total_customer}
+        )
         country_code_result: dict[str, Any] = {"hit": False, "reason": "not_evaluated"}
         carry_ai_result: dict[str, Any] = {"hit": False, "reason": "not_evaluated"}
 
@@ -4966,9 +5090,9 @@ def run_theft_confidence_for_grouping_batch(
             factor_details=factor_details,
             factors=factor_settings,
             factor_code="unusual_group_size",
-            hit=total_customer > settings.filter_unusual_group_size,
+            hit=_as_boolish(unusual_group_size_result.get("hit")),
             reason="unusual_group_size",
-            evidence={"total_customer": total_customer},
+            evidence=unusual_group_size_result,
         ):
             triggered_factors.append("unusual_group_size")
             should_continue_filtering = False
@@ -5079,6 +5203,7 @@ def run_theft_confidence_for_grouping_batch(
                 "after_is_yellow_bag": after_is_yellow_bag,
                 "carry_ai_result": carry_ai_result,
                 "country_code_result": country_code_result,
+                "unusual_group_size_result": unusual_group_size_result,
                 "total_customer": total_customer,
                 "transactions": _transaction_summary(transactions),
                 "issue_transactions": _transaction_summary(issue_transactions),

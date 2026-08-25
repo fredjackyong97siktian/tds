@@ -67,6 +67,8 @@ class Settings(BaseSettings):
     filter_transaction_issue_short_period_seconds: int = 120
     filter_carry_score_threshold: float = 40
     filter_unusual_group_size: int = 2
+    filter_unusual_group_size_min_history: int = 2
+    filter_unusual_group_size_delta: int = 2
     analysis_poll_seconds: int = 10
     analysis_max_global_workers: int = 1
     analysis_cooldown_seconds: int = 10
