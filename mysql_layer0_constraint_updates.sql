@@ -25,7 +25,8 @@ ALTER TABLE sesamedb.tds_script_run
         'entry',
         'kiosk',
         'kiosk_match',
-        'grouping'
+        'grouping',
+        'carry_confidence'
     ));
 
 ALTER TABLE sesamedb.tds_script_run
