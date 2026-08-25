@@ -3709,6 +3709,49 @@ def start_grouping_analysis_job(job: GroupingAnalysisQueued) -> ScriptExecutionR
         db.close()
 
 
+def _refresh_grouping_item_frame_payloads(db: Session, *, batch: Mapping[str, Any]) -> int:
+    location_id = int(batch["location_id"])
+    window_start = batch.get("window_start")
+    window_end = batch.get("window_end")
+    if window_start is None or window_end is None:
+        return 0
+    existing_items = repositories.list_grouping_items(db, int(batch["id"]))
+    existing_trigger_ids = {
+        int(item["trigger_id"])
+        for item in existing_items
+        if item.get("trigger_id") is not None
+    }
+    if not existing_trigger_ids:
+        return 0
+    frame_assets = repositories.list_trigger_frame_assets_for_window(
+        db,
+        location_id=location_id,
+        window_start=window_start,
+        window_end=window_end,
+    )
+    refreshed_count = 0
+    for row in frame_assets:
+        trigger_id = int(row["trigger_id"])
+        if trigger_id not in existing_trigger_ids:
+            continue
+        frames = _first_trigger_frame_payload(_frame_urls_from_trigger_frame_asset(row))
+        if not frames:
+            continue
+        repositories.upsert_grouping_item(
+            db,
+            batch_id=int(batch["id"]),
+            trigger_id=trigger_id,
+            video_asset_id=None,
+            group_key=None,
+            role="unknown",
+            status="pending",
+            frame_payload={"frames": frames},
+            result_payload=None,
+        )
+        refreshed_count += 1
+    return refreshed_count
+
+
 def retry_grouping_batch_now(db: Session, *, batch_id: int) -> dict[str, Any]:
     batch = repositories.get_grouping_batch(db, batch_id)
     status = str(batch.get("status") or "").strip().lower()
@@ -3730,6 +3773,7 @@ def retry_grouping_batch_now(db: Session, *, batch_id: int) -> dict[str, Any]:
         error="Rerun queued for grouping batch.",
     )
     repositories.reset_grouping_batch_for_retry(db, batch_id)
+    refreshed_count = _refresh_grouping_item_frame_payloads(db, batch=batch)
     if not repositories.claim_grouping_batch_for_dispatch(db, batch_id):
         raise ValueError(f"Grouping batch {batch_id} could not be claimed for retry.")
     try:
@@ -3751,6 +3795,7 @@ def retry_grouping_batch_now(db: Session, *, batch_id: int) -> dict[str, Any]:
         "script_run_id": result.script_run_id,
         "runner_job_id": result.runner_job_id,
         "status": result.status,
+        "refreshed_frame_payload_count": refreshed_count,
     }
 
 

@@ -2022,7 +2022,7 @@ def upsert_grouping_item(
                 role = values(role),
                 status = values(status),
                 score = values(score),
-                frame_payload = values(frame_payload),
+                frame_payload = coalesce(values(frame_payload), frame_payload),
                 result_payload = values(result_payload)
             """
         ),
