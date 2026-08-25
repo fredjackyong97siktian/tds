@@ -3478,14 +3478,22 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
         if not image_urls:
             continue
         prompt = (
-            "You are grouping retail door triggers into customer sessions using CCTV frame images. "
-            "Each trigger is a door opening event. Compare visible people across trigger images by clothing, body shape, bags, "
-            "walking direction, and timestamp order. A trigger must never be both entry and exit in the same group. "
-            "A trigger with phone_entry_id or credit_card_entry_id can still be an exit trigger; do not force it to entry. "
-            "Entry triggers must have phone_entry_id or credit_card_entry_id. Triggers without either identity can only be exit or unknown. "
-            "Only return a group when the same customer has at least one entry trigger and at least one different exit trigger. "
-            "Do not return entry-only groups. Put entry-only, exit-only, and uncertain triggers in unknown. "
-            "Use only the image-number mapping below. Unknown means the trigger cannot be grouped into a complete entry+exit pair. "
+            "You are grouping retail door trigger events into customer sessions. "
+            "The trigger list is in chronological order from earliest to latest. "
+            "Each trigger is a door-opening event. A trigger may be an entry or an exit. Do not assume every door-opening trigger is an entry. "
+            "Identity rule: Entry triggers must have phone_entry_id or credit_card_entry_id. "
+            "Triggers without phone_entry_id and without credit_card_entry_id can only be exit or unknown. "
+            "A trigger with phone_entry_id or credit_card_entry_id can still be exit if visual/timeline evidence clearly supports it. "
+            "Grouping rule: A complete session group must contain at least one entry trigger and at least one different exit trigger. "
+            "A trigger must never be both entry and exit in the same group. "
+            "Do not return entry-only groups. Do not return exit-only groups. Put entry-only, exit-only, and uncertain triggers into unknown. "
+            "If two triggers show the same customer, the earlier trigger should normally be entry and the later trigger should normally be exit. "
+            "If door direction is visually ambiguous, prefer the chronological session pattern: earlier identity trigger opens the session, later same-person trigger closes it. "
+            "Visual matching rule: compare people across trigger images using clothing color and pattern, pants/skirt color, shoes, bags or carried items, "
+            "body shape and height, walking direction, position relative to the door, and timestamp order. "
+            "Important: Do not create a separate group for every trigger. Only group triggers when they appear to show the same customer across time. "
+            "If the same customer appears in trigger 73 and later trigger 74, return entry [73], exit [74]. "
+            "If a trigger cannot be confidently matched into a complete entry+exit pair, put it in unknown. "
             "Return strict JSON only with schema: "
             '{"groups":[{"entry":[integer],"exit":[integer],"confidence":number,"reason":string}],'
             '"unknown":[integer],"notes":[string]}. '
