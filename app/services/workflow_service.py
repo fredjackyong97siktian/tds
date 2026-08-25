@@ -3430,7 +3430,7 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
     if current_chunk:
         chunks.append(current_chunk)
 
-    model_name = str(settings.grouping_gemini_model or "gemini-2.5-flash-lite").strip()
+    model_name = str(settings.grouping_gemini_model or "gemini-3.5-flash-lite").strip()
     resize_scale = _grouping_gemini_resize_scale()
     normalized_groups: list[dict[str, Any]] = []
     grouped_trigger_ids: set[int] = set()
