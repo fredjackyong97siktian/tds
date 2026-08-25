@@ -113,7 +113,7 @@ class Settings(BaseSettings):
     grouping_gemini_model: str = "gemini-3-flash-preview"
     grouping_gemini_frames_per_trigger: int = 5
     grouping_gemini_image_scale: float = 0.5
-    grouping_gemini_max_images_per_request: int = 25
+    grouping_gemini_max_images_per_request: int = 40
     kiosk_gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
     kiosk_gemini_timeout_seconds: int = 180
     gemini_input_cost_per_1m_tokens_usd: float = 0.0
