@@ -3288,17 +3288,6 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
         selected_periods = _selected_grouping_periods_for_location(periods, location_id)
         if not selected_periods:
             continue
-        stale_count = repositories.mark_stale_unresolved_trigger_frame_assets_issue(
-            db,
-            location_id=location_id,
-            cutoff_time=current - timedelta(hours=1),
-        )
-        if stale_count:
-            logger.info(
-                "Marked stale unresolved trigger frame assets issue location_id=%s count=%s",
-                location_id,
-                stale_count,
-            )
         ready_assets = repositories.list_manual_grouping_ready_trigger_frame_assets(
             db,
             location_id=location_id,
@@ -3322,6 +3311,18 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
 
             for (window_start, window_end), _ready_rows in sorted(assets_by_window.items()):
                 carryover_start = window_start - timedelta(hours=1)
+                stale_count = repositories.mark_stale_open_entry_frame_assets_issue(
+                    db,
+                    location_id=location_id,
+                    cutoff_time=carryover_start,
+                )
+                if stale_count:
+                    logger.info(
+                        "Marked stale open entry frame assets issue location_id=%s cutoff_time=%s count=%s",
+                        location_id,
+                        carryover_start,
+                        stale_count,
+                    )
                 ready_trigger_ids = {int(row["trigger_id"]) for row in _ready_rows if row.get("trigger_id") is not None}
                 trigger_assets = list(_ready_rows)
                 for row in ready_assets:

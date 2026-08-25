@@ -2416,7 +2416,7 @@ def mark_grouping_batch_frame_assets_retrieved(db: Session, batch_id: int, *, er
     return int(result.rowcount or 0)
 
 
-def mark_stale_unresolved_trigger_frame_assets_issue(
+def mark_stale_open_entry_frame_assets_issue(
     db: Session,
     *,
     location_id: int,
@@ -2442,12 +2442,14 @@ def mark_stale_unresolved_trigger_frame_assets_issue(
                   where gi.trigger_id = fa.trigger_id
                     and gb.status = 'success'
                     and gi.status = 'unknown'
+                    and gi.role = 'unknown'
+                    and json_unquote(json_extract(gi.result_payload, '$.reason')) = 'open_entry_waiting_for_exit'
               )
               and not exists (
                   select 1
-                  from {grouping_item_table} gi
-                  where gi.trigger_id = fa.trigger_id
-                    and gi.status = 'grouped'
+                  from {grouping_item_table} grouped_gi
+                  where grouped_gi.trigger_id = fa.trigger_id
+                    and grouped_gi.status = 'grouped'
               )
             """
         ),
