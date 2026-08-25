@@ -1993,6 +1993,21 @@ def reset_grouping_batch_for_retry(db: Session, batch_id: int) -> dict[str, Any]
     return get_grouping_batch(db, batch_id)
 
 
+def delete_filter_confidence_results_for_batch(db: Session, batch_id: int) -> int:
+    table_name = _table("filter_confidence_result")
+    result = db.execute(
+        text(
+            f"""
+            delete from {table_name}
+            where batch_id = :batch_id
+            """
+        ),
+        {"batch_id": batch_id},
+    )
+    db.commit()
+    return int(result.rowcount or 0)
+
+
 def upsert_grouping_item(
     db: Session,
     *,

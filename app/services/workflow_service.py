@@ -64,6 +64,14 @@ DEFAULT_FILTER_FACTORS: dict[str, dict[str, Any]] = {
     "unusual_group_size": {"enabled": True},
     "customer_risk_history": {"enabled": False},
 }
+GEMINI_COSTS_PER_1M_TOKENS_USD: dict[str, dict[str, float]] = {
+    "gemini-3.5-flash-lite": {"input": 0.30, "output": 2.50, "cached_input": 0.03},
+    "gemini-3.5-flash": {"input": 1.50, "output": 9.00, "cached_input": 0.15},
+    "gemini-3.1-flash-lite": {"input": 0.25, "output": 1.50, "cached_input": 0.025},
+    "gemini-3-flash-preview": {"input": 0.50, "output": 3.00, "cached_input": 0.05},
+    "gemini-2.5-flash-lite": {"input": 0.10, "output": 0.40, "cached_input": 0.025},
+}
+DEFAULT_RUNPOD_SERVERLESS_COST_PER_SECOND_USD = 0.69 / 3600
 
 
 @dataclass
@@ -833,6 +841,25 @@ def _positive_float(value: Any) -> float | None:
     return parsed
 
 
+def _gemini_model_key(model_name: Any) -> str:
+    normalized = str(model_name or "").strip().lower()
+    if not normalized:
+        return ""
+    normalized = normalized.removeprefix("models/")
+    normalized = normalized.split("/")[-1]
+    return normalized
+
+
+def _gemini_model_cost_rates(model_name: Any) -> dict[str, float]:
+    model_key = _gemini_model_key(model_name)
+    if model_key in GEMINI_COSTS_PER_1M_TOKENS_USD:
+        return GEMINI_COSTS_PER_1M_TOKENS_USD[model_key]
+    for known_model, rates in GEMINI_COSTS_PER_1M_TOKENS_USD.items():
+        if known_model in model_key:
+            return rates
+    return {}
+
+
 def _remote_runner_cost(remote_result: RemoteRunnerResult) -> tuple[float | None, str | None]:
     meta = remote_result.meta if isinstance(remote_result.meta, Mapping) else {}
     for key in ("cost_amount", "cost_usd", "runpod_cost_usd", "estimated_cost_usd"):
@@ -845,7 +872,16 @@ def _remote_runner_cost(remote_result: RemoteRunnerResult) -> tuple[float | None
         duration_seconds = _positive_float(meta.get(key))
         if duration_seconds is not None:
             break
-    cost_per_second = _positive_float(settings.runpod_cost_per_second_usd)
+    if duration_seconds is None:
+        for key in ("executionTime", "execution_time_ms", "runtime_ms"):
+            duration_milliseconds = _positive_float(meta.get(key))
+            if duration_milliseconds is not None:
+                duration_seconds = duration_milliseconds / 1000
+                break
+    cost_per_second = (
+        _positive_float(settings.runpod_cost_per_second_usd)
+        or DEFAULT_RUNPOD_SERVERLESS_COST_PER_SECOND_USD
+    )
     if duration_seconds is None or cost_per_second is None:
         return None, None
     return duration_seconds * cost_per_second, "runpod_estimate"
@@ -865,6 +901,8 @@ def _record_remote_runner_cost(db: Session, script_run_id: int, remote_result: R
 def _gemini_usage_cost(gemini_meta: Mapping[str, Any]) -> tuple[float | None, dict[str, Any]]:
     raw_usage = gemini_meta.get("raw_usage") if isinstance(gemini_meta.get("raw_usage"), Mapping) else {}
     usage = gemini_meta.get("usage") if isinstance(gemini_meta.get("usage"), Mapping) else {}
+    model_name = gemini_meta.get("model") or gemini_meta.get("model_name")
+    model_rates = _gemini_model_cost_rates(model_name)
     input_tokens = (
         _positive_float(raw_usage.get("promptTokenCount"))
         or _positive_float(usage.get("input_tokens"))
@@ -880,14 +918,17 @@ def _gemini_usage_cost(gemini_meta: Mapping[str, Any]) -> tuple[float | None, di
         or _positive_float(usage.get("cached_input_tokens"))
         or 0.0
     )
-    input_rate = _positive_float(settings.gemini_input_cost_per_1m_tokens_usd) or 0.0
-    output_rate = _positive_float(settings.gemini_output_cost_per_1m_tokens_usd) or 0.0
+    input_rate = _positive_float(settings.gemini_input_cost_per_1m_tokens_usd) or model_rates.get("input", 0.0)
+    output_rate = _positive_float(settings.gemini_output_cost_per_1m_tokens_usd) or model_rates.get("output", 0.0)
     cached_rate = _positive_float(settings.gemini_cached_input_cost_per_1m_tokens_usd)
+    if cached_rate is None:
+        cached_rate = model_rates.get("cached_input")
     billable_input_tokens = max(0.0, input_tokens - cached_input_tokens)
     amount = (billable_input_tokens * input_rate + output_tokens * output_rate) / 1_000_000
     if cached_rate is not None:
         amount += cached_input_tokens * cached_rate / 1_000_000
     detail = {
+        "model": model_name,
         "input_tokens": int(input_tokens),
         "output_tokens": int(output_tokens),
         "cached_input_tokens": int(cached_input_tokens),
@@ -3598,6 +3639,39 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
     }
 
 
+def _run_confidence_after_grouping_success(db: Session, *, batch_id: int) -> dict[str, Any]:
+    deleted_count = repositories.delete_filter_confidence_results_for_batch(db, batch_id)
+    try:
+        result = run_theft_confidence_for_grouping_batch(db, batch_id=batch_id)
+        return {
+            "status": "success",
+            "deleted_previous_confidence_result_count": deleted_count,
+            **result,
+        }
+    except Exception as exc:
+        logger.exception("Theft confidence failed immediately after grouping batch_id=%s", batch_id)
+        try:
+            batch = repositories.get_grouping_batch(db, batch_id)
+            repositories.upsert_filter_confidence_result(
+                db,
+                batch_id=batch_id,
+                group_key="__error__",
+                location_id=int(batch.get("location_id") or 0),
+                score=0,
+                need_deep_analysis=False,
+                reason="confidence_error",
+                factor_payload={"error": str(exc), "source": "grouping_completion"},
+            )
+        except Exception:
+            logger.exception("Could not persist immediate confidence error for batch_id=%s", batch_id)
+        return {
+            "status": "failed",
+            "batch_id": batch_id,
+            "deleted_previous_confidence_result_count": deleted_count,
+            "error": str(exc),
+        }
+
+
 def start_grouping_analysis_job(job: GroupingAnalysisQueued) -> ScriptExecutionResult:
     db = TransactionalSessionLocal()
     try:
@@ -3637,6 +3711,7 @@ def start_grouping_analysis_job(job: GroupingAnalysisQueued) -> ScriptExecutionR
                 "finished_at": datetime.now(UTC),
             },
         )
+        confidence_result = _run_confidence_after_grouping_success(db, batch_id=job.batch_id)
         repositories.assign_script_run_runner_job(
             db,
             script_run_id,
@@ -3662,6 +3737,7 @@ def start_grouping_analysis_job(job: GroupingAnalysisQueued) -> ScriptExecutionR
                 {
                     "grouping_summary": grouping_summary,
                     "gemini_meta": gemini_meta,
+                    "confidence_result": confidence_result,
                 },
                 indent=2,
                 default=str,
@@ -3772,6 +3848,7 @@ def retry_grouping_batch_now(db: Session, *, batch_id: int) -> dict[str, Any]:
         batch_id,
         error="Rerun queued for grouping batch.",
     )
+    deleted_confidence_count = repositories.delete_filter_confidence_results_for_batch(db, batch_id)
     repositories.reset_grouping_batch_for_retry(db, batch_id)
     refreshed_count = _refresh_grouping_item_frame_payloads(db, batch=batch)
     if not repositories.claim_grouping_batch_for_dispatch(db, batch_id):
@@ -3796,6 +3873,7 @@ def retry_grouping_batch_now(db: Session, *, batch_id: int) -> dict[str, Any]:
         "runner_job_id": result.runner_job_id,
         "status": result.status,
         "refreshed_frame_payload_count": refreshed_count,
+        "deleted_confidence_result_count": deleted_confidence_count,
     }
 
 
@@ -3857,6 +3935,7 @@ def _finalize_remote_grouping_script_run(
         logger.info("Marked grouping frame assets processed batch_id=%s count=%s", batch_id, processed_count)
     except Exception:
         logger.exception("Could not mark grouping frame assets processed batch_id=%s", batch_id)
+    _run_confidence_after_grouping_success(db, batch_id=batch_id)
     return result
 
 
