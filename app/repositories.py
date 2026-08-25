@@ -1984,7 +1984,7 @@ def reset_grouping_batch_for_retry(db: Session, batch_id: int) -> dict[str, Any]
                 finished_at = null,
                 updated_at = now()
             where id = :batch_id
-              and status in ('failed', 'issue')
+              and status in ('success', 'failed', 'issue', 'cancel', 'canceled', 'cancelled')
             """
         ),
         {"batch_id": batch_id},
