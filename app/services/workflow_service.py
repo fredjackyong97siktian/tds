@@ -3435,6 +3435,10 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
     normalized_groups: list[dict[str, Any]] = []
     grouped_trigger_ids: set[int] = set()
     normalized_unknown: set[int] = set()
+    trigger_has_identity: dict[int, bool] = {
+        int(trigger["trigger_id"]): trigger.get("phone_entry_id") is not None or trigger.get("credit_card_entry_id") is not None
+        for trigger in trigger_inputs
+    }
     notes: list[str] = []
     chunk_results: list[dict[str, Any]] = []
     raw_metas: list[dict[str, Any]] = []
@@ -3478,6 +3482,7 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
             "Each trigger is a door opening event. Compare visible people across trigger images by clothing, body shape, bags, "
             "walking direction, and timestamp order. A trigger must never be both entry and exit in the same group. "
             "A trigger with phone_entry_id or credit_card_entry_id can still be an exit trigger; do not force it to entry. "
+            "Entry triggers must have phone_entry_id or credit_card_entry_id. Triggers without either identity can only be exit or unknown. "
             "Only return a group when the same customer has at least one entry trigger and at least one different exit trigger. "
             "Do not return entry-only groups. Put entry-only, exit-only, and uncertain triggers in unknown. "
             "Use only the image-number mapping below. Unknown means the trigger cannot be grouped into a complete entry+exit pair. "
@@ -3505,6 +3510,11 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
             entry_ids = _group_trigger_id_list(group.get("entry"))
             exit_ids = [trigger_id for trigger_id in _group_trigger_id_list(group.get("exit")) if trigger_id not in entry_ids]
             if not entry_ids:
+                continue
+            invalid_entry_ids = [trigger_id for trigger_id in entry_ids if not trigger_has_identity.get(trigger_id, False)]
+            if invalid_entry_ids:
+                normalized_unknown.update(entry_ids)
+                normalized_unknown.update(exit_ids)
                 continue
             if not exit_ids:
                 normalized_unknown.update(entry_ids)
