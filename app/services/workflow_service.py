@@ -3942,27 +3942,12 @@ def retry_grouping_batch_now(db: Session, *, batch_id: int) -> dict[str, Any]:
     deleted_confidence_count = repositories.delete_filter_confidence_results_for_batch(db, batch_id)
     repositories.reset_grouping_batch_for_retry(db, batch_id)
     refreshed_count = _refresh_grouping_item_frame_payloads(db, batch=batch)
-    if not repositories.claim_grouping_batch_for_dispatch(db, batch_id):
-        raise ValueError(f"Grouping batch {batch_id} could not be claimed for retry.")
-    try:
-        job = build_grouping_analysis_job_from_batch(db, batch_id)
-        result = start_grouping_analysis_job(job)
-    except Exception as exc:
-        repositories.update_grouping_batch(
-            db,
-            batch_id,
-            {
-                "status": "issue",
-                "issue_reason": str(exc),
-            },
-        )
-        raise
     return {
         "ok": True,
         "batch_id": batch_id,
-        "script_run_id": result.script_run_id,
-        "runner_job_id": result.runner_job_id,
-        "status": result.status,
+        "status": "pending",
+        "queued": True,
+        "message": "Grouping batch queued for background rerun.",
         "refreshed_frame_payload_count": refreshed_count,
         "deleted_confidence_result_count": deleted_confidence_count,
     }
