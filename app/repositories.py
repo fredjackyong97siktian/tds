@@ -1702,15 +1702,20 @@ def list_manual_grouping_ready_trigger_frame_assets(
                    fa.created_at as frame_asset_created_at
             from {trigger_table} te
             join {frame_asset_table} fa on fa.trigger_id = te.id
-            left join {grouping_item_table} gi on gi.trigger_id = te.id
-            left join {grouping_batch_table} gb
-                   on gb.id = gi.batch_id
-                  and gb.status in ('pending', 'dispatching', 'running', 'success')
             where te.location_id = :location_id
               and te.whitelist_hit = 0
               and te.status <> 'whitelisted'
               and fa.status = 'retrieved'
-              and gb.id is null
+              and not exists (
+                  select 1
+                  from {grouping_item_table} gi
+                  join {grouping_batch_table} gb on gb.id = gi.batch_id
+                  where gi.trigger_id = te.id
+                    and (
+                        gb.status in ('pending', 'dispatching', 'running')
+                        or gi.status = 'grouped'
+                    )
+              )
             order by te.trigger_time asc, te.id asc, fa.id asc
             limit :limit
             """
@@ -2359,6 +2364,7 @@ def mark_grouping_batch_frame_assets_processed(db: Session, batch_id: int) -> in
                 fa.error = null,
                 fa.updated_at = now()
             where gi.batch_id = :batch_id
+              and gi.status = 'grouped'
               and fa.status in ('retrieved', 'processing')
             """
         ),
@@ -2405,6 +2411,47 @@ def mark_grouping_batch_frame_assets_retrieved(db: Session, batch_id: int, *, er
             """
         ),
         {"batch_id": batch_id, "error": error},
+    )
+    db.commit()
+    return int(result.rowcount or 0)
+
+
+def mark_stale_unresolved_trigger_frame_assets_issue(
+    db: Session,
+    *,
+    location_id: int,
+    cutoff_time: Any,
+) -> int:
+    frame_asset_table = _table("trigger_frame_asset")
+    grouping_item_table = _table("filter_grouping_item")
+    grouping_batch_table = _table("filter_grouping_batch")
+    result = db.execute(
+        text(
+            f"""
+            update {frame_asset_table} fa
+            set fa.status = 'issue',
+                fa.error = 'No matching exit found within 1 hour.',
+                fa.updated_at = now()
+            where fa.location_id = :location_id
+              and fa.status = 'retrieved'
+              and fa.start_time < :cutoff_time
+              and exists (
+                  select 1
+                  from {grouping_item_table} gi
+                  join {grouping_batch_table} gb on gb.id = gi.batch_id
+                  where gi.trigger_id = fa.trigger_id
+                    and gb.status = 'success'
+                    and gi.status = 'unknown'
+              )
+              and not exists (
+                  select 1
+                  from {grouping_item_table} gi
+                  where gi.trigger_id = fa.trigger_id
+                    and gi.status = 'grouped'
+              )
+            """
+        ),
+        {"location_id": location_id, "cutoff_time": cutoff_time},
     )
     db.commit()
     return int(result.rowcount or 0)

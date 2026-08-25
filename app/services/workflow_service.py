@@ -2334,6 +2334,8 @@ def _repair_grouping_with_gemini(
         "You are repairing retail entrance/exit grouping. Each trigger is a door event. "
         "A group should identify the same person across triggers. A trigger must never be both entry and exit in the same group. "
         "Use the image-number mapping to compare people by clothing, body shape, bags, and direction. "
+        "Direction is important: walking into the store means entry; walking out of or away from the store means exit. "
+        "If clear walking direction conflicts with simple timestamp assumptions, prioritize the walking direction. "
         "Return strict JSON only with schema: "
         '{"groups":[{"entry":[integer],"exit":[integer],"confidence":number,"reason":string}],'
         '"unknown":[integer],"notes":[string]}. '
@@ -2381,6 +2383,7 @@ def _repair_grouping_with_gemini(
         exit_ids = _group_trigger_id_list(repaired.get("exit"))
         if not entry_ids:
             continue
+        entry_ids = entry_ids[:1]
         exit_ids = [trigger_id for trigger_id in exit_ids if trigger_id not in entry_ids]
         if not exit_ids:
             continue
@@ -2423,11 +2426,14 @@ def _repair_grouping_with_gemini(
         ),
         stderr_log="",
     )
-    remaining_open_groups = [
-        group
-        for group in open_groups
-        if not any(trigger_id in consumed_trigger_ids for trigger_id in _group_trigger_id_list(group.get("entry")))
-    ]
+    remaining_open_entries = sorted(
+        {
+            trigger_id
+            for group in open_groups
+            for trigger_id in _group_trigger_id_list(group.get("entry"))
+            if trigger_id not in consumed_trigger_ids
+        }
+    )
     repaired_unknown = set(_group_trigger_id_list(repair_result.get("unknown")))
     remaining_unknown = sorted(
         {
@@ -2437,7 +2443,10 @@ def _repair_grouping_with_gemini(
         }
         | {trigger_id for trigger_id in repaired_unknown if trigger_id not in consumed_trigger_ids}
     )
-    grouping_summary["groups"] = completed_groups + repaired_groups + remaining_open_groups
+    grouping_summary["groups"] = completed_groups + repaired_groups
+    grouping_summary["open_entries"] = sorted(
+        set(_group_trigger_id_list(grouping_summary.get("open_entries"))) | set(remaining_open_entries)
+    )
     grouping_summary["unknown"] = remaining_unknown
     grouping_summary["gemini_repair"] = {
         "status": "success",
@@ -2488,6 +2497,25 @@ def _persist_grouping_items_from_summary(
                         )
                     except Exception:
                         logger.exception("Could not persist grouping item batch_id=%s trigger_id=%s", batch_id, trigger_id)
+    open_entries = grouping_summary.get("open_entries") or []
+    if isinstance(open_entries, list):
+        for trigger_id in open_entries:
+            try:
+                normalized_trigger_id = int(trigger_id)
+                if normalized_trigger_id in grouped_trigger_ids:
+                    continue
+                repositories.upsert_grouping_item(
+                    db,
+                    batch_id=batch_id,
+                    trigger_id=normalized_trigger_id,
+                    video_asset_id=None,
+                    group_key=None,
+                    role="unknown",
+                    status="unknown",
+                    result_payload={"reason": "open_entry_waiting_for_exit"},
+                )
+            except Exception:
+                logger.exception("Could not persist open grouping item batch_id=%s trigger_id=%s", batch_id, trigger_id)
     unknown = grouping_summary.get("unknown") or []
     if isinstance(unknown, list):
         for trigger_id in unknown:
@@ -3260,6 +3288,17 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
         selected_periods = _selected_grouping_periods_for_location(periods, location_id)
         if not selected_periods:
             continue
+        stale_count = repositories.mark_stale_unresolved_trigger_frame_assets_issue(
+            db,
+            location_id=location_id,
+            cutoff_time=current - timedelta(hours=1),
+        )
+        if stale_count:
+            logger.info(
+                "Marked stale unresolved trigger frame assets issue location_id=%s count=%s",
+                location_id,
+                stale_count,
+            )
         ready_assets = repositories.list_manual_grouping_ready_trigger_frame_assets(
             db,
             location_id=location_id,
@@ -3282,6 +3321,22 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
                 assets_by_window.setdefault(window, []).append(row)
 
             for (window_start, window_end), _ready_rows in sorted(assets_by_window.items()):
+                carryover_start = window_start - timedelta(hours=1)
+                ready_trigger_ids = {int(row["trigger_id"]) for row in _ready_rows if row.get("trigger_id") is not None}
+                trigger_assets = list(_ready_rows)
+                for row in ready_assets:
+                    try:
+                        trigger_id = int(row["trigger_id"])
+                    except (TypeError, ValueError):
+                        continue
+                    if trigger_id in ready_trigger_ids:
+                        continue
+                    grouping_time = _grouping_time_from_trigger_frame_asset(row)
+                    if grouping_time is None:
+                        continue
+                    if carryover_start <= grouping_time < window_start:
+                        trigger_assets.append(row)
+                        ready_trigger_ids.add(trigger_id)
                 period_code = str(period.get("period_code") or "period")
                 existing = repositories.get_grouping_batch_by_window(
                     db,
@@ -3292,7 +3347,6 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
                 )
                 if existing is not None:
                     continue
-                trigger_assets = _ready_rows
                 if not trigger_assets:
                     continue
                 batch = repositories.create_grouping_batch(
@@ -3478,6 +3532,7 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
     normalized_groups: list[dict[str, Any]] = []
     grouped_trigger_ids: set[int] = set()
     normalized_unknown: set[int] = set()
+    normalized_open_entries: set[int] = set()
     trigger_has_identity: dict[int, bool] = {
         int(trigger["trigger_id"]): trigger.get("phone_entry_id") is not None or trigger.get("credit_card_entry_id") is not None
         for trigger in trigger_inputs
@@ -3524,12 +3579,18 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
             "You are grouping retail door trigger events into customer sessions. "
             "The trigger list is in chronological order from earliest to latest. "
             "Each trigger is a door-opening event. A trigger may be an entry or an exit. Do not assume every door-opening trigger is an entry. "
+            "Direction rule: pay close attention to customer movement relative to the store entrance. "
+            "A person walking into the store should be treated as entry. A person walking out of the store or away from the store should be treated as exit. "
+            "If clear walking direction conflicts with simple timestamp assumptions, prioritize the walking direction. "
             "Identity rule: Entry triggers must have phone_entry_id or credit_card_entry_id. "
             "Triggers without phone_entry_id and without credit_card_entry_id can only be exit or unknown. "
             "A trigger with phone_entry_id or credit_card_entry_id can still be exit if visual/timeline evidence clearly supports it. "
-            "Grouping rule: A complete session group must contain at least one entry trigger and at least one different exit trigger. "
+            "Grouping rule: A complete session group must contain exactly one entry trigger and one or more later exit triggers. "
             "A trigger must never be both entry and exit in the same group. "
-            "Do not return entry-only groups. Do not return exit-only groups. Put entry-only, exit-only, and uncertain triggers into unknown. "
+            "Return confident complete entry+exit groups first even when other customers still have no visible exit yet. "
+            "If an entry customer has not exited yet, put that entry trigger in open_entries instead of creating an entry-only group. "
+            "Put exit-only and uncertain triggers into unknown. "
+            "If a customer has been inside for more than 1 hour with no matching exit, keep it in open_entries and mention the issue in notes. "
             "If two triggers show the same customer, the earlier trigger should normally be entry and the later trigger should normally be exit. "
             "If door direction is visually ambiguous, prefer the chronological session pattern: earlier identity trigger opens the session, later same-person trigger closes it. "
             "Visual matching rule: compare people across trigger images using clothing color and pattern, pants/skirt color, shoes, bags or carried items, "
@@ -3539,13 +3600,14 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
             "Record color, type, approximate size, count, and confidence. Use 0 count when the customer appears empty-handed. "
             "Important: Do not create a separate group for every trigger. Only group triggers when they appear to show the same customer across time. "
             "If the same customer appears in trigger 73 and later trigger 74, return entry [73], exit [74]. "
-            "If a trigger cannot be confidently matched into a complete entry+exit pair, put it in unknown. "
+            "If trigger 76 is an entry and trigger 77 is another entry before trigger 78 exits, return the complete matched pair and put still-waiting entries in open_entries. "
+            "If a trigger cannot be confidently matched into a complete entry+exit pair and is not a likely open entry, put it in unknown. "
             "Return strict JSON only with schema: "
             '{"groups":[{"entry":[integer],"exit":[integer],"confidence":number,"reason":string,'
             '"entry_carry":{"bag_count":integer,"item_count":integer,"items":[{"type":string,"color":string,"size":string,"count":integer,"confidence":number}],"summary":string},'
             '"exit_carry":{"bag_count":integer,"item_count":integer,"items":[{"type":string,"color":string,"size":string,"count":integer,"confidence":number}],"summary":string},'
             '"carry_change_summary":string,"total_customer":integer}],'
-            '"unknown":[integer],"notes":[string]}. '
+            '"open_entries":[integer],"unknown":[integer],"notes":[string]}. '
             f"Batch: {json.dumps({'batch_id': batch_id, 'location_id': batch.get('location_id'), 'period_code': batch.get('period_code'), 'window_start': batch.get('window_start'), 'window_end': batch.get('window_end'), 'chunk': chunk_index, 'chunk_count': len(chunks)}, default=str)}. "
             f"Triggers: {json.dumps(trigger_notes, default=str)}. "
             f"Image mapping: {json.dumps(image_mapping, default=str)}."
@@ -3559,6 +3621,7 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
         _record_gemini_cost(db, script_run_id, gemini_meta)
         raw_metas.append(gemini_meta)
         chunk_groups = gemini_result.get("groups") if isinstance(gemini_result.get("groups"), list) else []
+        chunk_open_entries = gemini_result.get("open_entries") if isinstance(gemini_result.get("open_entries"), list) else []
         chunk_unknown = gemini_result.get("unknown") if isinstance(gemini_result.get("unknown"), list) else []
         chunk_grouped_trigger_ids: set[int] = set()
         for group in chunk_groups:
@@ -3568,6 +3631,7 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
             exit_ids = [trigger_id for trigger_id in _group_trigger_id_list(group.get("exit")) if trigger_id not in entry_ids]
             if not entry_ids:
                 continue
+            entry_ids = entry_ids[:1]
             invalid_entry_ids = [trigger_id for trigger_id in entry_ids if not trigger_has_identity.get(trigger_id, False)]
             if invalid_entry_ids:
                 normalized_unknown.update(entry_ids)
@@ -3596,6 +3660,13 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
                 }
             )
             next_group_id += 1
+        for trigger_id in _group_trigger_id_list(chunk_open_entries):
+            if trigger_id in grouped_trigger_ids:
+                continue
+            if trigger_has_identity.get(trigger_id, False):
+                normalized_open_entries.add(trigger_id)
+            else:
+                normalized_unknown.add(trigger_id)
         normalized_unknown.update(_group_trigger_id_list(chunk_unknown))
         if isinstance(gemini_result.get("notes"), list):
             notes.extend(str(note) for note in gemini_result.get("notes") or [])
@@ -3614,7 +3685,7 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
     normalized_unknown = {
         trigger_id
         for trigger_id in (list(normalized_unknown) + all_trigger_ids)
-        if trigger_id not in grouped_trigger_ids
+        if trigger_id not in grouped_trigger_ids and trigger_id not in normalized_open_entries
     }
     total_image_count = sum(len(trigger.get("frames") or []) for trigger in trigger_inputs)
     cost_details = [_gemini_usage_cost(meta)[1] for meta in raw_metas]
@@ -3625,6 +3696,7 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
         "window_start": batch.get("window_start").isoformat() if hasattr(batch.get("window_start"), "isoformat") else batch.get("window_start"),
         "window_end": batch.get("window_end").isoformat() if hasattr(batch.get("window_end"), "isoformat") else batch.get("window_end"),
         "groups": normalized_groups,
+        "open_entries": sorted(normalized_open_entries),
         "unknown": sorted(normalized_unknown),
         "notes": notes,
         "diagnostics": {
@@ -3713,6 +3785,12 @@ def start_grouping_analysis_job(job: GroupingAnalysisQueued) -> ScriptExecutionR
         _persist_grouping_items_from_summary(db, batch_id=job.batch_id, grouping_summary=grouping_summary)
         processed_count = repositories.mark_grouping_batch_frame_assets_processed(db, job.batch_id)
         logger.info("Marked grouping frame assets processed batch_id=%s count=%s", job.batch_id, processed_count)
+        open_count = repositories.mark_grouping_batch_frame_assets_retrieved(
+            db,
+            job.batch_id,
+            error=None,
+        )
+        logger.info("Kept unresolved grouping frame assets reusable batch_id=%s count=%s", job.batch_id, open_count)
         repositories.update_grouping_batch(
             db,
             job.batch_id,
@@ -3945,6 +4023,12 @@ def _finalize_remote_grouping_script_run(
     try:
         processed_count = repositories.mark_grouping_batch_frame_assets_processed(db, batch_id)
         logger.info("Marked grouping frame assets processed batch_id=%s count=%s", batch_id, processed_count)
+        open_count = repositories.mark_grouping_batch_frame_assets_retrieved(
+            db,
+            batch_id,
+            error=None,
+        )
+        logger.info("Kept unresolved grouping frame assets reusable batch_id=%s count=%s", batch_id, open_count)
     except Exception:
         logger.exception("Could not mark grouping frame assets processed batch_id=%s", batch_id)
     _run_confidence_after_grouping_success(db, batch_id=batch_id)
