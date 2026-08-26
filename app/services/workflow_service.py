@@ -3594,7 +3594,6 @@ def create_self_grouping_batch(
             }
         )
 
-    unknown_ids = sorted(available_trigger_ids - used_trigger_ids)
     grouping_summary = {
         "batch_id": None,
         "location_id": location_id,
@@ -3603,13 +3602,13 @@ def create_self_grouping_batch(
         "window_end": window_end.isoformat(),
         "groups": normalized_groups,
         "open_entries": [],
-        "unknown": unknown_ids,
+        "unknown": [],
         "notes": ["Self grouping created by dashboard user."],
         "diagnostics": {
             "mode": "self_group",
             "trigger_count": len(available_trigger_ids),
             "group_count": len(normalized_groups),
-            "unknown_count": len(unknown_ids),
+            "ignored_count": len(available_trigger_ids - used_trigger_ids),
         },
     }
     batch = repositories.create_grouping_batch(
@@ -3638,18 +3637,6 @@ def create_self_grouping_batch(
                     frame_payload={"frames": frames_by_trigger.get(int(trigger_id), [])},
                     result_payload=group,
                 )
-    for trigger_id in unknown_ids:
-        repositories.upsert_grouping_item(
-            db,
-            batch_id=batch_id,
-            trigger_id=int(trigger_id),
-            video_asset_id=None,
-            group_key=None,
-            role="unknown",
-            status="unknown",
-            frame_payload={"frames": frames_by_trigger.get(int(trigger_id), [])},
-            result_payload={"reason": "not_used_in_self_group"},
-        )
     now = datetime.now(UTC)
     batch = repositories.update_grouping_batch(
         db,
@@ -3667,7 +3654,8 @@ def create_self_grouping_batch(
         "batch": batch,
         "batch_id": batch_id,
         "group_count": len(normalized_groups),
-        "unknown_count": len(unknown_ids),
+        "unknown_count": 0,
+        "ignored_count": len(available_trigger_ids - used_trigger_ids),
         "message": f"Self grouping batch #{batch_id} created.",
     }
 

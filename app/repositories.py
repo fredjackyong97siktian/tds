@@ -5110,8 +5110,8 @@ def get_current_month_script_run_cost_summary(db: Session) -> dict[str, Any]:
                 left join {session_table} s on s.id = sr.session_id
                 left join {trigger_table} te on te.id = sr.trigger_id
                 where coalesce(sr.cost_amount, 0) > 0
-                  and sr.created_at >= date_format(utc_timestamp(), '%Y-%m-01 00:00:00')
-                  and sr.created_at < date_add(date_format(utc_timestamp(), '%Y-%m-01 00:00:00'), interval 1 month)
+                  and sr.started_at >= date_format(utc_timestamp(), '%Y-%m-01 00:00:00')
+                  and sr.started_at < date_add(date_format(utc_timestamp(), '%Y-%m-01 00:00:00'), interval 1 month)
             )
             select date_format(utc_timestamp(), '%Y-%m') as month,
                    cr.cost_currency,
