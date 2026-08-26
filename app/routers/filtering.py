@@ -49,6 +49,20 @@ class GroupingRangePayload(BaseModel):
     end_time: str
 
 
+class SelfGroupingGroupPayload(BaseModel):
+    group_id: str | int | None = None
+    entry: list[int] = []
+    exit: list[int] = []
+    total_customer: int | None = None
+
+
+class SelfGroupingPayload(BaseModel):
+    location_id: int
+    start_time: str
+    end_time: str
+    groups: list[SelfGroupingGroupPayload]
+
+
 @router.get("/time-periods")
 def list_time_periods(db: Session = Depends(get_transaction_db)) -> list[dict[str, Any]]:
     return repositories.list_filter_time_periods(db)
@@ -142,6 +156,14 @@ def list_confidence_results(limit: int = 100, db: Session = Depends(get_transact
 def retry_confidence_result(confidence_result_id: int, db: Session = Depends(get_transaction_db)) -> dict[str, Any]:
     try:
         return repositories.retry_filter_confidence_result(db, confidence_result_id)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete("/confidence-results/{confidence_result_id}")
+def delete_confidence_result(confidence_result_id: int, db: Session = Depends(get_transaction_db)) -> dict[str, Any]:
+    try:
+        return repositories.delete_filter_confidence_result(db, confidence_result_id)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -250,6 +272,20 @@ def run_grouping_range(payload: GroupingRangePayload, db: Session = Depends(get_
         "dispatched": False,
         "message": "No retrieved, ungrouped trigger frames were found inside that time range.",
     }
+
+
+@router.post("/grouping-batches/self-group")
+def create_self_grouping(payload: SelfGroupingPayload, db: Session = Depends(get_transaction_db)) -> dict[str, Any]:
+    try:
+        return workflow_service.create_self_grouping_batch(
+            db,
+            location_id=payload.location_id,
+            start_time=payload.start_time,
+            end_time=payload.end_time,
+            groups=[group.model_dump() for group in payload.groups],
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/grouping-batches/{batch_id}/retry")

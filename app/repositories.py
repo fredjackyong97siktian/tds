@@ -1187,20 +1187,43 @@ def _issue_video_retry_status(
     return "not_retrieved"
 
 
-def list_trigger_frame_assets(db: Session, limit: int = 100) -> list[dict[str, Any]]:
+def list_trigger_frame_assets(
+    db: Session,
+    limit: int = 100,
+    *,
+    location_id: int | None = None,
+    start_time: Any | None = None,
+    end_time: Any | None = None,
+    status: str | None = None,
+) -> list[dict[str, Any]]:
     frame_asset_table = _table("trigger_frame_asset")
     frame_table = _table("trigger_frame")
+    where_clauses = ["status <> 'deleted'"]
+    params: dict[str, Any] = {"limit": limit}
+    if location_id is not None:
+        where_clauses.append("location_id = :location_id")
+        params["location_id"] = location_id
+    if start_time is not None:
+        where_clauses.append("start_time >= :start_time")
+        params["start_time"] = start_time
+    if end_time is not None:
+        where_clauses.append("start_time < :end_time")
+        params["end_time"] = end_time
+    if status:
+        where_clauses.append("status = :status")
+        params["status"] = status
+    where_sql = " and ".join(where_clauses)
     result = db.execute(
         text(
             f"""
             select id, trigger_id, location_id, start_time, end_time, status, error, created_at, updated_at
             from {frame_asset_table}
-            where status <> 'deleted'
+            where {where_sql}
             order by created_at desc, id desc
             limit :limit
             """
         ),
-        {"limit": limit},
+        params,
     )
     assets = _fetch_all_dicts(result)
     if not assets:
@@ -2204,6 +2227,21 @@ def delete_filter_confidence_results_for_batch(db: Session, batch_id: int) -> in
     return int(result.rowcount or 0)
 
 
+def delete_grouping_items_for_batch(db: Session, batch_id: int) -> int:
+    table_name = _table("filter_grouping_item")
+    result = db.execute(
+        text(
+            f"""
+            delete from {table_name}
+            where batch_id = :batch_id
+            """
+        ),
+        {"batch_id": batch_id},
+    )
+    db.commit()
+    return int(result.rowcount or 0)
+
+
 def upsert_grouping_item(
     db: Session,
     *,
@@ -2786,6 +2824,23 @@ def retry_filter_confidence_result(db: Session, confidence_result_id: int) -> di
         "confidence_result_id": confidence_result_id,
         "batch_id": int(payload["batch_id"]),
     }
+
+
+def delete_filter_confidence_result(db: Session, confidence_result_id: int) -> dict[str, Any]:
+    confidence_table = _table("filter_confidence_result")
+    result = db.execute(
+        text(
+            f"""
+            delete from {confidence_table}
+            where id = :confidence_result_id
+            """
+        ),
+        {"confidence_result_id": confidence_result_id},
+    )
+    db.commit()
+    if int(result.rowcount or 0) <= 0:
+        raise ValueError(f"Confidence result {confidence_result_id} was not found.")
+    return {"ok": True, "confidence_result_id": confidence_result_id}
 
 
 def promote_trigger_video_assets_to_full_retrieval(db: Session, trigger_ids: list[int]) -> int:

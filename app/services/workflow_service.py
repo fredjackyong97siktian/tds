@@ -3521,6 +3521,140 @@ def prepare_manual_grouping_batches_for_range(
     return prepared
 
 
+def create_self_grouping_batch(
+    db: Session,
+    *,
+    location_id: int,
+    start_time: Any,
+    end_time: Any,
+    groups: list[Mapping[str, Any]],
+) -> dict[str, Any]:
+    window_start = _coerce_datetime_value(start_time)
+    window_end = _coerce_datetime_value(end_time)
+    if window_start is None or window_end is None:
+        raise ValueError("Start time and end time are required.")
+    if window_end <= window_start:
+        raise ValueError("End time must be after start time.")
+    if not groups:
+        raise ValueError("At least one self group is required.")
+
+    frame_assets = repositories.list_trigger_frame_assets(
+        db,
+        limit=500,
+        location_id=location_id,
+        start_time=window_start,
+        end_time=window_end,
+    )
+    frames_by_trigger = {
+        int(row["trigger_id"]): _first_trigger_frame_payload(list(row.get("frames") or []))
+        for row in frame_assets
+        if row.get("trigger_id") is not None
+    }
+    available_trigger_ids = set(frames_by_trigger)
+    normalized_groups: list[dict[str, Any]] = []
+    used_trigger_ids: set[int] = set()
+
+    for index, group in enumerate(groups, start=1):
+        entry_ids = _group_trigger_id_list(group.get("entry"))
+        exit_ids = [trigger_id for trigger_id in _group_trigger_id_list(group.get("exit")) if trigger_id not in entry_ids]
+        if len(entry_ids) != 1:
+            raise ValueError(f"Self group {index} must have exactly one entry trigger.")
+        missing_ids = [trigger_id for trigger_id in entry_ids + exit_ids if trigger_id not in available_trigger_ids]
+        if missing_ids:
+            raise ValueError(f"Self group {index} contains trigger(s) outside this frame window: {missing_ids}.")
+        if any(trigger_id in used_trigger_ids for trigger_id in entry_ids + exit_ids):
+            raise ValueError(f"Self group {index} reuses a trigger that is already in another group.")
+        used_trigger_ids.update(entry_ids + exit_ids)
+        normalized_groups.append(
+            {
+                "group_id": str(group.get("group_id") or index),
+                "entry": entry_ids,
+                "exit": exit_ids,
+                "score": 1.0,
+                "reason": "self_grouped_by_user",
+                "source": "self_group",
+                "total_customer": _coerce_int(group.get("total_customer"), 1),
+            }
+        )
+
+    unknown_ids = sorted(available_trigger_ids - used_trigger_ids)
+    grouping_summary = {
+        "batch_id": None,
+        "location_id": location_id,
+        "period_code": "self_group",
+        "window_start": window_start.isoformat(),
+        "window_end": window_end.isoformat(),
+        "groups": normalized_groups,
+        "open_entries": [],
+        "unknown": unknown_ids,
+        "notes": ["Self grouping created by dashboard user."],
+        "diagnostics": {
+            "mode": "self_group",
+            "trigger_count": len(available_trigger_ids),
+            "group_count": len(normalized_groups),
+            "unknown_count": len(unknown_ids),
+        },
+    }
+    batch = repositories.create_grouping_batch(
+        db,
+        location_id=location_id,
+        period_code="self_group",
+        window_start=window_start,
+        window_end=window_end,
+    )
+    batch_id = int(batch["id"])
+    grouping_summary["batch_id"] = batch_id
+    repositories.delete_filter_confidence_results_for_batch(db, batch_id)
+    repositories.delete_grouping_items_for_batch(db, batch_id)
+    for group in normalized_groups:
+        for role in ("entry", "exit"):
+            for trigger_id in group[role]:
+                repositories.upsert_grouping_item(
+                    db,
+                    batch_id=batch_id,
+                    trigger_id=int(trigger_id),
+                    video_asset_id=None,
+                    group_key=str(group["group_id"]),
+                    role=role,
+                    status="grouped",
+                    score=1.0,
+                    frame_payload={"frames": frames_by_trigger.get(int(trigger_id), [])},
+                    result_payload=group,
+                )
+    for trigger_id in unknown_ids:
+        repositories.upsert_grouping_item(
+            db,
+            batch_id=batch_id,
+            trigger_id=int(trigger_id),
+            video_asset_id=None,
+            group_key=None,
+            role="unknown",
+            status="unknown",
+            frame_payload={"frames": frames_by_trigger.get(int(trigger_id), [])},
+            result_payload={"reason": "not_used_in_self_group"},
+        )
+    now = datetime.now(UTC)
+    batch = repositories.update_grouping_batch(
+        db,
+        batch_id,
+        {
+            "status": "success",
+            "result_payload": grouping_summary,
+            "started_at": now,
+            "finished_at": now,
+        },
+    )
+    repositories.mark_grouping_batch_frame_assets_processed(db, batch_id)
+    return {
+        "ok": True,
+        "batch": batch,
+        "batch_id": batch_id,
+        "group_count": len(normalized_groups),
+        "unknown_count": len(unknown_ids),
+        "message": f"Self grouping batch #{batch_id} created.",
+    }
+
+
 def build_grouping_analysis_job_from_batch(db: Session, batch_id: int) -> GroupingAnalysisQueued:
     batch = repositories.get_grouping_batch(db, batch_id)
     items = repositories.list_grouping_items(db, batch_id)
