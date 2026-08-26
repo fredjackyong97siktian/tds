@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import bindparam, text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from .config import settings
@@ -177,11 +178,28 @@ def get_phone_entry_identity(db: Session, phone_entry_id: Any) -> dict[str, Any]
     source = _whitelist_source_config("qrentry")
     row = _resolve_entry_source_row(db, source=source, entry_id=phone_entry_id)
     if row is None:
+        try:
+            fallback_row = db.execute(
+                text(
+                    """
+                    select id, participantId
+                    from qrentry
+                    where cast(id as char) = :entry_id
+                       or cast(participantId as char) = :entry_id
+                    limit 1
+                    """
+                ),
+                {"entry_id": str(phone_entry_id)},
+            ).mappings().first()
+        except SQLAlchemyError:
+            fallback_row = None
+        row = dict(fallback_row) if fallback_row else None
+    if row is None:
         return None
     return {
-        "id": row.get(source["id_column"]),
+        "id": row.get(source["id_column"]) or row.get("id"),
         "entry_id": phone_entry_id,
-        "phone_number": row.get(source["display_column"]) or row.get(source["value_column"]),
+        "phone_number": row.get(source["display_column"]) or row.get("participantId"),
         "raw": dict(row),
     }
 
@@ -758,8 +776,44 @@ def list_whitelist_entries(db: Session) -> list[dict[str, Any]]:
     return _fetch_all_dicts(result)
 
 
+def _ensure_list_entry_not_conflicting(
+    db: Session,
+    *,
+    target_table: str,
+    target_label: str,
+    method: str,
+    entry_id: str,
+) -> None:
+    result = db.execute(
+        text(
+            f"""
+            select id
+            from {target_table}
+            where method = :method
+              and entry_id = :entry_id
+            limit 1
+            """
+        ),
+        {"method": method, "entry_id": entry_id},
+    )
+    if result.mappings().first():
+        raise ValueError(f"This entry is already active in the {target_label}. Remove it there before adding it here.")
+
+
 def create_whitelist_entry(db: Session, payload: Mapping[str, Any]) -> dict[str, Any]:
     whitelist_table = _table("whitelist_entry")
+    blacklist_table = _table("blacklist_entry")
+    method = _validate_whitelist_method(str(payload.get("method") or ""))
+    entry_id = str(payload.get("entry_id") or "").strip()
+    if not entry_id:
+        raise ValueError("Entry ID is required.")
+    _ensure_list_entry_not_conflicting(
+        db,
+        target_table=blacklist_table,
+        target_label="blacklist",
+        method=method,
+        entry_id=entry_id,
+    )
     result = db.execute(
         text(
             f"""
@@ -771,7 +825,11 @@ def create_whitelist_entry(db: Session, payload: Mapping[str, Any]) -> dict[str,
             )
             """
         ),
-        payload,
+        {
+            "method": method,
+            "entry_id": entry_id,
+            "status": str(payload.get("status") or "active"),
+        },
     )
     db.commit()
     whitelist_id = int(result.lastrowid)
@@ -791,6 +849,96 @@ def delete_whitelist_entry(db: Session, whitelist_id: int) -> bool:
             """
         ),
         {"whitelist_id": whitelist_id},
+    )
+    db.commit()
+    return bool(result.rowcount)
+
+
+def list_blacklist_entries(db: Session) -> list[dict[str, Any]]:
+    blacklist_table = _table("blacklist_entry")
+    qrentry = _whitelist_source_config("qrentry")
+    entrylogs = _whitelist_source_config("entrylogs")
+
+    result = db.execute(
+        text(
+            f"""
+            select b.id, b.method, b.entry_id, b.criteria, b.status, b.created_at, b.updated_at,
+                   case
+                       when b.method = 'qrentry' then (
+                           select cast(q.{qrentry["display_column"]} as char)
+                           from {qrentry["table_name"]} q
+                           where cast(q.{qrentry["value_column"]} as char) = b.entry_id
+                           limit 1
+                       )
+                       when b.method = 'entrylogs' then (
+                           select cast(e.{entrylogs["display_column"]} as char)
+                           from {entrylogs["table_name"]} e
+                           where cast(e.{entrylogs["value_column"]} as char) = b.entry_id
+                           limit 1
+                       )
+                       else null
+                   end as resolved_value
+            from {blacklist_table} b
+            order by b.created_at desc, b.id desc
+            """
+        )
+    )
+    return _fetch_all_dicts(result)
+
+
+def create_blacklist_entry(db: Session, payload: Mapping[str, Any]) -> dict[str, Any]:
+    blacklist_table = _table("blacklist_entry")
+    whitelist_table = _table("whitelist_entry")
+    method = _validate_whitelist_method(str(payload.get("method") or ""))
+    entry_id = str(payload.get("entry_id") or "").strip()
+    criteria = str(payload.get("criteria") or "").strip()
+    if not entry_id:
+        raise ValueError("Entry ID is required.")
+    if not criteria:
+        raise ValueError("Blacklist criteria is required.")
+    _ensure_list_entry_not_conflicting(
+        db,
+        target_table=whitelist_table,
+        target_label="whitelist",
+        method=method,
+        entry_id=entry_id,
+    )
+    result = db.execute(
+        text(
+            f"""
+            insert into {blacklist_table} (
+                method, entry_id, criteria, status
+            )
+            values (
+                :method, :entry_id, :criteria, :status
+            )
+            """
+        ),
+        {
+            "method": method,
+            "entry_id": entry_id,
+            "criteria": criteria,
+            "status": str(payload.get("status") or "active"),
+        },
+    )
+    db.commit()
+    blacklist_id = int(result.lastrowid)
+    rows = [row for row in list_blacklist_entries(db) if int(row["id"]) == blacklist_id]
+    if not rows:
+        raise ValueError("Blacklist entry not found after create.")
+    return rows[0]
+
+
+def delete_blacklist_entry(db: Session, blacklist_id: int) -> bool:
+    blacklist_table = _table("blacklist_entry")
+    result = db.execute(
+        text(
+            f"""
+            delete from {blacklist_table}
+            where id = :blacklist_id
+            """
+        ),
+        {"blacklist_id": blacklist_id},
     )
     db.commit()
     return bool(result.rowcount)
@@ -3406,12 +3554,15 @@ def restart_video_asset_analysis(db: Session, video_asset_id: int) -> dict[str, 
 
 def get_session(db: Session, session_id: int) -> dict[str, Any]:
     session_table = _table("session")
+    has_grouping_id = _column_exists(db, session_table, "grouping_id")
+    grouping_id_select = ", grouping_id" if has_grouping_id else ""
     result = db.execute(
         text(
             f"""
             select id, entry_trigger_id, exit_trigger_id, location_id, status, start_time, end_time,
                    total_item_brought, actual_items_brought, transaction_total_items, total_customer,
                    result_summary, issue_reason
+                   {grouping_id_select}
             from {session_table}
             where id = :session_id
             """
@@ -3424,7 +3575,37 @@ def get_session(db: Session, session_id: int) -> dict[str, Any]:
             row["result_summary"] = json.loads(row["result_summary"])
         except json.JSONDecodeError:
             pass
+    row["confidence_result_id"] = _find_confidence_result_id_for_session(db, row)
     return row
+
+
+def _find_confidence_result_id_for_session(db: Session, session: Mapping[str, Any]) -> int | None:
+    grouping_id = session.get("grouping_id")
+    entry_trigger_id = session.get("entry_trigger_id")
+    if grouping_id is None or entry_trigger_id is None:
+        return None
+    confidence_table = _table("filter_confidence_result")
+    grouping_item_table = _table("filter_grouping_item")
+    result = db.execute(
+        text(
+            f"""
+            select c.id
+            from {confidence_table} c
+            inner join {grouping_item_table} gi
+                    on gi.batch_id = c.batch_id
+                   and gi.group_key = c.group_key
+                   and gi.role = 'entry'
+                   and gi.trigger_id = :entry_trigger_id
+                   and gi.status <> 'deleted'
+            where c.batch_id = :grouping_id
+            order by c.created_at desc, c.id desc
+            limit 1
+            """
+        ),
+        {"grouping_id": int(grouping_id), "entry_trigger_id": int(entry_trigger_id)},
+    )
+    row = result.mappings().first()
+    return int(row["id"]) if row else None
 
 
 def get_session_by_entry_trigger_id(db: Session, entry_trigger_id: int) -> dict[str, Any]:
@@ -3662,12 +3843,15 @@ def list_sessions(db: Session, limit: int = 50) -> list[dict[str, Any]]:
     location_table = settings.location_table_name
     location_id_column = settings.location_id_column
     location_name_column = settings.location_name_column
+    has_grouping_id = _column_exists(db, session_table, "grouping_id")
+    grouping_id_select = ", s.grouping_id" if has_grouping_id else ""
+    grouping_id_group_by = ", s.grouping_id" if has_grouping_id else ""
     result = db.execute(
         text(
             f"""
             select s.id, s.entry_trigger_id, s.exit_trigger_id, s.location_id, s.status,
                    s.start_time, s.end_time, s.total_item_brought, s.actual_items_brought,
-                   s.transaction_total_items, s.total_customer, s.issue_reason, s.result_summary,
+                   s.transaction_total_items, s.total_customer, s.issue_reason, s.result_summary{grouping_id_select},
                    l.{location_name_column} as location_name,
                    case when s.status in ('issue', 'closed')
                           or (s.status = 'pending' and s.end_time is not null)
@@ -3681,7 +3865,7 @@ def list_sessions(db: Session, limit: int = 50) -> list[dict[str, Any]]:
             left join {session_video_asset_table} sva on sva.session_id = s.id
             group by s.id, s.entry_trigger_id, s.exit_trigger_id, s.location_id, s.status,
                      s.start_time, s.end_time, s.total_item_brought, s.actual_items_brought,
-                     s.transaction_total_items, s.total_customer, s.issue_reason, s.result_summary,
+                     s.transaction_total_items, s.total_customer, s.issue_reason, s.result_summary{grouping_id_group_by},
                      l.{location_name_column},
                      can_retry,
                      s.created_at, s.updated_at
@@ -3699,6 +3883,7 @@ def list_sessions(db: Session, limit: int = 50) -> list[dict[str, Any]]:
             except json.JSONDecodeError:
                 pass
         row["session_videos"] = list_session_video_assets(db, session_id=int(row["id"]))
+        row["confidence_result_id"] = _find_confidence_result_id_for_session(db, row)
     return rows
 
 

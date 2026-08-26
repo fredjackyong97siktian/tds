@@ -2,6 +2,7 @@ from fastapi import FastAPI
 
 from .config import settings
 from .routers.alerts import router as alerts_router
+from .routers.blacklist import router as blacklist_router
 from .routers.cctv import router as cctv_router
 from .routers.filtering import router as filtering_router
 from .routers.frames import router as frames_router
@@ -26,6 +27,7 @@ app = FastAPI(
 
 app.include_router(health_router)
 app.include_router(alerts_router)
+app.include_router(blacklist_router)
 app.include_router(cctv_router)
 app.include_router(filtering_router)
 app.include_router(frames_router)

@@ -68,6 +68,24 @@ class WhitelistEntryResponse(BaseModel):
     updated_at: datetime
 
 
+class BlacklistEntryCreate(BaseModel):
+    method: str = Field(pattern="^(qrentry|entrylogs)$")
+    entry_id: str
+    criteria: str = Field(min_length=1, max_length=5000)
+    status: str = Field(default="active", pattern="^(active|inactive)$")
+
+
+class BlacklistEntryResponse(BaseModel):
+    id: int
+    method: str
+    entry_id: str
+    criteria: str
+    status: str
+    resolved_value: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
 class WhitelistSourceOption(BaseModel):
     value: str
     label: str
@@ -169,6 +187,7 @@ class SessionResponse(BaseModel):
     id: int
     entry_trigger_id: int
     exit_trigger_id: int | None = None
+    confidence_result_id: int | None = None
     location_id: int
     status: str
     start_time: datetime | None = None

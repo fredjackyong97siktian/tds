@@ -18,6 +18,19 @@ create table if not exists whitelist_entry (
 create unique index if not exists idx_whitelist_entry_method_entry_id
     on whitelist_entry(method, entry_id);
 
+create table if not exists blacklist_entry (
+    id bigserial primary key,
+    method varchar(50) not null,
+    entry_id varchar(255) not null,
+    criteria text not null,
+    status varchar(30) not null default 'active',
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now()
+);
+
+create unique index if not exists idx_blacklist_entry_method_entry_id
+    on blacklist_entry(method, entry_id);
+
 create table if not exists cctv (
     id bigserial primary key,
     location_id bigint not null,
@@ -172,6 +185,11 @@ $$;
 drop trigger if exists trg_whitelist_entry_updated_at on whitelist_entry;
 create trigger trg_whitelist_entry_updated_at
 before update on whitelist_entry
+for each row execute function set_updated_at();
+
+drop trigger if exists trg_blacklist_entry_updated_at on blacklist_entry;
+create trigger trg_blacklist_entry_updated_at
+before update on blacklist_entry
 for each row execute function set_updated_at();
 
 drop trigger if exists trg_cctv_updated_at on cctv;
