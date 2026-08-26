@@ -52,6 +52,7 @@ from ..storage import (
 
 UTC = timezone.utc
 SCRIPT_RUN_COMMAND_REDACTED = "[redacted]"
+GROUPING_GEMINI_IMAGE_RESIZE_SCALE = 0.35
 logger = logging.getLogger("tds.workflow_service")
 KIOSK_OWNERSHIP_MIN_MARGIN_SECONDS = 10.0
 NO_KIOSK_VIDEO_REASON = "No kiosk video was queued because no paid transactions were found inside the session window."
@@ -953,6 +954,30 @@ def _record_gemini_cost(db: Session, script_run_id: int, gemini_meta: Mapping[st
         cost_source="gemini_estimate",
     )
     return detail
+
+
+def _compact_gemini_meta_for_log(gemini_meta: Mapping[str, Any]) -> dict[str, Any]:
+    prompt = str(gemini_meta.get("prompt") or "")
+    compact: dict[str, Any] = {
+        "provider": gemini_meta.get("provider"),
+        "model": gemini_meta.get("model") or gemini_meta.get("model_name"),
+        "image_count": gemini_meta.get("image_count"),
+        "image_resize_scale": gemini_meta.get("image_resize_scale"),
+        "prompt_chars": len(prompt),
+        "prompt_preview": prompt[:800],
+        "raw_usage": gemini_meta.get("raw_usage") or {},
+    }
+    image_urls = gemini_meta.get("image_urls")
+    if isinstance(image_urls, list):
+        compact["image_urls"] = image_urls
+    chunks = gemini_meta.get("chunks")
+    if isinstance(chunks, list):
+        compact["chunks"] = [
+            _compact_gemini_meta_for_log(chunk)
+            for chunk in chunks
+            if isinstance(chunk, Mapping)
+        ]
+    return compact
 
 
 def _create_gemini_script_run(
@@ -3266,8 +3291,7 @@ def _grouping_gemini_max_images_per_request() -> int:
 
 
 def _grouping_gemini_resize_scale() -> float | None:
-    scale = _coerce_number(settings.grouping_gemini_image_scale, 1.0)
-    return scale if 0 < scale < 1 else None
+    return GROUPING_GEMINI_IMAGE_RESIZE_SCALE
 
 
 def _first_trigger_frame_payload(frames: list[dict[str, Any]], limit: int | None = None) -> list[dict[str, Any]]:
@@ -3524,10 +3548,6 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
     grouped_trigger_ids: set[int] = set()
     normalized_unknown: set[int] = set()
     normalized_open_entries: set[int] = set()
-    trigger_has_identity: dict[int, bool] = {
-        int(trigger["trigger_id"]): trigger.get("phone_entry_id") is not None or trigger.get("credit_card_entry_id") is not None
-        for trigger in trigger_inputs
-    }
     notes: list[str] = []
     chunk_results: list[dict[str, Any]] = []
     raw_metas: list[dict[str, Any]] = []
@@ -3614,9 +3634,9 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
             "Direction rule: once you have visually confirmed a candidate match, use customer movement relative to the store entrance to label each trigger. "
             "A person walking into the store should be treated as entry. A person walking out of the store or away from the store should be treated as exit. "
             "If clear walking direction conflicts with simple timestamp assumptions, prioritize the walking direction. "
-            "Identity rule: Entry triggers must have phone_entry_id or credit_card_entry_id. "
-            "Triggers without phone_entry_id and without credit_card_entry_id can only be exit or unknown. "
-            "A trigger with phone_entry_id or credit_card_entry_id can still be exit if visual/timeline evidence clearly supports it. "
+            "Credential hint rule: phone_entry_id and credit_card_entry_id are useful hints that a trigger may be an entry, but they are not mandatory. "
+            "A trigger without phone_entry_id or credit_card_entry_id can still be an entry if the primary actor is clearly walking into the store. "
+            "A trigger with phone_entry_id or credit_card_entry_id can still be exit if visual direction evidence clearly supports it. "
             "Grouping rule: A complete session group must contain exactly one entry trigger and one or more later exit triggers, and every trigger in the group must "
             "be a confirmed visual match of the same person. A trigger must never be both entry and exit in the same group. "
             "Return confident complete entry+exit groups first even when other customers still have no visible exit yet. "
@@ -3665,11 +3685,6 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
             if not entry_ids:
                 continue
             entry_ids = entry_ids[:1]
-            invalid_entry_ids = [trigger_id for trigger_id in entry_ids if not trigger_has_identity.get(trigger_id, False)]
-            if invalid_entry_ids:
-                normalized_unknown.update(entry_ids)
-                normalized_unknown.update(exit_ids)
-                continue
             if not exit_ids:
                 normalized_unknown.update(entry_ids)
                 continue
@@ -3702,10 +3717,7 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
         for trigger_id in _group_trigger_id_list(chunk_open_entries):
             if trigger_id in grouped_trigger_ids:
                 continue
-            if trigger_has_identity.get(trigger_id, False):
-                normalized_open_entries.add(trigger_id)
-            else:
-                normalized_unknown.add(trigger_id)
+            normalized_open_entries.add(trigger_id)
         normalized_unknown.update(_group_trigger_id_list(chunk_unknown))
         if isinstance(gemini_result.get("notes"), list):
             notes.extend(str(note) for note in gemini_result.get("notes") or [])
@@ -3876,7 +3888,7 @@ def start_grouping_analysis_job(job: GroupingAnalysisQueued) -> ScriptExecutionR
             stdout_log=json.dumps(
                 {
                     "grouping_summary": grouping_summary,
-                    "gemini_meta": gemini_meta,
+                    "gemini_meta": _compact_gemini_meta_for_log(gemini_meta),
                     "confidence_result": confidence_result,
                 },
                 indent=2,
