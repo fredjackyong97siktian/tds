@@ -18,6 +18,7 @@ from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 from PIL import Image
 
@@ -52,7 +53,6 @@ from ..storage import (
 
 UTC = timezone.utc
 SCRIPT_RUN_COMMAND_REDACTED = "[redacted]"
-GROUPING_GEMINI_IMAGE_RESIZE_SCALE = 0.35
 logger = logging.getLogger("tds.workflow_service")
 KIOSK_OWNERSHIP_MIN_MARGIN_SECONDS = 10.0
 NO_KIOSK_VIDEO_REASON = "No kiosk video was queued because no paid transactions were found inside the session window."
@@ -3291,7 +3291,8 @@ def _grouping_gemini_max_images_per_request() -> int:
 
 
 def _grouping_gemini_resize_scale() -> float | None:
-    return GROUPING_GEMINI_IMAGE_RESIZE_SCALE
+    scale = _coerce_number(settings.grouping_gemini_image_scale, 1.0)
+    return scale if 0 < scale < 1 else None
 
 
 def _first_trigger_frame_payload(frames: list[dict[str, Any]], limit: int | None = None) -> list[dict[str, Any]]:
@@ -3548,6 +3549,10 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
     grouped_trigger_ids: set[int] = set()
     normalized_unknown: set[int] = set()
     normalized_open_entries: set[int] = set()
+    trigger_has_identity: dict[int, bool] = {
+        int(trigger["trigger_id"]): trigger.get("phone_entry_id") is not None or trigger.get("credit_card_entry_id") is not None
+        for trigger in trigger_inputs
+    }
     notes: list[str] = []
     chunk_results: list[dict[str, Any]] = []
     raw_metas: list[dict[str, Any]] = []
@@ -3634,8 +3639,8 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
             "Direction rule: once you have visually confirmed a candidate match, use customer movement relative to the store entrance to label each trigger. "
             "A person walking into the store should be treated as entry. A person walking out of the store or away from the store should be treated as exit. "
             "If clear walking direction conflicts with simple timestamp assumptions, prioritize the walking direction. "
-            "Credential hint rule: phone_entry_id and credit_card_entry_id are useful hints that a trigger may be an entry, but they are not mandatory. "
-            "A trigger without phone_entry_id or credit_card_entry_id can still be an entry if the primary actor is clearly walking into the store. "
+            "Identity rule: Entry triggers must have phone_entry_id or credit_card_entry_id. "
+            "Triggers without phone_entry_id and without credit_card_entry_id can only be exit or unknown. "
             "A trigger with phone_entry_id or credit_card_entry_id can still be exit if visual direction evidence clearly supports it. "
             "Grouping rule: A complete session group must contain exactly one entry trigger and one or more later exit triggers, and every trigger in the group must "
             "be a confirmed visual match of the same person. A trigger must never be both entry and exit in the same group. "
@@ -3685,6 +3690,11 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
             if not entry_ids:
                 continue
             entry_ids = entry_ids[:1]
+            invalid_entry_ids = [trigger_id for trigger_id in entry_ids if not trigger_has_identity.get(trigger_id, False)]
+            if invalid_entry_ids:
+                normalized_unknown.update(entry_ids)
+                normalized_unknown.update(exit_ids)
+                continue
             if not exit_ids:
                 normalized_unknown.update(entry_ids)
                 continue
@@ -3717,7 +3727,10 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
         for trigger_id in _group_trigger_id_list(chunk_open_entries):
             if trigger_id in grouped_trigger_ids:
                 continue
-            normalized_open_entries.add(trigger_id)
+            if trigger_has_identity.get(trigger_id, False):
+                normalized_open_entries.add(trigger_id)
+            else:
+                normalized_unknown.add(trigger_id)
         normalized_unknown.update(_group_trigger_id_list(chunk_unknown))
         if isinstance(gemini_result.get("notes"), list):
             notes.extend(str(note) for note in gemini_result.get("notes") or [])
@@ -3863,7 +3876,6 @@ def start_grouping_analysis_job(job: GroupingAnalysisQueued) -> ScriptExecutionR
                 "finished_at": datetime.now(UTC),
             },
         )
-        confidence_result = _run_confidence_after_grouping_success(db, batch_id=job.batch_id)
         repositories.assign_script_run_runner_job(
             db,
             script_run_id,
@@ -3889,7 +3901,10 @@ def start_grouping_analysis_job(job: GroupingAnalysisQueued) -> ScriptExecutionR
                 {
                     "grouping_summary": grouping_summary,
                     "gemini_meta": _compact_gemini_meta_for_log(gemini_meta),
-                    "confidence_result": confidence_result,
+                    "confidence_result": {
+                        "status": "queued",
+                        "message": "Theft confidence worker will process this successful grouping batch.",
+                    },
                 },
                 indent=2,
                 default=str,
@@ -4078,7 +4093,6 @@ def _finalize_remote_grouping_script_run(
         logger.info("Kept unresolved grouping frame assets reusable batch_id=%s count=%s", batch_id, open_count)
     except Exception:
         logger.exception("Could not mark grouping frame assets processed batch_id=%s", batch_id)
-    _run_confidence_after_grouping_success(db, batch_id=batch_id)
     return result
 
 
@@ -4945,6 +4959,28 @@ def _queue_l1_video_for_trigger(
 
 
 def run_theft_confidence_for_grouping_batch(
+    db: Session,
+    *,
+    batch_id: int,
+) -> dict[str, Any]:
+    lock_name = f"tds_theft_confidence_batch_{int(batch_id)}"
+    lock_row = db.execute(text("select get_lock(:lock_name, 0) as acquired"), {"lock_name": lock_name}).mappings().first()
+    if int((lock_row or {}).get("acquired") or 0) != 1:
+        return {
+            "ok": True,
+            "batch_id": batch_id,
+            "analyzed_count": 0,
+            "promoted_count": 0,
+            "skipped": True,
+            "reason": "theft_confidence_batch_already_running",
+        }
+    try:
+        return _run_theft_confidence_for_grouping_batch_locked(db, batch_id=batch_id)
+    finally:
+        db.execute(text("select release_lock(:lock_name)"), {"lock_name": lock_name})
+
+
+def _run_theft_confidence_for_grouping_batch_locked(
     db: Session,
     *,
     batch_id: int,
