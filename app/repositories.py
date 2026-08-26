@@ -2787,6 +2787,7 @@ def list_filter_confidence_results(
             if trigger_id not in bucket[role]:
                 bucket[role].append(trigger_id)
     trigger_ids: set[int] = set()
+    entry_trigger_ids: set[int] = set()
     for row in rows:
         if isinstance(row.get("factor_payload"), str):
             try:
@@ -2814,9 +2815,12 @@ def list_filter_confidence_results(
             if isinstance(values, list):
                 for value in values:
                     try:
-                        trigger_ids.add(int(value))
+                        trigger_id = int(value)
                     except (TypeError, ValueError):
                         continue
+                    trigger_ids.add(trigger_id)
+                    if key == "entry_trigger_ids":
+                        entry_trigger_ids.add(trigger_id)
     trigger_times_by_id: dict[int, Any] = {}
     if trigger_ids:
         trigger_result = db.execute(
@@ -2830,10 +2834,38 @@ def list_filter_confidence_results(
             {"trigger_ids": sorted(trigger_ids)},
         )
         trigger_times_by_id = {int(row["id"]): row.get("trigger_time") for row in _fetch_all_dicts(trigger_result)}
+    session_ids_by_batch_entry: dict[tuple[int, int], int] = {}
+    if batch_ids and entry_trigger_ids:
+        session_table = _table("session")
+        if _column_exists(db, session_table, "grouping_id"):
+            session_result = db.execute(
+                text(
+                    f"""
+                    select id, grouping_id, entry_trigger_id
+                    from {session_table}
+                    where grouping_id in :batch_ids
+                      and entry_trigger_id in :entry_trigger_ids
+                    order by id desc
+                    """
+                ).bindparams(
+                    bindparam("batch_ids", expanding=True),
+                    bindparam("entry_trigger_ids", expanding=True),
+                ),
+                {
+                    "batch_ids": batch_ids,
+                    "entry_trigger_ids": sorted(entry_trigger_ids),
+                },
+            )
+            for session_row in _fetch_all_dicts(session_result):
+                if session_row.get("grouping_id") is None or session_row.get("entry_trigger_id") is None:
+                    continue
+                key = (int(session_row["grouping_id"]), int(session_row["entry_trigger_id"]))
+                session_ids_by_batch_entry.setdefault(key, int(session_row["id"]))
     for row in rows:
         payload = row.get("factor_payload")
         if not isinstance(payload, Mapping):
             continue
+        row["session_id"] = None
         row["session_window_start"] = payload.get("session_window_start")
         row["session_window_end"] = payload.get("session_window_end")
 
@@ -2853,6 +2885,11 @@ def list_filter_confidence_results(
         exit_times = [trigger_times_by_id[trigger_id] for trigger_id in _ids_from_payload("exit_trigger_ids") if trigger_id in trigger_times_by_id]
         if entry_times:
             row["session_window_start"] = min(entry_times)
+        for entry_trigger_id in _ids_from_payload("entry_trigger_ids"):
+            session_id = session_ids_by_batch_entry.get((int(row["batch_id"]), entry_trigger_id))
+            if session_id is not None:
+                row["session_id"] = session_id
+                break
         if exit_times:
             row["session_window_end"] = max(exit_times)
         elif not row.get("session_window_end"):
