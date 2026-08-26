@@ -43,6 +43,12 @@ class CountryCodeCheckPayload(BaseModel):
     metadata: dict[str, Any] | None = None
 
 
+class GroupingRangePayload(BaseModel):
+    location_id: int | None = None
+    start_time: str
+    end_time: str
+
+
 @router.get("/time-periods")
 def list_time_periods(db: Session = Depends(get_transaction_db)) -> list[dict[str, Any]]:
     return repositories.list_filter_time_periods(db)
@@ -194,6 +200,55 @@ def run_grouping_now(db: Session = Depends(get_transaction_db)) -> dict[str, Any
         "prepared_count": len(prepared_batches),
         "dispatched": False,
         "message": "No retrieved, ungrouped trigger frames are ready for manual grouping.",
+    }
+
+
+@router.post("/grouping-batches/run-range")
+def run_grouping_range(payload: GroupingRangePayload, db: Session = Depends(get_transaction_db)) -> dict[str, Any]:
+    try:
+        prepared_batches = workflow_service.prepare_manual_grouping_batches_for_range(
+            db,
+            start_time=payload.start_time,
+            end_time=payload.end_time,
+            location_id=payload.location_id,
+        )
+        if repositories.has_active_remote_analysis_script_run(db, script_names=["grouping"]):
+            raise HTTPException(status_code=409, detail="Grouping is already dispatching or running.")
+        pending_batches = repositories.list_pending_grouping_batches(db, limit=20)
+        for batch in pending_batches:
+            batch_id = int(batch["id"])
+            if not repositories.claim_grouping_batch_for_dispatch(db, batch_id):
+                continue
+            try:
+                job = workflow_service.build_grouping_analysis_job_from_batch(db, batch_id)
+                result = workflow_service.start_grouping_analysis_job(job)
+            except Exception as exc:
+                repositories.update_grouping_batch(
+                    db,
+                    batch_id,
+                    {
+                        "status": "issue",
+                        "issue_reason": str(exc),
+                    },
+                )
+                raise
+            return {
+                "ok": True,
+                "prepared_count": len(prepared_batches),
+                "dispatched": True,
+                "batch_id": batch_id,
+                "script_run_id": result.script_run_id,
+                "runner_job_id": result.runner_job_id,
+            }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "prepared_count": len(prepared_batches),
+        "dispatched": False,
+        "message": "No retrieved, ungrouped trigger frames were found inside that time range.",
     }
 
 

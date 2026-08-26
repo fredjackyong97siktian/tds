@@ -2661,6 +2661,7 @@ def upsert_filter_confidence_result(
 def list_filter_confidence_results(db: Session, limit: int = 100) -> list[dict[str, Any]]:
     confidence_table = _table("filter_confidence_result")
     batch_table = _table("filter_grouping_batch")
+    trigger_table = _table("trigger_event")
     location_table = settings.location_table_name
     location_id_column = settings.location_id_column
     location_name_column = settings.location_name_column
@@ -2681,12 +2682,71 @@ def list_filter_confidence_results(db: Session, limit: int = 100) -> list[dict[s
         {"limit": limit},
     )
     rows = _fetch_all_dicts(result)
+    trigger_ids: set[int] = set()
     for row in rows:
         if isinstance(row.get("factor_payload"), str):
             try:
                 row["factor_payload"] = json.loads(row["factor_payload"])
             except json.JSONDecodeError:
                 pass
+        payload = row.get("factor_payload")
+        if not isinstance(payload, Mapping):
+            continue
+        for key in ("entry_trigger_ids", "exit_trigger_ids", "trigger_ids"):
+            values = payload.get(key)
+            if isinstance(values, list):
+                for value in values:
+                    try:
+                        trigger_ids.add(int(value))
+                    except (TypeError, ValueError):
+                        continue
+    trigger_times_by_id: dict[int, Any] = {}
+    if trigger_ids:
+        trigger_result = db.execute(
+            text(
+                f"""
+                select id, trigger_time
+                from {trigger_table}
+                where id in :trigger_ids
+                """
+            ).bindparams(bindparam("trigger_ids", expanding=True)),
+            {"trigger_ids": sorted(trigger_ids)},
+        )
+        trigger_times_by_id = {int(row["id"]): row.get("trigger_time") for row in _fetch_all_dicts(trigger_result)}
+    for row in rows:
+        payload = row.get("factor_payload")
+        if not isinstance(payload, Mapping):
+            continue
+        row["session_window_start"] = payload.get("session_window_start")
+        row["session_window_end"] = payload.get("session_window_end")
+
+        def _ids_from_payload(key: str) -> list[int]:
+            values = payload.get(key)
+            if not isinstance(values, list):
+                return []
+            ids: list[int] = []
+            for value in values:
+                try:
+                    ids.append(int(value))
+                except (TypeError, ValueError):
+                    continue
+            return ids
+
+        entry_times = [trigger_times_by_id[trigger_id] for trigger_id in _ids_from_payload("entry_trigger_ids") if trigger_id in trigger_times_by_id]
+        exit_times = [trigger_times_by_id[trigger_id] for trigger_id in _ids_from_payload("exit_trigger_ids") if trigger_id in trigger_times_by_id]
+        if entry_times:
+            row["session_window_start"] = min(entry_times)
+        if exit_times:
+            row["session_window_end"] = max(exit_times)
+        elif not row.get("session_window_end"):
+            fallback_times = [
+                trigger_times_by_id[trigger_id]
+                for trigger_id in _ids_from_payload("trigger_ids")
+                if trigger_id in trigger_times_by_id
+            ]
+            if fallback_times:
+                row["session_window_start"] = row.get("session_window_start") or min(fallback_times)
+                row["session_window_end"] = max(fallback_times)
     return rows
 
 

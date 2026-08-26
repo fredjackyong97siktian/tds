@@ -3409,21 +3409,29 @@ def prepare_manual_grouping_batches(db: Session) -> list[dict[str, Any]]:
     prepared: list[dict[str, Any]] = []
     for location in locations:
         location_id = int(location["id"])
-        trigger_assets = repositories.list_manual_grouping_ready_trigger_frame_assets(
+        ready_assets = repositories.list_manual_grouping_ready_trigger_frame_assets(
             db,
             location_id=location_id,
             limit=200,
         )
+        if not ready_assets:
+            continue
+        newest_trigger_time = max(
+            (_coerce_datetime_value(row.get("trigger_time")) for row in ready_assets),
+            default=None,
+        )
+        if newest_trigger_time is None:
+            continue
+        window_start = newest_trigger_time - timedelta(hours=1)
+        window_end = newest_trigger_time + timedelta(seconds=1)
+        trigger_assets = [
+            row
+            for row in ready_assets
+            if (grouping_time := _coerce_datetime_value(row.get("trigger_time"))) is not None
+            and window_start <= grouping_time < window_end
+        ]
         if not trigger_assets:
             continue
-        window_start = min(
-            _coerce_datetime_value(row.get("trigger_time")) or datetime.now()
-            for row in trigger_assets
-        )
-        window_end = max(
-            _coerce_datetime_value(row.get("trigger_time")) or datetime.now()
-            for row in trigger_assets
-        ) + timedelta(seconds=1)
         batch = repositories.create_grouping_batch(
             db,
             location_id=location_id,
@@ -3438,6 +3446,67 @@ def prepare_manual_grouping_batches(db: Session) -> list[dict[str, Any]]:
                 {
                     "status": "pending",
                     "issue_reason": "Manual grouping retry queued.",
+                },
+            )
+        for row in trigger_assets:
+            repositories.upsert_grouping_item(
+                db,
+                batch_id=int(batch["id"]),
+                trigger_id=int(row["trigger_id"]),
+                video_asset_id=None,
+                frame_payload={"frames": _first_trigger_frame_payload(_frame_urls_from_trigger_frame_asset(row))},
+            )
+        prepared.append(batch)
+    return prepared
+
+
+def prepare_manual_grouping_batches_for_range(
+    db: Session,
+    *,
+    start_time: Any,
+    end_time: Any,
+    location_id: int | None = None,
+) -> list[dict[str, Any]]:
+    window_start = _coerce_datetime_value(start_time)
+    window_end = _coerce_datetime_value(end_time)
+    if window_start is None or window_end is None:
+        raise ValueError("Start time and end time are required.")
+    if window_end <= window_start:
+        raise ValueError("End time must be after start time.")
+
+    locations = repositories.list_locations(db)
+    if location_id is not None:
+        locations = [row for row in locations if int(row["id"]) == int(location_id)]
+    prepared: list[dict[str, Any]] = []
+    for location in locations:
+        current_location_id = int(location["id"])
+        ready_assets = repositories.list_manual_grouping_ready_trigger_frame_assets(
+            db,
+            location_id=current_location_id,
+            limit=1000,
+        )
+        trigger_assets = [
+            row
+            for row in ready_assets
+            if (grouping_time := _coerce_datetime_value(row.get("trigger_time"))) is not None
+            and window_start <= grouping_time < window_end
+        ]
+        if not trigger_assets:
+            continue
+        batch = repositories.create_grouping_batch(
+            db,
+            location_id=current_location_id,
+            period_code="manual_range",
+            window_start=window_start,
+            window_end=window_end,
+        )
+        if str(batch.get("status") or "").strip().lower() in {"failed", "issue"}:
+            batch = repositories.update_grouping_batch(
+                db,
+                int(batch["id"]),
+                {
+                    "status": "pending",
+                    "issue_reason": "Manual time-range grouping retry queued.",
                 },
             )
         for row in trigger_assets:
@@ -5385,6 +5454,10 @@ def _run_theft_confidence_for_grouping_batch_locked(
                     for row in minus_alerts
                 ],
                 "trigger_ids": trigger_ids,
+                "entry_trigger_ids": entry_trigger_ids,
+                "exit_trigger_ids": exit_trigger_ids,
+                "session_window_start": start_time.isoformat(),
+                "session_window_end": end_time.isoformat(),
                 "factor_settings": factor_settings,
                 "factor_details": factor_details,
                 "triggered_factors": triggered_factors,
