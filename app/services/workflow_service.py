@@ -3704,6 +3704,92 @@ def build_grouping_analysis_job_from_batch(db: Session, batch_id: int) -> Groupi
     )
 
 
+def _verify_gemini_grouping_match(
+    db: Session,
+    script_run_id: int,
+    *,
+    entry_trigger: Mapping[str, Any],
+    exit_triggers: list[Mapping[str, Any]],
+    model_name: str,
+    resize_scale: float | None,
+) -> dict[str, Any]:
+    """Independently re-check a single proposed entry/exit pairing with a small,
+    focused Gemini call that only sees that one pair's own images. A group's
+    first-pass "reason" text can sound confident while being ungrounded in the
+    actual images (seen in practice at confidence 1.0), so this asks a second,
+    narrower question instead of trusting the first pass's self-reported score.
+    """
+    entry_image_urls: list[str] = []
+    for frame in entry_trigger.get("frames") or []:
+        if not isinstance(frame, Mapping):
+            continue
+        image_url = str(frame.get("image_url") or "").strip()
+        if image_url and image_url not in entry_image_urls:
+            entry_image_urls.append(image_url)
+
+    exit_image_urls: list[str] = []
+    for exit_trigger in exit_triggers:
+        for frame in exit_trigger.get("frames") or []:
+            if not isinstance(frame, Mapping):
+                continue
+            image_url = str(frame.get("image_url") or "").strip()
+            if image_url and image_url not in entry_image_urls and image_url not in exit_image_urls:
+                exit_image_urls.append(image_url)
+
+    if not entry_image_urls or not exit_image_urls:
+        return {
+            "same_person": None,
+            "confidence": 0.0,
+            "matching_details": "",
+            "conflicting_details": "",
+            "error": "Missing entry or exit images for verification.",
+        }
+
+    image_urls = entry_image_urls + exit_image_urls
+    prompt = (
+        "You are independently double-checking one proposed customer match from a retail door trigger grouping "
+        f"system. Image set A (image numbers 1 to {len(entry_image_urls)}) shows a person at the store entrance for "
+        f"a trigger already labeled as an entry. Image set B (image numbers {len(entry_image_urls) + 1} to "
+        f"{len(image_urls)}) shows a person at the store entrance for a trigger already labeled as that same "
+        "person's exit. "
+        "Decide, based only on what is visibly present in these specific images, whether set A and set B show the "
+        "same physical person. Compare clothing color and pattern, pants/skirt, shoes, hair, body build and height, "
+        "and any bags or items carried. Do not assume they match just because they were already paired for you - "
+        "actively look for anything that would prove they are different people, such as a different clothing color, "
+        "a different build, or a different number of people present. "
+        "Return strict JSON only with schema: "
+        '{"same_person":boolean,"confidence":number,"matching_details":string,"conflicting_details":string}. '
+        "matching_details should cite the specific visual details that support your answer. conflicting_details "
+        "should cite any visual details that argue against your answer, or be an empty string if you found none."
+    )
+    try:
+        result, meta = _call_kiosk_gemini_summary(
+            prompt=prompt,
+            image_urls=image_urls,
+            model_name=model_name,
+            image_resize_scale=resize_scale,
+        )
+        _record_gemini_cost(db, script_run_id, meta)
+    except Exception as exc:
+        return {
+            "same_person": None,
+            "confidence": 0.0,
+            "matching_details": "",
+            "conflicting_details": "",
+            "error": str(exc),
+        }
+
+    same_person_raw = result.get("same_person")
+    same_person = same_person_raw if isinstance(same_person_raw, bool) else None
+    return {
+        "same_person": same_person,
+        "confidence": _coerce_number(result.get("confidence"), 0.0),
+        "matching_details": str(result.get("matching_details") or ""),
+        "conflicting_details": str(result.get("conflicting_details") or ""),
+        "error": None,
+    }
+
+
 def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id: int) -> tuple[dict[str, Any], dict[str, Any]]:
     batch = repositories.get_grouping_batch(db, batch_id)
     items = repositories.list_grouping_items(db, batch_id)
@@ -3726,6 +3812,10 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
     if not any(trigger.get("frames") for trigger in trigger_inputs):
         raise RuntimeError("No trigger frame images are available for Gemini grouping.")
 
+    trigger_input_by_id: dict[int, dict[str, Any]] = {
+        int(trigger_input["trigger_id"]): trigger_input for trigger_input in trigger_inputs
+    }
+
     max_images = _grouping_gemini_max_images_per_request()
     pending_triggers: list[dict[str, Any]] = list(trigger_inputs)
     carry_forward_entries: dict[int, dict[str, Any]] = {}
@@ -3745,6 +3835,34 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
     chunk_results: list[dict[str, Any]] = []
     raw_metas: list[dict[str, Any]] = []
     next_group_id = 1
+    # Tracks which group currently "owns" a given exit trigger, so two different
+    # entries can never both close against the same physical exit event.
+    exit_claims: dict[int, dict[str, Any]] = {}
+    # Once an exit has been fought over, it's permanently off-limits rather than
+    # being re-litigated on every later candidate that also wants it.
+    disputed_exit_ids: set[int] = set()
+
+    def _release_group(group_id: int) -> None:
+        for idx, existing in enumerate(normalized_groups):
+            if existing["group_id"] == group_id:
+                released = normalized_groups.pop(idx)
+                break
+        else:
+            return
+        for trigger_id in released["entry"]:
+            grouped_trigger_ids.discard(trigger_id)
+            if trigger_has_identity.get(trigger_id, False):
+                normalized_open_entries.add(trigger_id)
+                trigger_input = trigger_input_by_id.get(trigger_id)
+                if trigger_input is not None:
+                    carry_forward_entries[trigger_id] = trigger_input
+            else:
+                normalized_unknown.add(trigger_id)
+        for trigger_id in released["exit"]:
+            grouped_trigger_ids.discard(trigger_id)
+            normalized_unknown.add(trigger_id)
+            disputed_exit_ids.add(trigger_id)
+            exit_claims.pop(trigger_id, None)
 
     chunk_index = 0
     while pending_triggers:
@@ -3886,6 +4004,88 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
             if not exit_ids:
                 normalized_unknown.update(entry_ids)
                 continue
+
+            entry_trigger_id = entry_ids[0]
+
+            # An exit that's already been fought over is permanently contested;
+            # don't spend another verification call re-litigating it.
+            if any(exit_id in disputed_exit_ids for exit_id in exit_ids):
+                normalized_unknown.update(exit_ids)
+                if trigger_has_identity.get(entry_trigger_id, False):
+                    normalized_open_entries.add(entry_trigger_id)
+                else:
+                    normalized_unknown.add(entry_trigger_id)
+                notes.append(
+                    f"Entry {entry_trigger_id} matched exit(s) {sorted(exit_ids)}, but that exit is already "
+                    "disputed by another entry; held for review instead of guessing."
+                )
+                continue
+
+            # A brand-new conflict: some other entry already holds one of these exits.
+            # One exit trigger is one physical event, so it can only belong to one
+            # customer - pull the earlier group apart too rather than trust either.
+            conflicting_group_ids = {
+                exit_claims[exit_id]["group_id"] for exit_id in exit_ids if exit_id in exit_claims
+            }
+            if conflicting_group_ids:
+                conflicting_entries: list[int] = []
+                for conflicting_group_id in conflicting_group_ids:
+                    conflicting_group = next(
+                        (existing for existing in normalized_groups if existing["group_id"] == conflicting_group_id),
+                        None,
+                    )
+                    if conflicting_group:
+                        conflicting_entries.extend(conflicting_group["entry"])
+                    _release_group(conflicting_group_id)
+                normalized_unknown.update(exit_ids)
+                disputed_exit_ids.update(exit_ids)
+                if trigger_has_identity.get(entry_trigger_id, False):
+                    normalized_open_entries.add(entry_trigger_id)
+                else:
+                    normalized_unknown.add(entry_trigger_id)
+                notes.append(
+                    f"Conflicting exit claim: entries {sorted(set(conflicting_entries + [entry_trigger_id]))} all "
+                    f"matched exit(s) {sorted(exit_ids)}; held for review instead of guessing which is correct."
+                )
+                continue
+
+            entry_trigger_input = trigger_input_by_id.get(entry_trigger_id)
+            exit_trigger_inputs = [trigger_input_by_id[e] for e in exit_ids if e in trigger_input_by_id]
+            if entry_trigger_input is None or not exit_trigger_inputs:
+                verification: dict[str, Any] = {
+                    "same_person": None,
+                    "confidence": 0.0,
+                    "matching_details": "",
+                    "conflicting_details": "",
+                    "error": "Entry or exit trigger data was not available for verification.",
+                }
+            else:
+                verification = _verify_gemini_grouping_match(
+                    db,
+                    script_run_id,
+                    entry_trigger=entry_trigger_input,
+                    exit_triggers=exit_trigger_inputs,
+                    model_name=model_name,
+                    resize_scale=resize_scale,
+                )
+
+            # Reject outright when the independent check says no, or hedges with low
+            # confidence - a same_person=None (call failed / malformed) fails open,
+            # since that's a tooling problem, not evidence the match is wrong.
+            if verification["same_person"] is False or (
+                verification["same_person"] is True and verification["confidence"] < 0.5
+            ):
+                normalized_unknown.update(exit_ids)
+                if trigger_has_identity.get(entry_trigger_id, False):
+                    normalized_open_entries.add(entry_trigger_id)
+                else:
+                    normalized_unknown.add(entry_trigger_id)
+                notes.append(
+                    f"Verification rejected match between entry {entry_trigger_id} and exit(s) {sorted(exit_ids)}: "
+                    f"{verification['conflicting_details'] or 'independent check could not confirm the same person'}."
+                )
+                continue
+
             chunk_grouped_trigger_ids.update(entry_ids)
             chunk_grouped_trigger_ids.update(exit_ids)
             grouped_trigger_ids.update(entry_ids)
@@ -3896,9 +4096,11 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
             normalized_open_entries.difference_update(exit_ids)
             normalized_unknown.difference_update(entry_ids)
             normalized_unknown.difference_update(exit_ids)
+            this_group_id = next_group_id
+            next_group_id += 1
             normalized_groups.append(
                 {
-                    "group_id": next_group_id,
+                    "group_id": this_group_id,
                     "entry": entry_ids,
                     "exit": exit_ids,
                     "score": _coerce_number(group.get("confidence"), 0.0),
@@ -3909,9 +4111,12 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
                     "total_customer": _coerce_int(group.get("total_customer"), 0),
                     "source": "gemini_grouping_direct",
                     "chunk": chunk_index,
+                    "verified": verification["same_person"] is True,
+                    "verification": verification,
                 }
             )
-            next_group_id += 1
+            for exit_id in exit_ids:
+                exit_claims[exit_id] = {"group_id": this_group_id}
         for trigger_id in _group_trigger_id_list(chunk_open_entries):
             if trigger_id in grouped_trigger_ids:
                 continue
@@ -3937,10 +4142,10 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
         # a later chunk; anything grouped or marked unknown this round is final and is
         # dropped from the carry-forward set (an "all unknown" chunk simply stops there
         # instead of being retried).
-        chunk_trigger_by_id = {int(trigger_input["trigger_id"]): trigger_input for trigger_input in chunk}
-        for trigger_id in chunk_trigger_by_id:
+        chunk_ids = {int(trigger_input["trigger_id"]) for trigger_input in chunk}
+        for trigger_id in chunk_ids:
             if trigger_id in normalized_open_entries:
-                carry_forward_entries[trigger_id] = chunk_trigger_by_id[trigger_id]
+                carry_forward_entries[trigger_id] = trigger_input_by_id[trigger_id]
             else:
                 carry_forward_entries.pop(trigger_id, None)
 

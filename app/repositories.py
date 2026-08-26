@@ -2892,6 +2892,7 @@ def list_filter_confidence_results(
             select c.id, c.batch_id, c.group_key, c.location_id, c.score, c.need_deep_analysis,
                    c.reason, c.factor_payload, c.created_at, c.updated_at,
                    b.period_code, b.window_start, b.window_end, b.status as batch_status,
+                   b.result_payload as grouping_result_payload,
                    l.{location_name_column} as location_name
             from {confidence_table} c
             left join {batch_table} b on b.id = c.batch_id
@@ -2940,6 +2941,11 @@ def list_filter_confidence_results(
         if isinstance(row.get("factor_payload"), str):
             try:
                 row["factor_payload"] = json.loads(row["factor_payload"])
+            except json.JSONDecodeError:
+                pass
+        if isinstance(row.get("grouping_result_payload"), str):
+            try:
+                row["grouping_result_payload"] = json.loads(row["grouping_result_payload"])
             except json.JSONDecodeError:
                 pass
         payload = row.get("factor_payload")
