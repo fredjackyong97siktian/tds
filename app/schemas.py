@@ -314,6 +314,23 @@ class ScriptRunDetailResponse(BaseModel):
     finished_at: datetime | None = None
 
 
+class ScriptRunLocationCostResponse(BaseModel):
+    location_id: int
+    location_name: str | None = None
+    total: float = 0
+    gemini_total: float = 0
+    runpod_total: float = 0
+
+
+class ScriptRunMonthlyCostSummaryResponse(BaseModel):
+    month: str
+    currency: str = "USD"
+    total: float = 0
+    gemini_total: float = 0
+    runpod_total: float = 0
+    locations: list[ScriptRunLocationCostResponse] = Field(default_factory=list)
+
+
 class SessionPipelineLogSectionResponse(BaseModel):
     label: str
     script_run: ScriptRunDetailResponse | None = None

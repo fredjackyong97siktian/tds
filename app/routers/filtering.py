@@ -148,8 +148,26 @@ def list_grouping_batches(db: Session = Depends(get_transaction_db)) -> dict[str
 
 
 @router.get("/confidence-results")
-def list_confidence_results(limit: int = 100, db: Session = Depends(get_transaction_db)) -> list[dict[str, Any]]:
-    return repositories.list_filter_confidence_results(db, limit=max(1, min(limit, 500)))
+def list_confidence_results(
+    limit: int = 100,
+    offset: int = 0,
+    batch_id: int | None = None,
+    db: Session = Depends(get_transaction_db),
+) -> list[dict[str, Any]]:
+    return repositories.list_filter_confidence_results(
+        db,
+        limit=max(1, min(limit, 500)),
+        offset=max(0, offset),
+        batch_id=batch_id,
+    )
+
+
+@router.get("/confidence-results/count")
+def count_confidence_results(
+    batch_id: int | None = None,
+    db: Session = Depends(get_transaction_db),
+) -> dict[str, int]:
+    return {"total": repositories.count_filter_confidence_results(db, batch_id=batch_id)}
 
 
 @router.post("/confidence-results/{confidence_result_id}/retry")

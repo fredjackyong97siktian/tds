@@ -13,6 +13,7 @@ from ..schemas import (
     RetrievalRequest,
     SessionPipelineLogResponse,
     ScriptRunDetailResponse,
+    ScriptRunMonthlyCostSummaryResponse,
     ScriptRunResponse,
 )
 from ..services import workflow_service
@@ -73,6 +74,13 @@ def list_script_runs(
         model_name=model_name,
     )
     return [ScriptRunDetailResponse(**row) for row in rows]
+
+
+@router.get("/script-runs/monthly-costs", response_model=ScriptRunMonthlyCostSummaryResponse)
+def get_script_run_monthly_costs(
+    db: Session = Depends(get_transaction_db),
+) -> ScriptRunMonthlyCostSummaryResponse:
+    return ScriptRunMonthlyCostSummaryResponse(**repositories.get_current_month_script_run_cost_summary(db))
 
 
 @router.get("/script-runs/{script_run_id}", response_model=ScriptRunDetailResponse)

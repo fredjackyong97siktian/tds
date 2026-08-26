@@ -3550,6 +3550,11 @@ def create_self_grouping_batch(
         for row in frame_assets
         if row.get("trigger_id") is not None
     }
+    times_by_trigger = {
+        int(row["trigger_id"]): _coerce_datetime_value(row.get("start_time"))
+        for row in frame_assets
+        if row.get("trigger_id") is not None
+    }
     available_trigger_ids = set(frames_by_trigger)
     normalized_groups: list[dict[str, Any]] = []
     used_trigger_ids: set[int] = set()
@@ -3562,6 +3567,18 @@ def create_self_grouping_batch(
         missing_ids = [trigger_id for trigger_id in entry_ids + exit_ids if trigger_id not in available_trigger_ids]
         if missing_ids:
             raise ValueError(f"Self group {index} contains trigger(s) outside this frame window: {missing_ids}.")
+        entry_time = times_by_trigger.get(entry_ids[0])
+        invalid_exit_ids = [
+            trigger_id
+            for trigger_id in exit_ids
+            if entry_time is not None
+            and times_by_trigger.get(trigger_id) is not None
+            and times_by_trigger[trigger_id] <= entry_time
+        ]
+        if invalid_exit_ids:
+            raise ValueError(
+                f"Self group {index} has exit trigger(s) earlier than or equal to entry trigger {entry_ids[0]}: {invalid_exit_ids}."
+            )
         if any(trigger_id in used_trigger_ids for trigger_id in entry_ids + exit_ids):
             raise ValueError(f"Self group {index} reuses a trigger that is already in another group.")
         used_trigger_ids.update(entry_ids + exit_ids)

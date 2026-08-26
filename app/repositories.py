@@ -1,6 +1,7 @@
 import json
 import re
 from collections.abc import Mapping
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import bindparam, text
@@ -2696,13 +2697,47 @@ def upsert_filter_confidence_result(
     db.commit()
 
 
-def list_filter_confidence_results(db: Session, limit: int = 100) -> list[dict[str, Any]]:
+def count_filter_confidence_results(db: Session, *, batch_id: int | None = None) -> int:
+    confidence_table = _table("filter_confidence_result")
+    where_clauses: list[str] = []
+    params: dict[str, Any] = {}
+    if batch_id is not None:
+        where_clauses.append("batch_id = :batch_id")
+        params["batch_id"] = batch_id
+    where_sql = f"where {' and '.join(where_clauses)}" if where_clauses else ""
+    result = db.execute(
+        text(
+            f"""
+            select count(*) as total
+            from {confidence_table}
+            {where_sql}
+            """
+        ),
+        params,
+    )
+    row = result.mappings().first()
+    return int((row or {}).get("total") or 0)
+
+
+def list_filter_confidence_results(
+    db: Session,
+    limit: int = 100,
+    *,
+    offset: int = 0,
+    batch_id: int | None = None,
+) -> list[dict[str, Any]]:
     confidence_table = _table("filter_confidence_result")
     batch_table = _table("filter_grouping_batch")
     trigger_table = _table("trigger_event")
     location_table = settings.location_table_name
     location_id_column = settings.location_id_column
     location_name_column = settings.location_name_column
+    where_clauses: list[str] = []
+    params: dict[str, Any] = {"limit": limit, "offset": max(0, offset)}
+    if batch_id is not None:
+        where_clauses.append("c.batch_id = :batch_id")
+        params["batch_id"] = batch_id
+    where_sql = f"where {' and '.join(where_clauses)}" if where_clauses else ""
     result = db.execute(
         text(
             f"""
@@ -2713,13 +2748,44 @@ def list_filter_confidence_results(db: Session, limit: int = 100) -> list[dict[s
             from {confidence_table} c
             left join {batch_table} b on b.id = c.batch_id
             left join {location_table} l on l.{location_id_column} = c.location_id
+            {where_sql}
             order by c.created_at desc, c.id desc
             limit :limit
+            offset :offset
             """
         ),
-        {"limit": limit},
+        params,
     )
     rows = _fetch_all_dicts(result)
+    batch_ids = sorted({int(row["batch_id"]) for row in rows if row.get("batch_id") is not None})
+    grouping_items_by_result: dict[tuple[int, str], dict[str, list[int]]] = {}
+    if batch_ids:
+        grouping_item_table = _table("filter_grouping_item")
+        item_result = db.execute(
+            text(
+                f"""
+                select batch_id, group_key, trigger_id, role
+                from {grouping_item_table}
+                where batch_id in :batch_ids
+                  and trigger_id is not null
+                  and status <> 'deleted'
+                order by batch_id asc, group_key asc, role asc, trigger_id asc
+                """
+            ).bindparams(bindparam("batch_ids", expanding=True)),
+            {"batch_ids": batch_ids},
+        )
+        for item in _fetch_all_dicts(item_result):
+            key = (int(item["batch_id"]), str(item.get("group_key") or ""))
+            role = str(item.get("role") or "").strip().lower()
+            if role not in {"entry", "exit", "unknown"}:
+                continue
+            bucket = grouping_items_by_result.setdefault(key, {"entry": [], "exit": [], "unknown": []})
+            try:
+                trigger_id = int(item["trigger_id"])
+            except (TypeError, ValueError):
+                continue
+            if trigger_id not in bucket[role]:
+                bucket[role].append(trigger_id)
     trigger_ids: set[int] = set()
     for row in rows:
         if isinstance(row.get("factor_payload"), str):
@@ -2729,7 +2795,20 @@ def list_filter_confidence_results(db: Session, limit: int = 100) -> list[dict[s
                 pass
         payload = row.get("factor_payload")
         if not isinstance(payload, Mapping):
-            continue
+            payload = {}
+            row["factor_payload"] = payload
+        grouping_key = (int(row["batch_id"]), str(row.get("group_key") or ""))
+        grouping_item_ids = grouping_items_by_result.get(grouping_key)
+        if grouping_item_ids:
+            mutable_payload = dict(payload)
+            if not isinstance(mutable_payload.get("entry_trigger_ids"), list) and grouping_item_ids["entry"]:
+                mutable_payload["entry_trigger_ids"] = grouping_item_ids["entry"]
+            if not isinstance(mutable_payload.get("exit_trigger_ids"), list) and grouping_item_ids["exit"]:
+                mutable_payload["exit_trigger_ids"] = grouping_item_ids["exit"]
+            if not isinstance(mutable_payload.get("trigger_ids"), list):
+                mutable_payload["trigger_ids"] = grouping_item_ids["entry"] + grouping_item_ids["exit"]
+            row["factor_payload"] = mutable_payload
+            payload = mutable_payload
         for key in ("entry_trigger_ids", "exit_trigger_ids", "trigger_ids"):
             values = payload.get(key)
             if isinstance(values, list):
@@ -4987,6 +5066,116 @@ def add_script_run_cost(
         },
     )
     db.commit()
+
+
+def get_current_month_script_run_cost_summary(db: Session) -> dict[str, Any]:
+    script_run_table = _table("script_run")
+    current_month = datetime.now(timezone.utc).strftime("%Y-%m")
+    if not _script_run_has_cost_columns(db, script_run_table):
+        return {
+            "month": current_month,
+            "currency": "USD",
+            "total": 0.0,
+            "gemini_total": 0.0,
+            "runpod_total": 0.0,
+            "locations": [],
+        }
+
+    session_table = _table("session")
+    trigger_table = _table("trigger_event")
+    location_table = settings.location_table_name
+    location_id_column = settings.location_id_column
+    location_name_column = settings.location_name_column
+
+    result = db.execute(
+        text(
+            f"""
+            with cost_rows as (
+                select sr.id,
+                       coalesce(sr.cost_amount, 0) as cost_amount,
+                       coalesce(sr.cost_currency, 'USD') as cost_currency,
+                       lower(coalesce(sr.cost_source, '')) as cost_source,
+                       lower(coalesce(sr.model_name, '')) as model_name,
+                       lower(coalesce(sr.script_name, '')) as script_name,
+                       coalesce(
+                           s.location_id,
+                           te.location_id,
+                           case
+                               when json_valid(sr.runner_payload)
+                               then cast(nullif(json_unquote(json_extract(sr.runner_payload, '$.location_id')), '') as unsigned)
+                               else null
+                           end
+                       ) as location_id
+                from {script_run_table} sr
+                left join {session_table} s on s.id = sr.session_id
+                left join {trigger_table} te on te.id = sr.trigger_id
+                where coalesce(sr.cost_amount, 0) > 0
+                  and sr.created_at >= date_format(utc_timestamp(), '%Y-%m-01 00:00:00')
+                  and sr.created_at < date_add(date_format(utc_timestamp(), '%Y-%m-01 00:00:00'), interval 1 month)
+            )
+            select date_format(utc_timestamp(), '%Y-%m') as month,
+                   cr.cost_currency,
+                   cr.location_id,
+                   l.{location_name_column} as location_name,
+                   sum(cr.cost_amount) as total,
+                   sum(
+                       case
+                           when cr.cost_source like '%gemini%'
+                             or cr.model_name like 'gemini%'
+                             or cr.script_name in ('grouping', 'carry_confidence', 'grouping_repair')
+                           then cr.cost_amount
+                           else 0
+                       end
+                   ) as gemini_total,
+                   sum(
+                       case
+                           when cr.cost_source like '%runpod%'
+                             or cr.model_name = 'runpod_runner'
+                           then cr.cost_amount
+                           else 0
+                       end
+                   ) as runpod_total
+            from cost_rows cr
+            left join {location_table} l on l.{location_id_column} = cr.location_id
+            group by cr.cost_currency, cr.location_id, l.{location_name_column}
+            order by cr.location_id is null, cr.location_id asc
+            """
+        )
+    )
+    rows = _fetch_all_dicts(result)
+    month = rows[0]["month"] if rows else current_month
+    currency = rows[0]["cost_currency"] if rows else "USD"
+    locations: list[dict[str, Any]] = []
+    total = 0.0
+    gemini_total = 0.0
+    runpod_total = 0.0
+    for row in rows:
+        row_total = float(row.get("total") or 0)
+        row_gemini_total = float(row.get("gemini_total") or 0)
+        row_runpod_total = float(row.get("runpod_total") or 0)
+        total += row_total
+        gemini_total += row_gemini_total
+        runpod_total += row_runpod_total
+        if row.get("location_id") is None:
+            continue
+        locations.append(
+            {
+                "location_id": int(row["location_id"]),
+                "location_name": row.get("location_name") or f"Location {row['location_id']}",
+                "total": row_total,
+                "gemini_total": row_gemini_total,
+                "runpod_total": row_runpod_total,
+            }
+        )
+
+    return {
+        "month": str(month or ""),
+        "currency": str(currency or "USD"),
+        "total": total,
+        "gemini_total": gemini_total,
+        "runpod_total": runpod_total,
+        "locations": locations,
+    }
 
 
 def revise_script_run(
