@@ -3195,6 +3195,12 @@ def _period_window_for_datetime(period: Mapping[str, Any], value: datetime) -> t
     return _period_window_for_local_datetime(period, _to_time_period_local_naive(value))
 
 
+def _is_recently_completed_grouping_window(window_end: datetime, current: datetime) -> bool:
+    # Scheduled grouping should not catch up old missed periods after a setting is enabled.
+    grace_seconds = max(60, int(settings.grouping_poll_seconds or 30) * 4)
+    return window_end <= current < window_end + timedelta(seconds=grace_seconds)
+
+
 def _period_code_for_datetime(db: Session, location_id: int, value: datetime | None) -> str | None:
     if value is None:
         return None
@@ -3322,48 +3328,21 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
         if not ready_assets:
             continue
         for period in selected_periods:
+            window_start, window_end = _last_completed_period_window(period, now=current)
+            if not _is_recently_completed_grouping_window(window_end, current):
+                continue
             assets_by_window: dict[tuple[datetime, datetime], list[dict[str, Any]]] = {}
             for row in ready_assets:
                 grouping_time = _grouping_time_from_trigger_frame_asset(row)
                 if grouping_time is None:
                     continue
                 window = _period_window_for_local_datetime(period, grouping_time)
-                if window is None:
-                    continue
-                window_start, window_end = window
-                if window_end > current:
+                if window != (window_start, window_end):
                     continue
                 assets_by_window.setdefault(window, []).append(row)
 
             for (window_start, window_end), _ready_rows in sorted(assets_by_window.items()):
-                carryover_start = window_start - timedelta(hours=1)
-                stale_count = repositories.mark_stale_open_entry_frame_assets_issue(
-                    db,
-                    location_id=location_id,
-                    cutoff_time=carryover_start,
-                )
-                if stale_count:
-                    logger.info(
-                        "Marked stale open entry frame assets issue location_id=%s cutoff_time=%s count=%s",
-                        location_id,
-                        carryover_start,
-                        stale_count,
-                    )
-                ready_trigger_ids = {int(row["trigger_id"]) for row in _ready_rows if row.get("trigger_id") is not None}
                 trigger_assets = list(_ready_rows)
-                for row in ready_assets:
-                    try:
-                        trigger_id = int(row["trigger_id"])
-                    except (TypeError, ValueError):
-                        continue
-                    if trigger_id in ready_trigger_ids:
-                        continue
-                    grouping_time = _grouping_time_from_trigger_frame_asset(row)
-                    if grouping_time is None:
-                        continue
-                    if carryover_start <= grouping_time < window_start:
-                        trigger_assets.append(row)
-                        ready_trigger_ids.add(trigger_id)
                 period_code = str(period.get("period_code") or "period")
                 existing = repositories.get_grouping_batch_by_window(
                     db,
@@ -3393,7 +3372,7 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
                     )
                 prepared.append(batch)
                 logger.info(
-                    "Prepared grouping catch-up batch location_id=%s period_code=%s window_start=%s window_end=%s trigger_count=%s batch_id=%s",
+                    "Prepared scheduled grouping batch location_id=%s period_code=%s window_start=%s window_end=%s trigger_count=%s batch_id=%s",
                     location_id,
                     period_code,
                     window_start,
