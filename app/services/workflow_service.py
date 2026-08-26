@@ -71,6 +71,7 @@ GEMINI_COSTS_PER_1M_TOKENS_USD: dict[str, dict[str, float]] = {
     "gemini-3.5-flash": {"input": 1.50, "output": 9.00, "cached_input": 0.15},
     "gemini-3.1-flash-lite": {"input": 0.25, "output": 1.50, "cached_input": 0.025},
     "gemini-3-flash-preview": {"input": 0.50, "output": 3.00, "cached_input": 0.05},
+    "gemini-3.7-flash": {"input": 0.75, "output": 3.75, "cached_input": 0.075},
     "gemini-2.5-flash-lite": {"input": 0.10, "output": 0.40, "cached_input": 0.025},
 }
 DEFAULT_RUNPOD_SERVERLESS_COST_PER_SECOND_USD = 0.69 / 3600
