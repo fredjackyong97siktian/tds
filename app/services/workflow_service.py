@@ -7653,7 +7653,9 @@ def _build_dahua_rtsp_playback_url(
 def _build_retrieval_command(rtsp_url: str, output_path: Path) -> list[str]:
     codec = settings.dahua_output_video_codec.strip()
     threads = str(max(1, int(settings.dahua_ffmpeg_threads)))
+    scale = _coerce_number(settings.dahua_output_scale, 1.0)
     if codec == "copy":
+        # Stream copy remuxes without re-encoding, so it can't be resized this way.
         return [
             settings.ffmpeg_bin,
             "-y",
@@ -7666,6 +7668,9 @@ def _build_retrieval_command(rtsp_url: str, output_path: Path) -> list[str]:
             str(output_path),
         ]
 
+    scale_args = (
+        ["-vf", f"scale=trunc(iw*{scale}/2)*2:trunc(ih*{scale}/2)*2"] if 0 < scale < 1 else []
+    )
     return [
         settings.ffmpeg_bin,
         "-y",
@@ -7679,6 +7684,7 @@ def _build_retrieval_command(rtsp_url: str, output_path: Path) -> list[str]:
         codec,
         "-threads",
         threads,
+        *scale_args,
         "-preset",
         settings.dahua_output_preset,
         "-crf",

@@ -1415,6 +1415,30 @@ def get_trigger_frame_asset(db: Session, frame_asset_id: int) -> dict[str, Any]:
     return _fetch_one_dict(result)
 
 
+def retry_trigger_frame_asset_issue(db: Session, frame_asset_id: int) -> dict[str, Any]:
+    frame_asset = get_trigger_frame_asset(db, frame_asset_id)
+    if str(frame_asset.get("status") or "") != "issue":
+        raise ValueError("This trigger frame asset is not in issue state.")
+    frame_asset_table = _table("trigger_frame_asset")
+    result = db.execute(
+        text(
+            f"""
+            update {frame_asset_table}
+            set status = 'not_retrieved',
+                error = null,
+                updated_at = now()
+            where id = :frame_asset_id
+              and status = 'issue'
+            """
+        ),
+        {"frame_asset_id": frame_asset_id},
+    )
+    db.commit()
+    if not result.rowcount:
+        raise ValueError("This trigger frame asset is not in issue state.")
+    return get_trigger_frame_asset(db, frame_asset_id)
+
+
 def list_pending_trigger_frame_asset_retrievals(db: Session, limit: int = 50) -> list[dict[str, Any]]:
     frame_asset_table = _table("trigger_frame_asset")
     result = db.execute(

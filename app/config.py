@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     dahua_output_video_codec: str = "libx264"
     dahua_output_preset: str = "veryfast"
     dahua_output_crf: int = 23
+    dahua_output_scale: float = 0.5
     dahua_ffmpeg_threads: int = 2
     spaces_endpoint_url: str | None = None
     spaces_region: str = "sgp1"

@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from .. import repositories
@@ -28,3 +28,12 @@ def list_frame_assets(
         status=status,
     )
     return [TriggerFrameAssetListItem(**row) for row in rows]
+
+
+@router.post("/assets/{frame_asset_id}/retry-issue", response_model=TriggerFrameAssetListItem)
+def retry_frame_asset_issue(frame_asset_id: int, db: Session = Depends(get_transaction_db)) -> TriggerFrameAssetListItem:
+    try:
+        row = repositories.retry_trigger_frame_asset_issue(db, frame_asset_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return TriggerFrameAssetListItem(**row)
