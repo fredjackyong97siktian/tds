@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     dahua_output_video_codec: str = "libx264"
     dahua_output_preset: str = "veryfast"
     dahua_output_crf: int = 23
+    dahua_ffmpeg_threads: int = 2
     spaces_endpoint_url: str | None = None
     spaces_region: str = "sgp1"
     spaces_bucket: str | None = None
@@ -49,7 +50,7 @@ class Settings(BaseSettings):
     runpod_webhook_secret: str | None = None
     runpod_cost_per_second_usd: float = 0.0
     retrieval_poll_seconds: int = 10
-    retrieval_max_global_workers: int = 2
+    retrieval_max_global_workers: int = 1
     retrieval_max_per_location: int = 1
     retrieval_ffmpeg_timeout_seconds: int = 60
     retrieval_stale_seconds: int = 900

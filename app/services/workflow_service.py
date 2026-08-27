@@ -2927,6 +2927,8 @@ def _capture_snapshot_frame(
         "-y",
         "-rtsp_transport",
         "tcp",
+        "-threads",
+        str(max(1, int(settings.dahua_ffmpeg_threads))),
         "-i",
         rtsp_url,
         "-frames:v",
@@ -7650,6 +7652,7 @@ def _build_dahua_rtsp_playback_url(
 
 def _build_retrieval_command(rtsp_url: str, output_path: Path) -> list[str]:
     codec = settings.dahua_output_video_codec.strip()
+    threads = str(max(1, int(settings.dahua_ffmpeg_threads)))
     if codec == "copy":
         return [
             settings.ffmpeg_bin,
@@ -7668,10 +7671,14 @@ def _build_retrieval_command(rtsp_url: str, output_path: Path) -> list[str]:
         "-y",
         "-rtsp_transport",
         "tcp",
+        "-threads",
+        threads,
         "-i",
         rtsp_url,
         "-c:v",
         codec,
+        "-threads",
+        threads,
         "-preset",
         settings.dahua_output_preset,
         "-crf",
@@ -8107,6 +8114,8 @@ def _build_frame_batch_capture_command(
         "-y",
         "-rtsp_transport",
         "tcp",
+        "-threads",
+        str(max(1, int(settings.dahua_ffmpeg_threads))),
         "-i",
         rtsp_url,
         "-ss",
@@ -8127,6 +8136,8 @@ def _build_frame_capture_command(rtsp_url: str, offset_seconds: float, output_pa
         "-y",
         "-rtsp_transport",
         "tcp",
+        "-threads",
+        str(max(1, int(settings.dahua_ffmpeg_threads))),
         "-i",
         rtsp_url,
         "-ss",

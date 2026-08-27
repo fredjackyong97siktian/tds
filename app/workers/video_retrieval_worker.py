@@ -25,6 +25,12 @@ class RunningJob:
 
 class VideoRetrievalWorker:
     def __init__(self) -> None:
+        # Exactly one ffmpeg process runs at a time, full stop - frame retrieval
+        # (quick per-trigger snapshots feeding grouping) and video retrieval (full
+        # clips for L1 entrance/kiosk analysis) share this single slot rather than
+        # each getting their own budget. Video candidates are checked first each
+        # cycle (see _fill_available_slots) so an entrance/kiosk analysis waiting
+        # on its video doesn't sit behind a pile of new-trigger frame jobs.
         self._executor = ThreadPoolExecutor(max_workers=max(1, settings.retrieval_max_global_workers))
         self._running: dict[str, RunningJob] = {}
         self._lock = Lock()
@@ -108,53 +114,9 @@ class VideoRetrievalWorker:
                     1,
                 )
 
-            frame_candidates = repositories.list_pending_trigger_frame_asset_retrievals(
-                db,
-                limit=max(settings.retrieval_max_global_workers * 10, 20),
-            )
-            for candidate in frame_candidates:
-                if available_slots <= 0:
-                    break
-                location_id = candidate.get("location_id")
-                if location_id is None:
-                    continue
-                location_id = int(location_id)
-                if running_by_location.get(location_id, 0) >= max(1, settings.retrieval_max_per_location):
-                    continue
-                frame_asset_id = int(candidate["id"])
-                claimed = repositories.claim_trigger_frame_asset_for_retrieval(db, frame_asset_id)
-                if not claimed:
-                    continue
-                try:
-                    job = workflow_service.build_retrieval_job_from_trigger_frame_asset(db, frame_asset_id)
-                except Exception as exc:
-                    logger.exception("Could not build frame retrieval job for frame_asset_id=%s", frame_asset_id)
-                    repositories.update_trigger_frame_asset_status(db, frame_asset_id, "issue", error=str(exc))
-                    repositories.create_script_run(
-                        db,
-                        session_id=None,
-                        trigger_id=int(candidate["trigger_id"]) if candidate.get("trigger_id") is not None else None,
-                        script_name="retrieve_video",
-                        model_name="worker_build_frame_job",
-                        status="failed",
-                        command="worker_build_frame_job",
-                        stdout_log="",
-                        stderr_log=str(exc),
-                    )
-                    continue
-
-                future = self._executor.submit(workflow_service.start_trigger_frame_asset_retrieval_job, job)
-                with self._lock:
-                    self._running[f"frame:{frame_asset_id}"] = RunningJob(
-                        future=future,
-                        location_id=location_id,
-                        asset_id=frame_asset_id,
-                        asset_kind="frame_asset",
-                    )
-                running_by_location[location_id] = running_by_location.get(location_id, 0) + 1
-                available_slots -= 1
-                logger.info("Claimed frame retrieval job frame_asset_id=%s location_id=%s", frame_asset_id, location_id)
-
+            # Video candidates (entrance/kiosk L1 analysis) are claimed before frame
+            # candidates so an already-queued analysis video doesn't wait behind a
+            # burst of new-trigger frame jobs for the one available slot.
             video_candidates = repositories.list_pending_video_asset_retrievals(
                 db,
                 limit=max(settings.retrieval_max_global_workers * 10, 20),
@@ -201,6 +163,53 @@ class VideoRetrievalWorker:
                 running_by_location[location_id] = running_by_location.get(location_id, 0) + 1
                 available_slots -= 1
                 logger.info("Claimed retrieval job video_asset_id=%s location_id=%s", video_asset_id, location_id)
+
+            frame_candidates = repositories.list_pending_trigger_frame_asset_retrievals(
+                db,
+                limit=max(settings.retrieval_max_global_workers * 10, 20),
+            )
+            for candidate in frame_candidates:
+                if available_slots <= 0:
+                    break
+                location_id = candidate.get("location_id")
+                if location_id is None:
+                    continue
+                location_id = int(location_id)
+                if running_by_location.get(location_id, 0) >= max(1, settings.retrieval_max_per_location):
+                    continue
+                frame_asset_id = int(candidate["id"])
+                claimed = repositories.claim_trigger_frame_asset_for_retrieval(db, frame_asset_id)
+                if not claimed:
+                    continue
+                try:
+                    job = workflow_service.build_retrieval_job_from_trigger_frame_asset(db, frame_asset_id)
+                except Exception as exc:
+                    logger.exception("Could not build frame retrieval job for frame_asset_id=%s", frame_asset_id)
+                    repositories.update_trigger_frame_asset_status(db, frame_asset_id, "issue", error=str(exc))
+                    repositories.create_script_run(
+                        db,
+                        session_id=None,
+                        trigger_id=int(candidate["trigger_id"]) if candidate.get("trigger_id") is not None else None,
+                        script_name="retrieve_video",
+                        model_name="worker_build_frame_job",
+                        status="failed",
+                        command="worker_build_frame_job",
+                        stdout_log="",
+                        stderr_log=str(exc),
+                    )
+                    continue
+
+                future = self._executor.submit(workflow_service.start_trigger_frame_asset_retrieval_job, job)
+                with self._lock:
+                    self._running[f"frame:{frame_asset_id}"] = RunningJob(
+                        future=future,
+                        location_id=location_id,
+                        asset_id=frame_asset_id,
+                        asset_kind="frame_asset",
+                    )
+                running_by_location[location_id] = running_by_location.get(location_id, 0) + 1
+                available_slots -= 1
+                logger.info("Claimed frame retrieval job frame_asset_id=%s location_id=%s", frame_asset_id, location_id)
         finally:
             db.close()
 
