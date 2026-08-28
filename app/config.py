@@ -58,6 +58,8 @@ class Settings(BaseSettings):
     trigger_frame_count: int = 20
     trigger_frame_gap: int = 12
     trigger_frame_fps: int = 25
+    trigger_frame_crop_left_fraction: float = 0.30
+    grouping_open_entry_stale_hours: int = 6
     time_period_timezone: str = "Asia/Kuala_Lumpur"
     grouping_poll_seconds: int = 30
     grouping_max_global_workers: int = 1
@@ -114,7 +116,7 @@ class Settings(BaseSettings):
     kiosk_gemini_model: str = "gemini-3-flash-preview"
     grouping_gemini_model: str = "gemini-3-flash-preview"
     grouping_gemini_frames_per_trigger: int = 5
-    grouping_gemini_image_scale: float = 0.5
+    grouping_gemini_image_scale: float = 0.35
     grouping_gemini_max_images_per_request: int = 40
     kiosk_gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
     kiosk_gemini_timeout_seconds: int = 180

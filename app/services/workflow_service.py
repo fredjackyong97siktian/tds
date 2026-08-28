@@ -3318,10 +3318,20 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
     location_ids = [int(row["id"]) for row in locations if row.get("id") is not None]
     prepared: list[dict[str, Any]] = []
     current = _time_period_now()
+    stale_cutoff = current - timedelta(hours=max(1, int(settings.grouping_open_entry_stale_hours)))
     for location_id in location_ids:
         selected_periods = _selected_grouping_periods_for_location(periods, location_id)
         if not selected_periods:
             continue
+        # An entry left open in a prior, already-finalized batch has no window
+        # of its own left to be picked up in - without this, it (and whatever
+        # exit trigger is waiting for it) would be orphaned forever. Give up on
+        # genuinely stale ones instead of carrying them forward indefinitely.
+        repositories.mark_stale_open_entry_frame_assets_issue(
+            db,
+            location_id=location_id,
+            cutoff_time=stale_cutoff,
+        )
         ready_assets = repositories.list_manual_grouping_ready_trigger_frame_assets(
             db,
             location_id=location_id,
@@ -3333,55 +3343,58 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
             window_start, window_end = _last_completed_period_window(period, now=current)
             if not _is_recently_completed_grouping_window(window_end, current):
                 continue
-            assets_by_window: dict[tuple[datetime, datetime], list[dict[str, Any]]] = {}
+            period_code = str(period.get("period_code") or "period")
+            existing = repositories.get_grouping_batch_by_window(
+                db,
+                location_id=location_id,
+                period_code=period_code,
+                window_start=window_start,
+                window_end=window_end,
+            )
+            if existing is not None:
+                continue
+
+            current_window_rows: list[dict[str, Any]] = []
+            carried_over_rows: list[dict[str, Any]] = []
             for row in ready_assets:
                 grouping_time = _grouping_time_from_trigger_frame_asset(row)
                 if grouping_time is None:
                     continue
                 window = _period_window_for_local_datetime(period, grouping_time)
-                if window != (window_start, window_end):
-                    continue
-                assets_by_window.setdefault(window, []).append(row)
-
-            for (window_start, window_end), _ready_rows in sorted(assets_by_window.items()):
-                trigger_assets = list(_ready_rows)
-                period_code = str(period.get("period_code") or "period")
-                existing = repositories.get_grouping_batch_by_window(
+                if window == (window_start, window_end):
+                    current_window_rows.append(row)
+                elif window[1] <= window_start:
+                    carried_over_rows.append(row)
+            trigger_assets = current_window_rows + carried_over_rows
+            if not trigger_assets:
+                continue
+            batch = repositories.create_grouping_batch(
+                db,
+                location_id=location_id,
+                period_code=period_code,
+                window_start=window_start,
+                window_end=window_end,
+            )
+            for row in trigger_assets:
+                repositories.upsert_grouping_item(
                     db,
-                    location_id=location_id,
-                    period_code=period_code,
-                    window_start=window_start,
-                    window_end=window_end,
+                    batch_id=int(batch["id"]),
+                    trigger_id=int(row["trigger_id"]),
+                    video_asset_id=None,
+                    frame_payload={"frames": _first_trigger_frame_payload(_frame_urls_from_trigger_frame_asset(row))},
                 )
-                if existing is not None:
-                    continue
-                if not trigger_assets:
-                    continue
-                batch = repositories.create_grouping_batch(
-                    db,
-                    location_id=location_id,
-                    period_code=period_code,
-                    window_start=window_start,
-                    window_end=window_end,
-                )
-                for row in trigger_assets:
-                    repositories.upsert_grouping_item(
-                        db,
-                        batch_id=int(batch["id"]),
-                        trigger_id=int(row["trigger_id"]),
-                        video_asset_id=None,
-                        frame_payload={"frames": _first_trigger_frame_payload(_frame_urls_from_trigger_frame_asset(row))},
-                    )
-                prepared.append(batch)
-                logger.info(
-                    "Prepared scheduled grouping batch location_id=%s period_code=%s window_start=%s window_end=%s trigger_count=%s batch_id=%s",
-                    location_id,
-                    period_code,
-                    window_start,
-                    window_end,
-                    len(trigger_assets),
-                    batch.get("id"),
-                )
+            prepared.append(batch)
+            logger.info(
+                "Prepared scheduled grouping batch location_id=%s period_code=%s window_start=%s window_end=%s "
+                "trigger_count=%s carried_over_count=%s batch_id=%s",
+                location_id,
+                period_code,
+                window_start,
+                window_end,
+                len(trigger_assets),
+                len(carried_over_rows),
+                batch.get("id"),
+            )
     return prepared
 
 
@@ -3853,13 +3866,10 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
             return
         for trigger_id in released["entry"]:
             grouped_trigger_ids.discard(trigger_id)
-            if trigger_has_identity.get(trigger_id, False):
-                normalized_open_entries.add(trigger_id)
-                trigger_input = trigger_input_by_id.get(trigger_id)
-                if trigger_input is not None:
-                    carry_forward_entries[trigger_id] = trigger_input
-            else:
-                normalized_unknown.add(trigger_id)
+            normalized_open_entries.add(trigger_id)
+            trigger_input = trigger_input_by_id.get(trigger_id)
+            if trigger_input is not None:
+                carry_forward_entries[trigger_id] = trigger_input
         for trigger_id in released["exit"]:
             grouped_trigger_ids.discard(trigger_id)
             normalized_unknown.add(trigger_id)
@@ -3947,9 +3957,16 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
             "Direction rule: once you have visually confirmed a candidate match, use customer movement relative to the store entrance to label each trigger. "
             "A person walking into the store should be treated as entry. A person walking out of the store or away from the store should be treated as exit. "
             "If clear walking direction conflicts with simple timestamp assumptions, prioritize the walking direction. "
-            "Identity rule: Entry triggers must have phone_entry_id or credit_card_entry_id. "
-            "Triggers without phone_entry_id and without credit_card_entry_id can only be exit or unknown. "
+            "Identity rule: phone_entry_id or credit_card_entry_id, when present on a trigger, is a helpful supporting "
+            "signal that it is an entry, but its absence does not disqualify a trigger from being an entry - decide "
+            "entry versus exit primarily from walking direction and visual evidence, with identity as secondary support. "
             "A trigger with phone_entry_id or credit_card_entry_id can still be exit if visual direction evidence clearly supports it. "
+            "Do not route a trigger to unknown merely because it lacks phone_entry_id and credit_card_entry_id. A "
+            "trigger with no identity id is a completely normal, expected kind of entry and must be judged by the "
+            "exact same walking-direction and visual-matching standard as any other trigger. If its walking direction "
+            "clearly shows it entering and you can visually confirm the same person in a later exit trigger, return "
+            "it as a complete entry+exit group exactly as you would for an identity-bearing trigger - never default it "
+            "to unknown or open_entries just because the identity fields are empty. "
             "Grouping rule: A complete session group must contain exactly one entry trigger and one or more later exit triggers, and every trigger in the group must "
             "be a confirmed visual match of the same person. A trigger must never be both entry and exit in the same group. "
             "Return confident complete entry+exit groups first even when other customers still have no visible exit yet. "
@@ -3998,25 +4015,22 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
             if not entry_ids:
                 continue
             entry_ids = entry_ids[:1]
-            invalid_entry_ids = [trigger_id for trigger_id in entry_ids if not trigger_has_identity.get(trigger_id, False)]
-            if invalid_entry_ids:
-                normalized_unknown.update(entry_ids)
-                normalized_unknown.update(exit_ids)
-                continue
             if not exit_ids:
                 normalized_unknown.update(entry_ids)
                 continue
 
             entry_trigger_id = entry_ids[0]
+            # A visually confirmed entry without a phone/credit card id is still a
+            # real session - it just has no confirmed identity anchor. Rather than
+            # discarding it, form the group and carry that fact through to the
+            # confidence result and session so a reviewer can see it plainly.
+            entry_has_identity = trigger_has_identity.get(entry_trigger_id, False)
 
             # An exit that's already been fought over is permanently contested;
             # don't spend another verification call re-litigating it.
             if any(exit_id in disputed_exit_ids for exit_id in exit_ids):
                 normalized_unknown.update(exit_ids)
-                if trigger_has_identity.get(entry_trigger_id, False):
-                    normalized_open_entries.add(entry_trigger_id)
-                else:
-                    normalized_unknown.add(entry_trigger_id)
+                normalized_open_entries.add(entry_trigger_id)
                 notes.append(
                     f"Entry {entry_trigger_id} matched exit(s) {sorted(exit_ids)}, but that exit is already "
                     "disputed by another entry; held for review instead of guessing."
@@ -4041,10 +4055,7 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
                     _release_group(conflicting_group_id)
                 normalized_unknown.update(exit_ids)
                 disputed_exit_ids.update(exit_ids)
-                if trigger_has_identity.get(entry_trigger_id, False):
-                    normalized_open_entries.add(entry_trigger_id)
-                else:
-                    normalized_unknown.add(entry_trigger_id)
+                normalized_open_entries.add(entry_trigger_id)
                 notes.append(
                     f"Conflicting exit claim: entries {sorted(set(conflicting_entries + [entry_trigger_id]))} all "
                     f"matched exit(s) {sorted(exit_ids)}; held for review instead of guessing which is correct."
@@ -4078,10 +4089,7 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
                 verification["same_person"] is True and verification["confidence"] < 0.5
             ):
                 normalized_unknown.update(exit_ids)
-                if trigger_has_identity.get(entry_trigger_id, False):
-                    normalized_open_entries.add(entry_trigger_id)
-                else:
-                    normalized_unknown.add(entry_trigger_id)
+                normalized_open_entries.add(entry_trigger_id)
                 notes.append(
                     f"Verification rejected match between entry {entry_trigger_id} and exit(s) {sorted(exit_ids)}: "
                     f"{verification['conflicting_details'] or 'independent check could not confirm the same person'}."
@@ -4115,6 +4123,7 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
                     "chunk": chunk_index,
                     "verified": verification["same_person"] is True,
                     "verification": verification,
+                    "entry_has_identity": entry_has_identity,
                 }
             )
             for exit_id in exit_ids:
@@ -4122,10 +4131,7 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
         for trigger_id in _group_trigger_id_list(chunk_open_entries):
             if trigger_id in grouped_trigger_ids:
                 continue
-            if trigger_has_identity.get(trigger_id, False):
-                normalized_open_entries.add(trigger_id)
-            else:
-                normalized_unknown.add(trigger_id)
+            normalized_open_entries.add(trigger_id)
         normalized_unknown.update(_group_trigger_id_list(chunk_unknown))
         if isinstance(gemini_result.get("notes"), list):
             notes.extend(str(note) for note in gemini_result.get("notes") or [])
@@ -5183,6 +5189,7 @@ def _ensure_session_for_confidence_group(
     location_id: int,
     entry_trigger_ids: list[int],
     exit_trigger_ids: list[int],
+    entry_has_identity: bool = True,
 ) -> dict[str, Any] | None:
     trigger_rows: dict[int, dict[str, Any]] = {}
     for trigger_id in sorted(set(entry_trigger_ids + exit_trigger_ids)):
@@ -5191,16 +5198,18 @@ def _ensure_session_for_confidence_group(
         except Exception:
             logger.exception("Could not load trigger while creating confidence session trigger_id=%s", trigger_id)
 
+    # A visually confirmed entry with no phone/credit id is still a real
+    # session - it's just missing a confirmed identity anchor. That gets
+    # recorded on the session below rather than blocking creation outright.
     entry_candidates = [
         row
         for trigger_id in entry_trigger_ids
         if (row := trigger_rows.get(trigger_id)) is not None
         and int(row.get("location_id") or 0) == location_id
-        and _trigger_has_required_entry_identity(row)
     ]
     if not entry_candidates:
         logger.info(
-            "Layer 0 confidence could not create session because no entry trigger has phone/credit identity "
+            "Layer 0 confidence could not create session because no entry trigger resolved for this location "
             "location_id=%s entry_trigger_ids=%s exit_trigger_ids=%s",
             location_id,
             entry_trigger_ids,
@@ -5228,32 +5237,51 @@ def _ensure_session_for_confidence_group(
         else None
     )
 
+    session: dict[str, Any] | None = None
     if exit_trigger is not None:
         try:
-            return repositories.get_session_by_trigger_pair(
+            session = repositories.get_session_by_trigger_pair(
                 db,
                 entry_trigger_id=int(entry_trigger["id"]),
                 exit_trigger_id=int(exit_trigger["id"]),
             )
         except ValueError:
-            pass
+            session = None
 
-    session, _created = _get_or_create_session_for_entry_trigger(
-        db,
-        entry_trigger_id=int(entry_trigger["id"]),
-        location_id=location_id,
-        start_time=_trigger_time(entry_trigger),
-    )
+    if session is None:
+        session, _created = _get_or_create_session_for_entry_trigger(
+            db,
+            entry_trigger_id=int(entry_trigger["id"]),
+            location_id=location_id,
+            start_time=_trigger_time(entry_trigger),
+        )
+        if exit_trigger is not None:
+            exit_time = _trigger_time(exit_trigger)
+            if exit_time is not None:
+                session = repositories.close_session(
+                    db,
+                    int(session["id"]),
+                    exit_time,
+                    exit_trigger_id=int(exit_trigger["id"]),
+                )
 
-    if exit_trigger is not None:
-        exit_time = _trigger_time(exit_trigger)
-        if exit_time is not None:
-            session = repositories.close_session(
-                db,
-                int(session["id"]),
-                exit_time,
-                exit_trigger_id=int(exit_trigger["id"]),
-            )
+    raw_summary = session.get("result_summary")
+    if isinstance(raw_summary, str):
+        try:
+            existing_summary = json.loads(raw_summary)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            existing_summary = {}
+    elif isinstance(raw_summary, Mapping):
+        existing_summary = dict(raw_summary)
+    else:
+        existing_summary = {}
+    if existing_summary.get("entry_has_identity") != entry_has_identity:
+        existing_summary["entry_has_identity"] = entry_has_identity
+        session = repositories.update_session_summary(
+            db,
+            session_id=int(session["id"]),
+            result_summary=existing_summary,
+        )
 
     return session
 
@@ -5457,6 +5485,10 @@ def _run_theft_confidence_for_grouping_batch_locked(
         group_key = str(group.get("group_id") or group.get("id") or group_index)
         entry_trigger_ids = _trigger_id_list(group.get("entry"))
         exit_trigger_ids = _trigger_id_list(group.get("exit"))
+        # Default to True for groups from before this field existed, so older
+        # stored batches aren't retroactively (and incorrectly) flagged as
+        # identity-less just because the field is missing.
+        entry_has_identity = bool(group.get("entry_has_identity", True))
         trigger_ids = entry_trigger_ids + exit_trigger_ids
         if not trigger_ids:
             repositories.upsert_filter_confidence_result(
@@ -5781,6 +5813,7 @@ def _run_theft_confidence_for_grouping_batch_locked(
                 "trigger_ids": trigger_ids,
                 "entry_trigger_ids": entry_trigger_ids,
                 "exit_trigger_ids": exit_trigger_ids,
+                "entry_has_identity": entry_has_identity,
                 "session_window_start": start_time.isoformat(),
                 "session_window_end": end_time.isoformat(),
                 "factor_settings": factor_settings,
@@ -5796,6 +5829,7 @@ def _run_theft_confidence_for_grouping_batch_locked(
                 location_id=location_id,
                 entry_trigger_ids=entry_trigger_ids,
                 exit_trigger_ids=exit_trigger_ids,
+                entry_has_identity=entry_has_identity,
             )
             if session:
                 session_id = int(session["id"])
@@ -8107,6 +8141,20 @@ def _trigger_frame_spaces_key(
     )
 
 
+def _trigger_frame_crop_filter() -> str | None:
+    # The left portion of these entrance frames is street/background, not the
+    # door - cropping it out before it ever reaches Spaces or Gemini shrinks
+    # every downstream image (and every carry-forward resend of it) for free,
+    # and removes exactly the kind of background clutter that has caused
+    # mismatched-identity hallucinations in the grouping prompt.
+    fraction = _coerce_number(settings.trigger_frame_crop_left_fraction, 0.0)
+    if fraction <= 0:
+        return None
+    fraction = min(fraction, 0.9)
+    keep = 1 - fraction
+    return f"crop=iw*{keep}:ih:iw*{fraction}:0"
+
+
 def _build_frame_batch_capture_command(
     rtsp_url: str,
     *,
@@ -8115,6 +8163,9 @@ def _build_frame_batch_capture_command(
     frame_count: int,
     output_pattern: Path,
 ) -> list[str]:
+    crop_filter = _trigger_frame_crop_filter()
+    fps_filter = f"fps={1 / max(0.04, gap_seconds):.6f}"
+    vf_filter = f"{crop_filter},{fps_filter}" if crop_filter else fps_filter
     return [
         settings.ffmpeg_bin,
         "-y",
@@ -8127,7 +8178,7 @@ def _build_frame_batch_capture_command(
         "-ss",
         f"{max(0.0, start_offset_seconds):.3f}",
         "-vf",
-        f"fps={1 / max(0.04, gap_seconds):.6f}",
+        vf_filter,
         "-frames:v",
         str(max(1, frame_count)),
         "-q:v",
@@ -8137,7 +8188,7 @@ def _build_frame_batch_capture_command(
 
 
 def _build_frame_capture_command(rtsp_url: str, offset_seconds: float, output_path: Path) -> list[str]:
-    return [
+    command = [
         settings.ffmpeg_bin,
         "-y",
         "-rtsp_transport",
@@ -8148,12 +8199,18 @@ def _build_frame_capture_command(rtsp_url: str, offset_seconds: float, output_pa
         rtsp_url,
         "-ss",
         f"{max(0.0, offset_seconds):.3f}",
+    ]
+    crop_filter = _trigger_frame_crop_filter()
+    if crop_filter:
+        command += ["-vf", crop_filter]
+    command += [
         "-frames:v",
         "1",
         "-q:v",
         "2",
         str(output_path),
     ]
+    return command
 
 
 def _trigger_frame_offsets(duration_seconds: float, frame_count: int) -> list[float]:

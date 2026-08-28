@@ -1441,13 +1441,17 @@ def retry_trigger_frame_asset_issue(db: Session, frame_asset_id: int) -> dict[st
 
 def list_pending_trigger_frame_asset_retrievals(db: Session, limit: int = 50) -> list[dict[str, Any]]:
     frame_asset_table = _table("trigger_frame_asset")
+    trigger_table = _table("trigger_event")
     result = db.execute(
         text(
             f"""
-            select id, trigger_id, location_id, start_time, end_time, status, error, created_at, updated_at
-            from {frame_asset_table}
-            where status = 'not_retrieved'
-            order by start_time asc, id asc
+            select fa.id, fa.trigger_id, fa.location_id, fa.start_time, fa.end_time, fa.status, fa.error,
+                   fa.created_at, fa.updated_at
+            from {frame_asset_table} fa
+            left join {trigger_table} te on te.id = fa.trigger_id
+            where fa.status = 'not_retrieved'
+              and (te.id is null or (te.whitelist_hit = 0 and te.status <> 'whitelisted'))
+            order by fa.start_time asc, fa.id asc
             limit :limit
             """
         ),
@@ -2641,7 +2645,7 @@ def mark_stale_open_entry_frame_assets_issue(
             f"""
             update {frame_asset_table} fa
             set fa.status = 'issue',
-                fa.error = 'No matching exit found within 1 hour.',
+                fa.error = 'No matching exit found before the open-entry staleness cutoff.',
                 fa.updated_at = now()
             where fa.location_id = :location_id
               and fa.status = 'retrieved'
@@ -3851,8 +3855,52 @@ def delete_session(db: Session, session_id: int) -> None:
 def retry_session_issue(db: Session, session_id: int) -> dict[str, Any]:
     session = get_session(db, session_id)
     current_status = str(session.get("status") or "").strip().lower()
-    if current_status not in {"issue", "closed", "pending"}:
-        raise ValueError("This session is not in issue, closed, or pending state.")
+    if current_status not in {"issue", "closed", "pending", "need_review"}:
+        raise ValueError("This session is not in issue, need_review, closed, or pending state.")
+
+    # The pipeline is entrance -> kiosk. If entrance itself is broken, retrying
+    # kiosk first is pointless (and used to be all this function did) - kiosk
+    # can't produce a meaningful result without entrance having actually run.
+    entrance_videos = list_session_video_assets(db, session_id=session_id, section="entrance")
+    issue_entrance_video = next(
+        (row for row in entrance_videos if str(row.get("video_status") or "") == "issue"),
+        None,
+    )
+    if issue_entrance_video is not None:
+        entrance_retry_result = retry_video_asset_issue(db, int(issue_entrance_video["video_asset_id"]))
+        updated = update_session_fields(
+            db,
+            session_id=session_id,
+            status="pending",
+            issue_reason=None,
+        )
+        return {
+            "ok": True,
+            "session_id": session_id,
+            "new_status": str(updated.get("status") or "pending"),
+            "retried_stage": "entrance",
+            "entrance_retry": entrance_retry_result,
+        }
+
+    # need_review means entrance and kiosk both ran fine, but the kiosk item
+    # count didn't clearly match the transaction - there's no "issue" video to
+    # reset here, so retrying means forcing kiosk analysis to run again.
+    if current_status == "need_review":
+        kiosk_videos = list_session_video_assets(db, session_id=session_id, section="kiosk")
+        retriable_kiosk_video = next(
+            (row for row in kiosk_videos if str(row.get("video_status") or "") not in {"retrieving", "processing"}),
+            None,
+        )
+        if retriable_kiosk_video is not None:
+            kiosk_retry_result = restart_video_asset_analysis(db, int(retriable_kiosk_video["video_asset_id"]))
+            return {
+                "ok": True,
+                "session_id": session_id,
+                "new_status": "pending",
+                "retried_stage": "kiosk",
+                "kiosk_retry": kiosk_retry_result,
+            }
+
     updated = update_session_fields(
         db,
         session_id=session_id,
@@ -3863,6 +3911,7 @@ def retry_session_issue(db: Session, session_id: int) -> dict[str, Any]:
         "ok": True,
         "session_id": session_id,
         "new_status": str(updated.get("status") or "pending"),
+        "retried_stage": "kiosk",
     }
 
 
@@ -3883,7 +3932,7 @@ def list_sessions(db: Session, limit: int = 50) -> list[dict[str, Any]]:
                    s.start_time, s.end_time, s.total_item_brought, s.actual_items_brought,
                    s.transaction_total_items, s.total_customer, s.issue_reason, s.result_summary{grouping_id_select},
                    l.{location_name_column} as location_name,
-                   case when s.status in ('issue', 'closed')
+                   case when s.status in ('issue', 'closed', 'need_review')
                           or (s.status = 'pending' and s.end_time is not null)
                         then true else false end as can_retry,
                    s.created_at, s.updated_at,

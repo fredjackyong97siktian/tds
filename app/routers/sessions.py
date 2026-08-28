@@ -414,6 +414,12 @@ def finalize_session(session_id: int, payload: SessionFinalizeRequest, db: Sessi
 def retry_session_issue(session_id: int, db: Session = Depends(get_transaction_db)) -> dict:
     try:
         result = repositories.retry_session_issue(db, session_id)
+        # If entrance was just retried, kiosk shouldn't run yet - it'll be set up
+        # automatically once entrance actually finishes. If kiosk was already
+        # restarted directly (need_review path), ensure-kiosk would just no-op
+        # since a kiosk video already exists, so skip the redundant call.
+        if result.get("retried_stage") == "entrance" or "kiosk_retry" in result:
+            return result
         inserted_video_asset_ids = workflow_service.ensure_kiosk_video_assets_for_session(db, session_id)
         return {
             **result,
