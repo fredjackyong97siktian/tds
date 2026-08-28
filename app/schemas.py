@@ -531,7 +531,7 @@ class VideoAssetListItem(BaseModel):
     location_id: int | None = None
     section: str
     sequence_no: int | None = None
-    video_url: str
+    video_url: str | None = None
     file_path: str | None = None
     captured_start_time: datetime | None = None
     captured_end_time: datetime | None = None

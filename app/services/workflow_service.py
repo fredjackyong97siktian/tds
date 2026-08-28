@@ -5432,6 +5432,17 @@ def force_deep_analysis_for_confidence_result(db: Session, confidence_result_id:
         db, sorted(set(entry_trigger_ids + exit_trigger_ids))
     )
 
+    # In the automatic pipeline, kiosk retrieval only gets queued once entrance
+    # video analysis detects the exit (_maybe_close_session_and_prepare_kiosk),
+    # which can take a while. Here the exit trigger (and so the session's
+    # end_time) is already known synchronously from the grouping result, so
+    # there's no need to wait on that async cascade - queue kiosk directly now,
+    # same as the manual session-create flow in routers/sessions.py does.
+    if exit_trigger_ids:
+        session = repositories.get_session(db, session_id)
+        if session.get("end_time") is not None:
+            queued_video_asset_ids.update(ensure_kiosk_video_assets_for_session(db, session_id))
+
     updated_reason = str(row.get("reason") or "").strip()
     updated_reason = f"{updated_reason}; manual_deep_analysis_override" if updated_reason else "manual_deep_analysis_override"
     repositories.upsert_filter_confidence_result(
