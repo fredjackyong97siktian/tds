@@ -3836,11 +3836,17 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
     max_images = _grouping_gemini_max_images_per_request()
     pending_triggers: list[dict[str, Any]] = list(trigger_inputs)
     carry_forward_entries: dict[int, dict[str, Any]] = {}
-    # How many extra chunks an unresolved open entry gets re-sent into before we
-    # stop and leave it for the next scheduled batch to pick up via cross-batch
-    # carryover instead of paying for it again in every remaining chunk here.
-    MAX_OPEN_ENTRY_CARRY_FORWARD_CHUNKS = 2
-    carry_forward_retry_counts: dict[int, int] = {}
+    # How long (in trigger-clock time, not chunk count) an unresolved open entry
+    # keeps getting re-sent before we give up and leave it for the next scheduled
+    # batch to pick up via cross-batch carryover. A chunk-count cap is unfair
+    # during a burst of foot traffic - each chunk fills up on images fast, so a
+    # fixed number of chunks covers only a few real minutes - while during a
+    # quiet stretch the same cap would cover hours. Anchoring to real elapsed
+    # time instead gives every entry the same real-world window regardless of
+    # how busy the store is. Based on actual matched entry->exit gaps (median
+    # ~2min, p90 ~5min, p95 ~12min), 20 minutes covers the vast majority of
+    # genuine matches without chasing rare multi-hour stragglers live.
+    open_entry_max_wait = timedelta(minutes=max(1, int(settings.grouping_open_entry_max_wait_minutes)))
     chunks: list[list[dict[str, Any]]] = []
 
     model_name = str(settings.grouping_gemini_model or "gemini-3.5-flash-lite").strip()
@@ -3877,9 +3883,6 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
             trigger_input = trigger_input_by_id.get(trigger_id)
             if trigger_input is not None:
                 carry_forward_entries[trigger_id] = trigger_input
-                # It was matched (then disputed) rather than genuinely unresolved,
-                # so give it a fresh retry budget instead of inheriting a stale count.
-                carry_forward_retry_counts[trigger_id] = 0
         for trigger_id in released["exit"]:
             grouped_trigger_ids.discard(trigger_id)
             normalized_unknown.add(trigger_id)
@@ -4161,15 +4164,20 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
         # dropped from the carry-forward set (an "all unknown" chunk simply stops there
         # instead of being retried). A customer who genuinely hasn't exited yet would
         # otherwise get re-sent at full image cost into every remaining chunk of the
-        # batch - capping it at a couple of retries lets prepare_due_grouping_batches'
+        # batch - cutting it off once real trigger-clock time has moved more than
+        # open_entry_max_wait past its own entry time lets prepare_due_grouping_batches'
         # cross-batch carryover pick it back up in a later scheduled batch instead.
+        next_trigger_time = _coerce_datetime_value(pending_triggers[0].get("trigger_time")) if pending_triggers else None
         chunk_ids = {int(trigger_input["trigger_id"]) for trigger_input in chunk}
         for trigger_id in chunk_ids:
             if trigger_id in normalized_open_entries:
-                carried_count = carry_forward_retry_counts.get(trigger_id, 0)
-                if carried_count < MAX_OPEN_ENTRY_CARRY_FORWARD_CHUNKS:
+                keep_carrying = True
+                if next_trigger_time is not None:
+                    entry_trigger_time = _coerce_datetime_value(trigger_input_by_id[trigger_id].get("trigger_time"))
+                    if entry_trigger_time is not None and next_trigger_time - entry_trigger_time > open_entry_max_wait:
+                        keep_carrying = False
+                if keep_carrying:
                     carry_forward_entries[trigger_id] = trigger_input_by_id[trigger_id]
-                    carry_forward_retry_counts[trigger_id] = carried_count + 1
                 else:
                     carry_forward_entries.pop(trigger_id, None)
             else:
