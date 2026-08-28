@@ -178,6 +178,14 @@ def retry_confidence_result(confidence_result_id: int, db: Session = Depends(get
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.post("/confidence-results/{confidence_result_id}/force-deep-analysis")
+def force_deep_analysis(confidence_result_id: int, db: Session = Depends(get_transaction_db)) -> dict[str, Any]:
+    try:
+        return workflow_service.force_deep_analysis_for_confidence_result(db, confidence_result_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.delete("/confidence-results/{confidence_result_id}")
 def delete_confidence_result(confidence_result_id: int, db: Session = Depends(get_transaction_db)) -> dict[str, Any]:
     try:

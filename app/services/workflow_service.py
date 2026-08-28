@@ -2251,31 +2251,30 @@ def _group_trigger_id_list(value: Any) -> list[int]:
     return trigger_ids
 
 
-def _person_frame_urls_by_trigger(grouping_summary: Mapping[str, Any]) -> dict[int, list[str]]:
+def _person_frame_urls_by_trigger(db: Session, batch_id: int | None) -> dict[int, list[str]]:
+    # This used to read grouping_summary["diagnostics"] expecting a list of
+    # per-trigger {trigger_id, samples: [{person_count, image_url}]} entries
+    # from an older person-detection pre-pass. The current gemini-direct
+    # pipeline's diagnostics is a {"mode", "model", "chunks": [...]} dict
+    # instead, so that lookup always returned nothing and this repair pass
+    # silently never ran on any batch. Pull frame URLs from the grouping
+    # items themselves instead - the same source _run_gemini_grouping_for_batch
+    # uses - which works regardless of diagnostics shape.
     frames_by_trigger: dict[int, list[str]] = {}
-    diagnostics = grouping_summary.get("diagnostics")
-    if not isinstance(diagnostics, list):
+    if batch_id is None:
         return frames_by_trigger
-    for diagnostic in diagnostics:
-        if not isinstance(diagnostic, Mapping):
+    for item in repositories.list_grouping_items(db, batch_id):
+        trigger_id = item.get("trigger_id")
+        if trigger_id is None:
             continue
-        try:
-            trigger_id = int(diagnostic.get("trigger_id"))
-        except (TypeError, ValueError):
-            continue
-        frame_urls: list[str] = []
-        for sample in diagnostic.get("samples") or []:
-            if not isinstance(sample, Mapping):
-                continue
-            try:
-                person_count = int(sample.get("person_count") or 0)
-            except (TypeError, ValueError):
-                person_count = 0
-            image_url = str(sample.get("image_url") or "").strip()
-            if person_count > 0 and image_url and image_url not in frame_urls:
-                frame_urls.append(image_url)
+        frame_payload = item.get("frame_payload") if isinstance(item.get("frame_payload"), Mapping) else {}
+        frame_urls = [
+            str(frame.get("image_url") or "").strip()
+            for frame in (frame_payload.get("frames") or [])
+            if isinstance(frame, Mapping) and str(frame.get("image_url") or "").strip()
+        ]
         if frame_urls:
-            frames_by_trigger[trigger_id] = frame_urls[:6]
+            frames_by_trigger[int(trigger_id)] = frame_urls[:6]
     return frames_by_trigger
 
 
@@ -2311,7 +2310,7 @@ def _repair_grouping_with_gemini(
     if not open_groups and not unknown_trigger_ids:
         return grouping_summary
 
-    frames_by_trigger = _person_frame_urls_by_trigger(grouping_summary)
+    frames_by_trigger = _person_frame_urls_by_trigger(db, batch_id)
     candidate_trigger_ids: list[int] = []
     for group in open_groups:
         for trigger_id in _group_trigger_id_list(group.get("entry")):
@@ -3200,9 +3199,12 @@ def _period_window_for_datetime(period: Mapping[str, Any], value: datetime) -> t
 
 
 def _is_recently_completed_grouping_window(window_end: datetime, current: datetime) -> bool:
-    # Scheduled grouping should not catch up old missed periods after a setting is enabled.
-    grace_seconds = max(60, int(settings.grouping_poll_seconds or 30) * 4)
-    return window_end <= current < window_end + timedelta(seconds=grace_seconds)
+    # Scheduled grouping should not catch up old missed periods after a setting is
+    # enabled. This also bounds how long prepare_due_grouping_batches will keep
+    # waiting for straggling frame retrievals to finish for a window (see
+    # has_pending_trigger_frame_retrieval_in_window below) before giving up on it.
+    grace_minutes = max(1, int(settings.grouping_window_grace_minutes or 20))
+    return window_end <= current < window_end + timedelta(minutes=grace_minutes)
 
 
 def _period_code_for_datetime(db: Session, location_id: int, value: datetime | None) -> str | None:
@@ -3356,16 +3358,44 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
             if existing is not None:
                 continue
 
+            # Only pull in triggers from this exact window, plus a short buffer just
+            # before it starts (for an entry that fired a few minutes before the
+            # boundary and is still waiting on its exit) - not "however old and still
+            # unresolved", which let multi-day-old orphaned triggers keep getting
+            # swept into every future batch forever with no way to age out.
+            carry_forward_cutoff = window_start - timedelta(
+                minutes=max(0, int(settings.grouping_carry_forward_buffer_minutes))
+            )
+            # Don't lock in this window's trigger set while some of its own triggers
+            # are still mid-retrieval, or only partially retrieved (fewer than the
+            # expected frame count) - wait (up to the grace window above) for
+            # everything to finish first, rather than snapshotting a partial batch.
+            expected_frame_count = _grouping_frames_per_trigger()
+            repositories.requeue_incomplete_trigger_frame_assets_in_window(
+                db,
+                location_id=location_id,
+                window_start=carry_forward_cutoff,
+                window_end=window_end,
+                min_frame_count=expected_frame_count,
+            )
+            if repositories.has_pending_trigger_frame_retrieval_in_window(
+                db,
+                location_id=location_id,
+                window_start=carry_forward_cutoff,
+                window_end=window_end,
+                min_frame_count=expected_frame_count,
+            ):
+                continue
+
             current_window_rows: list[dict[str, Any]] = []
             carried_over_rows: list[dict[str, Any]] = []
             for row in ready_assets:
                 grouping_time = _grouping_time_from_trigger_frame_asset(row)
                 if grouping_time is None:
                     continue
-                window = _period_window_for_local_datetime(period, grouping_time)
-                if window == (window_start, window_end):
+                if window_start <= grouping_time < window_end:
                     current_window_rows.append(row)
-                elif window is not None and window[1] <= window_start:
+                elif carry_forward_cutoff <= grouping_time < window_start:
                     carried_over_rows.append(row)
             trigger_assets = current_window_rows + carried_over_rows
             if not trigger_assets:
@@ -4033,6 +4063,17 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
                 continue
 
             entry_trigger_id = entry_ids[0]
+
+            # trigger_id is assigned in the same chronological order as trigger_time,
+            # so a real exit can never have a smaller id than its own entry. This
+            # catches cases like the exit-precedes-entry mixup Gemini sometimes makes
+            # (e.g. matching an exit against a superficially similar person from an
+            # earlier, unrelated visit) without spending a verification call on it.
+            exit_ids = [exit_id for exit_id in exit_ids if exit_id > entry_trigger_id]
+            if not exit_ids:
+                normalized_open_entries.add(entry_trigger_id)
+                continue
+
             # A visually confirmed entry without a phone/credit card id is still a
             # real session - it just has no confirmed identity anchor. Rather than
             # discarding it, form the group and carry that fact through to the
@@ -5310,6 +5351,115 @@ def _ensure_session_for_confidence_group(
         )
 
     return session
+
+
+def force_deep_analysis_for_confidence_result(db: Session, confidence_result_id: int) -> dict[str, Any]:
+    row = repositories.get_filter_confidence_result(db, confidence_result_id)
+    if row is None:
+        raise ValueError(f"Confidence result {confidence_result_id} was not found.")
+    batch_id = int(row["batch_id"])
+    location_id = int(row["location_id"])
+    factor_payload = row.get("factor_payload") if isinstance(row.get("factor_payload"), Mapping) else {}
+
+    def _ids_from_payload(key: str) -> list[int]:
+        values = factor_payload.get(key)
+        if not isinstance(values, list):
+            return []
+        ids: list[int] = []
+        for value in values:
+            try:
+                ids.append(int(value))
+            except (TypeError, ValueError):
+                continue
+        return ids
+
+    entry_trigger_ids = _ids_from_payload("entry_trigger_ids")
+    exit_trigger_ids = _ids_from_payload("exit_trigger_ids")
+    if not entry_trigger_ids:
+        raise ValueError("This confidence result has no entry trigger recorded to run deep analysis on.")
+    entry_has_identity = bool(factor_payload.get("entry_has_identity", True))
+
+    trigger_rows: dict[int, dict[str, Any]] = {}
+    for trigger_id in sorted(set(entry_trigger_ids + exit_trigger_ids)):
+        try:
+            trigger_rows[trigger_id] = repositories.get_trigger(db, trigger_id)
+        except Exception:
+            logger.exception("Could not load trigger while forcing deep analysis trigger_id=%s", trigger_id)
+
+    session = _ensure_session_for_confidence_group(
+        db,
+        location_id=location_id,
+        entry_trigger_ids=entry_trigger_ids,
+        exit_trigger_ids=exit_trigger_ids,
+        entry_has_identity=entry_has_identity,
+    )
+    if session is None:
+        raise ValueError("Could not create a session for this group - its entry trigger does not belong to this location.")
+    session_id = int(session["id"])
+    repositories.update_session_grouping_link(db, session_id=session_id, grouping_id=batch_id)
+
+    queued_video_asset_ids: set[int] = set()
+    for trigger_id in entry_trigger_ids:
+        trigger = trigger_rows.get(trigger_id)
+        if trigger is None:
+            continue
+        video_asset_id = _queue_l1_video_for_trigger(
+            db,
+            session_id=session_id,
+            location_id=location_id,
+            trigger=trigger,
+            video_section="entrance",
+            link_section="entry",
+        )
+        if video_asset_id is not None:
+            queued_video_asset_ids.add(video_asset_id)
+    for trigger_id in exit_trigger_ids:
+        trigger = trigger_rows.get(trigger_id)
+        if trigger is None:
+            continue
+        video_asset_id = _queue_l1_video_for_trigger(
+            db,
+            session_id=session_id,
+            location_id=location_id,
+            trigger=trigger,
+            video_section="entrance",
+            link_section="exit",
+        )
+        if video_asset_id is not None:
+            queued_video_asset_ids.add(video_asset_id)
+
+    promoted_count = repositories.promote_trigger_video_assets_to_full_retrieval(
+        db, sorted(set(entry_trigger_ids + exit_trigger_ids))
+    )
+
+    updated_reason = str(row.get("reason") or "").strip()
+    updated_reason = f"{updated_reason}; manual_deep_analysis_override" if updated_reason else "manual_deep_analysis_override"
+    repositories.upsert_filter_confidence_result(
+        db,
+        batch_id=batch_id,
+        group_key=str(row.get("group_key") or ""),
+        location_id=location_id,
+        score=float(row.get("score") or 0),
+        need_deep_analysis=True,
+        reason=updated_reason,
+        factor_payload=factor_payload,
+    )
+    logger.info(
+        "Manually forced deep analysis confidence_result_id=%s batch_id=%s session_id=%s queued_video_assets=%s promoted_count=%s",
+        confidence_result_id,
+        batch_id,
+        session_id,
+        sorted(queued_video_asset_ids),
+        promoted_count,
+    )
+    return {
+        "ok": True,
+        "confidence_result_id": confidence_result_id,
+        "batch_id": batch_id,
+        "session_id": session_id,
+        "queued_video_asset_ids": sorted(queued_video_asset_ids),
+        "promoted_count": promoted_count,
+    }
 
 
 def _queue_l1_video_for_trigger(

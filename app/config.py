@@ -61,6 +61,8 @@ class Settings(BaseSettings):
     trigger_frame_crop_left_fraction: float = 0.40
     grouping_open_entry_stale_hours: int = 6
     grouping_open_entry_max_wait_minutes: int = 30
+    grouping_carry_forward_buffer_minutes: int = 30
+    grouping_window_grace_minutes: int = 20
     time_period_timezone: str = "Asia/Kuala_Lumpur"
     grouping_poll_seconds: int = 30
     grouping_max_global_workers: int = 1

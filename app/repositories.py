@@ -1875,6 +1875,111 @@ def list_trigger_frame_assets_for_window(
     return rows
 
 
+def has_pending_trigger_frame_retrieval_in_window(
+    db: Session,
+    *,
+    location_id: int,
+    window_start: Any,
+    window_end: Any,
+    min_frame_count: int = 1,
+) -> bool:
+    # A trigger with no frame_asset row yet (retrieval not even queued), one
+    # still short of a terminal state ('retrieved' or 'issue'), or one marked
+    # 'retrieved' with fewer than min_frame_count successfully-captured frames
+    # (the retrieval job marks the whole asset 'retrieved' the moment even one
+    # frame out of five succeeds) all mean this window's data isn't actually
+    # complete yet - forming a batch now would silently snapshot a partial or
+    # near-empty trigger set, exactly like trigger 454 and 410 slipping through.
+    trigger_table = _table("trigger_event")
+    frame_asset_table = _table("trigger_frame_asset")
+    frame_table = _table("trigger_frame")
+    result = db.execute(
+        text(
+            f"""
+            select 1
+            from {trigger_table} te
+            left join {frame_asset_table} fa on fa.trigger_id = te.id
+            left join (
+                select frame_asset_id, count(*) as ok_count
+                from {frame_table}
+                where status = 'ok'
+                group by frame_asset_id
+            ) okc on okc.frame_asset_id = fa.id
+            where te.location_id = :location_id
+              and te.trigger_time >= :window_start
+              and te.trigger_time < :window_end
+              and te.whitelist_hit = 0
+              and te.status <> 'whitelisted'
+              and (
+                  fa.id is null
+                  or fa.status not in ('retrieved', 'issue')
+                  or (fa.status = 'retrieved' and coalesce(okc.ok_count, 0) < :min_frame_count)
+              )
+            limit 1
+            """
+        ),
+        {
+            "location_id": location_id,
+            "window_start": window_start,
+            "window_end": window_end,
+            "min_frame_count": max(1, int(min_frame_count)),
+        },
+    )
+    return result.first() is not None
+
+
+def requeue_incomplete_trigger_frame_assets_in_window(
+    db: Session,
+    *,
+    location_id: int,
+    window_start: Any,
+    window_end: Any,
+    min_frame_count: int,
+    cooldown_seconds: int = 120,
+) -> int:
+    # Give a partially-retrieved asset another shot at filling in the missing
+    # frames, rate-limited so a persistently-broken trigger (e.g. the camera
+    # genuinely had nothing for that offset) doesn't get re-run every single
+    # poll tick for the whole grace window.
+    trigger_table = _table("trigger_event")
+    frame_asset_table = _table("trigger_frame_asset")
+    frame_table = _table("trigger_frame")
+    result = db.execute(
+        text(
+            f"""
+            update {frame_asset_table} fa
+            join {trigger_table} te on te.id = fa.trigger_id
+            left join (
+                select frame_asset_id, count(*) as ok_count
+                from {frame_table}
+                where status = 'ok'
+                group by frame_asset_id
+            ) okc on okc.frame_asset_id = fa.id
+            set fa.status = 'not_retrieved',
+                fa.error = null,
+                fa.updated_at = now()
+            where te.location_id = :location_id
+              and te.trigger_time >= :window_start
+              and te.trigger_time < :window_end
+              and te.whitelist_hit = 0
+              and te.status <> 'whitelisted'
+              and fa.status = 'retrieved'
+              and coalesce(okc.ok_count, 0) < :min_frame_count
+              and fa.updated_at < date_sub(now(), interval :cooldown_seconds second)
+            """
+        ),
+        {
+            "location_id": location_id,
+            "window_start": window_start,
+            "window_end": window_end,
+            "min_frame_count": max(1, int(min_frame_count)),
+            "cooldown_seconds": max(1, int(cooldown_seconds)),
+        },
+    )
+    db.commit()
+    return int(result.rowcount or 0)
+
+
 def list_manual_grouping_ready_trigger_frame_assets(
     db: Session,
     *,
@@ -2648,9 +2753,14 @@ def mark_stale_open_entry_frame_assets_issue(
     location_id: int,
     cutoff_time: Any,
 ) -> int:
+    # Catches any retrieved-but-never-resolved frame asset past the cutoff,
+    # regardless of whether it ever made it into a completed batch - a trigger
+    # that was retrieved but, for whatever reason, never got swept into a
+    # successful batch at all previously fell through this check entirely
+    # (no qualifying prior grouping_item row to match against) and would sit
+    # as "ready" and keep getting pulled into every future batch forever.
     frame_asset_table = _table("trigger_frame_asset")
     grouping_item_table = _table("filter_grouping_item")
-    grouping_batch_table = _table("filter_grouping_batch")
     result = db.execute(
         text(
             f"""
@@ -2661,16 +2771,6 @@ def mark_stale_open_entry_frame_assets_issue(
             where fa.location_id = :location_id
               and fa.status = 'retrieved'
               and fa.start_time < :cutoff_time
-              and exists (
-                  select 1
-                  from {grouping_item_table} gi
-                  join {grouping_batch_table} gb on gb.id = gi.batch_id
-                  where gi.trigger_id = fa.trigger_id
-                    and gb.status = 'success'
-                    and gi.status = 'unknown'
-                    and gi.role = 'unknown'
-                    and json_unquote(json_extract(gi.result_payload, '$.reason')) = 'open_entry_waiting_for_exit'
-              )
               and not exists (
                   select 1
                   from {grouping_item_table} grouped_gi
@@ -3141,6 +3241,31 @@ def list_filter_confidence_results(
                 row["session_window_start"] = row.get("session_window_start") or min(fallback_times)
                 row["session_window_end"] = max(fallback_times)
     return rows
+
+
+def get_filter_confidence_result(db: Session, confidence_result_id: int) -> dict[str, Any] | None:
+    confidence_table = _table("filter_confidence_result")
+    result = db.execute(
+        text(
+            f"""
+            select id, batch_id, group_key, location_id, score, need_deep_analysis, reason, factor_payload
+            from {confidence_table}
+            where id = :confidence_result_id
+            limit 1
+            """
+        ),
+        {"confidence_result_id": confidence_result_id},
+    )
+    row = result.mappings().first()
+    if row is None:
+        return None
+    payload = dict(row)
+    if isinstance(payload.get("factor_payload"), str):
+        try:
+            payload["factor_payload"] = json.loads(payload["factor_payload"])
+        except json.JSONDecodeError:
+            pass
+    return payload
 
 
 def retry_filter_confidence_result(db: Session, confidence_result_id: int) -> dict[str, Any]:
