@@ -1416,9 +1416,14 @@ def get_trigger_frame_asset(db: Session, frame_asset_id: int) -> dict[str, Any]:
 
 
 def retry_trigger_frame_asset_issue(db: Session, frame_asset_id: int) -> dict[str, Any]:
+    # Also allows retrying a 'retrieved' asset that only got a partial frame
+    # set (e.g. 2/5 frames) - the retrieval job marks the whole asset
+    # 'retrieved' once even one frame succeeds, so completeness has to be
+    # judged by the caller (the frontend shows this button whenever the
+    # frame count looks short) rather than gatekept purely on status here.
     frame_asset = get_trigger_frame_asset(db, frame_asset_id)
-    if str(frame_asset.get("status") or "") != "issue":
-        raise ValueError("This trigger frame asset is not in issue state.")
+    if str(frame_asset.get("status") or "") not in {"issue", "retrieved"}:
+        raise ValueError("This trigger frame asset is not in a retryable state.")
     frame_asset_table = _table("trigger_frame_asset")
     result = db.execute(
         text(
@@ -1428,14 +1433,14 @@ def retry_trigger_frame_asset_issue(db: Session, frame_asset_id: int) -> dict[st
                 error = null,
                 updated_at = now()
             where id = :frame_asset_id
-              and status = 'issue'
+              and status in ('issue', 'retrieved')
             """
         ),
         {"frame_asset_id": frame_asset_id},
     )
     db.commit()
     if not result.rowcount:
-        raise ValueError("This trigger frame asset is not in issue state.")
+        raise ValueError("This trigger frame asset is not in a retryable state.")
     return get_trigger_frame_asset(db, frame_asset_id)
 
 
@@ -3635,7 +3640,14 @@ def list_video_assets(db: Session, limit: int = 50) -> list[dict[str, Any]]:
         ),
         {"limit": limit},
     )
-    return _fetch_all_dicts(result)
+    rows = _fetch_all_dicts(result)
+    for row in rows:
+        if isinstance(row.get("metadata"), str):
+            try:
+                row["metadata"] = json.loads(row["metadata"])
+            except json.JSONDecodeError:
+                pass
+    return rows
 
 
 def retry_video_asset_issue(db: Session, video_asset_id: int) -> dict[str, Any]:

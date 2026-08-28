@@ -1,11 +1,19 @@
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException
 
 from fastapi.responses import FileResponse, RedirectResponse
+from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
 from ..db import get_transaction_db
 from .. import repositories
-from ..spaces import generate_presigned_download_url, generate_public_object_url, is_spaces_public_read_enabled
+from ..spaces import (
+    _public_base_url,
+    generate_presigned_download_url,
+    generate_public_object_url,
+    is_spaces_public_read_enabled,
+)
 from ..schemas import VideoAssetCreate, VideoAssetListItem
 from ..storage import (
     guess_media_type,
@@ -16,12 +24,24 @@ from ..storage import (
 )
 
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/api/v1/videos", tags=["videos"])
+
+
+def _known_video_base_urls() -> tuple[str, ...]:
+    bases: list[str] = []
+    try:
+        bases.append(_public_base_url())
+    except RuntimeError:
+        pass
+    return tuple(bases)
 
 
 @router.get("/assets", response_model=list[VideoAssetListItem])
 def list_video_assets(limit: int = 50, db: Session = Depends(get_transaction_db)) -> list[VideoAssetListItem]:
     rows = repositories.list_video_assets(db, limit=limit)
+    known_bases = _known_video_base_urls()
     for row in rows:
         file_path = row.get("file_path")
         if (
@@ -38,9 +58,29 @@ def list_video_assets(limit: int = 50, db: Session = Depends(get_transaction_db)
                         if is_spaces_public_read_enabled()
                         else generate_presigned_download_url(spaces_object_key)
                     )
-                except RuntimeError:
+                except Exception:
+                    logger.exception("Could not build video URL for video_asset_id=%s", row.get("id"))
                     row["video_url"] = row.get("video_url") or ""
-    return [VideoAssetListItem(**row) for row in rows]
+        video_url = row.get("video_url")
+        # A relative path (our own /api/... fallback) is fine; anything else that
+        # doesn't point at our known Spaces base is unrecognized/malformed - don't
+        # surface it as a playable link, just treat the video as not-yet-available.
+        if (
+            known_bases
+            and isinstance(video_url, str)
+            and video_url
+            and not video_url.startswith("/")
+            and not video_url.startswith(known_bases)
+        ):
+            row["video_url"] = None
+
+    items: list[VideoAssetListItem] = []
+    for row in rows:
+        try:
+            items.append(VideoAssetListItem(**row))
+        except ValidationError:
+            logger.exception("Skipping malformed video_asset row id=%s", row.get("id"))
+    return items
 
 
 @router.post("/assets/{video_asset_id}/retry-issue")
