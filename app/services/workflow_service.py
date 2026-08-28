@@ -3365,7 +3365,7 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
                 window = _period_window_for_local_datetime(period, grouping_time)
                 if window == (window_start, window_end):
                     current_window_rows.append(row)
-                elif window[1] <= window_start:
+                elif window is not None and window[1] <= window_start:
                     carried_over_rows.append(row)
             trigger_assets = current_window_rows + carried_over_rows
             if not trigger_assets:

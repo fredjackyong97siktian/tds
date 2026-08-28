@@ -1,7 +1,7 @@
 import json
 import re
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import bindparam, text
@@ -1965,7 +1965,18 @@ def list_filter_time_periods(db: Session, *, selected_only: bool = False) -> lis
                 row["metadata"] = json.loads(row["metadata"])
             except json.JSONDecodeError:
                 pass
+        row["start_time"] = _mysql_time_value_to_clock_string(row.get("start_time"))
+        row["end_time"] = _mysql_time_value_to_clock_string(row.get("end_time"))
     return rows
+
+
+def _mysql_time_value_to_clock_string(value: Any) -> Any:
+    if isinstance(value, timedelta):
+        total_seconds = int(value.total_seconds()) % 86400
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return value
 
 
 def _normalize_mysql_time_value(value: Any) -> Any:
