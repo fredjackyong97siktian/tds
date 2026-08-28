@@ -3836,6 +3836,11 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
     max_images = _grouping_gemini_max_images_per_request()
     pending_triggers: list[dict[str, Any]] = list(trigger_inputs)
     carry_forward_entries: dict[int, dict[str, Any]] = {}
+    # How many extra chunks an unresolved open entry gets re-sent into before we
+    # stop and leave it for the next scheduled batch to pick up via cross-batch
+    # carryover instead of paying for it again in every remaining chunk here.
+    MAX_OPEN_ENTRY_CARRY_FORWARD_CHUNKS = 2
+    carry_forward_retry_counts: dict[int, int] = {}
     chunks: list[list[dict[str, Any]]] = []
 
     model_name = str(settings.grouping_gemini_model or "gemini-3.5-flash-lite").strip()
@@ -3872,6 +3877,9 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
             trigger_input = trigger_input_by_id.get(trigger_id)
             if trigger_input is not None:
                 carry_forward_entries[trigger_id] = trigger_input
+                # It was matched (then disputed) rather than genuinely unresolved,
+                # so give it a fresh retry budget instead of inheriting a stale count.
+                carry_forward_retry_counts[trigger_id] = 0
         for trigger_id in released["exit"]:
             grouped_trigger_ids.discard(trigger_id)
             normalized_unknown.add(trigger_id)
@@ -4151,11 +4159,19 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
         # Only triggers the model just reconfirmed as open_entries get another look in
         # a later chunk; anything grouped or marked unknown this round is final and is
         # dropped from the carry-forward set (an "all unknown" chunk simply stops there
-        # instead of being retried).
+        # instead of being retried). A customer who genuinely hasn't exited yet would
+        # otherwise get re-sent at full image cost into every remaining chunk of the
+        # batch - capping it at a couple of retries lets prepare_due_grouping_batches'
+        # cross-batch carryover pick it back up in a later scheduled batch instead.
         chunk_ids = {int(trigger_input["trigger_id"]) for trigger_input in chunk}
         for trigger_id in chunk_ids:
             if trigger_id in normalized_open_entries:
-                carry_forward_entries[trigger_id] = trigger_input_by_id[trigger_id]
+                carried_count = carry_forward_retry_counts.get(trigger_id, 0)
+                if carried_count < MAX_OPEN_ENTRY_CARRY_FORWARD_CHUNKS:
+                    carry_forward_entries[trigger_id] = trigger_input_by_id[trigger_id]
+                    carry_forward_retry_counts[trigger_id] = carried_count + 1
+                else:
+                    carry_forward_entries.pop(trigger_id, None)
             else:
                 carry_forward_entries.pop(trigger_id, None)
 
@@ -8227,7 +8243,12 @@ def _trigger_frame_offsets(duration_seconds: float, frame_count: int) -> list[fl
 def _selected_trigger_frame_offsets(duration_seconds: float) -> tuple[list[float], int]:
     planned_frame_count = max(1, int(settings.trigger_frame_count))
     selected_frame_count = min(planned_frame_count, _grouping_frames_per_trigger())
-    return _trigger_frame_offsets(duration_seconds, planned_frame_count)[:selected_frame_count], planned_frame_count
+    # Spread the frames we actually capture across the *entire* trigger window,
+    # not just its first slice - taking [:selected_frame_count] from offsets
+    # spaced for planned_frame_count only covered the first ~8s of a 40s
+    # window, so anyone who appeared later in the window was never captured
+    # at all and showed up as "no visible subject" despite a real entry id.
+    return _trigger_frame_offsets(duration_seconds, selected_frame_count), planned_frame_count
 
 
 def _run_trigger_frame_retrieval_job(
