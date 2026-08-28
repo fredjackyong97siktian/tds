@@ -61,6 +61,7 @@ def run_kiosk(
 @router.get("/script-runs", response_model=list[ScriptRunDetailResponse])
 def list_script_runs(
     limit: int = 100,
+    offset: int = 0,
     script_name: str | None = None,
     script_type: str | None = None,
     model_name: str | None = None,
@@ -69,11 +70,29 @@ def list_script_runs(
     rows = workflow_service.list_script_run_details(
         db,
         limit=max(1, min(limit, 500)),
+        offset=max(0, offset),
         script_name=script_name,
         script_type=script_type,
         model_name=model_name,
     )
     return [ScriptRunDetailResponse(**row) for row in rows]
+
+
+@router.get("/script-runs/count")
+def count_script_runs(
+    script_name: str | None = None,
+    script_type: str | None = None,
+    model_name: str | None = None,
+    db: Session = Depends(get_transaction_db),
+) -> dict[str, int]:
+    return {
+        "total": repositories.count_script_runs(
+            db,
+            script_name=script_name,
+            script_type=script_type,
+            model_name=model_name,
+        )
+    }
 
 
 @router.get("/script-runs/monthly-costs", response_model=ScriptRunMonthlyCostSummaryResponse)

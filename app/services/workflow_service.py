@@ -114,6 +114,7 @@ def list_script_run_details(
     db: Session,
     limit: int = 100,
     *,
+    offset: int = 0,
     script_name: str | None = None,
     script_type: str | None = None,
     model_name: str | None = None,
@@ -123,6 +124,7 @@ def list_script_run_details(
         for record in repositories.list_script_runs(
             db,
             limit=limit,
+            offset=offset,
             script_name=script_name,
             script_type=script_type,
             model_name=model_name,

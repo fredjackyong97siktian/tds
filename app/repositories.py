@@ -2674,18 +2674,14 @@ def mark_stale_open_entry_frame_assets_issue(
     return int(result.rowcount or 0)
 
 
-def list_script_runs(
-    db: Session,
-    limit: int = 100,
+def _script_run_list_filters(
     *,
-    script_name: str | None = None,
-    script_type: str | None = None,
-    model_name: str | None = None,
-) -> list[dict[str, Any]]:
-    script_run_table = _table("script_run")
-    cost_select = _script_run_cost_select(db, script_run_table)
+    script_name: str | None,
+    script_type: str | None,
+    model_name: str | None,
+) -> tuple[list[str], dict[str, Any]]:
     filters: list[str] = []
-    params: dict[str, Any] = {"limit": limit}
+    params: dict[str, Any] = {}
     if script_name:
         filters.append("script_name = :script_name")
         params["script_name"] = script_name
@@ -2697,6 +2693,27 @@ def list_script_runs(
         filters.append("model_name like 'gemini_%'")
     elif normalized_type == "runpod":
         filters.append("(model_name = 'runpod_runner' or runner_job_id is not null)")
+    return filters, params
+
+
+def list_script_runs(
+    db: Session,
+    limit: int = 100,
+    *,
+    offset: int = 0,
+    script_name: str | None = None,
+    script_type: str | None = None,
+    model_name: str | None = None,
+) -> list[dict[str, Any]]:
+    script_run_table = _table("script_run")
+    cost_select = _script_run_cost_select(db, script_run_table)
+    filters, params = _script_run_list_filters(
+        script_name=script_name,
+        script_type=script_type,
+        model_name=model_name,
+    )
+    params["limit"] = limit
+    params["offset"] = offset
     where_clause = f"where {' and '.join(filters)}" if filters else ""
     result = db.execute(
         text(
@@ -2707,6 +2724,7 @@ def list_script_runs(
             {where_clause}
             order by started_at desc, id desc
             limit :limit
+            offset :offset
             """
         ),
         params,
@@ -2719,6 +2737,34 @@ def list_script_runs(
             except json.JSONDecodeError:
                 pass
     return rows
+
+
+def count_script_runs(
+    db: Session,
+    *,
+    script_name: str | None = None,
+    script_type: str | None = None,
+    model_name: str | None = None,
+) -> int:
+    script_run_table = _table("script_run")
+    filters, params = _script_run_list_filters(
+        script_name=script_name,
+        script_type=script_type,
+        model_name=model_name,
+    )
+    where_clause = f"where {' and '.join(filters)}" if filters else ""
+    result = db.execute(
+        text(
+            f"""
+            select count(*) as total
+            from {script_run_table}
+            {where_clause}
+            """
+        ),
+        params,
+    )
+    row = result.mappings().first()
+    return int(row["total"]) if row and row.get("total") is not None else 0
 
 
 def list_pending_theft_confidence_batches(db: Session, limit: int = 50) -> list[dict[str, Any]]:
