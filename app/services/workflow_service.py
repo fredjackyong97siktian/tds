@@ -8412,19 +8412,7 @@ def _trigger_frame_offsets(duration_seconds: float, frame_count: int) -> list[fl
 def _selected_trigger_frame_offsets(duration_seconds: float) -> tuple[list[float], int]:
     planned_frame_count = max(1, int(settings.trigger_frame_count))
     selected_frame_count = min(planned_frame_count, _grouping_frames_per_trigger())
-    # The capture window itself is heavily asymmetric around the trigger time
-    # (observed ~35s before it, ~5s after) - the customer is almost never
-    # visible in the first two-thirds of that window, only near the end where
-    # it's close to the actual trigger moment. Spreading frames across the
-    # *entire* window (the previous fix, which corrected an even worse bug
-    # where only the first ~8s of 40s was ever sampled) wastes most of the
-    # budget on that near-guaranteed-empty lead-in. Concentrate the frames we
-    # actually capture into just the tail of the window instead.
-    recent_window_seconds = max(1.0, min(float(duration_seconds), float(settings.trigger_frame_recent_window_seconds or duration_seconds)))
-    window_start_offset = max(0.0, duration_seconds - recent_window_seconds)
-    relative_offsets = _trigger_frame_offsets(duration_seconds - window_start_offset, selected_frame_count)
-    offsets = [window_start_offset + value for value in relative_offsets]
-    return offsets, planned_frame_count
+    return _trigger_frame_offsets(duration_seconds, planned_frame_count)[:selected_frame_count], planned_frame_count
 
 
 def _run_trigger_frame_retrieval_job(
