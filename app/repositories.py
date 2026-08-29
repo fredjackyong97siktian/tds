@@ -2154,6 +2154,21 @@ def upsert_filter_time_period(db: Session, payload: Mapping[str, Any]) -> dict[s
     return _fetch_one_dict(result)
 
 
+def delete_filter_time_period(db: Session, *, period_code: str, location_id: int | None = None) -> None:
+    table_name = _table("filter_time_period")
+    db.execute(
+        text(
+            f"""
+            delete from {table_name}
+            where ((location_id is null and :location_id is null) or location_id = :location_id)
+              and period_code = :period_code
+            """
+        ),
+        {"location_id": location_id, "period_code": period_code},
+    )
+    db.commit()
+
+
 def list_filter_factors(db: Session) -> list[dict[str, Any]]:
     table_name = _table("filter_factor")
     result = db.execute(

@@ -82,6 +82,19 @@ def upsert_time_period(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.delete("/time-periods/{period_code}")
+def delete_time_period(
+    period_code: str,
+    location_id: int | None = None,
+    db: Session = Depends(get_transaction_db),
+) -> dict[str, Any]:
+    try:
+        repositories.delete_filter_time_period(db, period_code=period_code, location_id=location_id)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True}
+
+
 @router.get("/factors")
 def list_factors(db: Session = Depends(get_transaction_db)) -> list[dict[str, Any]]:
     return repositories.list_filter_factors(db)
