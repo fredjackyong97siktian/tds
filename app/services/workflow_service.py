@@ -5185,13 +5185,16 @@ def _evaluate_carry_item_signal_with_ai(
         "You are a retail theft confidence reviewer. Decide whether a customer's exit carrying state is suspicious "
         "after comparing entry carry evidence, exit carry evidence, and paid receipt item details. "
         "Flag only when the exit bag/plastic bag/container/items are not reasonably explained by the paid transaction. "
-        "If visual carry evidence is missing or weak, return hit=false and reason='insufficient_visual_carry_evidence' instead of guessing. "
+        "If visual carry evidence is missing or too weak to make a real determination either way, do not guess - set "
+        "insufficient_evidence=true and reason='insufficient_visual_carry_evidence'. This is a separate signal from hit: "
+        "it means a human or deeper video analysis needs to look at this case because the evidence here wasn't enough "
+        "to clear it, not that it's confirmed innocent. "
         "Examples: entry empty-handed then exit with a large red woven bag while receipt has only one small drink = suspicious. "
         "Entry already carrying the same bag and exit still carrying it = usually not suspicious. "
         "Exit carrying a normal plastic bag with several paid items that fit inside = usually reasonable. "
         "Use item names, quantity, likely physical size, and total value. Be conservative when evidence is unclear. "
         "Return strict JSON only with schema: "
-        '{"hit":true|false,"score":number,"reason":string,"entry_bag_count":integer,'
+        '{"hit":true|false,"insufficient_evidence":true|false,"score":number,"reason":string,"entry_bag_count":integer,'
         '"exit_bag_count":integer,"reasonable_with_receipt":true|false,'
         '"evidence_summary":string,"suspicious_objects":[string]}. '
         f"Input: {json.dumps(runner_payload, default=str)}"
@@ -5206,6 +5209,7 @@ def _evaluate_carry_item_signal_with_ai(
         cost_detail = _record_gemini_cost(db, script_run_id, meta)
         normalized = {
             "hit": _as_boolish(result.get("hit")),
+            "insufficient_evidence": _as_boolish(result.get("insufficient_evidence")),
             "score": _coerce_number(result.get("score"), 0.0),
             "reason": str(result.get("reason") or "carry_ai"),
             "source": "gemini_carry_confidence",
@@ -5241,6 +5245,9 @@ def _evaluate_carry_item_signal_with_ai(
         )
         return {
             "hit": legacy_hit,
+            # The AI call itself failed, so we genuinely don't know either way -
+            # that's exactly the "can't clear it" case, not a confirmed pass.
+            "insufficient_evidence": True,
             "score": carry_evidence["legacy_carry_score"],
             "reason": "carry_ai_failed_legacy_fallback" if legacy_hit else "carry_ai_failed",
             "source": "legacy_carry_fallback",
@@ -5953,7 +5960,10 @@ def _run_theft_confidence_for_grouping_batch_locked(
             factor_details=factor_details,
             factors=factor_settings,
             factor_code="carry_item_signal",
-            hit=_as_boolish(carry_ai_result.get("hit")),
+            # Insufficient evidence means we couldn't clear this case, not that
+            # it's confirmed innocent - route it to deep analysis the same as a
+            # real hit rather than letting an unclear case pass silently.
+            hit=_as_boolish(carry_ai_result.get("hit")) or _as_boolish(carry_ai_result.get("insufficient_evidence")),
             reason="carry_item_signal",
             evidence=carry_ai_result,
         ):
