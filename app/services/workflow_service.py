@@ -3340,11 +3340,15 @@ def _period_window_for_datetime(period: Mapping[str, Any], value: datetime) -> t
 
 
 def _is_recently_completed_grouping_window(window_end: datetime, current: datetime) -> bool:
-    # Scheduled grouping should not catch up old missed periods after a setting is
-    # enabled. This also bounds how long prepare_due_grouping_batches will keep
-    # waiting for straggling frame retrievals to finish for a window (see
-    # has_pending_trigger_frame_retrieval_in_window below) before giving up on it.
-    grace_minutes = max(1, int(settings.grouping_window_grace_minutes or 20))
+    # Bounds both (a) how long prepare_due_grouping_batches will keep waiting for
+    # straggling frame retrievals to finish for a window (see
+    # has_pending_trigger_frame_retrieval_in_window below), and (b) how long a
+    # window stays eligible to be picked up at all if the worker itself was down
+    # (a restart/rebuild) when it closed. Kept generous (hours, not minutes) so a
+    # brief outage doesn't permanently orphan that period's triggers - it does NOT
+    # mean scheduled grouping will backfill old windows indefinitely; a
+    # newly-enabled period still only reaches back this far, not to its full history.
+    grace_minutes = max(1, int(settings.grouping_window_grace_minutes or 240))
     return window_end <= current < window_end + timedelta(minutes=grace_minutes)
 
 
