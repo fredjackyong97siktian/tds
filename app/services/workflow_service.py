@@ -1142,6 +1142,128 @@ def _call_kiosk_gemini_summary(
     }
 
 
+def _call_deepseek_vision_summary(
+    *,
+    prompt: str,
+    image_urls: list[str],
+    model_name: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    api_key = str(settings.deepseek_api_key or os.environ.get("DEEPSEEK_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("DeepSeek API key is not configured in tds_api. Set THEFT_API_DEEPSEEK_API_KEY.")
+    if not image_urls:
+        raise RuntimeError("No image URLs were provided for the DeepSeek vision call.")
+
+    selected_model = str(model_name or settings.deepseek_vision_model).strip()
+    content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    for image_url in image_urls:
+        content.append({"type": "image_url", "image_url": {"url": image_url}})
+
+    request_body = {
+        "model": selected_model,
+        "messages": [{"role": "user", "content": content}],
+        "response_format": {"type": "json_object"},
+    }
+    url = f"{str(settings.deepseek_base_url).rstrip('/')}/chat/completions"
+    request = Request(
+        url,
+        data=json.dumps(request_body).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=settings.deepseek_timeout_seconds) as response:
+            raw_body = response.read().decode("utf-8", errors="replace")
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"DeepSeek request failed with HTTP {exc.code}: {detail[:1000]}") from exc
+
+    parsed = json.loads(raw_body)
+    choices = parsed.get("choices") or []
+    message_content = str(((choices[0] or {}).get("message") or {}).get("content") or "") if choices else ""
+    result = _extract_json_object(message_content)
+    raw_usage = parsed.get("usage") or {}
+    return result, {
+        "provider": "tds_api_deepseek",
+        "model": selected_model,
+        "image_count": len(image_urls),
+        "prompt": prompt,
+        "image_urls": image_urls,
+        "raw_response": parsed,
+        "raw_usage": raw_usage,
+        "usage": {
+            "input_tokens": raw_usage.get("prompt_tokens"),
+            "output_tokens": raw_usage.get("completion_tokens"),
+            "cached_input_tokens": (raw_usage.get("prompt_tokens_details") or {}).get("cached_tokens"),
+        },
+    }
+
+
+def _is_deepseek_peak_hour(now: datetime | None = None) -> bool:
+    # Peak: 01:00-04:00 and 06:00-10:00 UTC, Monday-Friday only.
+    current = (now or datetime.now(UTC)).astimezone(UTC)
+    if current.weekday() >= 5:
+        return False
+    hour = current.hour
+    return (1 <= hour < 4) or (6 <= hour < 10)
+
+
+def _deepseek_usage_cost(deepseek_meta: Mapping[str, Any]) -> tuple[float | None, dict[str, Any]]:
+    usage = deepseek_meta.get("usage") if isinstance(deepseek_meta.get("usage"), Mapping) else {}
+    model_name = deepseek_meta.get("model")
+    input_tokens = _positive_float(usage.get("input_tokens")) or 0.0
+    output_tokens = _positive_float(usage.get("output_tokens")) or 0.0
+    cached_input_tokens = _positive_float(usage.get("cached_input_tokens")) or 0.0
+    peak = _is_deepseek_peak_hour()
+    input_rate = (
+        settings.deepseek_input_cost_per_1m_tokens_usd_peak
+        if peak
+        else settings.deepseek_input_cost_per_1m_tokens_usd_offpeak
+    )
+    output_rate = (
+        settings.deepseek_output_cost_per_1m_tokens_usd_peak
+        if peak
+        else settings.deepseek_output_cost_per_1m_tokens_usd_offpeak
+    )
+    cached_rate = (
+        settings.deepseek_cached_input_cost_per_1m_tokens_usd_peak
+        if peak
+        else settings.deepseek_cached_input_cost_per_1m_tokens_usd_offpeak
+    )
+    billable_input_tokens = max(0.0, input_tokens - cached_input_tokens)
+    amount = (billable_input_tokens * input_rate + output_tokens * output_rate) / 1_000_000
+    amount += cached_input_tokens * cached_rate / 1_000_000
+    detail = {
+        "model": model_name,
+        "peak_hour": peak,
+        "input_tokens": int(input_tokens),
+        "output_tokens": int(output_tokens),
+        "cached_input_tokens": int(cached_input_tokens),
+        "input_cost_per_1m_tokens_usd": input_rate,
+        "output_cost_per_1m_tokens_usd": output_rate,
+        "cached_input_cost_per_1m_tokens_usd": cached_rate,
+        "estimated_cost_usd": amount,
+    }
+    if amount <= 0:
+        return None, detail
+    return amount, detail
+
+
+def _record_deepseek_cost(db: Session, script_run_id: int, deepseek_meta: Mapping[str, Any]) -> dict[str, Any]:
+    amount, detail = _deepseek_usage_cost(deepseek_meta)
+    repositories.add_script_run_cost(
+        db,
+        script_run_id,
+        cost_amount=amount,
+        cost_currency="USD",
+        cost_source="deepseek_estimate",
+    )
+    return detail
+
+
 def _count_items_from_kiosk_vlm_result(result: Mapping[str, Any]) -> int:
     for key in ("suspected_total_count", "confirmed_visible_count", "total_items_taken_out"):
         try:
@@ -2363,6 +2485,9 @@ def _repair_grouping_with_gemini(
         "Use the image-number mapping to compare people by clothing, body shape, bags, and direction. "
         "Direction is important: walking into the store means entry; walking out of or away from the store means exit. "
         "If clear walking direction conflicts with simple timestamp assumptions, prioritize the walking direction. "
+        "Each string in notes must be a single finished conclusion, not your reasoning process - no self-corrections, "
+        "hedging, or thinking-out-loud phrases such as 'wait' or 'let me check'. Resolve uncertainty internally first, "
+        "then write only the final answer. "
         "Return strict JSON only with schema: "
         '{"groups":[{"entry":[integer],"exit":[integer],"confidence":number,"reason":string}],'
         '"unknown":[integer],"notes":[string]}. '
@@ -4028,6 +4153,10 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
             "If the same customer appears in trigger 73 and later trigger 74, return entry [73], exit [74]. "
             "If trigger 76 is an entry and trigger 77 is another entry before trigger 78 exits, return the complete matched pair and put still-waiting entries in open_entries. "
             "If a trigger cannot be confidently and visually matched into a complete entry+exit pair and is not a likely open entry, put it in unknown. "
+            "Notes field rule: each string in notes must be a single finished conclusion about a specific trigger or group, written after you have already "
+            "decided - never your live reasoning process. Do not include self-corrections, hedging, or thinking-out-loud phrases such as 'wait', 'let me "
+            "check', 'hold on', 'actually', or 'let's re-verify'. If you are unsure, resolve the uncertainty internally first, then write only the final "
+            "answer you settled on. A note should read as a plain factual statement, not a narration of how you arrived at it. "
             "Return strict JSON only with schema: "
             '{"groups":[{"entry":[integer],"exit":[integer],"confidence":number,"reason":string,'
             '"entry_carry":{"bag_count":integer,"item_count":integer,"items":[{"type":string,"color":string,"size":string,"count":integer,"confidence":number}],"summary":string},'
@@ -4038,13 +4167,22 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
             f"Triggers: {json.dumps(trigger_notes, default=str)}. "
             f"Image mapping: {json.dumps(image_mapping, default=str)}."
         )
-        gemini_result, gemini_meta = _call_kiosk_gemini_summary(
-            prompt=prompt,
-            image_urls=image_urls,
-            model_name=model_name,
-            image_resize_scale=resize_scale,
-        )
-        _record_gemini_cost(db, script_run_id, gemini_meta)
+        use_deepseek = str(settings.grouping_provider or "gemini").strip().lower() == "deepseek"
+        if use_deepseek:
+            gemini_result, gemini_meta = _call_deepseek_vision_summary(
+                prompt=prompt,
+                image_urls=image_urls,
+                model_name=settings.deepseek_vision_model,
+            )
+            _record_deepseek_cost(db, script_run_id, gemini_meta)
+        else:
+            gemini_result, gemini_meta = _call_kiosk_gemini_summary(
+                prompt=prompt,
+                image_urls=image_urls,
+                model_name=model_name,
+                image_resize_scale=resize_scale,
+            )
+            _record_gemini_cost(db, script_run_id, gemini_meta)
         raw_metas.append(gemini_meta)
         chunk_groups = gemini_result.get("groups") if isinstance(gemini_result.get("groups"), list) else []
         chunk_open_entries = gemini_result.get("open_entries") if isinstance(gemini_result.get("open_entries"), list) else []

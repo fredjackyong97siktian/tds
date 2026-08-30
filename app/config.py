@@ -126,6 +126,20 @@ class Settings(BaseSettings):
     gemini_input_cost_per_1m_tokens_usd: float = 0.0
     gemini_output_cost_per_1m_tokens_usd: float = 0.0
     gemini_cached_input_cost_per_1m_tokens_usd: float = 0.0
+    # Which provider the main grouping call uses - "gemini" or "deepseek". Only the
+    # primary grouping chunk call switches; verification/repair/carry-item-signal
+    # stay on Gemini until deepseek is actually evaluated for those too.
+    grouping_provider: str = "gemini"
+    deepseek_api_key: str | None = None
+    deepseek_vision_model: str = "deepseek-v4-flash-vision-exp"
+    deepseek_base_url: str = "https://api.deepseek.com"
+    deepseek_timeout_seconds: int = 180
+    deepseek_input_cost_per_1m_tokens_usd_offpeak: float = 0.22
+    deepseek_input_cost_per_1m_tokens_usd_peak: float = 0.44
+    deepseek_output_cost_per_1m_tokens_usd_offpeak: float = 0.66
+    deepseek_output_cost_per_1m_tokens_usd_peak: float = 1.32
+    deepseek_cached_input_cost_per_1m_tokens_usd_offpeak: float = 0.007
+    deepseek_cached_input_cost_per_1m_tokens_usd_peak: float = 0.014
 
     model_config = SettingsConfigDict(
         env_prefix="THEFT_API_",
