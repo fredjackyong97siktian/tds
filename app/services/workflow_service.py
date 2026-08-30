@@ -3348,7 +3348,7 @@ def _is_recently_completed_grouping_window(window_end: datetime, current: dateti
     # brief outage doesn't permanently orphan that period's triggers - it does NOT
     # mean scheduled grouping will backfill old windows indefinitely; a
     # newly-enabled period still only reaches back this far, not to its full history.
-    grace_minutes = max(1, int(settings.grouping_window_grace_minutes or 240))
+    grace_minutes = max(1, int(settings.grouping_window_grace_minutes or 60))
     return window_end <= current < window_end + timedelta(minutes=grace_minutes)
 
 
