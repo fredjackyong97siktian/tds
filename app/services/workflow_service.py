@@ -1264,6 +1264,15 @@ def _record_deepseek_cost(db: Session, script_run_id: int, deepseek_meta: Mappin
     return detail
 
 
+def _usage_cost_for_call_meta(call_meta: Mapping[str, Any]) -> tuple[float | None, dict[str, Any]]:
+    # Picks the right cost formula (and pricing) for a single chunk's own
+    # provider, rather than always pricing it as if it were Gemini - a batch's
+    # chunks list can be a mix (main call on deepseek, verification on gemini).
+    if str(call_meta.get("provider") or "") == "tds_api_deepseek":
+        return _deepseek_usage_cost(call_meta)
+    return _gemini_usage_cost(call_meta)
+
+
 def _count_items_from_kiosk_vlm_result(result: Mapping[str, Any]) -> int:
     for key in ("suspected_total_count", "confirmed_visible_count", "total_items_taken_out"):
         try:
@@ -3962,6 +3971,19 @@ def _verify_gemini_grouping_match(
     }
 
 
+def _grouping_provider_is_deepseek() -> bool:
+    return str(settings.grouping_provider or "gemini").strip().lower() == "deepseek"
+
+
+def _grouping_model_name_label() -> str:
+    # Reflects only the main grouping call's provider. Verification/repair/
+    # carry-item-signal stay on Gemini regardless, so a batch's script_run cost
+    # can still show a combined "deepseek_estimate+gemini_estimate" source even
+    # when this label says deepseek - that's the verification pass's Gemini
+    # spend accumulating on the same script_run row, not a mislabel.
+    return "deepseek_grouping_direct" if _grouping_provider_is_deepseek() else "gemini_grouping_direct"
+
+
 def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id: int) -> tuple[dict[str, Any], dict[str, Any]]:
     batch = repositories.get_grouping_batch(db, batch_id)
     items = repositories.list_grouping_items(db, batch_id)
@@ -4167,7 +4189,7 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
             f"Triggers: {json.dumps(trigger_notes, default=str)}. "
             f"Image mapping: {json.dumps(image_mapping, default=str)}."
         )
-        use_deepseek = str(settings.grouping_provider or "gemini").strip().lower() == "deepseek"
+        use_deepseek = _grouping_provider_is_deepseek()
         if use_deepseek:
             gemini_result, gemini_meta = _call_deepseek_vision_summary(
                 prompt=prompt,
@@ -4369,7 +4391,7 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
         if trigger_id not in grouped_trigger_ids and trigger_id not in normalized_open_entries
     }
     total_image_count = sum(len(trigger.get("frames") or []) for trigger in trigger_inputs)
-    cost_details = [_gemini_usage_cost(meta)[1] for meta in raw_metas]
+    cost_details = [_usage_cost_for_call_meta(meta)[1] for meta in raw_metas]
     grouping_summary = {
         "batch_id": batch_id,
         "location_id": int(batch["location_id"]),
@@ -4381,9 +4403,9 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
         "unknown": sorted(normalized_unknown),
         "notes": notes,
         "diagnostics": {
-            "mode": "gemini_grouping_direct",
+            "mode": _grouping_model_name_label(),
             "temporary_runpod_grouping_disabled": True,
-            "model": model_name,
+            "model": settings.deepseek_vision_model if _grouping_provider_is_deepseek() else model_name,
             "image_resize_scale": resize_scale,
             "max_frames_per_trigger": _grouping_frames_per_trigger(),
             "max_images_per_request": max_images,
@@ -4395,8 +4417,8 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
         },
     }
     return grouping_summary, {
-        "provider": "tds_api_gemini",
-        "model": model_name,
+        "provider": "tds_api_deepseek" if _grouping_provider_is_deepseek() else "tds_api_gemini",
+        "model": settings.deepseek_vision_model if _grouping_provider_is_deepseek() else model_name,
         "image_resize_scale": resize_scale,
         "chunk_count": len(chunks),
         "image_count": total_image_count,
@@ -4445,7 +4467,7 @@ def start_grouping_analysis_job(job: GroupingAnalysisQueued) -> ScriptExecutionR
             session_id=None,
             trigger_id=None,
             script_name="grouping",
-            model_name="gemini_grouping_direct",
+            model_name=_grouping_model_name_label(),
             status="running",
             command=SCRIPT_RUN_COMMAND_REDACTED,
         )
@@ -4494,9 +4516,9 @@ def start_grouping_analysis_job(job: GroupingAnalysisQueued) -> ScriptExecutionR
                 "window_end": job.window_end.isoformat(),
                 "manifest_object_key": job.manifest_object_key,
                 "manifest_url": job.manifest_url,
-                "provider": "tds_api_gemini",
-                "model": settings.grouping_gemini_model,
-                "mode": "gemini_grouping_direct",
+                "provider": "tds_api_deepseek" if _grouping_provider_is_deepseek() else "tds_api_gemini",
+                "model": settings.deepseek_vision_model if _grouping_provider_is_deepseek() else settings.grouping_gemini_model,
+                "mode": _grouping_model_name_label(),
             },
         )
         repositories.finish_script_run(
@@ -4521,7 +4543,7 @@ def start_grouping_analysis_job(job: GroupingAnalysisQueued) -> ScriptExecutionR
             script_run_id=script_run_id,
             runner_job_id=None,
             script_name="grouping",
-            model_name="gemini_grouping_direct",
+            model_name=_grouping_model_name_label(),
             status="success",
             command=["tds_api_gemini", "grouping"],
             stdout=json.dumps(grouping_summary, default=str),
