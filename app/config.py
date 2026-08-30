@@ -117,7 +117,7 @@ class Settings(BaseSettings):
     paid_transaction_detail_item_name_column: str = "name"
     gemini_api_key: str | None = None
     kiosk_gemini_model: str = "gemini-3-flash-preview"
-    grouping_gemini_model: str = "gemini-3-flash-preview"
+    grouping_gemini_model: str = "gemini-3.5-flash-lite"
     grouping_gemini_frames_per_trigger: int = 4
     grouping_gemini_image_scale: float = 0.35
     grouping_gemini_max_images_per_request: int = 40
