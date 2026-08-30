@@ -3999,30 +3999,6 @@ def _grouping_model_name_label() -> str:
     return "deepseek_grouping_direct" if _grouping_provider_is_deepseek() else "gemini_grouping_direct"
 
 
-_GROUPING_NO_VISUAL_DATA_NOTE_PATTERN = re.compile(r"no visual data", re.IGNORECASE)
-
-
-def _grouping_chunk_response_is_visual_failure(gemini_result: dict[str, Any], *, chunk_trigger_count: int) -> bool:
-    # Seen in production: the model claims it received no images even though a
-    # well-formed request with valid image URLs was sent, and dumps every
-    # trigger in the chunk straight into "unknown" with zero groups. This is a
-    # provider-side fetch/processing failure, not a real "couldn't match"
-    # verdict, so it's worth one retry before accepting it.
-    groups = gemini_result.get("groups")
-    if isinstance(groups, list) and groups:
-        return False
-    open_entries = gemini_result.get("open_entries")
-    if isinstance(open_entries, list) and open_entries:
-        return False
-    notes = gemini_result.get("notes")
-    notes_text = " ".join(str(note) for note in notes) if isinstance(notes, list) else ""
-    if not _GROUPING_NO_VISUAL_DATA_NOTE_PATTERN.search(notes_text):
-        return False
-    unknown = gemini_result.get("unknown")
-    unknown_count = len(unknown) if isinstance(unknown, list) else 0
-    return unknown_count >= chunk_trigger_count
-
-
 def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id: int) -> tuple[dict[str, Any], dict[str, Any]]:
     batch = repositories.get_grouping_batch(db, batch_id)
     items = repositories.list_grouping_items(db, batch_id)
@@ -4229,28 +4205,21 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
             f"Image mapping: {json.dumps(image_mapping, default=str)}."
         )
         use_deepseek = _grouping_provider_is_deepseek()
-
-        def _call_chunk_vision() -> tuple[dict[str, Any], dict[str, Any]]:
-            if use_deepseek:
-                result, meta = _call_deepseek_vision_summary(
-                    prompt=prompt,
-                    image_urls=image_urls,
-                    model_name=settings.deepseek_vision_model,
-                )
-                _record_deepseek_cost(db, script_run_id, meta)
-            else:
-                result, meta = _call_kiosk_gemini_summary(
-                    prompt=prompt,
-                    image_urls=image_urls,
-                    model_name=model_name,
-                    image_resize_scale=resize_scale,
-                )
-                _record_gemini_cost(db, script_run_id, meta)
-            return result, meta
-
-        gemini_result, gemini_meta = _call_chunk_vision()
-        if _grouping_chunk_response_is_visual_failure(gemini_result, chunk_trigger_count=len(chunk)):
-            gemini_result, gemini_meta = _call_chunk_vision()
+        if use_deepseek:
+            gemini_result, gemini_meta = _call_deepseek_vision_summary(
+                prompt=prompt,
+                image_urls=image_urls,
+                model_name=settings.deepseek_vision_model,
+            )
+            _record_deepseek_cost(db, script_run_id, gemini_meta)
+        else:
+            gemini_result, gemini_meta = _call_kiosk_gemini_summary(
+                prompt=prompt,
+                image_urls=image_urls,
+                model_name=model_name,
+                image_resize_scale=resize_scale,
+            )
+            _record_gemini_cost(db, script_run_id, gemini_meta)
         raw_metas.append(gemini_meta)
         chunk_groups = gemini_result.get("groups") if isinstance(gemini_result.get("groups"), list) else []
         chunk_open_entries = gemini_result.get("open_entries") if isinstance(gemini_result.get("open_entries"), list) else []
