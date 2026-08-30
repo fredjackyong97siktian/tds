@@ -1889,12 +1889,16 @@ def has_pending_trigger_frame_retrieval_in_window(
     min_frame_count: int = 1,
 ) -> bool:
     # A trigger with no frame_asset row yet (retrieval not even queued), one
-    # still short of a terminal state ('retrieved' or 'issue'), or one marked
-    # 'retrieved' with fewer than min_frame_count successfully-captured frames
-    # (the retrieval job marks the whole asset 'retrieved' the moment even one
-    # frame out of five succeeds) all mean this window's data isn't actually
+    # still short of a terminal state ('retrieved', 'processed', or 'issue'), or
+    # one marked 'retrieved' with fewer than min_frame_count successfully-captured
+    # frames (the retrieval job marks the whole asset 'retrieved' the moment even
+    # one frame out of five succeeds) all mean this window's data isn't actually
     # complete yet - forming a batch now would silently snapshot a partial or
     # near-empty trigger set, exactly like trigger 454 and 410 slipping through.
+    # 'processed' is included as terminal because a trigger just inside this
+    # window's carry-forward buffer can already have been fully consumed by an
+    # earlier, adjacent period's batch (mark_grouping_batch_frame_assets_processed)
+    # - that's finished, not still pending, and must not block this window forever.
     trigger_table = _table("trigger_event")
     frame_asset_table = _table("trigger_frame_asset")
     frame_table = _table("trigger_frame")
@@ -1917,7 +1921,7 @@ def has_pending_trigger_frame_retrieval_in_window(
               and te.status <> 'whitelisted'
               and (
                   fa.id is null
-                  or fa.status not in ('retrieved', 'issue')
+                  or fa.status not in ('retrieved', 'processed', 'issue')
                   or (fa.status = 'retrieved' and coalesce(okc.ok_count, 0) < :min_frame_count)
               )
             limit 1
