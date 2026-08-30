@@ -5587,6 +5587,7 @@ def get_current_month_script_run_cost_summary(db: Session) -> dict[str, Any]:
             "currency": "USD",
             "total": 0.0,
             "gemini_total": 0.0,
+            "deepseek_total": 0.0,
             "runpod_total": 0.0,
             "locations": [],
         }
@@ -5630,9 +5631,24 @@ def get_current_month_script_run_cost_summary(db: Session) -> dict[str, Any]:
                    sum(cr.cost_amount) as total,
                    sum(
                        case
-                           when cr.cost_source like '%gemini%'
-                             or cr.model_name like 'gemini%'
-                             or cr.script_name in ('grouping', 'carry_confidence', 'grouping_repair')
+                           when cr.cost_source like '%deepseek%' then cr.cost_amount
+                           else 0
+                       end
+                   ) as deepseek_total,
+                   sum(
+                       case
+                           -- A batch's cost_source can be a combined
+                           -- "deepseek_estimate+gemini_estimate" when the main
+                           -- grouping call ran on deepseek but verification still
+                           -- ran on gemini (or vice versa isn't possible today) -
+                           -- one script_run's cost_amount can't be split by
+                           -- provider after the fact, so a mixed row counts
+                           -- toward deepseek_total only, not both, to avoid
+                           -- double-counting the same dollar in two buckets.
+                           when cr.cost_source like '%deepseek%' then 0
+                           when cr.cost_source like '%gemini%' then cr.cost_amount
+                           when cr.cost_source = ''
+                             and (cr.model_name like 'gemini%' or cr.script_name in ('grouping', 'carry_confidence', 'grouping_repair'))
                            then cr.cost_amount
                            else 0
                        end
@@ -5658,13 +5674,16 @@ def get_current_month_script_run_cost_summary(db: Session) -> dict[str, Any]:
     locations: list[dict[str, Any]] = []
     total = 0.0
     gemini_total = 0.0
+    deepseek_total = 0.0
     runpod_total = 0.0
     for row in rows:
         row_total = float(row.get("total") or 0)
         row_gemini_total = float(row.get("gemini_total") or 0)
+        row_deepseek_total = float(row.get("deepseek_total") or 0)
         row_runpod_total = float(row.get("runpod_total") or 0)
         total += row_total
         gemini_total += row_gemini_total
+        deepseek_total += row_deepseek_total
         runpod_total += row_runpod_total
         if row.get("location_id") is None:
             continue
@@ -5674,6 +5693,7 @@ def get_current_month_script_run_cost_summary(db: Session) -> dict[str, Any]:
                 "location_name": row.get("location_name") or f"Location {row['location_id']}",
                 "total": row_total,
                 "gemini_total": row_gemini_total,
+                "deepseek_total": row_deepseek_total,
                 "runpod_total": row_runpod_total,
             }
         )
@@ -5683,6 +5703,7 @@ def get_current_month_script_run_cost_summary(db: Session) -> dict[str, Any]:
         "currency": str(currency or "USD"),
         "total": total,
         "gemini_total": gemini_total,
+        "deepseek_total": deepseek_total,
         "runpod_total": runpod_total,
         "locations": locations,
     }

@@ -338,6 +338,7 @@ class ScriptRunLocationCostResponse(BaseModel):
     location_name: str | None = None
     total: float = 0
     gemini_total: float = 0
+    deepseek_total: float = 0
     runpod_total: float = 0
 
 
@@ -346,6 +347,7 @@ class ScriptRunMonthlyCostSummaryResponse(BaseModel):
     currency: str = "USD"
     total: float = 0
     gemini_total: float = 0
+    deepseek_total: float = 0
     runpod_total: float = 0
     locations: list[ScriptRunLocationCostResponse] = Field(default_factory=list)
 
