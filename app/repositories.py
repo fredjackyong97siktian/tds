@@ -2653,7 +2653,7 @@ def list_running_grouping_batches(db: Session) -> list[dict[str, Any]]:
     return _fetch_all_dicts(result)
 
 
-def list_recent_grouping_batches(db: Session, limit: int = 50) -> list[dict[str, Any]]:
+def list_recent_grouping_batches(db: Session, limit: int = 50, *, offset: int = 0) -> list[dict[str, Any]]:
     table_name = _table("filter_grouping_batch")
     result = db.execute(
         text(
@@ -2663,10 +2663,10 @@ def list_recent_grouping_batches(db: Session, limit: int = 50) -> list[dict[str,
             from {table_name}
             where status in ('success', 'failed', 'issue')
             order by coalesce(finished_at, updated_at, created_at) desc, id desc
-            limit :limit
+            limit :limit offset :offset
             """
         ),
-        {"limit": limit},
+        {"limit": limit, "offset": max(0, offset)},
     )
     rows = _fetch_all_dicts(result)
     for row in rows:
@@ -2676,6 +2676,21 @@ def list_recent_grouping_batches(db: Session, limit: int = 50) -> list[dict[str,
             except json.JSONDecodeError:
                 pass
     return rows
+
+
+def count_recent_grouping_batches(db: Session) -> int:
+    table_name = _table("filter_grouping_batch")
+    result = db.execute(
+        text(
+            f"""
+            select count(*) as total
+            from {table_name}
+            where status in ('success', 'failed', 'issue')
+            """
+        )
+    )
+    row = result.mappings().first()
+    return int((row or {}).get("total") or 0)
 
 
 def list_grouping_items(db: Session, batch_id: int) -> list[dict[str, Any]]:

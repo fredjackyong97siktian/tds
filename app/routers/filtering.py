@@ -152,12 +152,23 @@ def delete_country_code_check(rule_id: int, db: Session = Depends(get_transactio
 
 
 @router.get("/grouping-batches")
-def list_grouping_batches(db: Session = Depends(get_transaction_db)) -> dict[str, Any]:
+def list_grouping_batches(
+    recent_limit: int = 20,
+    recent_offset: int = 0,
+    db: Session = Depends(get_transaction_db),
+) -> dict[str, Any]:
     return {
         "pending": repositories.list_pending_grouping_batches(db, limit=200),
         "running": repositories.list_running_grouping_batches(db),
-        "recent": repositories.list_recent_grouping_batches(db, limit=100),
+        "recent": repositories.list_recent_grouping_batches(
+            db, limit=max(1, min(recent_limit, 200)), offset=max(0, recent_offset)
+        ),
     }
+
+
+@router.get("/grouping-batches/recent/count")
+def count_recent_grouping_batches(db: Session = Depends(get_transaction_db)) -> dict[str, int]:
+    return {"total": repositories.count_recent_grouping_batches(db)}
 
 
 @router.get("/grouping-batches/{batch_id}")

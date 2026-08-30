@@ -5640,6 +5640,20 @@ def force_deep_analysis_for_confidence_result(db: Session, confidence_result_id:
 
     updated_reason = str(row.get("reason") or "").strip()
     updated_reason = f"{updated_reason}; manual_deep_analysis_override" if updated_reason else "manual_deep_analysis_override"
+
+    updated_factor_payload = dict(factor_payload)
+    triggered_factors = list(updated_factor_payload.get("triggered_factors") or [])
+    if "triggered_by_admin" not in triggered_factors:
+        triggered_factors.append("triggered_by_admin")
+    updated_factor_payload["triggered_factors"] = triggered_factors
+    factor_details = dict(updated_factor_payload.get("factor_details") or {})
+    factor_details["triggered_by_admin"] = {
+        "hit": True,
+        "enabled": True,
+        "message": "Manually sent to L1 analysis by an admin, not flagged by any automatic factor.",
+    }
+    updated_factor_payload["factor_details"] = factor_details
+
     repositories.upsert_filter_confidence_result(
         db,
         batch_id=batch_id,
@@ -5648,7 +5662,7 @@ def force_deep_analysis_for_confidence_result(db: Session, confidence_result_id:
         score=float(row.get("score") or 0),
         need_deep_analysis=True,
         reason=updated_reason,
-        factor_payload=factor_payload,
+        factor_payload=updated_factor_payload,
     )
     logger.info(
         "Manually forced deep analysis confidence_result_id=%s batch_id=%s session_id=%s queued_video_assets=%s promoted_count=%s",
