@@ -160,6 +160,14 @@ def list_grouping_batches(db: Session = Depends(get_transaction_db)) -> dict[str
     }
 
 
+@router.get("/grouping-batches/{batch_id}")
+def get_grouping_batch(batch_id: int, db: Session = Depends(get_transaction_db)) -> dict[str, Any]:
+    try:
+        return repositories.get_grouping_batch(db, batch_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.get("/confidence-results")
 def list_confidence_results(
     limit: int = 100,
