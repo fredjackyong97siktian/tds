@@ -1147,11 +1147,12 @@ def _call_deepseek_vision_summary(
     prompt: str,
     image_urls: list[str],
     model_name: str | None = None,
+    allow_text_only: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     api_key = str(settings.deepseek_api_key or os.environ.get("DEEPSEEK_API_KEY") or "").strip()
     if not api_key:
         raise RuntimeError("DeepSeek API key is not configured in tds_api. Set THEFT_API_DEEPSEEK_API_KEY.")
-    if not image_urls:
+    if not image_urls and not allow_text_only:
         raise RuntimeError("No image URLs were provided for the DeepSeek vision call.")
 
     selected_model = str(model_name or settings.deepseek_vision_model).strip()
@@ -2479,7 +2480,7 @@ def _repair_grouping_with_gemini(
         session_id=None,
         trigger_id=None,
         script_name="grouping",
-        model_name="gemini_grouping_repair",
+        model_name="deepseek_grouping_repair" if _grouping_provider_is_deepseek() else "gemini_grouping_repair",
         runner_payload={
             "batch_id": batch_id,
             "location_id": location_id,
@@ -2506,8 +2507,14 @@ def _repair_grouping_with_gemini(
         "Only create an exit match if the same person is clearly visible. If unsure, leave the trigger in unknown."
     )
     try:
-        repair_result, repair_meta = _call_kiosk_gemini_summary(prompt=prompt, image_urls=image_urls)
-        repair_cost = _record_gemini_cost(db, repair_script_run_id, repair_meta)
+        if _grouping_provider_is_deepseek():
+            repair_result, repair_meta = _call_deepseek_vision_summary(
+                prompt=prompt, image_urls=image_urls, model_name=settings.deepseek_vision_model
+            )
+            repair_cost = _record_deepseek_cost(db, repair_script_run_id, repair_meta)
+        else:
+            repair_result, repair_meta = _call_kiosk_gemini_summary(prompt=prompt, image_urls=image_urls)
+            repair_cost = _record_gemini_cost(db, repair_script_run_id, repair_meta)
     except Exception as exc:
         repositories.finish_script_run(
             db,
@@ -3944,13 +3951,21 @@ def _verify_gemini_grouping_match(
         "should cite any visual details that argue against your answer, or be an empty string if you found none."
     )
     try:
-        result, meta = _call_kiosk_gemini_summary(
-            prompt=prompt,
-            image_urls=image_urls,
-            model_name=model_name,
-            image_resize_scale=resize_scale,
-        )
-        _record_gemini_cost(db, script_run_id, meta)
+        if _grouping_provider_is_deepseek():
+            result, meta = _call_deepseek_vision_summary(
+                prompt=prompt,
+                image_urls=image_urls,
+                model_name=settings.deepseek_vision_model,
+            )
+            _record_deepseek_cost(db, script_run_id, meta)
+        else:
+            result, meta = _call_kiosk_gemini_summary(
+                prompt=prompt,
+                image_urls=image_urls,
+                model_name=model_name,
+                image_resize_scale=resize_scale,
+            )
+            _record_gemini_cost(db, script_run_id, meta)
     except Exception as exc:
         return {
             "same_person": None,
@@ -5319,7 +5334,12 @@ def _evaluate_carry_item_signal_with_ai(
         or not _as_boolish(carry_evidence["before_is_yellow_bag"])
         and _as_boolish(carry_evidence["after_is_yellow_bag"])
     )
-    model_name = str(settings.grouping_gemini_model or "gemini-3.5-flash-lite").strip()
+    use_deepseek = _grouping_provider_is_deepseek()
+    model_name = (
+        str(settings.deepseek_vision_model).strip()
+        if use_deepseek
+        else str(settings.grouping_gemini_model or "gemini-3.5-flash-lite").strip()
+    )
     transaction_payload = _transaction_summary(transactions)
     runner_payload = {
         "batch_id": batch_id,
@@ -5360,19 +5380,27 @@ def _evaluate_carry_item_signal_with_ai(
         f"Input: {json.dumps(runner_payload, default=str)}"
     )
     try:
-        result, meta = _call_kiosk_gemini_summary(
-            prompt=prompt,
-            image_urls=[],
-            model_name=model_name,
-            allow_text_only=True,
-        )
-        cost_detail = _record_gemini_cost(db, script_run_id, meta)
+        if use_deepseek:
+            result, meta = _call_deepseek_vision_summary(
+                prompt=prompt,
+                image_urls=[],
+                model_name=model_name,
+                allow_text_only=True,
+            )
+        else:
+            result, meta = _call_kiosk_gemini_summary(
+                prompt=prompt,
+                image_urls=[],
+                model_name=model_name,
+                allow_text_only=True,
+            )
+        cost_detail = _record_deepseek_cost(db, script_run_id, meta) if use_deepseek else _record_gemini_cost(db, script_run_id, meta)
         normalized = {
             "hit": _as_boolish(result.get("hit")),
             "insufficient_evidence": _as_boolish(result.get("insufficient_evidence")),
             "score": _coerce_number(result.get("score"), 0.0),
             "reason": str(result.get("reason") or "carry_ai"),
-            "source": "gemini_carry_confidence",
+            "source": "deepseek_carry_confidence" if use_deepseek else "gemini_carry_confidence",
             "entry_bag_count": _coerce_int(result.get("entry_bag_count"), 0),
             "exit_bag_count": _coerce_int(result.get("exit_bag_count"), 0),
             "reasonable_with_receipt": _as_boolish(result.get("reasonable_with_receipt")),
