@@ -2543,6 +2543,7 @@ def _repair_grouping_with_gemini(
 
     repaired_groups: list[dict[str, Any]] = []
     consumed_trigger_ids: set[int] = set()
+    repair_verification_notes: list[str] = []
     next_group_id = len(completed_groups) + 1
     for repaired in repair_result.get("groups") or []:
         if not isinstance(repaired, Mapping):
@@ -2558,6 +2559,32 @@ def _repair_grouping_with_gemini(
         confidence = _coerce_number(repaired.get("confidence"), 0.0)
         if confidence < 0.75:
             continue
+        # Repair pairings never went through the same independent double-check the
+        # main grouping pass gets, which was letting bad repair pairs (e.g. a
+        # different person matched only on generic clothing similarity) through
+        # unverified. Run the same focused re-check here before accepting one.
+        entry_trigger_input = {
+            "frames": [{"image_url": url} for url in frames_by_trigger.get(entry_ids[0], [])]
+        }
+        exit_trigger_input = {
+            "frames": [{"image_url": url} for url in frames_by_trigger.get(exit_ids[0], [])]
+        }
+        verification = _verify_gemini_grouping_match(
+            db,
+            repair_script_run_id,
+            entry_trigger=entry_trigger_input,
+            exit_triggers=[exit_trigger_input],
+            model_name=settings.grouping_gemini_model,
+            resize_scale=_grouping_gemini_resize_scale(),
+        )
+        if verification["same_person"] is False or (
+            verification["same_person"] is True and verification["confidence"] < 0.5
+        ):
+            repair_verification_notes.append(
+                f"Verification rejected repaired match between entry {entry_ids[0]} and exit {exit_ids[0]}: "
+                f"{verification['conflicting_details'] or 'independent check could not confirm the same person'}."
+            )
+            continue
         group_payload = {
             "group_id": next_group_id,
             "entry": entry_ids,
@@ -2565,6 +2592,8 @@ def _repair_grouping_with_gemini(
             "score": confidence,
             "repair_source": "gemini",
             "reason": str(repaired.get("reason") or "gemini_grouping_repair"),
+            "verified": verification["same_person"] is True,
+            "verification": verification,
         }
         next_group_id += 1
         repaired_groups.append(group_payload)
@@ -2616,6 +2645,10 @@ def _repair_grouping_with_gemini(
         set(_group_trigger_id_list(grouping_summary.get("open_entries"))) | set(remaining_open_entries)
     )
     grouping_summary["unknown"] = remaining_unknown
+    if repair_verification_notes:
+        existing_notes = grouping_summary.get("notes")
+        prior_notes = [str(note) for note in existing_notes if note] if isinstance(existing_notes, list) else []
+        grouping_summary["notes"] = prior_notes + repair_verification_notes
     grouping_summary["gemini_repair"] = {
         "status": "success",
         "script_run_id": repair_script_run_id,
