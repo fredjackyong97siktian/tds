@@ -2426,6 +2426,12 @@ def _repair_grouping_with_gemini(
         return grouping_summary
     unknown_trigger_ids = _group_trigger_id_list(grouping_summary.get("unknown"))
     completed_groups: list[dict[str, Any]] = []
+    # This never actually matches anything in practice: the main grouping pass
+    # never appends an entry-only object to "groups" (see normalized_groups in
+    # _run_gemini_grouping_for_batch, which only appends once both entry and exit
+    # are known). Real still-open entries live separately in the flat
+    # grouping_summary["open_entries"] list below - kept here too only in case
+    # some other producer (e.g. a self-grouping batch) ever does shape it this way.
     open_groups: list[dict[str, Any]] = []
     for index, group in enumerate(groups, start=1):
         if not isinstance(group, Mapping):
@@ -2439,15 +2445,20 @@ def _repair_grouping_with_gemini(
         elif entry_ids:
             open_groups.append(normalized_group)
 
-    if not open_groups and not unknown_trigger_ids:
+    open_entry_trigger_ids = _group_trigger_id_list(grouping_summary.get("open_entries"))
+    for group in open_groups:
+        for trigger_id in _group_trigger_id_list(group.get("entry")):
+            if trigger_id not in open_entry_trigger_ids:
+                open_entry_trigger_ids.append(trigger_id)
+
+    if not open_entry_trigger_ids and not unknown_trigger_ids:
         return grouping_summary
 
     frames_by_trigger = _person_frame_urls_by_trigger(db, batch_id)
     candidate_trigger_ids: list[int] = []
-    for group in open_groups:
-        for trigger_id in _group_trigger_id_list(group.get("entry")):
-            if trigger_id not in candidate_trigger_ids:
-                candidate_trigger_ids.append(trigger_id)
+    for trigger_id in open_entry_trigger_ids:
+        if trigger_id not in candidate_trigger_ids:
+            candidate_trigger_ids.append(trigger_id)
     for trigger_id in unknown_trigger_ids:
         if trigger_id not in candidate_trigger_ids:
             candidate_trigger_ids.append(trigger_id)
@@ -2463,7 +2474,7 @@ def _repair_grouping_with_gemini(
                 {
                     "image_number": len(image_urls),
                     "trigger_id": trigger_id,
-                    "role_hint": "open_entry" if any(trigger_id in _group_trigger_id_list(group.get("entry")) for group in open_groups) else "unknown",
+                    "role_hint": "open_entry" if trigger_id in open_entry_trigger_ids else "unknown",
                 }
             )
 
@@ -2501,7 +2512,7 @@ def _repair_grouping_with_gemini(
         "Return strict JSON only with schema: "
         '{"groups":[{"entry":[integer],"exit":[integer],"confidence":number,"reason":string}],'
         '"unknown":[integer],"notes":[string]}. '
-        f"Open entry groups needing exit: {json.dumps([{'group_id': group.get('group_id'), 'entry': _group_trigger_id_list(group.get('entry'))} for group in open_groups])}. "
+        f"Entries still waiting for an exit match: {json.dumps(open_entry_trigger_ids)}. "
         f"Unknown triggers: {json.dumps(unknown_trigger_ids)}. "
         f"Image mapping: {json.dumps(image_notes)}. "
         "Only create an exit match if the same person is clearly visible. If unsure, leave the trigger in unknown."
@@ -2623,27 +2634,24 @@ def _repair_grouping_with_gemini(
         ),
         stderr_log="",
     )
+    repaired_unknown = set(_group_trigger_id_list(repair_result.get("unknown")))
     remaining_open_entries = sorted(
         {
             trigger_id
-            for group in open_groups
-            for trigger_id in _group_trigger_id_list(group.get("entry"))
-            if trigger_id not in consumed_trigger_ids
+            for trigger_id in open_entry_trigger_ids
+            if trigger_id not in consumed_trigger_ids and trigger_id not in repaired_unknown
         }
     )
-    repaired_unknown = set(_group_trigger_id_list(repair_result.get("unknown")))
     remaining_unknown = sorted(
         {
             trigger_id
             for trigger_id in candidate_trigger_ids + unknown_trigger_ids
-            if trigger_id not in consumed_trigger_ids
+            if trigger_id not in consumed_trigger_ids and trigger_id not in open_entry_trigger_ids
         }
         | {trigger_id for trigger_id in repaired_unknown if trigger_id not in consumed_trigger_ids}
     )
     grouping_summary["groups"] = completed_groups + repaired_groups
-    grouping_summary["open_entries"] = sorted(
-        set(_group_trigger_id_list(grouping_summary.get("open_entries"))) | set(remaining_open_entries)
-    )
+    grouping_summary["open_entries"] = remaining_open_entries
     grouping_summary["unknown"] = remaining_unknown
     if repair_verification_notes:
         existing_notes = grouping_summary.get("notes")
@@ -2653,7 +2661,7 @@ def _repair_grouping_with_gemini(
         "status": "success",
         "script_run_id": repair_script_run_id,
         "input": {
-            "open_groups": open_groups,
+            "open_entry_trigger_ids": open_entry_trigger_ids,
             "unknown": unknown_trigger_ids,
             "image_mapping": image_notes,
         },
