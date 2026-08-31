@@ -4151,8 +4151,6 @@ def list_sessions(
     db: Session, limit: int = 50, *, offset: int = 0, session_id: int | None = None
 ) -> list[dict[str, Any]]:
     session_table = _table("session")
-    session_customer_table = _table("session_customer")
-    session_video_asset_table = _table("session_video_asset")
     location_table = settings.location_table_name
     location_id_column = settings.location_id_column
     location_name_column = settings.location_name_column
@@ -4169,9 +4167,7 @@ def list_sessions(
                    case when s.status in ('issue', 'closed', 'need_review')
                           or (s.status = 'pending' and s.end_time is not null)
                         then true else false end as can_retry,
-                   s.created_at, s.updated_at,
-                   (select count(*) from {session_customer_table} sc where sc.session_id = s.id) as linked_customer_count,
-                   (select count(*) from {session_video_asset_table} sva where sva.session_id = s.id) as linked_video_count
+                   s.created_at, s.updated_at
             from {session_table} s
             left join {location_table} l on l.{location_id_column} = s.location_id
             {where_sql}
