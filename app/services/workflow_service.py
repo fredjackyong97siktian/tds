@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
@@ -1188,9 +1189,23 @@ def _call_deepseek_vision_summary(
 
     selected_model = str(model_name or settings.deepseek_vision_model).strip()
     content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
-    for image_url in image_urls:
-        data_url = _download_image_data_url_for_deepseek(image_url, resize_scale=image_resize_scale)
-        content.append({"type": "image_url", "image_url": {"url": data_url}})
+    if image_urls:
+        # Fetching these one at a time added enough wall-clock time (up to ~40
+        # sequential downloads per chunk) to trip a reverse-proxy gateway timeout
+        # on the synchronous run-now/retry endpoints. Fetch concurrently instead -
+        # executor.map preserves input order, which the prompt's image-number
+        # mapping depends on.
+        with ThreadPoolExecutor(max_workers=min(8, len(image_urls))) as executor:
+            data_urls = list(
+                executor.map(
+                    lambda image_url: _download_image_data_url_for_deepseek(
+                        image_url, resize_scale=image_resize_scale
+                    ),
+                    image_urls,
+                )
+            )
+        for data_url in data_urls:
+            content.append({"type": "image_url", "image_url": {"url": data_url}})
 
     request_body = {
         "model": selected_model,
