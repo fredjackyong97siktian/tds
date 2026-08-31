@@ -2560,6 +2560,8 @@ def _repair_grouping_with_gemini(
         '{"groups":[{"entry":[integer],"exit":[integer],"confidence":number,"reason":string}],'
         '"unknown":[integer],"notes":[string]}. '
         f"Entries still waiting for an exit match: {json.dumps(open_entry_trigger_ids)}. "
+        "Every id in that list is a CONFIRMED entry, already established by an earlier pass - do not relabel, "
+        "reinterpret, or move any of them; only use them as the entry side of a pairing, exactly as given. "
         f"Unknown triggers: {json.dumps(unknown_trigger_ids)}. "
         f"Image mapping: {json.dumps(image_notes)}. "
         "Only create an exit match if the same person is clearly visible. If unsure, leave the trigger in unknown."
@@ -2685,12 +2687,13 @@ def _repair_grouping_with_gemini(
         stderr_log="",
     )
     repaired_unknown = set(_group_trigger_id_list(repair_result.get("unknown")))
+    # A confirmed open entry can only leave "open" status by actually being
+    # consumed into an accepted group here - never just because the model's own
+    # free-text "unknown" list mentions it (seen in production: repair narrated
+    # trigger 822 as "an exit" despite it being a locked, pre-confirmed entry,
+    # while its structured groups output never actually used it as one).
     remaining_open_entries = sorted(
-        {
-            trigger_id
-            for trigger_id in open_entry_trigger_ids
-            if trigger_id not in consumed_trigger_ids and trigger_id not in repaired_unknown
-        }
+        {trigger_id for trigger_id in open_entry_trigger_ids if trigger_id not in consumed_trigger_ids}
     )
     remaining_unknown = sorted(
         {
@@ -2698,7 +2701,11 @@ def _repair_grouping_with_gemini(
             for trigger_id in candidate_trigger_ids + unknown_trigger_ids
             if trigger_id not in consumed_trigger_ids and trigger_id not in open_entry_trigger_ids
         }
-        | {trigger_id for trigger_id in repaired_unknown if trigger_id not in consumed_trigger_ids}
+        | {
+            trigger_id
+            for trigger_id in repaired_unknown
+            if trigger_id not in consumed_trigger_ids and trigger_id not in open_entry_trigger_ids
+        }
     )
     grouping_summary["groups"] = completed_groups + repaired_groups
     grouping_summary["open_entries"] = remaining_open_entries
