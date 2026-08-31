@@ -1225,9 +1225,28 @@ def _call_deepseek_vision_summary(
     try:
         with urlopen(request, timeout=settings.deepseek_timeout_seconds) as response:
             raw_body = response.read().decode("utf-8", errors="replace")
+            response_status = response.status
+            response_headers = dict(response.headers.items())
     except HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
+        logger.warning(
+            "DeepSeek request failed status=%s headers=%s body=%s",
+            exc.code,
+            dict(exc.headers.items()) if exc.headers else {},
+            detail[:500],
+        )
         raise RuntimeError(f"DeepSeek request failed with HTTP {exc.code}: {detail[:1000]}") from exc
+
+    # Captured so a "no visual data" response (a normal 200 completion, not an
+    # HTTP error) can be cross-checked against rate-limit headers after the fact
+    # if DeepSeek sends any - this failure mode doesn't raise an exception, so
+    # without this we'd have no evidence beyond the model's own claim.
+    logger.info(
+        "DeepSeek response status=%s remaining=%s reset=%s",
+        response_status,
+        response_headers.get("x-ratelimit-remaining") or response_headers.get("x-ratelimit-remaining-requests"),
+        response_headers.get("x-ratelimit-reset") or response_headers.get("x-ratelimit-reset-requests"),
+    )
 
     parsed = json.loads(raw_body)
     choices = parsed.get("choices") or []
@@ -1242,6 +1261,8 @@ def _call_deepseek_vision_summary(
         "image_urls": image_urls,
         "raw_response": parsed,
         "raw_usage": raw_usage,
+        "response_status": response_status,
+        "response_headers": response_headers,
         "usage": {
             "input_tokens": raw_usage.get("prompt_tokens"),
             "output_tokens": raw_usage.get("completion_tokens"),
@@ -4107,6 +4128,33 @@ def _grouping_model_name_label() -> str:
     return "deepseek_grouping_direct" if _grouping_provider_is_deepseek() else "gemini_grouping_direct"
 
 
+_GROUPING_NO_VISUAL_DATA_NOTE_PATTERN = re.compile(r"no visual data|no image content|visual information not available|insufficient visual evidence", re.IGNORECASE)
+_GROUPING_CHUNK_RETRY_MAX_ATTEMPTS = 3
+_GROUPING_CHUNK_RETRY_INTERVAL_SECONDS = 5.0
+_GROUPING_CHUNK_CALL_INTERVAL_SECONDS = 2.5
+
+
+def _grouping_chunk_response_is_visual_failure(gemini_result: dict[str, Any], *, chunk_trigger_count: int) -> bool:
+    # Seen repeatedly in production: the model claims it received no images even
+    # though a well-formed request with valid image data was sent, and dumps
+    # every trigger in the chunk straight into "unknown" with zero groups. This
+    # is a provider-side fetch/processing failure, not a real "couldn't match"
+    # verdict, so it's worth retrying before accepting it.
+    groups = gemini_result.get("groups")
+    if isinstance(groups, list) and groups:
+        return False
+    open_entries = gemini_result.get("open_entries")
+    if isinstance(open_entries, list) and open_entries:
+        return False
+    notes = gemini_result.get("notes")
+    notes_text = " ".join(str(note) for note in notes) if isinstance(notes, list) else ""
+    if not _GROUPING_NO_VISUAL_DATA_NOTE_PATTERN.search(notes_text):
+        return False
+    unknown = gemini_result.get("unknown")
+    unknown_count = len(unknown) if isinstance(unknown, list) else 0
+    return unknown_count >= chunk_trigger_count
+
+
 def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id: int) -> tuple[dict[str, Any], dict[str, Any]]:
     batch = repositories.get_grouping_batch(db, batch_id)
     items = repositories.list_grouping_items(db, batch_id)
@@ -4313,22 +4361,41 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
             f"Image mapping: {json.dumps(image_mapping, default=str)}."
         )
         use_deepseek = _grouping_provider_is_deepseek()
-        if use_deepseek:
-            gemini_result, gemini_meta = _call_deepseek_vision_summary(
-                prompt=prompt,
-                image_urls=image_urls,
-                model_name=settings.deepseek_vision_model,
-                image_resize_scale=_grouping_deepseek_resize_scale(),
-            )
-            _record_deepseek_cost(db, script_run_id, gemini_meta)
-        else:
-            gemini_result, gemini_meta = _call_kiosk_gemini_summary(
-                prompt=prompt,
-                image_urls=image_urls,
-                model_name=model_name,
-                image_resize_scale=resize_scale,
-            )
-            _record_gemini_cost(db, script_run_id, gemini_meta)
+
+        def _call_chunk_vision() -> tuple[dict[str, Any], dict[str, Any]]:
+            if use_deepseek:
+                result, meta = _call_deepseek_vision_summary(
+                    prompt=prompt,
+                    image_urls=image_urls,
+                    model_name=settings.deepseek_vision_model,
+                    image_resize_scale=_grouping_deepseek_resize_scale(),
+                )
+                _record_deepseek_cost(db, script_run_id, meta)
+            else:
+                result, meta = _call_kiosk_gemini_summary(
+                    prompt=prompt,
+                    image_urls=image_urls,
+                    model_name=model_name,
+                    image_resize_scale=resize_scale,
+                )
+                _record_gemini_cost(db, script_run_id, meta)
+            return result, meta
+
+        if chunk_index > 1:
+            # Spread chunk calls out a bit rather than firing them back-to-back -
+            # a suspected soft rate limit/throttle on the provider side seems to
+            # correlate with how many vision calls land in a short window.
+            time.sleep(_GROUPING_CHUNK_CALL_INTERVAL_SECONDS)
+
+        gemini_result, gemini_meta = _call_chunk_vision()
+        retry_attempts = 0
+        while (
+            _grouping_chunk_response_is_visual_failure(gemini_result, chunk_trigger_count=len(chunk))
+            and retry_attempts < _GROUPING_CHUNK_RETRY_MAX_ATTEMPTS
+        ):
+            retry_attempts += 1
+            time.sleep(_GROUPING_CHUNK_RETRY_INTERVAL_SECONDS)
+            gemini_result, gemini_meta = _call_chunk_vision()
         raw_metas.append(gemini_meta)
         chunk_groups = gemini_result.get("groups") if isinstance(gemini_result.get("groups"), list) else []
         chunk_open_entries = gemini_result.get("open_entries") if isinstance(gemini_result.get("open_entries"), list) else []
