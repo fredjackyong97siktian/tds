@@ -4129,7 +4129,6 @@ def _grouping_model_name_label() -> str:
     return "deepseek_grouping_direct" if _grouping_provider_is_deepseek() else "gemini_grouping_direct"
 
 
-_GROUPING_NO_VISUAL_DATA_NOTE_PATTERN = re.compile(r"no visual data|no image content|visual information not available|insufficient visual evidence", re.IGNORECASE)
 _GROUPING_CHUNK_RETRY_MAX_ATTEMPTS = 3
 _GROUPING_CHUNK_RETRY_INTERVAL_SECONDS = 5.0
 _GROUPING_CHUNK_CALL_INTERVAL_SECONDS = 2.5
@@ -4140,16 +4139,17 @@ def _grouping_chunk_response_is_visual_failure(gemini_result: dict[str, Any], *,
     # though a well-formed request with valid image data was sent, and dumps
     # every trigger in the chunk straight into "unknown" with zero groups. This
     # is a provider-side fetch/processing failure, not a real "couldn't match"
-    # verdict, so it's worth retrying before accepting it.
+    # verdict, so it's worth retrying before accepting it. Originally this also
+    # required the notes text to match a fixed set of phrases, but the model
+    # phrases "I got no images" a different way nearly every time ("image data
+    # was not provided", "visual data is not available", "visual evidence not
+    # provided", etc.) - chasing every wording is a losing game, so this now
+    # relies purely on the structural signature: nothing at all was resolved.
     groups = gemini_result.get("groups")
     if isinstance(groups, list) and groups:
         return False
     open_entries = gemini_result.get("open_entries")
     if isinstance(open_entries, list) and open_entries:
-        return False
-    notes = gemini_result.get("notes")
-    notes_text = " ".join(str(note) for note in notes) if isinstance(notes, list) else ""
-    if not _GROUPING_NO_VISUAL_DATA_NOTE_PATTERN.search(notes_text):
         return False
     unknown = gemini_result.get("unknown")
     unknown_count = len(unknown) if isinstance(unknown, list) else 0
