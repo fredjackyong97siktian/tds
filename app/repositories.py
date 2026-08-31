@@ -4168,18 +4168,10 @@ def list_sessions(db: Session, limit: int = 50) -> list[dict[str, Any]]:
                           or (s.status = 'pending' and s.end_time is not null)
                         then true else false end as can_retry,
                    s.created_at, s.updated_at,
-                   count(distinct sc.id) as linked_customer_count,
-                   count(distinct sva.id) as linked_video_count
+                   (select count(*) from {session_customer_table} sc where sc.session_id = s.id) as linked_customer_count,
+                   (select count(*) from {session_video_asset_table} sva where sva.session_id = s.id) as linked_video_count
             from {session_table} s
             left join {location_table} l on l.{location_id_column} = s.location_id
-            left join {session_customer_table} sc on sc.session_id = s.id
-            left join {session_video_asset_table} sva on sva.session_id = s.id
-            group by s.id, s.entry_trigger_id, s.exit_trigger_id, s.location_id, s.status,
-                     s.start_time, s.end_time, s.total_item_brought, s.actual_items_brought,
-                     s.transaction_total_items, s.total_customer, s.issue_reason, s.result_summary{grouping_id_group_by},
-                     l.{location_name_column},
-                     can_retry,
-                     s.created_at, s.updated_at
             order by s.created_at desc, s.id desc
             limit :limit
             """
