@@ -121,7 +121,7 @@ class Settings(BaseSettings):
     grouping_gemini_frames_per_trigger: int = 6
     grouping_gemini_image_scale: float = 0.35
     grouping_deepseek_image_scale: float = 0.5
-    grouping_gemini_max_images_per_request: int = 24
+    grouping_gemini_max_images_per_request: int = 36
     kiosk_gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
     kiosk_gemini_timeout_seconds: int = 180
     gemini_input_cost_per_1m_tokens_usd: float = 0.0
