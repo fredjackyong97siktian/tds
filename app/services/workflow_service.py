@@ -1142,12 +1142,43 @@ def _call_kiosk_gemini_summary(
     }
 
 
+def _download_image_data_url_for_deepseek(image_url: str, *, resize_scale: float | None = None) -> str:
+    # DeepSeek fetches plain image URLs itself server-side, and that fetch step has
+    # been observed to intermittently fail for an entire chunk at once ("no visual
+    # data available in the prompt" despite a well-formed request) - embedding the
+    # bytes directly removes that dependency entirely. Mirrors
+    # _download_image_for_gemini's fetch/resize logic, just returning an OpenAI-style
+    # data: URL instead of a Gemini inline_data part.
+    with urlopen(image_url, timeout=settings.deepseek_timeout_seconds) as response:
+        payload = response.read()
+        content_type = response.headers.get_content_type()
+    if not content_type or content_type == "application/octet-stream":
+        guessed, _ = mimetypes.guess_type(image_url)
+        content_type = guessed or "image/jpeg"
+    scale = _coerce_number(resize_scale, 1.0) if resize_scale is not None else 1.0
+    if 0 < scale < 1:
+        try:
+            with Image.open(BytesIO(payload)) as image:
+                width, height = image.size
+                resized_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+                resized = image.convert("RGB").resize(resized_size, Image.Resampling.LANCZOS)
+                output = BytesIO()
+                resized.save(output, format="JPEG", quality=85, optimize=True)
+                payload = output.getvalue()
+                content_type = "image/jpeg"
+        except Exception:
+            logger.exception("Could not resize DeepSeek image before sending url=%s", image_url)
+    encoded = base64.b64encode(payload).decode("ascii")
+    return f"data:{content_type};base64,{encoded}"
+
+
 def _call_deepseek_vision_summary(
     *,
     prompt: str,
     image_urls: list[str],
     model_name: str | None = None,
     allow_text_only: bool = False,
+    image_resize_scale: float | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     api_key = str(settings.deepseek_api_key or os.environ.get("DEEPSEEK_API_KEY") or "").strip()
     if not api_key:
@@ -1158,7 +1189,8 @@ def _call_deepseek_vision_summary(
     selected_model = str(model_name or settings.deepseek_vision_model).strip()
     content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
     for image_url in image_urls:
-        content.append({"type": "image_url", "image_url": {"url": image_url}})
+        data_url = _download_image_data_url_for_deepseek(image_url, resize_scale=image_resize_scale)
+        content.append({"type": "image_url", "image_url": {"url": data_url}})
 
     request_body = {
         "model": selected_model,
@@ -2520,7 +2552,10 @@ def _repair_grouping_with_gemini(
     try:
         if _grouping_provider_is_deepseek():
             repair_result, repair_meta = _call_deepseek_vision_summary(
-                prompt=prompt, image_urls=image_urls, model_name=settings.deepseek_vision_model
+                prompt=prompt,
+                image_urls=image_urls,
+                model_name=settings.deepseek_vision_model,
+                image_resize_scale=_grouping_gemini_resize_scale(),
             )
             repair_cost = _record_deepseek_cost(db, repair_script_run_id, repair_meta)
         else:
@@ -4001,6 +4036,7 @@ def _verify_gemini_grouping_match(
                 prompt=prompt,
                 image_urls=image_urls,
                 model_name=settings.deepseek_vision_model,
+                image_resize_scale=resize_scale,
             )
             _record_deepseek_cost(db, script_run_id, meta)
         else:
@@ -4255,6 +4291,7 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
                 prompt=prompt,
                 image_urls=image_urls,
                 model_name=settings.deepseek_vision_model,
+                image_resize_scale=resize_scale,
             )
             _record_deepseek_cost(db, script_run_id, gemini_meta)
         else:
