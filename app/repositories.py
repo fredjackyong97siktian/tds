@@ -4171,7 +4171,7 @@ def list_sessions(
             from {session_table} s
             left join {location_table} l on l.{location_id_column} = s.location_id
             {where_sql}
-            order by s.created_at desc, s.id desc
+            order by s.id desc
             limit :limit offset :offset
             """
         ),
