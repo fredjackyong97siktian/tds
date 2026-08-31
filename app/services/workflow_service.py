@@ -8709,19 +8709,14 @@ def _build_frame_capture_command(rtsp_url: str, offset_seconds: float, output_pa
     return command
 
 
-def _trigger_frame_offsets(duration_seconds: float, frame_count: int) -> list[float]:
-    frame_count = max(1, int(frame_count))
-    duration_seconds = max(0.0, float(duration_seconds))
-    if frame_count == 1 or duration_seconds <= 0:
-        return [0.0 for _ in range(frame_count)]
-    step_seconds = duration_seconds / max(1, frame_count - 1)
-    return [min(duration_seconds, index * step_seconds) for index in range(frame_count)]
-
-
 def _selected_trigger_frame_offsets(duration_seconds: float) -> tuple[list[float], int]:
-    planned_frame_count = max(1, int(settings.trigger_frame_count))
-    selected_frame_count = min(planned_frame_count, _grouping_frames_per_trigger())
-    return _trigger_frame_offsets(duration_seconds, planned_frame_count)[:selected_frame_count], planned_frame_count
+    # Fixed-interval sampling from the start of the window (offset 0), not spread
+    # across the whole window - e.g. 6 frames, 1 second apart: [0, 1, 2, 3, 4, 5].
+    frame_count = _grouping_frames_per_trigger()
+    interval_seconds = max(0.01, _coerce_number(settings.trigger_frame_interval_seconds, 1.0))
+    duration_seconds = max(0.0, float(duration_seconds))
+    offsets = [min(duration_seconds, index * interval_seconds) for index in range(frame_count)]
+    return offsets, frame_count
 
 
 def _run_trigger_frame_retrieval_job(
@@ -9137,7 +9132,7 @@ def start_trigger_frame_asset_retrieval_job(job: TriggerFrameAssetRetrievalQueue
             error = None
         elif ok_count:
             error = (
-                f"Retrieved {ok_count}/{frame_count} trigger frames from the first {frame_count} of {planned_frame_count} planned samples. "
+                f"Retrieved {ok_count}/{frame_count} trigger frames. "
                 "Check the retrieve_video script log for missing-frame ffmpeg errors."
             )
         else:
