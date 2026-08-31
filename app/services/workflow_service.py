@@ -2570,7 +2570,7 @@ def _repair_grouping_with_gemini(
                 prompt=prompt,
                 image_urls=image_urls,
                 model_name=settings.deepseek_vision_model,
-                image_resize_scale=_grouping_gemini_resize_scale(),
+                image_resize_scale=_grouping_deepseek_resize_scale(),
             )
             repair_cost = _record_deepseek_cost(db, repair_script_run_id, repair_meta)
         else:
@@ -3544,6 +3544,11 @@ def _grouping_gemini_resize_scale() -> float | None:
     return scale if 0 < scale < 1 else None
 
 
+def _grouping_deepseek_resize_scale() -> float | None:
+    scale = _coerce_number(settings.grouping_deepseek_image_scale, 1.0)
+    return scale if 0 < scale < 1 else None
+
+
 def _first_trigger_frame_payload(frames: list[dict[str, Any]], limit: int | None = None) -> list[dict[str, Any]]:
     if limit is None:
         limit = _grouping_frames_per_trigger()
@@ -4051,7 +4056,7 @@ def _verify_gemini_grouping_match(
                 prompt=prompt,
                 image_urls=image_urls,
                 model_name=settings.deepseek_vision_model,
-                image_resize_scale=resize_scale,
+                image_resize_scale=_grouping_deepseek_resize_scale(),
             )
             _record_deepseek_cost(db, script_run_id, meta)
         else:
@@ -4306,7 +4311,7 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
                 prompt=prompt,
                 image_urls=image_urls,
                 model_name=settings.deepseek_vision_model,
-                image_resize_scale=resize_scale,
+                image_resize_scale=_grouping_deepseek_resize_scale(),
             )
             _record_deepseek_cost(db, script_run_id, gemini_meta)
         else:
