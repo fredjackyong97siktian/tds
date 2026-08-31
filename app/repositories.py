@@ -1344,6 +1344,7 @@ def list_trigger_frame_assets(
     start_time: Any | None = None,
     end_time: Any | None = None,
     status: str | None = None,
+    trigger_id: int | None = None,
 ) -> list[dict[str, Any]]:
     frame_asset_table = _table("trigger_frame_asset")
     frame_table = _table("trigger_frame")
@@ -1361,6 +1362,9 @@ def list_trigger_frame_assets(
     if status:
         where_clauses.append("status = :status")
         params["status"] = status
+    if trigger_id is not None:
+        where_clauses.append("trigger_id = :trigger_id")
+        params["trigger_id"] = trigger_id
     where_sql = " and ".join(where_clauses)
     result = db.execute(
         text(
