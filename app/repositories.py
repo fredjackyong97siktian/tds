@@ -4147,7 +4147,9 @@ def retry_session_issue(db: Session, session_id: int) -> dict[str, Any]:
     }
 
 
-def list_sessions(db: Session, limit: int = 50, *, offset: int = 0) -> list[dict[str, Any]]:
+def list_sessions(
+    db: Session, limit: int = 50, *, offset: int = 0, session_id: int | None = None
+) -> list[dict[str, Any]]:
     session_table = _table("session")
     session_customer_table = _table("session_customer")
     session_video_asset_table = _table("session_video_asset")
@@ -4156,6 +4158,7 @@ def list_sessions(db: Session, limit: int = 50, *, offset: int = 0) -> list[dict
     location_name_column = settings.location_name_column
     has_grouping_id = _column_exists(db, session_table, "grouping_id")
     grouping_id_select = ", s.grouping_id" if has_grouping_id else ""
+    where_sql = "where s.id = :session_id" if session_id is not None else ""
     result = db.execute(
         text(
             f"""
@@ -4171,11 +4174,12 @@ def list_sessions(db: Session, limit: int = 50, *, offset: int = 0) -> list[dict
                    (select count(*) from {session_video_asset_table} sva where sva.session_id = s.id) as linked_video_count
             from {session_table} s
             left join {location_table} l on l.{location_id_column} = s.location_id
+            {where_sql}
             order by s.created_at desc, s.id desc
             limit :limit offset :offset
             """
         ),
-        {"limit": limit, "offset": offset},
+        {"limit": limit, "offset": offset, "session_id": session_id},
     )
     rows = _fetch_all_dicts(result)
     for row in rows:

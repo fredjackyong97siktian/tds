@@ -210,6 +210,14 @@ def count_sessions(db: Session = Depends(get_transaction_db)) -> dict[str, int]:
     return {"total": repositories.count_sessions(db)}
 
 
+@router.get("/{session_id}", response_model=SessionListItem)
+def get_session_detail(session_id: int, db: Session = Depends(get_transaction_db)) -> SessionListItem:
+    rows = repositories.list_sessions(db, limit=1, session_id=session_id)
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"Session {session_id} was not found.")
+    return SessionListItem(**rows[0])
+
+
 @router.get("/{session_id}/customers", response_model=list[SessionCustomerResponse])
 def list_session_customers(session_id: int, db: Session = Depends(get_transaction_db)) -> list[SessionCustomerResponse]:
     rows = repositories.list_session_customers(db, session_id)
