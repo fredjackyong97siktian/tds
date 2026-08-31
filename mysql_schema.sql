@@ -124,6 +124,7 @@ CREATE TABLE IF NOT EXISTS sesamedb.tds_session (
     KEY idx_session_entry_trigger_id (entry_trigger_id),
     KEY idx_session_exit_trigger_id (exit_trigger_id),
     KEY idx_session_location_created (location_id, created_at),
+    KEY idx_session_created_at (created_at, id),
     KEY idx_session_grouping (grouping_id),
     CONSTRAINT fk_session_entry_trigger
         FOREIGN KEY (entry_trigger_id) REFERENCES tds_trigger_event(id),
