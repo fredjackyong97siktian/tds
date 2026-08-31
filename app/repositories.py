@@ -4147,7 +4147,7 @@ def retry_session_issue(db: Session, session_id: int) -> dict[str, Any]:
     }
 
 
-def list_sessions(db: Session, limit: int = 50) -> list[dict[str, Any]]:
+def list_sessions(db: Session, limit: int = 50, *, offset: int = 0) -> list[dict[str, Any]]:
     session_table = _table("session")
     session_customer_table = _table("session_customer")
     session_video_asset_table = _table("session_video_asset")
@@ -4156,7 +4156,6 @@ def list_sessions(db: Session, limit: int = 50) -> list[dict[str, Any]]:
     location_name_column = settings.location_name_column
     has_grouping_id = _column_exists(db, session_table, "grouping_id")
     grouping_id_select = ", s.grouping_id" if has_grouping_id else ""
-    grouping_id_group_by = ", s.grouping_id" if has_grouping_id else ""
     result = db.execute(
         text(
             f"""
@@ -4173,10 +4172,10 @@ def list_sessions(db: Session, limit: int = 50) -> list[dict[str, Any]]:
             from {session_table} s
             left join {location_table} l on l.{location_id_column} = s.location_id
             order by s.created_at desc, s.id desc
-            limit :limit
+            limit :limit offset :offset
             """
         ),
-        {"limit": limit},
+        {"limit": limit, "offset": offset},
     )
     rows = _fetch_all_dicts(result)
     for row in rows:
@@ -4188,6 +4187,13 @@ def list_sessions(db: Session, limit: int = 50) -> list[dict[str, Any]]:
         row["session_videos"] = list_session_video_assets(db, session_id=int(row["id"]))
         row["confidence_result_id"] = _find_confidence_result_id_for_session(db, row)
     return rows
+
+
+def count_sessions(db: Session) -> int:
+    session_table = _table("session")
+    result = db.execute(text(f"select count(*) as total from {session_table}"))
+    row = _fetch_one_dict(result)
+    return int(row.get("total") or 0)
 
 
 def get_transaction_total_items(db: Session, session_id: int) -> int:

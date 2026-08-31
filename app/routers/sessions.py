@@ -200,9 +200,14 @@ def create_manual_session(payload: SessionManualCreateRequest, db: Session = Dep
 
 
 @router.get("", response_model=list[SessionListItem])
-def list_sessions(limit: int = 50, db: Session = Depends(get_transaction_db)) -> list[SessionListItem]:
-    rows = repositories.list_sessions(db, limit=limit)
+def list_sessions(limit: int = 50, offset: int = 0, db: Session = Depends(get_transaction_db)) -> list[SessionListItem]:
+    rows = repositories.list_sessions(db, limit=limit, offset=offset)
     return [SessionListItem(**row) for row in rows]
+
+
+@router.get("/count")
+def count_sessions(db: Session = Depends(get_transaction_db)) -> dict[str, int]:
+    return {"total": repositories.count_sessions(db)}
 
 
 @router.get("/{session_id}/customers", response_model=list[SessionCustomerResponse])
