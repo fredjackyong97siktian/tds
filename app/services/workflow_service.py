@@ -2839,12 +2839,20 @@ def _persist_grouping_items_from_summary(
             except Exception:
                 logger.exception("Could not persist unknown grouping item batch_id=%s trigger_id=%s", batch_id, trigger_id)
     issues = grouping_summary.get("issues") or []
+    frame_retrieval_issue_trigger_ids = {
+        int(trigger_id) for trigger_id in (grouping_summary.get("frame_retrieval_issue_trigger_ids") or [])
+    }
     if isinstance(issues, list):
         for trigger_id in issues:
             try:
                 normalized_trigger_id = int(trigger_id)
                 if normalized_trigger_id in grouped_trigger_ids:
                     continue
+                reason = (
+                    "no_frames_retrieved"
+                    if normalized_trigger_id in frame_retrieval_issue_trigger_ids
+                    else "no_visible_person_in_any_frame"
+                )
                 repositories.upsert_grouping_item(
                     db,
                     batch_id=batch_id,
@@ -2853,7 +2861,7 @@ def _persist_grouping_items_from_summary(
                     group_key=None,
                     role="unknown",
                     status="issue",
-                    result_payload={"reason": "no_visible_person_in_any_frame"},
+                    result_payload={"reason": reason},
                 )
             except Exception:
                 logger.exception("Could not persist issue grouping item batch_id=%s trigger_id=%s", batch_id, trigger_id)
@@ -4531,8 +4539,32 @@ def _grouping_chunk_response_is_visual_failure(gemini_result: dict[str, Any], *,
     return unknown_count >= chunk_trigger_count
 
 
+def _confirm_trigger_frame_retrieval_terminal(db: Session, trigger_id: int) -> tuple[bool, int]:
+    """Live-check this trigger's actual frame retrieval state directly from
+    trigger_frame_asset/trigger_frame - not the possibly-stale frame_payload
+    snapshot stored on the grouping item - so a trigger is only ever excluded as
+    genuinely frame-less after retrieval was truly attempted and concluded, not
+    just because it's still queued or in flight. Mirrors the terminal-status
+    definition used by has_pending_trigger_frame_retrieval_in_window ('retrieved',
+    'processed', or 'issue'). Returns (is_terminal, ok_frame_count).
+    """
+    assets = repositories.list_trigger_frame_assets(db, limit=1, trigger_id=trigger_id)
+    if not assets:
+        return False, 0
+    asset = assets[0]
+    status = str(asset.get("status") or "").strip().lower()
+    ok_frame_count = sum(
+        1 for frame in asset.get("frames") or [] if str(frame.get("status") or "").strip().lower() == "ok"
+    )
+    return status in {"retrieved", "processed", "issue"}, ok_frame_count
+
+
 def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[str, Any], dict[str, Any], int]:
     batch = repositories.get_grouping_batch(db, batch_id)
+    # A trigger's stored frame_payload snapshot can predate retrieval finishing -
+    # refresh it from live data first so "this trigger has no frames" reflects
+    # retrieval's actual current outcome, not a stale snapshot taken too early.
+    _refresh_grouping_item_frame_payloads(db, batch=batch)
     items = repositories.list_grouping_items(db, batch_id)
     trigger_inputs: list[dict[str, Any]] = []
     for item in items:
@@ -4550,7 +4582,46 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
             }
         )
 
-    if not any(trigger.get("frames") for trigger in trigger_inputs):
+    notes: list[str] = []
+    issue_trigger_ids: set[int] = set()
+
+    # A trigger with zero frames in the refreshed payload still gets one last,
+    # live, per-trigger check against trigger_frame_asset/trigger_frame before
+    # being excluded - only a CONFIRMED, concluded retrieval attempt with zero
+    # ok frames is treated as genuinely frame-less (an "issue", excluded from
+    # adjacent/direct/repair like the no-visible-person case below). One whose
+    # retrieval hasn't actually concluded yet is left out of this run without
+    # being marked an issue - the scheduler should already prevent this by
+    # gating batch creation on retrieval completeness, so it should be rare;
+    # it falls through to "unknown" as a safety net rather than blocking or
+    # mislabeling the whole batch.
+    frameless_trigger_ids = [int(trigger["trigger_id"]) for trigger in trigger_inputs if not trigger.get("frames")]
+    still_pending_trigger_ids: list[int] = []
+    for trigger_id in frameless_trigger_ids:
+        is_terminal, ok_frame_count = _confirm_trigger_frame_retrieval_terminal(db, trigger_id)
+        if is_terminal and ok_frame_count == 0:
+            issue_trigger_ids.add(trigger_id)
+        else:
+            still_pending_trigger_ids.append(trigger_id)
+    if issue_trigger_ids:
+        notes.extend(
+            f"Trigger {trigger_id} had no successfully retrieved frames after retrieval concluded; "
+            "marked as an issue, not usable by grouping_direct or grouping_repair."
+            for trigger_id in sorted(issue_trigger_ids)
+        )
+    if still_pending_trigger_ids:
+        notes.append(
+            "Frame retrieval had not actually concluded yet for triggers "
+            f"{sorted(still_pending_trigger_ids)} despite reaching a grouping batch; left out of this run."
+        )
+    excluded_trigger_ids = issue_trigger_ids | set(still_pending_trigger_ids)
+    if excluded_trigger_ids:
+        trigger_inputs = [item for item in trigger_inputs if int(item["trigger_id"]) not in excluded_trigger_ids]
+    # Recorded separately so persistence can give these a distinct reason
+    # ("no_frames_retrieved") from the no-visible-person issues found later.
+    frame_retrieval_issue_trigger_ids = set(issue_trigger_ids)
+
+    if not trigger_inputs:
         # No script_run for this batch exists yet at this point (the direct-stage
         # script_run is only created after Stage 1 adjacent checking finishes, so
         # the two stay in real execution order in the script_run table) - but this
@@ -4581,7 +4652,6 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
     grouped_trigger_ids: set[int] = set()
     normalized_unknown: set[int] = set()
     normalized_open_entries: set[int] = set()
-    notes: list[str] = []
     raw_metas: list[dict[str, Any]] = []
 
     # Stage 1 (Adjacent Checking): try to close out confirmed (identity-bearing)
@@ -4617,7 +4687,8 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
     # grouping_direct and grouping_repair, distinct from "unknown" (which means
     # a person WAS seen but couldn't be matched/classified). One with a person
     # in SOME but not all frames keeps only the person frames going forward.
-    issue_trigger_ids: set[int] = set()
+    # issue_trigger_ids may already contain confirmed frame-less triggers found
+    # before Stage 1 even ran - this only adds to that set, never replaces it.
     for trigger_id, presence_list in adjacent_frame_presence_by_trigger.items():
         if trigger_id in grouped_trigger_ids or not presence_list:
             continue
@@ -5088,6 +5159,7 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
             "open_entries": sorted(normalized_open_entries),
             "unknown": sorted(normalized_unknown),
             "issues": sorted(issue_trigger_ids),
+            "frame_retrieval_issue_trigger_ids": sorted(frame_retrieval_issue_trigger_ids),
             "notes": notes,
             "diagnostics": {
                 "mode": _grouping_model_name_label(),
