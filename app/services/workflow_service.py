@@ -4249,8 +4249,17 @@ def _verify_entry_groups_against_candidates_batch(
         "Separately, for every numbered image across all groups (1 to "
         f"{len(image_urls)}), also note whether a person is visibly present in that specific image at all - not "
         "just an empty scene, doorway, vehicle, or object. "
+        "Carry observation rule: for every group, whether or not it matched, describe what the entry customer visibly "
+        "carries in the entry image set, and - only if matched_candidate is not null - what they visibly carry in that "
+        "matched candidate's images. Count bags, plastic bags, woven/reusable bags, backpacks, boxes, cartons, bottles, "
+        "and loose items only when visibly held, worn, or moving with the person. Record color, type, approximate size, "
+        "count, and confidence. Use 0 count when the customer appears empty-handed. If matched_candidate is null, still "
+        "return entry_carry from the entry images, and leave exit_carry empty. "
         "Return strict JSON only with schema: "
-        '{"results":[{"group_number":integer,"matched_candidate":integer or null,"confidence":number,"reason":string}],'
+        '{"results":[{"group_number":integer,"matched_candidate":integer or null,"confidence":number,"reason":string,'
+        '"entry_carry":{"bag_count":integer,"item_count":integer,"items":[{"type":string,"color":string,"size":string,"count":integer,"confidence":number}],"summary":string},'
+        '"exit_carry":{"bag_count":integer,"item_count":integer,"items":[{"type":string,"color":string,"size":string,"count":integer,"confidence":number}],"summary":string},'
+        '"carry_change_summary":string}],'
         '"image_presence":[{"image_number":integer,"has_person":0 or 1}]}. '
         "Include exactly one result per group listed above, using its group_number, and one image_presence entry "
         "per image number. matched_candidate is the candidate_number of the match within that group, or null if "
@@ -4308,6 +4317,9 @@ def _verify_entry_groups_against_candidates_batch(
             "matched_candidate": matched_candidate,
             "confidence": _coerce_number(entry.get("confidence"), 0.0),
             "reason": str(entry.get("reason") or ""),
+            "entry_carry": entry.get("entry_carry") if isinstance(entry.get("entry_carry"), Mapping) else None,
+            "exit_carry": entry.get("exit_carry") if isinstance(entry.get("exit_carry"), Mapping) else None,
+            "carry_change_summary": str(entry.get("carry_change_summary") or ""),
         }
     return results_by_group, frame_presence_by_trigger, meta
 
@@ -4460,7 +4472,9 @@ def _run_grouping_adjacent_pass(
                     },
                     "total_customer": 1,
                     "entry_has_identity": True,
-                    "carry_change_summary": "",
+                    "entry_carry": result.get("entry_carry"),
+                    "exit_carry": result.get("exit_carry"),
+                    "carry_change_summary": str(result.get("carry_change_summary") or ""),
                 }
             )
             next_group_id += 1
