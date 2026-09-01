@@ -4971,6 +4971,12 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
                         image_resize_scale=resize_scale,
                     )
                     _record_gemini_cost(db, script_run_id, meta)
+                # Recorded here, not once after the retry loop below - a retried
+                # attempt is charged for real the moment it's made, so its meta
+                # must be captured immediately or that real cost goes missing
+                # from cost_details/gemini_meta.chunks (only the final attempt's
+                # meta would otherwise ever be appended).
+                raw_metas.append(meta)
                 return result, meta
 
             if chunk_index > 1:
@@ -4988,7 +4994,6 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
                 retry_attempts += 1
                 time.sleep(_GROUPING_CHUNK_RETRY_INTERVAL_SECONDS)
                 gemini_result, gemini_meta = _call_chunk_vision()
-            raw_metas.append(gemini_meta)
             chunk_groups = gemini_result.get("groups") if isinstance(gemini_result.get("groups"), list) else []
             chunk_open_entries = gemini_result.get("open_entries") if isinstance(gemini_result.get("open_entries"), list) else []
             chunk_unknown = gemini_result.get("unknown") if isinstance(gemini_result.get("unknown"), list) else []
