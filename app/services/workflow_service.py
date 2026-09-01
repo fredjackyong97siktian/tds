@@ -4392,6 +4392,12 @@ def _run_grouping_adjacent_pass(
             for item in sorted_inputs
             if int(item["trigger_id"]) != entry_id
             and item.get("frames")
+            # A trigger with its own phone/credit card id is someone else's
+            # CONFIRMED entry, not this entry's exit - skip over it rather than
+            # offering it as a candidate, and keep looking further ahead within
+            # the same lookahead window for a genuine (non-identity) candidate.
+            and item.get("phone_entry_id") is None
+            and item.get("credit_card_entry_id") is None
             and (_coerce_datetime_value(item.get("trigger_time")) or entry_time) > entry_time
             and (_coerce_datetime_value(item.get("trigger_time")) or entry_time) - entry_time <= lookahead_window
         ][:_GROUPING_ADJACENT_LOOKAHEAD_COUNT]
