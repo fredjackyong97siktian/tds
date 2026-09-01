@@ -4122,65 +4122,87 @@ def _verify_gemini_grouping_match(
     }
 
 
-def _verify_entry_against_candidates(
+def _verify_entry_groups_against_candidates_batch(
     db: Session,
     script_run_id: int,
     *,
-    entry_trigger: Mapping[str, Any],
-    candidate_triggers: list[Mapping[str, Any]],
+    entry_groups: list[dict[str, Any]],
     model_name: str,
     resize_scale: float | None,
-) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    """Check one confirmed entry against several nearby candidate exits in a
-    single call, asking which candidate (if any) is the same person - used by
-    the adjacent-pairing pass so a confirmed entry doesn't need one separate
-    call per candidate it's compared against.
+) -> tuple[dict[int, dict[str, Any]], dict[str, Any] | None]:
+    """Check several independent confirmed entries, each against its own small
+    set of nearby candidate exits, in ONE combined call - rather than one call
+    per entry. Each entry_group is {"group_number": int, "entry": Mapping,
+    "candidates": list[Mapping]}. Returns a dict of group_number -> result.
     """
-    entry_image_urls: list[str] = []
-    for frame in entry_trigger.get("frames") or []:
-        if not isinstance(frame, Mapping):
-            continue
-        image_url = str(frame.get("image_url") or "").strip()
-        if image_url and image_url not in entry_image_urls:
-            entry_image_urls.append(image_url)
+    image_urls: list[str] = []
+    group_blocks: list[dict[str, Any]] = []
+    group_by_number: dict[int, dict[str, Any]] = {}
 
-    candidate_blocks: list[dict[str, Any]] = []
-    image_urls = list(entry_image_urls)
-    for candidate in candidate_triggers:
-        candidate_image_urls: list[str] = []
-        for frame in candidate.get("frames") or []:
+    for entry_group in entry_groups:
+        group_number = int(entry_group["group_number"])
+        entry_trigger = entry_group["entry"]
+        candidate_triggers = entry_group["candidates"]
+
+        entry_start = len(image_urls) + 1
+        for frame in entry_trigger.get("frames") or []:
             if not isinstance(frame, Mapping):
                 continue
             image_url = str(frame.get("image_url") or "").strip()
-            if image_url and image_url not in image_urls and image_url not in candidate_image_urls:
-                candidate_image_urls.append(image_url)
-        if not candidate_image_urls:
+            if image_url and image_url not in image_urls:
+                image_urls.append(image_url)
+        if len(image_urls) < entry_start:
             continue
-        start_number = len(image_urls) + 1
-        image_urls.extend(candidate_image_urls)
-        candidate_blocks.append(
+        entry_end = len(image_urls)
+
+        candidate_blocks: list[dict[str, Any]] = []
+        for candidate in candidate_triggers:
+            candidate_start = len(image_urls) + 1
+            for frame in candidate.get("frames") or []:
+                if not isinstance(frame, Mapping):
+                    continue
+                image_url = str(frame.get("image_url") or "").strip()
+                if image_url and image_url not in image_urls:
+                    image_urls.append(image_url)
+            if len(image_urls) < candidate_start:
+                continue
+            candidate_blocks.append(
+                {
+                    "candidate_number": len(candidate_blocks) + 1,
+                    "trigger_id": int(candidate["trigger_id"]),
+                    "image_numbers": f"{candidate_start} to {len(image_urls)}",
+                }
+            )
+        if not candidate_blocks:
+            continue
+
+        group_blocks.append(
             {
-                "candidate_number": len(candidate_blocks) + 1,
-                "trigger_id": int(candidate["trigger_id"]),
-                "image_numbers": f"{start_number} to {len(image_urls)}",
+                "group_number": group_number,
+                "entry_trigger_id": int(entry_trigger["trigger_id"]),
+                "entry_image_numbers": f"{entry_start} to {entry_end}",
+                "candidates": candidate_blocks,
             }
         )
+        group_by_number[group_number] = entry_group
 
-    if not entry_image_urls or not candidate_blocks:
-        return {"matched_candidate": None, "confidence": 0.0, "reason": "Missing entry or candidate images."}, None
+    if not group_blocks:
+        return {}, None
 
     prompt = (
-        "You are checking whether a confirmed store entry has its exit among several nearby candidate triggers. "
-        f"Image set A (image numbers 1 to {len(entry_image_urls)}) shows the confirmed entry. "
-        f"Each candidate below shows a different, separate trigger: {json.dumps(candidate_blocks)}. "
-        "Decide whether ANY ONE candidate shows the exact same physical person as set A, based only on clothing, "
-        "build, hair, and carried items visibly present in these images. At most one candidate can be correct - "
-        "candidates are different, unrelated triggers, not multiple views of the same event. If none of them show "
-        "the same person, or you are not confident, say so rather than guessing. "
+        "You are checking several completely independent confirmed store entries in one request, each against its "
+        "own small set of nearby candidate exit triggers. Groups are unrelated to each other - never compare a "
+        "group's entry or candidates against another group's images. "
+        f"Groups: {json.dumps(group_blocks)}. "
+        "For each group, decide whether ANY ONE of that group's candidates shows the exact same physical person as "
+        "that group's own entry image set, based only on clothing, build, hair, and carried items visibly present. "
+        "At most one candidate per group can be correct - candidates are different, unrelated triggers, not "
+        "multiple views of the same event. If none of a group's candidates show the same person, or you are not "
+        "confident, say so for that group rather than guessing. "
         "Return strict JSON only with schema: "
-        '{"matched_candidate":integer or null,"confidence":number,"reason":string}. '
-        "matched_candidate is the candidate_number of the match, or null if none match. reason should cite the "
-        "specific visual details that support the decision."
+        '{"results":[{"group_number":integer,"matched_candidate":integer or null,"confidence":number,"reason":string}]}. '
+        "Include exactly one result per group listed above, using its group_number. matched_candidate is the "
+        "candidate_number of the match within that group, or null if none match."
     )
     try:
         if _grouping_provider_is_deepseek():
@@ -4199,16 +4221,26 @@ def _verify_entry_against_candidates(
                 image_resize_scale=resize_scale,
             )
             _record_gemini_cost(db, script_run_id, meta)
-    except Exception as exc:
-        return {"matched_candidate": None, "confidence": 0.0, "reason": str(exc)}, None
+    except Exception:
+        return {}, None
 
-    matched_raw = result.get("matched_candidate")
-    matched_candidate = int(matched_raw) if isinstance(matched_raw, (int, float)) and matched_raw is not None else None
-    return {
-        "matched_candidate": matched_candidate,
-        "confidence": _coerce_number(result.get("confidence"), 0.0),
-        "reason": str(result.get("reason") or ""),
-    }, meta
+    raw_results = result.get("results") if isinstance(result.get("results"), list) else []
+    results_by_group: dict[int, dict[str, Any]] = {}
+    for entry in raw_results:
+        if not isinstance(entry, Mapping) or entry.get("group_number") is None:
+            continue
+        try:
+            group_number = int(entry["group_number"])
+        except (TypeError, ValueError):
+            continue
+        matched_raw = entry.get("matched_candidate")
+        matched_candidate = int(matched_raw) if isinstance(matched_raw, (int, float)) and matched_raw is not None else None
+        results_by_group[group_number] = {
+            "matched_candidate": matched_candidate,
+            "confidence": _coerce_number(entry.get("confidence"), 0.0),
+            "reason": str(entry.get("reason") or ""),
+        }
+    return results_by_group, meta
 
 
 _GROUPING_ADJACENT_LOOKAHEAD_COUNT = 3
@@ -4247,9 +4279,13 @@ def _run_grouping_adjacent_pass(
         if item.get("phone_entry_id") is not None or item.get("credit_card_entry_id") is not None
     ]
 
+    # Build every entry's candidate set up front, then pack as many of these
+    # independent (entry, candidates) checks as fit into one combined call
+    # (bounded by the same image budget as a normal chunk) instead of sending
+    # one call per entry - a batch of identity entries should cost roughly as
+    # many calls as a batch of chunks, not one call per entry.
+    pending_entry_groups: list[dict[str, Any]] = []
     for entry_id in identity_entry_ids:
-        if entry_id in consumed:
-            continue
         entry_trigger = by_id[entry_id]
         entry_time = _coerce_datetime_value(entry_trigger.get("trigger_time"))
         if entry_time is None or not entry_trigger.get("frames"):
@@ -4258,56 +4294,96 @@ def _run_grouping_adjacent_pass(
             item
             for item in sorted_inputs
             if int(item["trigger_id"]) != entry_id
-            and int(item["trigger_id"]) not in consumed
             and item.get("frames")
             and (_coerce_datetime_value(item.get("trigger_time")) or entry_time) > entry_time
             and (_coerce_datetime_value(item.get("trigger_time")) or entry_time) - entry_time <= lookahead_window
         ][:_GROUPING_ADJACENT_LOOKAHEAD_COUNT]
         if not candidates:
             continue
-        result, meta = _verify_entry_against_candidates(
+        pending_entry_groups.append({"entry_id": entry_id, "entry": entry_trigger, "candidates": candidates})
+
+    max_images = _grouping_gemini_max_images_per_request()
+
+    def _image_count_for(entry_group: dict[str, Any]) -> int:
+        count = len(entry_group["entry"].get("frames") or [])
+        for candidate in entry_group["candidates"]:
+            count += len(candidate.get("frames") or [])
+        return count
+
+    batch: list[dict[str, Any]] = []
+    batch_image_count = 0
+
+    def _flush_batch() -> None:
+        nonlocal next_group_id
+        if not batch:
+            return
+        numbered_groups = [
+            {"group_number": index + 1, "entry": item["entry"], "candidates": item["candidates"]}
+            for index, item in enumerate(batch)
+        ]
+        results_by_group, meta = _verify_entry_groups_against_candidates_batch(
             db,
             script_run_id,
-            entry_trigger=entry_trigger,
-            candidate_triggers=candidates,
+            entry_groups=numbered_groups,
             model_name=model_name,
             resize_scale=resize_scale,
         )
         if meta is not None:
             metas.append(meta)
-        matched_candidate = result.get("matched_candidate")
-        confidence = _coerce_number(result.get("confidence"), 0.0)
-        if matched_candidate is None or confidence < 0.5 or not (1 <= int(matched_candidate) <= len(candidates)):
+        for index, item in enumerate(batch):
+            group_number = index + 1
+            entry_id = item["entry_id"]
+            candidates = item["candidates"]
+            result = results_by_group.get(group_number)
+            if not result:
+                continue
+            matched_candidate = result.get("matched_candidate")
+            confidence = _coerce_number(result.get("confidence"), 0.0)
+            if matched_candidate is None or confidence < 0.5 or not (1 <= int(matched_candidate) <= len(candidates)):
+                continue
+            exit_trigger = candidates[int(matched_candidate) - 1]
+            exit_id = int(exit_trigger["trigger_id"])
+            if entry_id in consumed or exit_id in consumed:
+                continue
+            consumed.add(entry_id)
+            consumed.add(exit_id)
+            groups.append(
+                {
+                    "group_id": next_group_id,
+                    "entry": [entry_id],
+                    "exit": [exit_id],
+                    "score": confidence,
+                    "reason": str(result.get("reason") or "Matched by adjacency check."),
+                    "source": "gemini_grouping_adjacent",
+                    "verified": True,
+                    "verification": {
+                        "error": None,
+                        "confidence": confidence,
+                        "same_person": True,
+                        "matching_details": str(result.get("reason") or ""),
+                        "conflicting_details": "",
+                    },
+                    "total_customer": 1,
+                    "entry_has_identity": True,
+                    "carry_change_summary": "",
+                }
+            )
+            next_group_id += 1
+            notes.append(
+                f"Trigger {entry_id} matched trigger {exit_id} via adjacency check (confidence {confidence:.2f})."
+            )
+
+    for entry_group in pending_entry_groups:
+        if entry_group["entry_id"] in consumed:
             continue
-        exit_trigger = candidates[int(matched_candidate) - 1]
-        exit_id = int(exit_trigger["trigger_id"])
-        consumed.add(entry_id)
-        consumed.add(exit_id)
-        groups.append(
-            {
-                "group_id": next_group_id,
-                "entry": [entry_id],
-                "exit": [exit_id],
-                "score": confidence,
-                "reason": str(result.get("reason") or "Matched by adjacency check."),
-                "source": "gemini_grouping_adjacent",
-                "verified": True,
-                "verification": {
-                    "error": None,
-                    "confidence": confidence,
-                    "same_person": True,
-                    "matching_details": str(result.get("reason") or ""),
-                    "conflicting_details": "",
-                },
-                "total_customer": 1,
-                "entry_has_identity": True,
-                "carry_change_summary": "",
-            }
-        )
-        next_group_id += 1
-        notes.append(
-            f"Trigger {entry_id} matched trigger {exit_id} via adjacency check (confidence {confidence:.2f})."
-        )
+        image_count = _image_count_for(entry_group)
+        if batch and batch_image_count + image_count > max_images:
+            _flush_batch()
+            batch = []
+            batch_image_count = 0
+        batch.append(entry_group)
+        batch_image_count += image_count
+    _flush_batch()
 
     remaining = [item for item in trigger_inputs if int(item["trigger_id"]) not in consumed]
     return remaining, groups, notes, metas
