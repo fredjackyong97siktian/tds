@@ -2641,6 +2641,7 @@ def _repair_grouping_with_gemini(
     repaired_groups: list[dict[str, Any]] = []
     consumed_trigger_ids: set[int] = set()
     repair_verification_notes: list[str] = []
+    repair_verification_metas: list[dict[str, Any]] = []
     next_group_id = len(completed_groups) + 1
     for repaired in repair_result.get("groups") or []:
         if not isinstance(repaired, Mapping):
@@ -2666,7 +2667,7 @@ def _repair_grouping_with_gemini(
         exit_trigger_input = {
             "frames": [{"image_url": url} for url in frames_by_trigger.get(exit_ids[0], [])]
         }
-        verification = _verify_gemini_grouping_match(
+        verification, verification_meta = _verify_gemini_grouping_match(
             db,
             repair_script_run_id,
             entry_trigger=entry_trigger_input,
@@ -2674,6 +2675,8 @@ def _repair_grouping_with_gemini(
             model_name=settings.grouping_gemini_model,
             resize_scale=_grouping_gemini_resize_scale(),
         )
+        if verification_meta is not None:
+            repair_verification_metas.append(verification_meta)
         if verification["same_person"] is False or (
             verification["same_person"] is True and verification["confidence"] < 0.5
         ):
@@ -2717,6 +2720,9 @@ def _repair_grouping_with_gemini(
                         if trigger_id not in consumed_trigger_ids
                     }
                 ),
+                "verification_cost_details": [
+                    _usage_cost_for_call_meta(meta)[1] for meta in repair_verification_metas
+                ],
             },
             indent=2,
             default=str,
@@ -4071,12 +4077,16 @@ def _verify_gemini_grouping_match(
     exit_triggers: list[Mapping[str, Any]],
     model_name: str,
     resize_scale: float | None,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Independently re-check a single proposed entry/exit pairing with a small,
     focused Gemini call that only sees that one pair's own images. A group's
     first-pass "reason" text can sound confident while being ungrounded in the
     actual images (seen in practice at confidence 1.0), so this asks a second,
     narrower question instead of trusting the first pass's self-reported score.
+    Returns (verification_result, call_meta) - call_meta is None when no call
+    was actually made (missing images) or it failed; callers should fold a
+    non-None meta into their own cost/diagnostics log, since the cost is
+    already charged to script_run_id here either way.
     """
     entry_image_urls: list[str] = []
     for frame in entry_trigger.get("frames") or []:
@@ -4102,7 +4112,7 @@ def _verify_gemini_grouping_match(
             "matching_details": "",
             "conflicting_details": "",
             "error": "Missing entry or exit images for verification.",
-        }
+        }, None
 
     image_urls = entry_image_urls + exit_image_urls
     prompt = (
@@ -4145,7 +4155,7 @@ def _verify_gemini_grouping_match(
             "matching_details": "",
             "conflicting_details": "",
             "error": str(exc),
-        }
+        }, None
 
     same_person_raw = result.get("same_person")
     same_person = same_person_raw if isinstance(same_person_raw, bool) else None
@@ -4155,7 +4165,7 @@ def _verify_gemini_grouping_match(
         "matching_details": str(result.get("matching_details") or ""),
         "conflicting_details": str(result.get("conflicting_details") or ""),
         "error": None,
-    }
+    }, meta
 
 
 def _verify_entry_groups_against_candidates_batch(
@@ -4667,6 +4677,10 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
     normalized_unknown: set[int] = set()
     normalized_open_entries: set[int] = set()
     raw_metas: list[dict[str, Any]] = []
+    # Separate from raw_metas (adjacent's calls + direct's own chunk calls) so
+    # the per-match verification calls' real, already-charged cost is visible
+    # in diagnostics instead of silently missing from every cost breakdown.
+    verification_metas: list[dict[str, Any]] = []
 
     # Stage 1 (Adjacent Checking): try to close out confirmed (identity-bearing)
     # entries against just the next few chronologically-following triggers
@@ -5056,7 +5070,7 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
                         "error": "Entry or exit trigger data was not available for verification.",
                     }
                 else:
-                    verification = _verify_gemini_grouping_match(
+                    verification, verification_meta = _verify_gemini_grouping_match(
                         db,
                         script_run_id,
                         entry_trigger=entry_trigger_input,
@@ -5064,6 +5078,8 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
                         model_name=model_name,
                         resize_scale=resize_scale,
                     )
+                    if verification_meta is not None:
+                        verification_metas.append(verification_meta)
 
                 # Reject outright when the independent check says no, or hedges with low
                 # confidence - a same_person=None (call failed / malformed) fails open,
@@ -5163,6 +5179,7 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
         }
         total_image_count = sum(len(trigger.get("frames") or []) for trigger in trigger_inputs)
         cost_details = [_usage_cost_for_call_meta(meta)[1] for meta in raw_metas]
+        verification_cost_details = [_usage_cost_for_call_meta(meta)[1] for meta in verification_metas]
         grouping_summary = {
             "batch_id": batch_id,
             "location_id": int(batch["location_id"]),
@@ -5187,6 +5204,7 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
                 "image_count": total_image_count,
                 "chunks": chunk_results,
                 "cost_details": cost_details,
+                "verification_cost_details": verification_cost_details,
                 "issue_trigger_ids": sorted(issue_trigger_ids),
                 "adjacent_matched_groups": len(adjacent_groups),
             },
