@@ -4311,13 +4311,12 @@ _GROUPING_ADJACENT_LOOKAHEAD_MINUTES = 30
 def _run_grouping_adjacent_pass(
     db: Session,
     *,
-    script_run_id: int,
     batch_id: int,
     location_id: Any,
     trigger_inputs: list[dict[str, Any]],
     model_name: str,
     resize_scale: float | None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str], list[dict[str, Any]], dict[int, list[bool]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str], list[dict[str, Any]], dict[int, list[bool]], int | None]:
     """Before any chunk scanning, try to close out confirmed entries (ones with
     a phone_entry_id or credit_card_entry_id) against just the next few
     chronologically-following triggers. Most real visits are short, and this
@@ -4371,7 +4370,7 @@ def _run_grouping_adjacent_pass(
         pending_entry_groups.append({"entry_id": entry_id, "entry": entry_trigger, "candidates": candidates})
 
     if not pending_entry_groups:
-        return trigger_inputs, groups, notes, metas, frame_presence_by_trigger
+        return trigger_inputs, groups, notes, metas, frame_presence_by_trigger, None
 
     # Give this stage its own script_run instead of folding its calls into the
     # grouping_direct run's cost/activity - it needs to be independently
@@ -4385,7 +4384,6 @@ def _run_grouping_adjacent_pass(
         runner_payload={
             "batch_id": batch_id,
             "location_id": location_id,
-            "parent_script_run_id": script_run_id,
             "identity_entry_count": len(pending_entry_groups),
         },
     )
@@ -4490,7 +4488,7 @@ def _run_grouping_adjacent_pass(
         ),
         stderr_log="",
     )
-    return remaining, groups, notes, metas, frame_presence_by_trigger
+    return remaining, groups, notes, metas, frame_presence_by_trigger, adjacent_script_run_id
 
 
 def _grouping_provider_is_deepseek() -> bool:
@@ -4533,7 +4531,7 @@ def _grouping_chunk_response_is_visual_failure(gemini_result: dict[str, Any], *,
     return unknown_count >= chunk_trigger_count
 
 
-def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id: int) -> tuple[dict[str, Any], dict[str, Any]]:
+def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[str, Any], dict[str, Any], int]:
     batch = repositories.get_grouping_batch(db, batch_id)
     items = repositories.list_grouping_items(db, batch_id)
     trigger_inputs: list[dict[str, Any]] = []
@@ -4553,6 +4551,28 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
         )
 
     if not any(trigger.get("frames") for trigger in trigger_inputs):
+        # No script_run for this batch exists yet at this point (the direct-stage
+        # script_run is only created after Stage 1 adjacent checking finishes, so
+        # the two stay in real execution order in the script_run table) - but this
+        # failure still needs to be visible, so record one now instead of leaving
+        # this batch failing with no script_run row at all.
+        early_failure_script_run_id = repositories.create_script_run_started(
+            db,
+            session_id=None,
+            trigger_id=None,
+            script_name="grouping",
+            model_name=_grouping_model_name_label(),
+            status="running",
+            command=SCRIPT_RUN_COMMAND_REDACTED,
+        )
+        repositories.update_grouping_batch(db, batch_id, {"script_run_id": early_failure_script_run_id})
+        repositories.finish_script_run(
+            db,
+            early_failure_script_run_id,
+            status="failed",
+            stdout_log="",
+            stderr_log="No trigger frame images are available for Gemini grouping.",
+        )
         raise RuntimeError("No trigger frame images are available for Gemini grouping.")
 
     model_name = str(settings.grouping_gemini_model or "gemini-3.5-flash-lite").strip()
@@ -4570,16 +4590,20 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
     # _run_grouping_adjacent_pass docstring. As a byproduct of these same
     # calls, also learn - per frame, not just per trigger - which images
     # actually show a person at all.
-    trigger_inputs, adjacent_groups, adjacent_notes, adjacent_metas, adjacent_frame_presence_by_trigger = (
-        _run_grouping_adjacent_pass(
-            db,
-            script_run_id=script_run_id,
-            batch_id=batch_id,
-            location_id=batch.get("location_id"),
-            trigger_inputs=trigger_inputs,
-            model_name=model_name,
-            resize_scale=resize_scale,
-        )
+    (
+        trigger_inputs,
+        adjacent_groups,
+        adjacent_notes,
+        adjacent_metas,
+        adjacent_frame_presence_by_trigger,
+        adjacent_script_run_id,
+    ) = _run_grouping_adjacent_pass(
+        db,
+        batch_id=batch_id,
+        location_id=batch.get("location_id"),
+        trigger_inputs=trigger_inputs,
+        model_name=model_name,
+        resize_scale=resize_scale,
     )
     normalized_groups.extend(adjacent_groups)
     for adjacent_group in adjacent_groups:
@@ -4619,455 +4643,485 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
             for trigger_id in sorted(issue_trigger_ids)
         )
 
-    trigger_input_by_id: dict[int, dict[str, Any]] = {
-        int(trigger_input["trigger_id"]): trigger_input for trigger_input in trigger_inputs
-    }
+    # Created only now, after Stage 1 (adjacent checking) has already run and
+    # created its own script_run - this keeps the two rows in real execution
+    # order in the script_run table (adjacent, then direct) instead of this one
+    # always appearing first just because it used to be created at job start.
+    script_run_id = repositories.create_script_run_started(
+        db,
+        session_id=None,
+        trigger_id=None,
+        script_name="grouping",
+        model_name=_grouping_model_name_label(),
+        status="running",
+        command=SCRIPT_RUN_COMMAND_REDACTED,
+        runner_payload={
+            "batch_id": batch_id,
+            "location_id": batch.get("location_id"),
+            "adjacent_script_run_id": adjacent_script_run_id,
+        },
+    )
+    repositories.update_grouping_batch(db, batch_id, {"script_run_id": script_run_id})
 
-    max_images = _grouping_gemini_max_images_per_request()
-    pending_triggers: list[dict[str, Any]] = list(trigger_inputs)
-    carry_forward_entries: dict[int, dict[str, Any]] = {}
-    # How long (in trigger-clock time, not chunk count) an unresolved open entry
-    # keeps getting re-sent before we give up and leave it for the next scheduled
-    # batch to pick up via cross-batch carryover. A chunk-count cap is unfair
-    # during a burst of foot traffic - each chunk fills up on images fast, so a
-    # fixed number of chunks covers only a few real minutes - while during a
-    # quiet stretch the same cap would cover hours. Anchoring to real elapsed
-    # time instead gives every entry the same real-world window regardless of
-    # how busy the store is. Based on actual matched entry->exit gaps (median
-    # ~2min, p90 ~5min, p95 ~12min), 20 minutes covers the vast majority of
-    # genuine matches without chasing rare multi-hour stragglers live.
-    open_entry_max_wait = timedelta(minutes=max(1, int(settings.grouping_open_entry_max_wait_minutes)))
-    chunks: list[list[dict[str, Any]]] = []
+    try:
+        trigger_input_by_id: dict[int, dict[str, Any]] = {
+            int(trigger_input["trigger_id"]): trigger_input for trigger_input in trigger_inputs
+        }
 
-    trigger_has_identity: dict[int, bool] = {
-        int(trigger["trigger_id"]): trigger.get("phone_entry_id") is not None or trigger.get("credit_card_entry_id") is not None
-        for trigger in trigger_inputs
-    }
-    chunk_results: list[dict[str, Any]] = []
-    next_group_id = len(adjacent_groups) + 1
-    # Tracks which group currently "owns" a given exit trigger, so two different
-    # entries can never both close against the same physical exit event.
-    exit_claims: dict[int, dict[str, Any]] = {}
-    # Once an exit has been fought over, it's permanently off-limits rather than
-    # being re-litigated on every later candidate that also wants it.
-    disputed_exit_ids: set[int] = set()
+        max_images = _grouping_gemini_max_images_per_request()
+        pending_triggers: list[dict[str, Any]] = list(trigger_inputs)
+        carry_forward_entries: dict[int, dict[str, Any]] = {}
+        # How long (in trigger-clock time, not chunk count) an unresolved open entry
+        # keeps getting re-sent before we give up and leave it for the next scheduled
+        # batch to pick up via cross-batch carryover. A chunk-count cap is unfair
+        # during a burst of foot traffic - each chunk fills up on images fast, so a
+        # fixed number of chunks covers only a few real minutes - while during a
+        # quiet stretch the same cap would cover hours. Anchoring to real elapsed
+        # time instead gives every entry the same real-world window regardless of
+        # how busy the store is. Based on actual matched entry->exit gaps (median
+        # ~2min, p90 ~5min, p95 ~12min), 20 minutes covers the vast majority of
+        # genuine matches without chasing rare multi-hour stragglers live.
+        open_entry_max_wait = timedelta(minutes=max(1, int(settings.grouping_open_entry_max_wait_minutes)))
+        chunks: list[list[dict[str, Any]]] = []
 
-    def _release_group(group_id: int) -> None:
-        for idx, existing in enumerate(normalized_groups):
-            if existing["group_id"] == group_id:
-                released = normalized_groups.pop(idx)
-                break
-        else:
-            return
-        for trigger_id in released["entry"]:
-            grouped_trigger_ids.discard(trigger_id)
-            normalized_open_entries.add(trigger_id)
-            trigger_input = trigger_input_by_id.get(trigger_id)
-            if trigger_input is not None:
-                carry_forward_entries[trigger_id] = trigger_input
-        for trigger_id in released["exit"]:
-            grouped_trigger_ids.discard(trigger_id)
-            normalized_unknown.add(trigger_id)
-            disputed_exit_ids.add(trigger_id)
-            exit_claims.pop(trigger_id, None)
+        trigger_has_identity: dict[int, bool] = {
+            int(trigger["trigger_id"]): trigger.get("phone_entry_id") is not None or trigger.get("credit_card_entry_id") is not None
+            for trigger in trigger_inputs
+        }
+        chunk_results: list[dict[str, Any]] = []
+        next_group_id = len(adjacent_groups) + 1
+        # Tracks which group currently "owns" a given exit trigger, so two different
+        # entries can never both close against the same physical exit event.
+        exit_claims: dict[int, dict[str, Any]] = {}
+        # Once an exit has been fought over, it's permanently off-limits rather than
+        # being re-litigated on every later candidate that also wants it.
+        disputed_exit_ids: set[int] = set()
 
-    chunk_index = 0
-    while pending_triggers:
-        chunk_index += 1
-        # Reserve enough budget for at least one unseen trigger so a pile-up of
-        # carried-forward open entries can never starve the loop of new triggers
-        # to compare against (which would otherwise never terminate).
-        next_frame_count = len(pending_triggers[0].get("frames") or [])
-        carry_budget = max(max_images - next_frame_count, 0)
-        chunk: list[dict[str, Any]] = []
-        carry_image_count = 0
-        for trigger_id in sorted(carry_forward_entries):
-            trigger_input = carry_forward_entries[trigger_id]
-            frame_count = len(trigger_input.get("frames") or [])
-            if chunk and carry_image_count + frame_count > carry_budget:
-                continue
-            chunk.append(trigger_input)
-            carry_image_count += frame_count
-        current_image_count = carry_image_count
+        def _release_group(group_id: int) -> None:
+            for idx, existing in enumerate(normalized_groups):
+                if existing["group_id"] == group_id:
+                    released = normalized_groups.pop(idx)
+                    break
+            else:
+                return
+            for trigger_id in released["entry"]:
+                grouped_trigger_ids.discard(trigger_id)
+                normalized_open_entries.add(trigger_id)
+                trigger_input = trigger_input_by_id.get(trigger_id)
+                if trigger_input is not None:
+                    carry_forward_entries[trigger_id] = trigger_input
+            for trigger_id in released["exit"]:
+                grouped_trigger_ids.discard(trigger_id)
+                normalized_unknown.add(trigger_id)
+                disputed_exit_ids.add(trigger_id)
+                exit_claims.pop(trigger_id, None)
+
+        chunk_index = 0
         while pending_triggers:
-            frame_count = len(pending_triggers[0].get("frames") or [])
-            if chunk and current_image_count + frame_count > max_images:
-                break
-            chunk.append(pending_triggers.pop(0))
-            current_image_count += frame_count
-        chunks.append(chunk)
+            chunk_index += 1
+            # Reserve enough budget for at least one unseen trigger so a pile-up of
+            # carried-forward open entries can never starve the loop of new triggers
+            # to compare against (which would otherwise never terminate).
+            next_frame_count = len(pending_triggers[0].get("frames") or [])
+            carry_budget = max(max_images - next_frame_count, 0)
+            chunk: list[dict[str, Any]] = []
+            carry_image_count = 0
+            for trigger_id in sorted(carry_forward_entries):
+                trigger_input = carry_forward_entries[trigger_id]
+                frame_count = len(trigger_input.get("frames") or [])
+                if chunk and carry_image_count + frame_count > carry_budget:
+                    continue
+                chunk.append(trigger_input)
+                carry_image_count += frame_count
+            current_image_count = carry_image_count
+            while pending_triggers:
+                frame_count = len(pending_triggers[0].get("frames") or [])
+                if chunk and current_image_count + frame_count > max_images:
+                    break
+                chunk.append(pending_triggers.pop(0))
+                current_image_count += frame_count
+            chunks.append(chunk)
 
-        trigger_notes: list[dict[str, Any]] = []
-        image_urls: list[str] = []
-        image_mapping: list[dict[str, Any]] = []
-        for trigger_input in chunk:
-            note = {
-                "trigger_id": trigger_input["trigger_id"],
-                "trigger_time": trigger_input.get("trigger_time"),
-                "phone_entry_id": trigger_input.get("phone_entry_id"),
-                "credit_card_entry_id": trigger_input.get("credit_card_entry_id"),
-                "entry_source_type": trigger_input.get("entry_source_type"),
-                "image_numbers": [],
-            }
-            for frame in trigger_input.get("frames") or []:
-                if not isinstance(frame, Mapping):
+            trigger_notes: list[dict[str, Any]] = []
+            image_urls: list[str] = []
+            image_mapping: list[dict[str, Any]] = []
+            for trigger_input in chunk:
+                note = {
+                    "trigger_id": trigger_input["trigger_id"],
+                    "trigger_time": trigger_input.get("trigger_time"),
+                    "phone_entry_id": trigger_input.get("phone_entry_id"),
+                    "credit_card_entry_id": trigger_input.get("credit_card_entry_id"),
+                    "entry_source_type": trigger_input.get("entry_source_type"),
+                    "image_numbers": [],
+                }
+                for frame in trigger_input.get("frames") or []:
+                    if not isinstance(frame, Mapping):
+                        continue
+                    image_url = str(frame.get("image_url") or "").strip()
+                    if not image_url or image_url in image_urls:
+                        continue
+                    image_urls.append(image_url)
+                    image_number = len(image_urls)
+                    note["image_numbers"].append(image_number)
+                    image_mapping.append(
+                        {
+                            "image_number": image_number,
+                            "trigger_id": int(trigger_input["trigger_id"]),
+                            "frame_index": frame.get("index"),
+                            "sample_time": frame.get("sample_time"),
+                        }
+                    )
+                trigger_notes.append(note)
+            if not image_urls:
+                continue
+            prompt = (
+                "You are grouping retail door trigger events into customer sessions. "
+                "The trigger list is in chronological order from earliest to latest. "
+                "Each trigger is a door-opening event. A trigger may be an entry or an exit. Do not assume every door-opening trigger is an entry. "
+                "Primary actor rule: a trigger's images can contain more than one person, for example a bystander walking past on the sidewalk, or a different "
+                "customer from another trigger crossing through the background. For each trigger, identify the primary actor: the person who is directly interacting "
+                "with the door, card reader, or QR scanner, or who is clearly the one passing through the doorway during that trigger's own frame sequence. Only the "
+                "primary actor determines this trigger's entry/exit label and identity. A person who merely appears somewhere in the background of this trigger's "
+                "images, without interacting with the door themselves, is not this trigger's subject even if you recognize them from another trigger; if you recognize "
+                "a background person as the subject of a different trigger, use that observation only to help label that other trigger, not this one. "
+                "Scene-consistency guard: before closing an entry with a candidate exit, check that the exit trigger's scene is actually consistent with the same "
+                "single customer, matching clothing, build, and carried items, and not a visibly different number of people or a different group entirely. "
+                "If the candidate exit shows a different number of people, unrelated new people, or no visible match to the entry customer's specific clothing, do not "
+                "force the pairing. Leave the entry in open_entries and the exit trigger in unknown instead of guessing. Never invent or assume clothing, color, or "
+                "item details that are not clearly visible in the specific images for that trigger. "
+                "Identity matching is the gate for grouping: two triggers may only be placed in the same group if you can visually confirm they show the same physical "
+                "person. Compare clothing color and pattern, pants/skirt color, shoes, bags or carried items, body shape and height, hair, and any other distinguishing "
+                "visual detail across the trigger images before deciding two triggers belong together. "
+                "Do not group two triggers together just because their timestamps or order look like a plausible entry-then-exit pair. Timing and order are supporting "
+                "evidence only, never a substitute for a visual identity match. If you cannot visually confirm the same person, do not form a group even if the timeline fits. "
+                "Direction rule: once you have visually confirmed a candidate match, use customer movement relative to the store entrance to label each trigger. "
+                "This camera has a fixed orientation: a customer facing right and walking to the right is an entry. A customer facing left and "
+                "walking to the left is an exit. A customer entering also faces toward the camera (front of their body/face visible); a customer "
+                "exiting has their back to the camera (only the back of their head and body visible). Use whichever of these two cues - left/right "
+                "movement or front/back facing - is clearer in the frames; they should agree. Judge this from the sequence of frames for that trigger, "
+                "not a single still frame - compare the person's position and facing direction across the frames to determine which way they are actually moving. "
+                "If clear walking direction conflicts with simple timestamp assumptions, prioritize the walking direction. "
+                "Identity rule: a trigger with phone_entry_id or credit_card_entry_id is a CONFIRMED entry. This is "
+                "authoritative - do not use walking direction to override it, question it, or reclassify it as exit. "
+                "Only use the walking-direction rule above to decide entry versus exit for a trigger that has neither "
+                "phone_entry_id nor credit_card_entry_id. "
+                "Do not route a trigger to unknown merely because it lacks phone_entry_id and credit_card_entry_id. A "
+                "trigger with no identity id is a completely normal, expected kind of entry and must be judged by the "
+                "exact same walking-direction and visual-matching standard as any other trigger. If its walking direction "
+                "clearly shows it entering and you can visually confirm the same person in a later exit trigger, return "
+                "it as a complete entry+exit group exactly as you would for an identity-bearing trigger - never default it "
+                "to unknown or open_entries just because the identity fields are empty. "
+                "Grouping rule: A complete session group must contain exactly one entry trigger and one or more later exit triggers, and every trigger in the group must "
+                "be a confirmed visual match of the same person. A trigger must never be both entry and exit in the same group. "
+                "Return confident complete entry+exit groups first even when other customers still have no visible exit yet. "
+                "If an entry customer has not exited yet, put that entry trigger in open_entries instead of creating an entry-only group. "
+                "Put exit-only and uncertain triggers into unknown. "
+                "If a customer has been inside for more than 1 hour with no matching exit, keep it in open_entries and mention the issue in notes. "
+                "If two triggers are visually confirmed as the same customer, the earlier trigger should normally be entry and the later trigger should normally be exit, "
+                "with walking direction used to break ties. "
+                "If door direction is visually ambiguous but the visual identity match is confirmed, prefer the chronological session pattern: earlier identity trigger "
+                "opens the session, later same-person trigger closes it. "
+                "Adjacency rule: most visits are short. When looking for an entry's exit, check the next one or two triggers immediately after it first, not just "
+                "distant ones later in the batch - a customer entering and leaving again within a couple of minutes is common and expected, not unusual. Do not "
+                "assume a nearby trigger must belong to a different customer just because it is close in time; visually compare it before ruling it out. "
+                "Full-sequence rule: a trigger's outcome must be judged from its whole image sequence, especially the last frame, not just the first frame or the "
+                "clearest one. If the person is near the door early in the sequence but is no longer visible by the last frame, they went through the door - use "
+                "the direction rule to decide whether that means they entered or exited. Do not conclude a trigger from a single frame in isolation. "
+                "Background-person rule: a trigger's frames can contain more than one person - a bystander, or a different customer passing through in the "
+                "background who is not this trigger's primary actor. If you recognize a customer from a different trigger in this batch appearing in the "
+                "background (for example, someone whose entry you already identified, now shown walking away), mention this in notes even though they remain "
+                "that other trigger's customer, not this trigger's - this can explain why an open entry has no exit trigger of its own. "
+                "Carry observation rule: for every grouped customer, describe what they visibly carry at entry and at exit. "
+                "Count bags, plastic bags, woven/reusable bags, backpacks, boxes, cartons, bottles, and loose items only when visibly held, worn, or moving with the person. "
+                "Record color, type, approximate size, count, and confidence. Use 0 count when the customer appears empty-handed. "
+                "Important: Do not create a separate group for every trigger, and do not create a group from two triggers that merely fit a plausible timeline. Only group "
+                "triggers when you have visually confirmed they show the same customer across time. "
+                "If the same customer appears in trigger 73 and later trigger 74, return entry [73], exit [74]. "
+                "If trigger 76 is an entry and trigger 77 is another entry before trigger 78 exits, return the complete matched pair and put still-waiting entries in open_entries. "
+                "If a trigger cannot be confidently and visually matched into a complete entry+exit pair and is not a likely open entry, put it in unknown. "
+                "Notes field rule: each string in notes must be a single finished conclusion about a specific trigger or group, written after you have already "
+                "decided - never your live reasoning process. Do not include self-corrections, hedging, or thinking-out-loud phrases such as 'wait', 'let me "
+                "check', 'hold on', 'actually', or 'let's re-verify'. If you are unsure, resolve the uncertainty internally first, then write only the final "
+                "answer you settled on. A note should read as a plain factual statement, not a narration of how you arrived at it. "
+                "Return strict JSON only with schema: "
+                '{"groups":[{"entry":[integer],"exit":[integer],"confidence":number,"reason":string,'
+                '"entry_carry":{"bag_count":integer,"item_count":integer,"items":[{"type":string,"color":string,"size":string,"count":integer,"confidence":number}],"summary":string},'
+                '"exit_carry":{"bag_count":integer,"item_count":integer,"items":[{"type":string,"color":string,"size":string,"count":integer,"confidence":number}],"summary":string},'
+                '"carry_change_summary":string,"total_customer":integer}],'
+                '"open_entries":[integer],"unknown":[integer],"notes":[string]}. '
+                f"Batch: {json.dumps({'batch_id': batch_id, 'location_id': batch.get('location_id'), 'period_code': batch.get('period_code'), 'window_start': batch.get('window_start'), 'window_end': batch.get('window_end'), 'chunk': chunk_index}, default=str)}. "
+                f"Triggers: {json.dumps(trigger_notes, default=str)}. "
+                f"Image mapping: {json.dumps(image_mapping, default=str)}."
+            )
+            use_deepseek = _grouping_provider_is_deepseek()
+
+            def _call_chunk_vision() -> tuple[dict[str, Any], dict[str, Any]]:
+                if use_deepseek:
+                    result, meta = _call_deepseek_vision_summary(
+                        prompt=prompt,
+                        image_urls=image_urls,
+                        model_name=settings.deepseek_vision_model,
+                        image_resize_scale=_grouping_deepseek_resize_scale(),
+                    )
+                    _record_deepseek_cost(db, script_run_id, meta)
+                else:
+                    result, meta = _call_kiosk_gemini_summary(
+                        prompt=prompt,
+                        image_urls=image_urls,
+                        model_name=model_name,
+                        image_resize_scale=resize_scale,
+                    )
+                    _record_gemini_cost(db, script_run_id, meta)
+                return result, meta
+
+            if chunk_index > 1:
+                # Spread chunk calls out a bit rather than firing them back-to-back -
+                # a suspected soft rate limit/throttle on the provider side seems to
+                # correlate with how many vision calls land in a short window.
+                time.sleep(_GROUPING_CHUNK_CALL_INTERVAL_SECONDS)
+
+            gemini_result, gemini_meta = _call_chunk_vision()
+            retry_attempts = 0
+            while (
+                _grouping_chunk_response_is_visual_failure(gemini_result, chunk_trigger_count=len(chunk))
+                and retry_attempts < _GROUPING_CHUNK_RETRY_MAX_ATTEMPTS
+            ):
+                retry_attempts += 1
+                time.sleep(_GROUPING_CHUNK_RETRY_INTERVAL_SECONDS)
+                gemini_result, gemini_meta = _call_chunk_vision()
+            raw_metas.append(gemini_meta)
+            chunk_groups = gemini_result.get("groups") if isinstance(gemini_result.get("groups"), list) else []
+            chunk_open_entries = gemini_result.get("open_entries") if isinstance(gemini_result.get("open_entries"), list) else []
+            chunk_unknown = gemini_result.get("unknown") if isinstance(gemini_result.get("unknown"), list) else []
+            chunk_grouped_trigger_ids: set[int] = set()
+            for group in chunk_groups:
+                if not isinstance(group, Mapping):
                     continue
-                image_url = str(frame.get("image_url") or "").strip()
-                if not image_url or image_url in image_urls:
+                entry_ids = _group_trigger_id_list(group.get("entry"))
+                exit_ids = [trigger_id for trigger_id in _group_trigger_id_list(group.get("exit")) if trigger_id not in entry_ids]
+                if not entry_ids:
                     continue
-                image_urls.append(image_url)
-                image_number = len(image_urls)
-                note["image_numbers"].append(image_number)
-                image_mapping.append(
+                entry_ids = entry_ids[:1]
+                if not exit_ids:
+                    normalized_unknown.update(entry_ids)
+                    continue
+
+                entry_trigger_id = entry_ids[0]
+
+                # trigger_id is assigned in the same chronological order as trigger_time,
+                # so a real exit can never have a smaller id than its own entry. This
+                # catches cases like the exit-precedes-entry mixup Gemini sometimes makes
+                # (e.g. matching an exit against a superficially similar person from an
+                # earlier, unrelated visit) without spending a verification call on it.
+                exit_ids = [exit_id for exit_id in exit_ids if exit_id > entry_trigger_id]
+                if not exit_ids:
+                    normalized_open_entries.add(entry_trigger_id)
+                    continue
+
+                # A visually confirmed entry without a phone/credit card id is still a
+                # real session - it just has no confirmed identity anchor. Rather than
+                # discarding it, form the group and carry that fact through to the
+                # confidence result and session so a reviewer can see it plainly.
+                entry_has_identity = trigger_has_identity.get(entry_trigger_id, False)
+
+                # An exit that's already been fought over is permanently contested;
+                # don't spend another verification call re-litigating it.
+                if any(exit_id in disputed_exit_ids for exit_id in exit_ids):
+                    normalized_unknown.update(exit_ids)
+                    normalized_open_entries.add(entry_trigger_id)
+                    notes.append(
+                        f"Entry {entry_trigger_id} matched exit(s) {sorted(exit_ids)}, but that exit is already "
+                        "disputed by another entry; held for review instead of guessing."
+                    )
+                    continue
+
+                # A brand-new conflict: some other entry already holds one of these exits.
+                # One exit trigger is one physical event, so it can only belong to one
+                # customer - pull the earlier group apart too rather than trust either.
+                conflicting_group_ids = {
+                    exit_claims[exit_id]["group_id"] for exit_id in exit_ids if exit_id in exit_claims
+                }
+                if conflicting_group_ids:
+                    conflicting_entries: list[int] = []
+                    for conflicting_group_id in conflicting_group_ids:
+                        conflicting_group = next(
+                            (existing for existing in normalized_groups if existing["group_id"] == conflicting_group_id),
+                            None,
+                        )
+                        if conflicting_group:
+                            conflicting_entries.extend(conflicting_group["entry"])
+                        _release_group(conflicting_group_id)
+                    normalized_unknown.update(exit_ids)
+                    disputed_exit_ids.update(exit_ids)
+                    normalized_open_entries.add(entry_trigger_id)
+                    notes.append(
+                        f"Conflicting exit claim: entries {sorted(set(conflicting_entries + [entry_trigger_id]))} all "
+                        f"matched exit(s) {sorted(exit_ids)}; held for review instead of guessing which is correct."
+                    )
+                    continue
+
+                entry_trigger_input = trigger_input_by_id.get(entry_trigger_id)
+                exit_trigger_inputs = [trigger_input_by_id[e] for e in exit_ids if e in trigger_input_by_id]
+                if entry_trigger_input is None or not exit_trigger_inputs:
+                    verification: dict[str, Any] = {
+                        "same_person": None,
+                        "confidence": 0.0,
+                        "matching_details": "",
+                        "conflicting_details": "",
+                        "error": "Entry or exit trigger data was not available for verification.",
+                    }
+                else:
+                    verification = _verify_gemini_grouping_match(
+                        db,
+                        script_run_id,
+                        entry_trigger=entry_trigger_input,
+                        exit_triggers=exit_trigger_inputs,
+                        model_name=model_name,
+                        resize_scale=resize_scale,
+                    )
+
+                # Reject outright when the independent check says no, or hedges with low
+                # confidence - a same_person=None (call failed / malformed) fails open,
+                # since that's a tooling problem, not evidence the match is wrong.
+                if verification["same_person"] is False or (
+                    verification["same_person"] is True and verification["confidence"] < 0.5
+                ):
+                    normalized_unknown.update(exit_ids)
+                    normalized_open_entries.add(entry_trigger_id)
+                    notes.append(
+                        f"Verification rejected match between entry {entry_trigger_id} and exit(s) {sorted(exit_ids)}: "
+                        f"{verification['conflicting_details'] or 'independent check could not confirm the same person'}."
+                    )
+                    continue
+
+                chunk_grouped_trigger_ids.update(entry_ids)
+                chunk_grouped_trigger_ids.update(exit_ids)
+                grouped_trigger_ids.update(entry_ids)
+                grouped_trigger_ids.update(exit_ids)
+                # An entry carried forward from an earlier chunk may only now be closing;
+                # drop it from open/unknown so it doesn't also linger in those buckets.
+                normalized_open_entries.difference_update(entry_ids)
+                normalized_open_entries.difference_update(exit_ids)
+                normalized_unknown.difference_update(entry_ids)
+                normalized_unknown.difference_update(exit_ids)
+                this_group_id = next_group_id
+                next_group_id += 1
+                normalized_groups.append(
                     {
-                        "image_number": image_number,
-                        "trigger_id": int(trigger_input["trigger_id"]),
-                        "frame_index": frame.get("index"),
-                        "sample_time": frame.get("sample_time"),
+                        "group_id": this_group_id,
+                        "entry": entry_ids,
+                        "exit": exit_ids,
+                        "score": _coerce_number(group.get("confidence"), 0.0),
+                        "reason": str(group.get("reason") or "gemini_grouping_direct"),
+                        "entry_carry": group.get("entry_carry") if isinstance(group.get("entry_carry"), Mapping) else None,
+                        "exit_carry": group.get("exit_carry") if isinstance(group.get("exit_carry"), Mapping) else None,
+                        "carry_change_summary": str(group.get("carry_change_summary") or ""),
+                        "total_customer": _coerce_int(group.get("total_customer"), 0),
+                        "source": "gemini_grouping_direct",
+                        "chunk": chunk_index,
+                        "verified": verification["same_person"] is True,
+                        "verification": verification,
+                        "entry_has_identity": entry_has_identity,
                     }
                 )
-            trigger_notes.append(note)
-        if not image_urls:
-            continue
-        prompt = (
-            "You are grouping retail door trigger events into customer sessions. "
-            "The trigger list is in chronological order from earliest to latest. "
-            "Each trigger is a door-opening event. A trigger may be an entry or an exit. Do not assume every door-opening trigger is an entry. "
-            "Primary actor rule: a trigger's images can contain more than one person, for example a bystander walking past on the sidewalk, or a different "
-            "customer from another trigger crossing through the background. For each trigger, identify the primary actor: the person who is directly interacting "
-            "with the door, card reader, or QR scanner, or who is clearly the one passing through the doorway during that trigger's own frame sequence. Only the "
-            "primary actor determines this trigger's entry/exit label and identity. A person who merely appears somewhere in the background of this trigger's "
-            "images, without interacting with the door themselves, is not this trigger's subject even if you recognize them from another trigger; if you recognize "
-            "a background person as the subject of a different trigger, use that observation only to help label that other trigger, not this one. "
-            "Scene-consistency guard: before closing an entry with a candidate exit, check that the exit trigger's scene is actually consistent with the same "
-            "single customer, matching clothing, build, and carried items, and not a visibly different number of people or a different group entirely. "
-            "If the candidate exit shows a different number of people, unrelated new people, or no visible match to the entry customer's specific clothing, do not "
-            "force the pairing. Leave the entry in open_entries and the exit trigger in unknown instead of guessing. Never invent or assume clothing, color, or "
-            "item details that are not clearly visible in the specific images for that trigger. "
-            "Identity matching is the gate for grouping: two triggers may only be placed in the same group if you can visually confirm they show the same physical "
-            "person. Compare clothing color and pattern, pants/skirt color, shoes, bags or carried items, body shape and height, hair, and any other distinguishing "
-            "visual detail across the trigger images before deciding two triggers belong together. "
-            "Do not group two triggers together just because their timestamps or order look like a plausible entry-then-exit pair. Timing and order are supporting "
-            "evidence only, never a substitute for a visual identity match. If you cannot visually confirm the same person, do not form a group even if the timeline fits. "
-            "Direction rule: once you have visually confirmed a candidate match, use customer movement relative to the store entrance to label each trigger. "
-            "This camera has a fixed orientation: a customer facing right and walking to the right is an entry. A customer facing left and "
-            "walking to the left is an exit. A customer entering also faces toward the camera (front of their body/face visible); a customer "
-            "exiting has their back to the camera (only the back of their head and body visible). Use whichever of these two cues - left/right "
-            "movement or front/back facing - is clearer in the frames; they should agree. Judge this from the sequence of frames for that trigger, "
-            "not a single still frame - compare the person's position and facing direction across the frames to determine which way they are actually moving. "
-            "If clear walking direction conflicts with simple timestamp assumptions, prioritize the walking direction. "
-            "Identity rule: a trigger with phone_entry_id or credit_card_entry_id is a CONFIRMED entry. This is "
-            "authoritative - do not use walking direction to override it, question it, or reclassify it as exit. "
-            "Only use the walking-direction rule above to decide entry versus exit for a trigger that has neither "
-            "phone_entry_id nor credit_card_entry_id. "
-            "Do not route a trigger to unknown merely because it lacks phone_entry_id and credit_card_entry_id. A "
-            "trigger with no identity id is a completely normal, expected kind of entry and must be judged by the "
-            "exact same walking-direction and visual-matching standard as any other trigger. If its walking direction "
-            "clearly shows it entering and you can visually confirm the same person in a later exit trigger, return "
-            "it as a complete entry+exit group exactly as you would for an identity-bearing trigger - never default it "
-            "to unknown or open_entries just because the identity fields are empty. "
-            "Grouping rule: A complete session group must contain exactly one entry trigger and one or more later exit triggers, and every trigger in the group must "
-            "be a confirmed visual match of the same person. A trigger must never be both entry and exit in the same group. "
-            "Return confident complete entry+exit groups first even when other customers still have no visible exit yet. "
-            "If an entry customer has not exited yet, put that entry trigger in open_entries instead of creating an entry-only group. "
-            "Put exit-only and uncertain triggers into unknown. "
-            "If a customer has been inside for more than 1 hour with no matching exit, keep it in open_entries and mention the issue in notes. "
-            "If two triggers are visually confirmed as the same customer, the earlier trigger should normally be entry and the later trigger should normally be exit, "
-            "with walking direction used to break ties. "
-            "If door direction is visually ambiguous but the visual identity match is confirmed, prefer the chronological session pattern: earlier identity trigger "
-            "opens the session, later same-person trigger closes it. "
-            "Adjacency rule: most visits are short. When looking for an entry's exit, check the next one or two triggers immediately after it first, not just "
-            "distant ones later in the batch - a customer entering and leaving again within a couple of minutes is common and expected, not unusual. Do not "
-            "assume a nearby trigger must belong to a different customer just because it is close in time; visually compare it before ruling it out. "
-            "Full-sequence rule: a trigger's outcome must be judged from its whole image sequence, especially the last frame, not just the first frame or the "
-            "clearest one. If the person is near the door early in the sequence but is no longer visible by the last frame, they went through the door - use "
-            "the direction rule to decide whether that means they entered or exited. Do not conclude a trigger from a single frame in isolation. "
-            "Background-person rule: a trigger's frames can contain more than one person - a bystander, or a different customer passing through in the "
-            "background who is not this trigger's primary actor. If you recognize a customer from a different trigger in this batch appearing in the "
-            "background (for example, someone whose entry you already identified, now shown walking away), mention this in notes even though they remain "
-            "that other trigger's customer, not this trigger's - this can explain why an open entry has no exit trigger of its own. "
-            "Carry observation rule: for every grouped customer, describe what they visibly carry at entry and at exit. "
-            "Count bags, plastic bags, woven/reusable bags, backpacks, boxes, cartons, bottles, and loose items only when visibly held, worn, or moving with the person. "
-            "Record color, type, approximate size, count, and confidence. Use 0 count when the customer appears empty-handed. "
-            "Important: Do not create a separate group for every trigger, and do not create a group from two triggers that merely fit a plausible timeline. Only group "
-            "triggers when you have visually confirmed they show the same customer across time. "
-            "If the same customer appears in trigger 73 and later trigger 74, return entry [73], exit [74]. "
-            "If trigger 76 is an entry and trigger 77 is another entry before trigger 78 exits, return the complete matched pair and put still-waiting entries in open_entries. "
-            "If a trigger cannot be confidently and visually matched into a complete entry+exit pair and is not a likely open entry, put it in unknown. "
-            "Notes field rule: each string in notes must be a single finished conclusion about a specific trigger or group, written after you have already "
-            "decided - never your live reasoning process. Do not include self-corrections, hedging, or thinking-out-loud phrases such as 'wait', 'let me "
-            "check', 'hold on', 'actually', or 'let's re-verify'. If you are unsure, resolve the uncertainty internally first, then write only the final "
-            "answer you settled on. A note should read as a plain factual statement, not a narration of how you arrived at it. "
-            "Return strict JSON only with schema: "
-            '{"groups":[{"entry":[integer],"exit":[integer],"confidence":number,"reason":string,'
-            '"entry_carry":{"bag_count":integer,"item_count":integer,"items":[{"type":string,"color":string,"size":string,"count":integer,"confidence":number}],"summary":string},'
-            '"exit_carry":{"bag_count":integer,"item_count":integer,"items":[{"type":string,"color":string,"size":string,"count":integer,"confidence":number}],"summary":string},'
-            '"carry_change_summary":string,"total_customer":integer}],'
-            '"open_entries":[integer],"unknown":[integer],"notes":[string]}. '
-            f"Batch: {json.dumps({'batch_id': batch_id, 'location_id': batch.get('location_id'), 'period_code': batch.get('period_code'), 'window_start': batch.get('window_start'), 'window_end': batch.get('window_end'), 'chunk': chunk_index}, default=str)}. "
-            f"Triggers: {json.dumps(trigger_notes, default=str)}. "
-            f"Image mapping: {json.dumps(image_mapping, default=str)}."
-        )
-        use_deepseek = _grouping_provider_is_deepseek()
-
-        def _call_chunk_vision() -> tuple[dict[str, Any], dict[str, Any]]:
-            if use_deepseek:
-                result, meta = _call_deepseek_vision_summary(
-                    prompt=prompt,
-                    image_urls=image_urls,
-                    model_name=settings.deepseek_vision_model,
-                    image_resize_scale=_grouping_deepseek_resize_scale(),
-                )
-                _record_deepseek_cost(db, script_run_id, meta)
-            else:
-                result, meta = _call_kiosk_gemini_summary(
-                    prompt=prompt,
-                    image_urls=image_urls,
-                    model_name=model_name,
-                    image_resize_scale=resize_scale,
-                )
-                _record_gemini_cost(db, script_run_id, meta)
-            return result, meta
-
-        if chunk_index > 1:
-            # Spread chunk calls out a bit rather than firing them back-to-back -
-            # a suspected soft rate limit/throttle on the provider side seems to
-            # correlate with how many vision calls land in a short window.
-            time.sleep(_GROUPING_CHUNK_CALL_INTERVAL_SECONDS)
-
-        gemini_result, gemini_meta = _call_chunk_vision()
-        retry_attempts = 0
-        while (
-            _grouping_chunk_response_is_visual_failure(gemini_result, chunk_trigger_count=len(chunk))
-            and retry_attempts < _GROUPING_CHUNK_RETRY_MAX_ATTEMPTS
-        ):
-            retry_attempts += 1
-            time.sleep(_GROUPING_CHUNK_RETRY_INTERVAL_SECONDS)
-            gemini_result, gemini_meta = _call_chunk_vision()
-        raw_metas.append(gemini_meta)
-        chunk_groups = gemini_result.get("groups") if isinstance(gemini_result.get("groups"), list) else []
-        chunk_open_entries = gemini_result.get("open_entries") if isinstance(gemini_result.get("open_entries"), list) else []
-        chunk_unknown = gemini_result.get("unknown") if isinstance(gemini_result.get("unknown"), list) else []
-        chunk_grouped_trigger_ids: set[int] = set()
-        for group in chunk_groups:
-            if not isinstance(group, Mapping):
-                continue
-            entry_ids = _group_trigger_id_list(group.get("entry"))
-            exit_ids = [trigger_id for trigger_id in _group_trigger_id_list(group.get("exit")) if trigger_id not in entry_ids]
-            if not entry_ids:
-                continue
-            entry_ids = entry_ids[:1]
-            if not exit_ids:
-                normalized_unknown.update(entry_ids)
-                continue
-
-            entry_trigger_id = entry_ids[0]
-
-            # trigger_id is assigned in the same chronological order as trigger_time,
-            # so a real exit can never have a smaller id than its own entry. This
-            # catches cases like the exit-precedes-entry mixup Gemini sometimes makes
-            # (e.g. matching an exit against a superficially similar person from an
-            # earlier, unrelated visit) without spending a verification call on it.
-            exit_ids = [exit_id for exit_id in exit_ids if exit_id > entry_trigger_id]
-            if not exit_ids:
-                normalized_open_entries.add(entry_trigger_id)
-                continue
-
-            # A visually confirmed entry without a phone/credit card id is still a
-            # real session - it just has no confirmed identity anchor. Rather than
-            # discarding it, form the group and carry that fact through to the
-            # confidence result and session so a reviewer can see it plainly.
-            entry_has_identity = trigger_has_identity.get(entry_trigger_id, False)
-
-            # An exit that's already been fought over is permanently contested;
-            # don't spend another verification call re-litigating it.
-            if any(exit_id in disputed_exit_ids for exit_id in exit_ids):
-                normalized_unknown.update(exit_ids)
-                normalized_open_entries.add(entry_trigger_id)
-                notes.append(
-                    f"Entry {entry_trigger_id} matched exit(s) {sorted(exit_ids)}, but that exit is already "
-                    "disputed by another entry; held for review instead of guessing."
-                )
-                continue
-
-            # A brand-new conflict: some other entry already holds one of these exits.
-            # One exit trigger is one physical event, so it can only belong to one
-            # customer - pull the earlier group apart too rather than trust either.
-            conflicting_group_ids = {
-                exit_claims[exit_id]["group_id"] for exit_id in exit_ids if exit_id in exit_claims
-            }
-            if conflicting_group_ids:
-                conflicting_entries: list[int] = []
-                for conflicting_group_id in conflicting_group_ids:
-                    conflicting_group = next(
-                        (existing for existing in normalized_groups if existing["group_id"] == conflicting_group_id),
-                        None,
-                    )
-                    if conflicting_group:
-                        conflicting_entries.extend(conflicting_group["entry"])
-                    _release_group(conflicting_group_id)
-                normalized_unknown.update(exit_ids)
-                disputed_exit_ids.update(exit_ids)
-                normalized_open_entries.add(entry_trigger_id)
-                notes.append(
-                    f"Conflicting exit claim: entries {sorted(set(conflicting_entries + [entry_trigger_id]))} all "
-                    f"matched exit(s) {sorted(exit_ids)}; held for review instead of guessing which is correct."
-                )
-                continue
-
-            entry_trigger_input = trigger_input_by_id.get(entry_trigger_id)
-            exit_trigger_inputs = [trigger_input_by_id[e] for e in exit_ids if e in trigger_input_by_id]
-            if entry_trigger_input is None or not exit_trigger_inputs:
-                verification: dict[str, Any] = {
-                    "same_person": None,
-                    "confidence": 0.0,
-                    "matching_details": "",
-                    "conflicting_details": "",
-                    "error": "Entry or exit trigger data was not available for verification.",
-                }
-            else:
-                verification = _verify_gemini_grouping_match(
-                    db,
-                    script_run_id,
-                    entry_trigger=entry_trigger_input,
-                    exit_triggers=exit_trigger_inputs,
-                    model_name=model_name,
-                    resize_scale=resize_scale,
-                )
-
-            # Reject outright when the independent check says no, or hedges with low
-            # confidence - a same_person=None (call failed / malformed) fails open,
-            # since that's a tooling problem, not evidence the match is wrong.
-            if verification["same_person"] is False or (
-                verification["same_person"] is True and verification["confidence"] < 0.5
-            ):
-                normalized_unknown.update(exit_ids)
-                normalized_open_entries.add(entry_trigger_id)
-                notes.append(
-                    f"Verification rejected match between entry {entry_trigger_id} and exit(s) {sorted(exit_ids)}: "
-                    f"{verification['conflicting_details'] or 'independent check could not confirm the same person'}."
-                )
-                continue
-
-            chunk_grouped_trigger_ids.update(entry_ids)
-            chunk_grouped_trigger_ids.update(exit_ids)
-            grouped_trigger_ids.update(entry_ids)
-            grouped_trigger_ids.update(exit_ids)
-            # An entry carried forward from an earlier chunk may only now be closing;
-            # drop it from open/unknown so it doesn't also linger in those buckets.
-            normalized_open_entries.difference_update(entry_ids)
-            normalized_open_entries.difference_update(exit_ids)
-            normalized_unknown.difference_update(entry_ids)
-            normalized_unknown.difference_update(exit_ids)
-            this_group_id = next_group_id
-            next_group_id += 1
-            normalized_groups.append(
+                for exit_id in exit_ids:
+                    exit_claims[exit_id] = {"group_id": this_group_id}
+            for trigger_id in _group_trigger_id_list(chunk_open_entries):
+                if trigger_id in grouped_trigger_ids:
+                    continue
+                normalized_open_entries.add(trigger_id)
+            normalized_unknown.update(_group_trigger_id_list(chunk_unknown))
+            if isinstance(gemini_result.get("notes"), list):
+                notes.extend(str(note) for note in gemini_result.get("notes") or [])
+            chunk_results.append(
                 {
-                    "group_id": this_group_id,
-                    "entry": entry_ids,
-                    "exit": exit_ids,
-                    "score": _coerce_number(group.get("confidence"), 0.0),
-                    "reason": str(group.get("reason") or "gemini_grouping_direct"),
-                    "entry_carry": group.get("entry_carry") if isinstance(group.get("entry_carry"), Mapping) else None,
-                    "exit_carry": group.get("exit_carry") if isinstance(group.get("exit_carry"), Mapping) else None,
-                    "carry_change_summary": str(group.get("carry_change_summary") or ""),
-                    "total_customer": _coerce_int(group.get("total_customer"), 0),
-                    "source": "gemini_grouping_direct",
                     "chunk": chunk_index,
-                    "verified": verification["same_person"] is True,
-                    "verification": verification,
-                    "entry_has_identity": entry_has_identity,
+                    "trigger_ids": [int(trigger["trigger_id"]) for trigger in chunk],
+                    "image_count": len(image_urls),
+                    "image_mapping": image_mapping,
+                    "raw_result": gemini_result,
+                    "grouped_trigger_ids": sorted(chunk_grouped_trigger_ids),
                 }
             )
-            for exit_id in exit_ids:
-                exit_claims[exit_id] = {"group_id": this_group_id}
-        for trigger_id in _group_trigger_id_list(chunk_open_entries):
-            if trigger_id in grouped_trigger_ids:
-                continue
-            normalized_open_entries.add(trigger_id)
-        normalized_unknown.update(_group_trigger_id_list(chunk_unknown))
-        if isinstance(gemini_result.get("notes"), list):
-            notes.extend(str(note) for note in gemini_result.get("notes") or [])
-        chunk_results.append(
-            {
-                "chunk": chunk_index,
-                "trigger_ids": [int(trigger["trigger_id"]) for trigger in chunk],
-                "image_count": len(image_urls),
-                "image_mapping": image_mapping,
-                "raw_result": gemini_result,
-                "grouped_trigger_ids": sorted(chunk_grouped_trigger_ids),
-            }
-        )
 
-        # Only triggers the model just reconfirmed as open_entries get another look in
-        # a later chunk; anything grouped or marked unknown this round is final and is
-        # dropped from the carry-forward set (an "all unknown" chunk simply stops there
-        # instead of being retried). A customer who genuinely hasn't exited yet would
-        # otherwise get re-sent at full image cost into every remaining chunk of the
-        # batch - cutting it off once real trigger-clock time has moved more than
-        # open_entry_max_wait past its own entry time lets prepare_due_grouping_batches'
-        # cross-batch carryover pick it back up in a later scheduled batch instead.
-        next_trigger_time = _coerce_datetime_value(pending_triggers[0].get("trigger_time")) if pending_triggers else None
-        chunk_ids = {int(trigger_input["trigger_id"]) for trigger_input in chunk}
-        for trigger_id in chunk_ids:
-            if trigger_id in normalized_open_entries:
-                keep_carrying = True
-                if next_trigger_time is not None:
-                    entry_trigger_time = _coerce_datetime_value(trigger_input_by_id[trigger_id].get("trigger_time"))
-                    if entry_trigger_time is not None and next_trigger_time - entry_trigger_time > open_entry_max_wait:
-                        keep_carrying = False
-                if keep_carrying:
-                    carry_forward_entries[trigger_id] = trigger_input_by_id[trigger_id]
+            # Only triggers the model just reconfirmed as open_entries get another look in
+            # a later chunk; anything grouped or marked unknown this round is final and is
+            # dropped from the carry-forward set (an "all unknown" chunk simply stops there
+            # instead of being retried). A customer who genuinely hasn't exited yet would
+            # otherwise get re-sent at full image cost into every remaining chunk of the
+            # batch - cutting it off once real trigger-clock time has moved more than
+            # open_entry_max_wait past its own entry time lets prepare_due_grouping_batches'
+            # cross-batch carryover pick it back up in a later scheduled batch instead.
+            next_trigger_time = _coerce_datetime_value(pending_triggers[0].get("trigger_time")) if pending_triggers else None
+            chunk_ids = {int(trigger_input["trigger_id"]) for trigger_input in chunk}
+            for trigger_id in chunk_ids:
+                if trigger_id in normalized_open_entries:
+                    keep_carrying = True
+                    if next_trigger_time is not None:
+                        entry_trigger_time = _coerce_datetime_value(trigger_input_by_id[trigger_id].get("trigger_time"))
+                        if entry_trigger_time is not None and next_trigger_time - entry_trigger_time > open_entry_max_wait:
+                            keep_carrying = False
+                    if keep_carrying:
+                        carry_forward_entries[trigger_id] = trigger_input_by_id[trigger_id]
+                    else:
+                        carry_forward_entries.pop(trigger_id, None)
                 else:
                     carry_forward_entries.pop(trigger_id, None)
-            else:
-                carry_forward_entries.pop(trigger_id, None)
 
-    all_trigger_ids = [int(item["trigger_id"]) for item in items if item.get("trigger_id") is not None]
-    normalized_unknown = {
-        trigger_id
-        for trigger_id in (list(normalized_unknown) + all_trigger_ids)
-        if trigger_id not in grouped_trigger_ids
-        and trigger_id not in normalized_open_entries
-        and trigger_id not in issue_trigger_ids
-    }
-    total_image_count = sum(len(trigger.get("frames") or []) for trigger in trigger_inputs)
-    cost_details = [_usage_cost_for_call_meta(meta)[1] for meta in raw_metas]
-    grouping_summary = {
-        "batch_id": batch_id,
-        "location_id": int(batch["location_id"]),
-        "period_code": batch.get("period_code"),
-        "window_start": batch.get("window_start").isoformat() if hasattr(batch.get("window_start"), "isoformat") else batch.get("window_start"),
-        "window_end": batch.get("window_end").isoformat() if hasattr(batch.get("window_end"), "isoformat") else batch.get("window_end"),
-        "groups": normalized_groups,
-        "open_entries": sorted(normalized_open_entries),
-        "unknown": sorted(normalized_unknown),
-        "issues": sorted(issue_trigger_ids),
-        "notes": notes,
-        "diagnostics": {
-            "mode": _grouping_model_name_label(),
-            "temporary_runpod_grouping_disabled": True,
+        all_trigger_ids = [int(item["trigger_id"]) for item in items if item.get("trigger_id") is not None]
+        normalized_unknown = {
+            trigger_id
+            for trigger_id in (list(normalized_unknown) + all_trigger_ids)
+            if trigger_id not in grouped_trigger_ids
+            and trigger_id not in normalized_open_entries
+            and trigger_id not in issue_trigger_ids
+        }
+        total_image_count = sum(len(trigger.get("frames") or []) for trigger in trigger_inputs)
+        cost_details = [_usage_cost_for_call_meta(meta)[1] for meta in raw_metas]
+        grouping_summary = {
+            "batch_id": batch_id,
+            "location_id": int(batch["location_id"]),
+            "period_code": batch.get("period_code"),
+            "window_start": batch.get("window_start").isoformat() if hasattr(batch.get("window_start"), "isoformat") else batch.get("window_start"),
+            "window_end": batch.get("window_end").isoformat() if hasattr(batch.get("window_end"), "isoformat") else batch.get("window_end"),
+            "groups": normalized_groups,
+            "open_entries": sorted(normalized_open_entries),
+            "unknown": sorted(normalized_unknown),
+            "issues": sorted(issue_trigger_ids),
+            "notes": notes,
+            "diagnostics": {
+                "mode": _grouping_model_name_label(),
+                "temporary_runpod_grouping_disabled": True,
+                "model": settings.deepseek_vision_model if _grouping_provider_is_deepseek() else model_name,
+                "image_resize_scale": resize_scale,
+                "max_frames_per_trigger": _grouping_frames_per_trigger(),
+                "max_images_per_request": max_images,
+                "chunk_count": len(chunks),
+                "trigger_count": len(all_trigger_ids),
+                "image_count": total_image_count,
+                "chunks": chunk_results,
+                "cost_details": cost_details,
+                "issue_trigger_ids": sorted(issue_trigger_ids),
+                "adjacent_matched_groups": len(adjacent_groups),
+            },
+        }
+        return grouping_summary, {
+            "provider": "tds_api_deepseek" if _grouping_provider_is_deepseek() else "tds_api_gemini",
             "model": settings.deepseek_vision_model if _grouping_provider_is_deepseek() else model_name,
             "image_resize_scale": resize_scale,
-            "max_frames_per_trigger": _grouping_frames_per_trigger(),
-            "max_images_per_request": max_images,
             "chunk_count": len(chunks),
-            "trigger_count": len(all_trigger_ids),
             "image_count": total_image_count,
-            "chunks": chunk_results,
-            "cost_details": cost_details,
-            "issue_trigger_ids": sorted(issue_trigger_ids),
-            "adjacent_matched_groups": len(adjacent_groups),
-        },
-    }
-    return grouping_summary, {
-        "provider": "tds_api_deepseek" if _grouping_provider_is_deepseek() else "tds_api_gemini",
-        "model": settings.deepseek_vision_model if _grouping_provider_is_deepseek() else model_name,
-        "image_resize_scale": resize_scale,
-        "chunk_count": len(chunks),
-        "image_count": total_image_count,
-        "chunks": raw_metas,
-    }
+            "chunks": raw_metas,
+        }, script_run_id
+    except Exception as exc:
+        repositories.finish_script_run(
+            db,
+            script_run_id,
+            status="failed",
+            stdout_log="",
+            stderr_log=str(exc),
+        )
+        raise
 
 
 def _run_confidence_after_grouping_success(db: Session, *, batch_id: int) -> dict[str, Any]:
@@ -5106,20 +5160,10 @@ def _run_confidence_after_grouping_success(db: Session, *, batch_id: int) -> dic
 def start_grouping_analysis_job(job: GroupingAnalysisQueued) -> ScriptExecutionResult:
     db = TransactionalSessionLocal()
     try:
-        script_run_id = repositories.create_script_run_started(
-            db,
-            session_id=None,
-            trigger_id=None,
-            script_name="grouping",
-            model_name=_grouping_model_name_label(),
-            status="running",
-            command=SCRIPT_RUN_COMMAND_REDACTED,
-        )
         repositories.update_grouping_batch(
             db,
             job.batch_id,
             {
-                "script_run_id": script_run_id,
                 "status": "running",
                 "started_at": datetime.now(UTC),
                 "manifest_url": job.manifest_url,
@@ -5128,7 +5172,10 @@ def start_grouping_analysis_job(job: GroupingAnalysisQueued) -> ScriptExecutionR
         )
         processing_count = repositories.mark_grouping_batch_frame_assets_processing(db, job.batch_id)
         logger.info("Marked grouping frame assets processing batch_id=%s count=%s", job.batch_id, processing_count)
-        grouping_summary, gemini_meta = _run_gemini_grouping_for_batch(db, batch_id=job.batch_id, script_run_id=script_run_id)
+        # script_run_id (for the direct stage) is created inside this call, only after
+        # Stage 1 adjacent checking has already run and created its own script_run -
+        # see _run_gemini_grouping_for_batch.
+        grouping_summary, gemini_meta, script_run_id = _run_gemini_grouping_for_batch(db, batch_id=job.batch_id)
         _persist_grouping_items_from_summary(db, batch_id=job.batch_id, grouping_summary=grouping_summary)
         processed_count = repositories.mark_grouping_batch_frame_assets_processed(db, job.batch_id)
         logger.info("Marked grouping frame assets processed batch_id=%s count=%s", job.batch_id, processed_count)
