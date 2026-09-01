@@ -2584,8 +2584,14 @@ def _repair_grouping_with_gemini(
         "Each string in notes must be a single finished conclusion, not your reasoning process - no self-corrections, "
         "hedging, or thinking-out-loud phrases such as 'wait' or 'let me check'. Resolve uncertainty internally first, "
         "then write only the final answer. "
+        "Carry observation rule: for every matched pair, describe what the customer visibly carries at entry and at exit. "
+        "Count bags, plastic bags, woven/reusable bags, backpacks, boxes, cartons, bottles, and loose items only when visibly held, worn, or moving with the person. "
+        "Record color, type, approximate size, count, and confidence. Use 0 count when the customer appears empty-handed. "
         "Return strict JSON only with schema: "
-        '{"groups":[{"entry":[integer],"exit":[integer],"confidence":number,"reason":string}],'
+        '{"groups":[{"entry":[integer],"exit":[integer],"confidence":number,"reason":string,'
+        '"entry_carry":{"bag_count":integer,"item_count":integer,"items":[{"type":string,"color":string,"size":string,"count":integer,"confidence":number}],"summary":string},'
+        '"exit_carry":{"bag_count":integer,"item_count":integer,"items":[{"type":string,"color":string,"size":string,"count":integer,"confidence":number}],"summary":string},'
+        '"carry_change_summary":string}],'
         '"unknown":[integer],"notes":[string]}. '
         f"Entries still waiting for an exit match: {json.dumps(open_entry_trigger_ids)}. "
         "Every id in that list is a CONFIRMED entry, already established by an earlier pass - do not relabel, "
@@ -2685,6 +2691,9 @@ def _repair_grouping_with_gemini(
             "reason": str(repaired.get("reason") or "gemini_grouping_repair"),
             "verified": verification["same_person"] is True,
             "verification": verification,
+            "entry_carry": repaired.get("entry_carry") if isinstance(repaired.get("entry_carry"), Mapping) else None,
+            "exit_carry": repaired.get("exit_carry") if isinstance(repaired.get("exit_carry"), Mapping) else None,
+            "carry_change_summary": str(repaired.get("carry_change_summary") or ""),
         }
         next_group_id += 1
         repaired_groups.append(group_payload)
@@ -4303,6 +4312,8 @@ def _run_grouping_adjacent_pass(
     db: Session,
     *,
     script_run_id: int,
+    batch_id: int,
+    location_id: Any,
     trigger_inputs: list[dict[str, Any]],
     model_name: str,
     resize_scale: float | None,
@@ -4359,6 +4370,26 @@ def _run_grouping_adjacent_pass(
             continue
         pending_entry_groups.append({"entry_id": entry_id, "entry": entry_trigger, "candidates": candidates})
 
+    if not pending_entry_groups:
+        return trigger_inputs, groups, notes, metas, frame_presence_by_trigger
+
+    # Give this stage its own script_run instead of folding its calls into the
+    # grouping_direct run's cost/activity - it needs to be independently
+    # visible and auditable, not silently merged into another stage's row.
+    adjacent_script_run_id = _create_gemini_script_run(
+        db,
+        session_id=None,
+        trigger_id=None,
+        script_name="grouping",
+        model_name="deepseek_grouping_adjacent" if _grouping_provider_is_deepseek() else "gemini_grouping_adjacent",
+        runner_payload={
+            "batch_id": batch_id,
+            "location_id": location_id,
+            "parent_script_run_id": script_run_id,
+            "identity_entry_count": len(pending_entry_groups),
+        },
+    )
+
     max_images = _grouping_gemini_max_images_per_request()
 
     def _image_count_for(entry_group: dict[str, Any]) -> int:
@@ -4380,7 +4411,7 @@ def _run_grouping_adjacent_pass(
         ]
         results_by_group, batch_presence, meta = _verify_entry_groups_against_candidates_batch(
             db,
-            script_run_id,
+            adjacent_script_run_id,
             entry_groups=numbered_groups,
             model_name=model_name,
             resize_scale=resize_scale,
@@ -4444,6 +4475,21 @@ def _run_grouping_adjacent_pass(
     _flush_batch()
 
     remaining = [item for item in trigger_inputs if int(item["trigger_id"]) not in consumed]
+    repositories.finish_script_run(
+        db,
+        adjacent_script_run_id,
+        status="success",
+        stdout_log=json.dumps(
+            {
+                "identity_entry_count": len(pending_entry_groups),
+                "matched_groups": groups,
+                "remaining_trigger_ids": sorted(int(item["trigger_id"]) for item in remaining),
+            },
+            indent=2,
+            default=str,
+        ),
+        stderr_log="",
+    )
     return remaining, groups, notes, metas, frame_presence_by_trigger
 
 
@@ -4526,7 +4572,13 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
     # actually show a person at all.
     trigger_inputs, adjacent_groups, adjacent_notes, adjacent_metas, adjacent_frame_presence_by_trigger = (
         _run_grouping_adjacent_pass(
-            db, script_run_id=script_run_id, trigger_inputs=trigger_inputs, model_name=model_name, resize_scale=resize_scale
+            db,
+            script_run_id=script_run_id,
+            batch_id=batch_id,
+            location_id=batch.get("location_id"),
+            trigger_inputs=trigger_inputs,
+            model_name=model_name,
+            resize_scale=resize_scale,
         )
     )
     normalized_groups.extend(adjacent_groups)
