@@ -4129,41 +4129,45 @@ def _verify_entry_groups_against_candidates_batch(
     entry_groups: list[dict[str, Any]],
     model_name: str,
     resize_scale: float | None,
-) -> tuple[dict[int, dict[str, Any]], dict[str, Any] | None]:
+) -> tuple[dict[int, dict[str, Any]], dict[int, bool], dict[str, Any] | None]:
     """Check several independent confirmed entries, each against its own small
     set of nearby candidate exits, in ONE combined call - rather than one call
     per entry. Each entry_group is {"group_number": int, "entry": Mapping,
-    "candidates": list[Mapping]}. Returns a dict of group_number -> result.
+    "candidates": list[Mapping]}. Also asks the model to flag, per image,
+    whether a person is visible at all - a byproduct of this same call rather
+    than a separate dedicated pre-check pass - so a trigger whose images show
+    no one at all can be skipped by the chunk scan afterward. Returns
+    (group_number -> match result, trigger_id -> has any person visible).
     """
     image_urls: list[str] = []
+    trigger_id_by_image_number: dict[int, int] = {}
     group_blocks: list[dict[str, Any]] = []
-    group_by_number: dict[int, dict[str, Any]] = {}
+
+    def _add_frames(trigger: Mapping[str, Any]) -> int:
+        start = len(image_urls) + 1
+        trigger_id = int(trigger["trigger_id"])
+        for frame in trigger.get("frames") or []:
+            if not isinstance(frame, Mapping):
+                continue
+            image_url = str(frame.get("image_url") or "").strip()
+            if image_url and image_url not in image_urls:
+                image_urls.append(image_url)
+                trigger_id_by_image_number[len(image_urls)] = trigger_id
+        return start
 
     for entry_group in entry_groups:
         group_number = int(entry_group["group_number"])
         entry_trigger = entry_group["entry"]
         candidate_triggers = entry_group["candidates"]
 
-        entry_start = len(image_urls) + 1
-        for frame in entry_trigger.get("frames") or []:
-            if not isinstance(frame, Mapping):
-                continue
-            image_url = str(frame.get("image_url") or "").strip()
-            if image_url and image_url not in image_urls:
-                image_urls.append(image_url)
+        entry_start = _add_frames(entry_trigger)
         if len(image_urls) < entry_start:
             continue
         entry_end = len(image_urls)
 
         candidate_blocks: list[dict[str, Any]] = []
         for candidate in candidate_triggers:
-            candidate_start = len(image_urls) + 1
-            for frame in candidate.get("frames") or []:
-                if not isinstance(frame, Mapping):
-                    continue
-                image_url = str(frame.get("image_url") or "").strip()
-                if image_url and image_url not in image_urls:
-                    image_urls.append(image_url)
+            candidate_start = _add_frames(candidate)
             if len(image_urls) < candidate_start:
                 continue
             candidate_blocks.append(
@@ -4184,10 +4188,9 @@ def _verify_entry_groups_against_candidates_batch(
                 "candidates": candidate_blocks,
             }
         )
-        group_by_number[group_number] = entry_group
 
     if not group_blocks:
-        return {}, None
+        return {}, {}, None
 
     prompt = (
         "You are checking several completely independent confirmed store entries in one request, each against its "
@@ -4199,10 +4202,15 @@ def _verify_entry_groups_against_candidates_batch(
         "At most one candidate per group can be correct - candidates are different, unrelated triggers, not "
         "multiple views of the same event. If none of a group's candidates show the same person, or you are not "
         "confident, say so for that group rather than guessing. "
+        "Separately, for every numbered image across all groups (1 to "
+        f"{len(image_urls)}), also note whether a person is visibly present in that specific image at all - not "
+        "just an empty scene, doorway, vehicle, or object. "
         "Return strict JSON only with schema: "
-        '{"results":[{"group_number":integer,"matched_candidate":integer or null,"confidence":number,"reason":string}]}. '
-        "Include exactly one result per group listed above, using its group_number. matched_candidate is the "
-        "candidate_number of the match within that group, or null if none match."
+        '{"results":[{"group_number":integer,"matched_candidate":integer or null,"confidence":number,"reason":string}],'
+        '"image_presence":[{"image_number":integer,"has_person":0 or 1}]}. '
+        "Include exactly one result per group listed above, using its group_number, and one image_presence entry "
+        "per image number. matched_candidate is the candidate_number of the match within that group, or null if "
+        "none match."
     )
     try:
         if _grouping_provider_is_deepseek():
@@ -4222,7 +4230,24 @@ def _verify_entry_groups_against_candidates_batch(
             )
             _record_gemini_cost(db, script_run_id, meta)
     except Exception:
-        return {}, None
+        return {}, {}, None
+
+    # Fail-open per trigger: only mark a trigger person-absent if the model
+    # actually said so for every one of its images we sent - a missing/partial
+    # image_presence response must never cause real evidence to be discarded.
+    raw_presence = result.get("image_presence") if isinstance(result.get("image_presence"), list) else []
+    has_person_by_image: dict[int, bool] = {}
+    for entry in raw_presence:
+        if not isinstance(entry, Mapping) or entry.get("image_number") is None:
+            continue
+        try:
+            has_person_by_image[int(entry["image_number"])] = bool(entry.get("has_person"))
+        except (TypeError, ValueError):
+            continue
+    presence_by_trigger: dict[int, bool] = {}
+    for image_number, trigger_id in trigger_id_by_image_number.items():
+        has_person = has_person_by_image.get(image_number, True)
+        presence_by_trigger[trigger_id] = presence_by_trigger.get(trigger_id, False) or has_person
 
     raw_results = result.get("results") if isinstance(result.get("results"), list) else []
     results_by_group: dict[int, dict[str, Any]] = {}
@@ -4240,7 +4265,7 @@ def _verify_entry_groups_against_candidates_batch(
             "confidence": _coerce_number(entry.get("confidence"), 0.0),
             "reason": str(entry.get("reason") or ""),
         }
-    return results_by_group, meta
+    return results_by_group, presence_by_trigger, meta
 
 
 _GROUPING_ADJACENT_LOOKAHEAD_COUNT = 3
@@ -4254,13 +4279,16 @@ def _run_grouping_adjacent_pass(
     trigger_inputs: list[dict[str, Any]],
     model_name: str,
     resize_scale: float | None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str], list[dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str], list[dict[str, Any]], dict[int, bool]]:
     """Before any chunk scanning, try to close out confirmed entries (ones with
     a phone_entry_id or credit_card_entry_id) against just the next few
     chronologically-following triggers. Most real visits are short, and this
     lets the far more reliable single-pair verification call do the matching
     directly instead of relying on a chunk scan across many unrelated people.
     Whatever isn't resolved here still flows into the normal chunk-based pass.
+    Also returns per-trigger person-presence, a byproduct of these same calls
+    (see _verify_entry_groups_against_candidates_batch) covering every trigger
+    that appeared in at least one adjacent check, whether or not it matched.
     """
     sorted_inputs = sorted(
         trigger_inputs, key=lambda item: _coerce_datetime_value(item.get("trigger_time")) or datetime.min
@@ -4270,6 +4298,7 @@ def _run_grouping_adjacent_pass(
     groups: list[dict[str, Any]] = []
     notes: list[str] = []
     metas: list[dict[str, Any]] = []
+    presence_by_trigger: dict[int, bool] = {}
     next_group_id = 1
     lookahead_window = timedelta(minutes=_GROUPING_ADJACENT_LOOKAHEAD_MINUTES)
 
@@ -4321,7 +4350,7 @@ def _run_grouping_adjacent_pass(
             {"group_number": index + 1, "entry": item["entry"], "candidates": item["candidates"]}
             for index, item in enumerate(batch)
         ]
-        results_by_group, meta = _verify_entry_groups_against_candidates_batch(
+        results_by_group, batch_presence, meta = _verify_entry_groups_against_candidates_batch(
             db,
             script_run_id,
             entry_groups=numbered_groups,
@@ -4330,6 +4359,8 @@ def _run_grouping_adjacent_pass(
         )
         if meta is not None:
             metas.append(meta)
+        for trigger_id, has_person in batch_presence.items():
+            presence_by_trigger[trigger_id] = presence_by_trigger.get(trigger_id, False) or has_person
         for index, item in enumerate(batch):
             group_number = index + 1
             entry_id = item["entry_id"]
@@ -4386,106 +4417,7 @@ def _run_grouping_adjacent_pass(
     _flush_batch()
 
     remaining = [item for item in trigger_inputs if int(item["trigger_id"]) not in consumed]
-    return remaining, groups, notes, metas
-
-
-def _detect_trigger_person_presence(
-    db: Session,
-    *,
-    script_run_id: int,
-    trigger_inputs: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], set[int], list[str], list[dict[str, Any]]]:
-    """Cheap pre-check across every frame before any matching pass runs: does
-    this image actually show a person? Frames with no person are dropped, and
-    a trigger left with zero frames after that is classified as unknown
-    outright, sparing the far more expensive matching/verification calls from
-    ever having to deal with an empty scene (a recurring real cause of
-    "no visual data"-style dead ends).
-    """
-    use_deepseek = _grouping_provider_is_deepseek()
-    model_name = str(settings.grouping_gemini_model or "gemini-3.5-flash-lite").strip()
-    resize_scale = _grouping_gemini_resize_scale()
-    max_images = _grouping_gemini_max_images_per_request()
-
-    all_frames: list[tuple[int, int, str]] = []
-    for trigger_input in trigger_inputs:
-        trigger_id = int(trigger_input["trigger_id"])
-        for frame_position, frame in enumerate(trigger_input.get("frames") or []):
-            if not isinstance(frame, Mapping):
-                continue
-            image_url = str(frame.get("image_url") or "").strip()
-            if image_url:
-                all_frames.append((trigger_id, frame_position, image_url))
-
-    # (trigger_id, frame_position) -> has_person; defaults (fail-open) below mean
-    # a tooling hiccup here can never wrongly discard real evidence.
-    presence_by_key: dict[tuple[int, int], bool] = {}
-    metas: list[dict[str, Any]] = []
-    offset = 0
-    while offset < len(all_frames):
-        batch = all_frames[offset : offset + max_images]
-        offset += max_images
-        image_urls = [item[2] for item in batch]
-        image_mapping = [{"image_number": index + 1, "trigger_id": item[0]} for index, item in enumerate(batch)]
-        prompt = (
-            "For each numbered image, decide whether a person (any part of a human body) is visibly present in "
-            "the frame - not just an empty scene, doorway, vehicle, or object. "
-            "Return strict JSON only with schema: {\"results\":[{\"image_number\":integer,\"has_person\":0 or 1}]}. "
-            f"Image mapping: {json.dumps(image_mapping, default=str)}."
-        )
-        try:
-            if use_deepseek:
-                result, meta = _call_deepseek_vision_summary(
-                    prompt=prompt,
-                    image_urls=image_urls,
-                    model_name=settings.deepseek_vision_model,
-                    image_resize_scale=_grouping_deepseek_resize_scale(),
-                )
-                _record_deepseek_cost(db, script_run_id, meta)
-            else:
-                result, meta = _call_kiosk_gemini_summary(
-                    prompt=prompt,
-                    image_urls=image_urls,
-                    model_name=model_name,
-                    image_resize_scale=resize_scale,
-                )
-                _record_gemini_cost(db, script_run_id, meta)
-            metas.append(meta)
-        except Exception:
-            logger.exception("Person-presence pre-check failed for a frame batch; keeping all frames")
-            for item in batch:
-                presence_by_key[(item[0], item[1])] = True
-            continue
-        raw_results = result.get("results") if isinstance(result.get("results"), list) else []
-        has_person_by_number: dict[int, bool] = {}
-        for entry in raw_results:
-            if not isinstance(entry, Mapping) or entry.get("image_number") is None:
-                continue
-            try:
-                has_person_by_number[int(entry["image_number"])] = bool(entry.get("has_person"))
-            except (TypeError, ValueError):
-                continue
-        for index, item in enumerate(batch):
-            presence_by_key[(item[0], item[1])] = has_person_by_number.get(index + 1, True)
-
-    empty_trigger_ids: set[int] = set()
-    notes: list[str] = []
-    filtered_trigger_inputs: list[dict[str, Any]] = []
-    for trigger_input in trigger_inputs:
-        trigger_id = int(trigger_input["trigger_id"])
-        frames = trigger_input.get("frames") or []
-        kept_frames = [
-            frame for frame_position, frame in enumerate(frames) if presence_by_key.get((trigger_id, frame_position), True)
-        ]
-        if frames and not kept_frames:
-            empty_trigger_ids.add(trigger_id)
-            notes.append(f"Trigger {trigger_id} has no visible person in any frame; placed in unknown before matching.")
-            continue
-        updated_trigger_input = dict(trigger_input)
-        updated_trigger_input["frames"] = kept_frames or frames
-        filtered_trigger_inputs.append(updated_trigger_input)
-
-    return filtered_trigger_inputs, empty_trigger_ids, notes, metas
+    return remaining, groups, notes, metas, presence_by_trigger
 
 
 def _grouping_provider_is_deepseek() -> bool:
@@ -4559,20 +4491,18 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
     notes: list[str] = []
     raw_metas: list[dict[str, Any]] = []
 
-    # Stage 0a: drop frames with no visible person at all, and take any trigger
-    # left with zero frames straight to unknown before any matching is attempted.
-    trigger_inputs, empty_trigger_ids, presence_notes, presence_metas = _detect_trigger_person_presence(
-        db, script_run_id=script_run_id, trigger_inputs=trigger_inputs
-    )
-    normalized_unknown.update(empty_trigger_ids)
-    notes.extend(presence_notes)
-    raw_metas.extend(presence_metas)
-
-    # Stage 0b: try to close out confirmed (identity-bearing) entries against
-    # just the next few chronologically-following triggers before falling back
-    # to the full chunk scan - see _run_grouping_adjacent_pass docstring.
-    trigger_inputs, adjacent_groups, adjacent_notes, adjacent_metas = _run_grouping_adjacent_pass(
-        db, script_run_id=script_run_id, trigger_inputs=trigger_inputs, model_name=model_name, resize_scale=resize_scale
+    # Stage 1 (Adjacent Checking): try to close out confirmed (identity-bearing)
+    # entries against just the next few chronologically-following triggers
+    # before falling back to the full chunk scan - see
+    # _run_grouping_adjacent_pass docstring. As a byproduct of these same
+    # calls, also learn which triggers actually show a person at all - a
+    # trigger that appeared in a check but showed no one in any of its images
+    # is dropped straight to unknown, sparing stage 2 (grouping_direct) from
+    # ever having to deal with an empty scene.
+    trigger_inputs, adjacent_groups, adjacent_notes, adjacent_metas, adjacent_presence_by_trigger = (
+        _run_grouping_adjacent_pass(
+            db, script_run_id=script_run_id, trigger_inputs=trigger_inputs, model_name=model_name, resize_scale=resize_scale
+        )
     )
     normalized_groups.extend(adjacent_groups)
     for adjacent_group in adjacent_groups:
@@ -4580,6 +4510,20 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int, script_run_id:
         grouped_trigger_ids.update(adjacent_group["exit"])
     notes.extend(adjacent_notes)
     raw_metas.extend(adjacent_metas)
+
+    empty_trigger_ids = {
+        trigger_id
+        for trigger_id, has_person in adjacent_presence_by_trigger.items()
+        if not has_person and trigger_id not in grouped_trigger_ids
+    }
+    if empty_trigger_ids:
+        trigger_inputs = [item for item in trigger_inputs if int(item["trigger_id"]) not in empty_trigger_ids]
+        normalized_unknown.update(empty_trigger_ids)
+        notes.extend(
+            f"Trigger {trigger_id} showed no visible person in any image checked during adjacency matching; "
+            "placed in unknown before the chunk scan."
+            for trigger_id in sorted(empty_trigger_ids)
+        )
 
     trigger_input_by_id: dict[int, dict[str, Any]] = {
         int(trigger_input["trigger_id"]): trigger_input for trigger_input in trigger_inputs
