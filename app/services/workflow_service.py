@@ -9328,17 +9328,21 @@ def _trigger_frame_spaces_key(
 
 
 def _trigger_frame_crop_filter() -> str | None:
-    # The left portion of these entrance frames is street/background, not the
-    # door - cropping it out before it ever reaches Spaces or Gemini shrinks
-    # every downstream image (and every carry-forward resend of it) for free,
-    # and removes exactly the kind of background clutter that has caused
+    # The left and right portions of these entrance frames are street/background,
+    # not the door - cropping them out before they ever reach Spaces or Gemini
+    # shrinks every downstream image (and every carry-forward resend of it) for
+    # free, and removes exactly the kind of background clutter that has caused
     # mismatched-identity hallucinations in the grouping prompt.
-    fraction = _coerce_number(settings.trigger_frame_crop_left_fraction, 0.0)
-    if fraction <= 0:
+    left_fraction = max(0.0, _coerce_number(settings.trigger_frame_crop_left_fraction, 0.0))
+    right_fraction = max(0.0, _coerce_number(settings.trigger_frame_crop_right_fraction, 0.0))
+    if left_fraction <= 0 and right_fraction <= 0:
         return None
-    fraction = min(fraction, 0.9)
-    keep = 1 - fraction
-    return f"crop=iw*{keep}:ih:iw*{fraction}:0"
+    if left_fraction + right_fraction >= 0.9:
+        scale = 0.9 / (left_fraction + right_fraction)
+        left_fraction *= scale
+        right_fraction *= scale
+    keep = 1 - left_fraction - right_fraction
+    return f"crop=iw*{keep}:ih:iw*{left_fraction}:0"
 
 
 def _build_frame_batch_capture_command(
