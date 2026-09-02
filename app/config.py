@@ -55,7 +55,7 @@ class Settings(BaseSettings):
     retrieval_max_per_location: int = 1
     retrieval_ffmpeg_timeout_seconds: int = 60
     retrieval_stale_seconds: int = 900
-    trigger_frame_interval_seconds: float = 1.5
+    trigger_frame_interval_seconds: float = 1.0
     trigger_frame_gap: int = 12
     trigger_frame_fps: int = 25
     trigger_frame_crop_left_fraction: float = 0.50
@@ -119,7 +119,7 @@ class Settings(BaseSettings):
     gemini_api_key: str | None = None
     kiosk_gemini_model: str = "gemini-3-flash-preview"
     grouping_gemini_model: str = "gemini-3.5-flash-lite"
-    grouping_gemini_frames_per_trigger: int = 6
+    grouping_gemini_frames_per_trigger: int = 5
     grouping_gemini_image_scale: float = 0.35
     grouping_deepseek_image_scale: float = 0.5
     grouping_gemini_max_images_per_request: int = 36
