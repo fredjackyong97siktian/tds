@@ -1083,6 +1083,31 @@ def get_trigger(db: Session, trigger_id: int) -> dict[str, Any]:
     return row
 
 
+def get_app_setting(db: Session, setting_key: str) -> str | None:
+    setting_table = _table("app_setting")
+    result = db.execute(
+        text(f"select setting_value from {setting_table} where setting_key = :setting_key limit 1"),
+        {"setting_key": setting_key},
+    )
+    row = result.first()
+    return row[0] if row is not None else None
+
+
+def set_app_setting(db: Session, setting_key: str, setting_value: str) -> None:
+    setting_table = _table("app_setting")
+    db.execute(
+        text(
+            f"""
+            insert into {setting_table} (setting_key, setting_value)
+            values (:setting_key, :setting_value)
+            on duplicate key update setting_value = values(setting_value)
+            """
+        ),
+        {"setting_key": setting_key, "setting_value": setting_value},
+    )
+    db.commit()
+
+
 def get_worker_control(db: Session, worker_name: str) -> dict[str, Any]:
     worker_control_table = _table("worker_control")
     result = db.execute(

@@ -128,9 +128,11 @@ class Settings(BaseSettings):
     gemini_input_cost_per_1m_tokens_usd: float = 0.0
     gemini_output_cost_per_1m_tokens_usd: float = 0.0
     gemini_cached_input_cost_per_1m_tokens_usd: float = 0.0
-    # Which provider the main grouping call uses - "gemini" or "deepseek". Only the
-    # primary grouping chunk call switches; verification/repair/carry-item-signal
-    # stay on Gemini until deepseek is actually evaluated for those too.
+    # Which provider grouping/verification/repair/carry-item-signal use -
+    # "gemini", "deepseek", or "glm". This is only the .env default; the live
+    # value is a runtime app_setting (see repositories.get_app_setting), so it
+    # can be changed from the dashboard without a restart. This default only
+    # applies when no app_setting row exists yet.
     grouping_provider: str = "gemini"
     deepseek_api_key: str | None = None
     deepseek_vision_model: str = "deepseek-v4-flash-vision-exp"
@@ -142,6 +144,16 @@ class Settings(BaseSettings):
     deepseek_output_cost_per_1m_tokens_usd_peak: float = 1.32
     deepseek_cached_input_cost_per_1m_tokens_usd_offpeak: float = 0.007
     deepseek_cached_input_cost_per_1m_tokens_usd_peak: float = 0.014
+    glm_api_key: str | None = None
+    glm_vision_model: str = "glm-5.3-flash"
+    glm_base_url: str = "https://api.z.ai/api/paas/v4"
+    glm_timeout_seconds: int = 180
+    glm_image_scale: float = 0.5
+    # z.ai promotional rate, active until 2026-09-09 (UTC+8); reverts to
+    # 0.15 / 0.50 / 0.03 after that - update these once the promo ends.
+    glm_input_cost_per_1m_tokens_usd: float = 0.075
+    glm_output_cost_per_1m_tokens_usd: float = 0.25
+    glm_cached_input_cost_per_1m_tokens_usd: float = 0.015
 
     model_config = SettingsConfigDict(
         env_prefix="THEFT_API_",

@@ -1,0 +1,8 @@
+CREATE TABLE IF NOT EXISTS sesamedb.tds_app_setting (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    setting_key VARCHAR(80) NOT NULL,
+    setting_value TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_app_setting_key (setting_key)
+);

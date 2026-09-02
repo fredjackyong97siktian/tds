@@ -1347,12 +1347,129 @@ def _record_deepseek_cost(db: Session, script_run_id: int, deepseek_meta: Mappin
     return detail
 
 
+def _call_glm_vision_summary(
+    *,
+    prompt: str,
+    image_urls: list[str],
+    model_name: str | None = None,
+    allow_text_only: bool = False,
+    image_resize_scale: float | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    api_key = str(settings.glm_api_key or os.environ.get("GLM_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("GLM (z.ai) API key is not configured in tds_api. Set THEFT_API_GLM_API_KEY.")
+    if not image_urls and not allow_text_only:
+        raise RuntimeError("No image URLs were provided for the GLM vision call.")
+
+    selected_model = str(model_name or settings.glm_vision_model).strip()
+    content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    if image_urls:
+        # Same OpenAI-style chat-completions shape as DeepSeek - reuses the
+        # same generic download/crop/resize/base64-embed helper rather than
+        # trusting z.ai to fetch plain URLs itself.
+        with ThreadPoolExecutor(max_workers=min(8, len(image_urls))) as executor:
+            data_urls = list(
+                executor.map(
+                    lambda image_url: _download_image_data_url_for_deepseek(
+                        image_url, resize_scale=image_resize_scale
+                    ),
+                    image_urls,
+                )
+            )
+        for data_url in data_urls:
+            content.append({"type": "image_url", "image_url": {"url": data_url}})
+
+    request_body = {
+        "model": selected_model,
+        "messages": [{"role": "user", "content": content}],
+        "response_format": {"type": "json_object"},
+    }
+    url = f"{str(settings.glm_base_url).rstrip('/')}/chat/completions"
+    request = Request(
+        url,
+        data=json.dumps(request_body).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=settings.glm_timeout_seconds) as response:
+            raw_body = response.read().decode("utf-8", errors="replace")
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"GLM request failed with HTTP {exc.code}: {detail[:1000]}") from exc
+
+    parsed = json.loads(raw_body)
+    choices = parsed.get("choices") or []
+    message_content = str(((choices[0] or {}).get("message") or {}).get("content") or "") if choices else ""
+    result = _extract_json_object(message_content)
+    raw_usage = parsed.get("usage") or {}
+    return result, {
+        "provider": "tds_api_glm",
+        "model": selected_model,
+        "image_count": len(image_urls),
+        "prompt": prompt,
+        "image_urls": image_urls,
+        "raw_response": parsed,
+        "raw_usage": raw_usage,
+        "usage": {
+            "input_tokens": raw_usage.get("prompt_tokens"),
+            "output_tokens": raw_usage.get("completion_tokens"),
+            "cached_input_tokens": (raw_usage.get("prompt_tokens_details") or {}).get("cached_tokens"),
+        },
+    }
+
+
+def _glm_usage_cost(glm_meta: Mapping[str, Any]) -> tuple[float | None, dict[str, Any]]:
+    usage = glm_meta.get("usage") if isinstance(glm_meta.get("usage"), Mapping) else {}
+    model_name = glm_meta.get("model")
+    input_tokens = _positive_float(usage.get("input_tokens")) or 0.0
+    output_tokens = _positive_float(usage.get("output_tokens")) or 0.0
+    cached_input_tokens = _positive_float(usage.get("cached_input_tokens")) or 0.0
+    input_rate = settings.glm_input_cost_per_1m_tokens_usd
+    output_rate = settings.glm_output_cost_per_1m_tokens_usd
+    cached_rate = settings.glm_cached_input_cost_per_1m_tokens_usd
+    billable_input_tokens = max(0.0, input_tokens - cached_input_tokens)
+    amount = (billable_input_tokens * input_rate + output_tokens * output_rate) / 1_000_000
+    amount += cached_input_tokens * cached_rate / 1_000_000
+    detail = {
+        "model": model_name,
+        "input_tokens": int(input_tokens),
+        "output_tokens": int(output_tokens),
+        "cached_input_tokens": int(cached_input_tokens),
+        "input_cost_per_1m_tokens_usd": input_rate,
+        "output_cost_per_1m_tokens_usd": output_rate,
+        "cached_input_cost_per_1m_tokens_usd": cached_rate,
+        "estimated_cost_usd": amount,
+    }
+    if amount <= 0:
+        return None, detail
+    return amount, detail
+
+
+def _record_glm_cost(db: Session, script_run_id: int, glm_meta: Mapping[str, Any]) -> dict[str, Any]:
+    amount, detail = _glm_usage_cost(glm_meta)
+    repositories.add_script_run_cost(
+        db,
+        script_run_id,
+        cost_amount=amount,
+        cost_currency="USD",
+        cost_source="glm_estimate",
+    )
+    return detail
+
+
 def _usage_cost_for_call_meta(call_meta: Mapping[str, Any]) -> tuple[float | None, dict[str, Any]]:
     # Picks the right cost formula (and pricing) for a single chunk's own
     # provider, rather than always pricing it as if it were Gemini - a batch's
     # chunks list can be a mix (main call on deepseek, verification on gemini).
-    if str(call_meta.get("provider") or "") == "tds_api_deepseek":
+    provider = str(call_meta.get("provider") or "")
+    if provider == "tds_api_deepseek":
         return _deepseek_usage_cost(call_meta)
+    if provider == "tds_api_glm":
+        return _glm_usage_cost(call_meta)
     return _gemini_usage_cost(call_meta)
 
 
@@ -2633,7 +2750,11 @@ def _repair_grouping_with_gemini(
         session_id=None,
         trigger_id=None,
         script_name="grouping",
-        model_name="deepseek_grouping_repair" if _grouping_provider_is_deepseek() else "gemini_grouping_repair",
+        model_name=(
+            "deepseek_grouping_repair"
+            if _grouping_provider_is_deepseek(db)
+            else "glm_grouping_repair" if _grouping_provider_is_glm(db) else "gemini_grouping_repair"
+        ),
         runner_payload={
             "batch_id": batch_id,
             "location_id": location_id,
@@ -2675,7 +2796,7 @@ def _repair_grouping_with_gemini(
         "Only create an exit match if the same person is clearly visible. If unsure, leave the trigger in unknown."
     )
     try:
-        if _grouping_provider_is_deepseek():
+        if _grouping_provider_is_deepseek(db):
             repair_result, repair_meta = _call_deepseek_vision_summary(
                 prompt=prompt,
                 image_urls=image_urls,
@@ -2683,6 +2804,14 @@ def _repair_grouping_with_gemini(
                 image_resize_scale=_grouping_deepseek_resize_scale(),
             )
             repair_cost = _record_deepseek_cost(db, repair_script_run_id, repair_meta)
+        elif _grouping_provider_is_glm(db):
+            repair_result, repair_meta = _call_glm_vision_summary(
+                prompt=prompt,
+                image_urls=image_urls,
+                model_name=settings.glm_vision_model,
+                image_resize_scale=_grouping_glm_resize_scale(),
+            )
+            repair_cost = _record_glm_cost(db, repair_script_run_id, repair_meta)
         else:
             repair_result, repair_meta = _call_kiosk_gemini_summary(prompt=prompt, image_urls=image_urls)
             repair_cost = _record_gemini_cost(db, repair_script_run_id, repair_meta)
@@ -3700,6 +3829,11 @@ def _grouping_deepseek_resize_scale() -> float | None:
     return scale if 0 < scale < 1 else None
 
 
+def _grouping_glm_resize_scale() -> float | None:
+    scale = _coerce_number(settings.glm_image_scale, 1.0)
+    return scale if 0 < scale < 1 else None
+
+
 def _first_trigger_frame_payload(frames: list[dict[str, Any]], limit: int | None = None) -> list[dict[str, Any]]:
     if limit is None:
         limit = _grouping_frames_per_trigger()
@@ -4206,7 +4340,7 @@ def _verify_gemini_grouping_match(
         "should cite any visual details that argue against your answer, or be an empty string if you found none."
     )
     try:
-        if _grouping_provider_is_deepseek():
+        if _grouping_provider_is_deepseek(db):
             result, meta = _call_deepseek_vision_summary(
                 prompt=prompt,
                 image_urls=image_urls,
@@ -4214,6 +4348,14 @@ def _verify_gemini_grouping_match(
                 image_resize_scale=_grouping_deepseek_resize_scale(),
             )
             _record_deepseek_cost(db, script_run_id, meta)
+        elif _grouping_provider_is_glm(db):
+            result, meta = _call_glm_vision_summary(
+                prompt=prompt,
+                image_urls=image_urls,
+                model_name=settings.glm_vision_model,
+                image_resize_scale=_grouping_glm_resize_scale(),
+            )
+            _record_glm_cost(db, script_run_id, meta)
         else:
             result, meta = _call_kiosk_gemini_summary(
                 prompt=prompt,
@@ -4350,7 +4492,7 @@ def _verify_entry_groups_against_candidates_batch(
         "none match."
     )
     try:
-        if _grouping_provider_is_deepseek():
+        if _grouping_provider_is_deepseek(db):
             result, meta = _call_deepseek_vision_summary(
                 prompt=prompt,
                 image_urls=image_urls,
@@ -4358,6 +4500,14 @@ def _verify_entry_groups_against_candidates_batch(
                 image_resize_scale=_grouping_deepseek_resize_scale(),
             )
             _record_deepseek_cost(db, script_run_id, meta)
+        elif _grouping_provider_is_glm(db):
+            result, meta = _call_glm_vision_summary(
+                prompt=prompt,
+                image_urls=image_urls,
+                model_name=settings.glm_vision_model,
+                image_resize_scale=_grouping_glm_resize_scale(),
+            )
+            _record_glm_cost(db, script_run_id, meta)
         else:
             result, meta = _call_kiosk_gemini_summary(
                 prompt=prompt,
@@ -4490,7 +4640,11 @@ def _run_grouping_adjacent_pass(
         session_id=None,
         trigger_id=None,
         script_name="grouping",
-        model_name="deepseek_grouping_adjacent" if _grouping_provider_is_deepseek() else "gemini_grouping_adjacent",
+        model_name=(
+            "deepseek_grouping_adjacent"
+            if _grouping_provider_is_deepseek(db)
+            else "glm_grouping_adjacent" if _grouping_provider_is_glm(db) else "gemini_grouping_adjacent"
+        ),
         runner_payload={
             "batch_id": batch_id,
             "location_id": location_id,
@@ -4603,17 +4757,39 @@ def _run_grouping_adjacent_pass(
     return remaining, groups, notes, metas, frame_presence_by_trigger, adjacent_script_run_id
 
 
-def _grouping_provider_is_deepseek() -> bool:
-    return str(settings.grouping_provider or "gemini").strip().lower() == "deepseek"
+_GROUPING_PROVIDER_APP_SETTING_KEY = "grouping_provider"
+_GROUPING_PROVIDERS = ("gemini", "deepseek", "glm")
 
 
-def _grouping_model_name_label() -> str:
-    # Reflects only the main grouping call's provider. Verification/repair/
-    # carry-item-signal stay on Gemini regardless, so a batch's script_run cost
-    # can still show a combined "deepseek_estimate+gemini_estimate" source even
-    # when this label says deepseek - that's the verification pass's Gemini
-    # spend accumulating on the same script_run row, not a mislabel.
-    return "deepseek_grouping_direct" if _grouping_provider_is_deepseek() else "gemini_grouping_direct"
+def _current_grouping_provider(db: Session) -> str:
+    # Live-selectable from the dashboard (see routers/workers.py) via
+    # app_setting, falling back to the .env default when no override has ever
+    # been saved. Applies to grouping, verification, repair, and
+    # carry-item-signal alike - all of them read this same value.
+    try:
+        stored = repositories.get_app_setting(db, _GROUPING_PROVIDER_APP_SETTING_KEY)
+    except Exception:
+        logger.exception("Could not read grouping_provider app_setting; using .env default")
+        stored = None
+    provider = str(stored or settings.grouping_provider or "gemini").strip().lower()
+    return provider if provider in _GROUPING_PROVIDERS else "gemini"
+
+
+def _grouping_provider_is_deepseek(db: Session) -> bool:
+    return _current_grouping_provider(db) == "deepseek"
+
+
+def _grouping_provider_is_glm(db: Session) -> bool:
+    return _current_grouping_provider(db) == "glm"
+
+
+def _grouping_model_name_label(db: Session) -> str:
+    provider = _current_grouping_provider(db)
+    if provider == "deepseek":
+        return "deepseek_grouping_direct"
+    if provider == "glm":
+        return "glm_grouping_direct"
+    return "gemini_grouping_direct"
 
 
 _GROUPING_CHUNK_RETRY_MAX_ATTEMPTS = 3
@@ -4736,7 +4912,7 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
             session_id=None,
             trigger_id=None,
             script_name="grouping",
-            model_name=_grouping_model_name_label(),
+            model_name=_grouping_model_name_label(db),
             status="running",
             command=SCRIPT_RUN_COMMAND_REDACTED,
         )
@@ -4831,7 +5007,7 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
         session_id=None,
         trigger_id=None,
         script_name="grouping",
-        model_name=_grouping_model_name_label(),
+        model_name=_grouping_model_name_label(db),
         status="running",
         command=SCRIPT_RUN_COMMAND_REDACTED,
         runner_payload={
@@ -5032,7 +5208,8 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
                 f"Triggers: {json.dumps(trigger_notes, default=str)}. "
                 f"Image mapping: {json.dumps(image_mapping, default=str)}."
             )
-            use_deepseek = _grouping_provider_is_deepseek()
+            use_deepseek = _grouping_provider_is_deepseek(db)
+            use_glm = _grouping_provider_is_glm(db)
 
             def _call_chunk_vision() -> tuple[dict[str, Any], dict[str, Any]]:
                 if use_deepseek:
@@ -5043,6 +5220,14 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
                         image_resize_scale=_grouping_deepseek_resize_scale(),
                     )
                     _record_deepseek_cost(db, script_run_id, meta)
+                elif use_glm:
+                    result, meta = _call_glm_vision_summary(
+                        prompt=prompt,
+                        image_urls=image_urls,
+                        model_name=settings.glm_vision_model,
+                        image_resize_scale=_grouping_glm_resize_scale(),
+                    )
+                    _record_glm_cost(db, script_run_id, meta)
                 else:
                     result, meta = _call_kiosk_gemini_summary(
                         prompt=prompt,
@@ -5278,9 +5463,13 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
             "frame_retrieval_issue_trigger_ids": sorted(frame_retrieval_issue_trigger_ids),
             "notes": notes,
             "diagnostics": {
-                "mode": _grouping_model_name_label(),
+                "mode": _grouping_model_name_label(db),
                 "temporary_runpod_grouping_disabled": True,
-                "model": settings.deepseek_vision_model if _grouping_provider_is_deepseek() else model_name,
+                "model": (
+                    settings.deepseek_vision_model
+                    if _grouping_provider_is_deepseek(db)
+                    else settings.glm_vision_model if _grouping_provider_is_glm(db) else model_name
+                ),
                 "image_resize_scale": resize_scale,
                 "max_frames_per_trigger": _grouping_frames_per_trigger(),
                 "max_images_per_request": max_images,
@@ -5295,8 +5484,16 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
             },
         }
         return grouping_summary, {
-            "provider": "tds_api_deepseek" if _grouping_provider_is_deepseek() else "tds_api_gemini",
-            "model": settings.deepseek_vision_model if _grouping_provider_is_deepseek() else model_name,
+            "provider": (
+                "tds_api_deepseek"
+                if _grouping_provider_is_deepseek(db)
+                else "tds_api_glm" if _grouping_provider_is_glm(db) else "tds_api_gemini"
+            ),
+            "model": (
+                settings.deepseek_vision_model
+                if _grouping_provider_is_deepseek(db)
+                else settings.glm_vision_model if _grouping_provider_is_glm(db) else model_name
+            ),
             "image_resize_scale": resize_scale,
             "chunk_count": len(chunks),
             "image_count": total_image_count,
@@ -5396,9 +5593,17 @@ def start_grouping_analysis_job(job: GroupingAnalysisQueued) -> ScriptExecutionR
                 "window_end": job.window_end.isoformat(),
                 "manifest_object_key": job.manifest_object_key,
                 "manifest_url": job.manifest_url,
-                "provider": "tds_api_deepseek" if _grouping_provider_is_deepseek() else "tds_api_gemini",
-                "model": settings.deepseek_vision_model if _grouping_provider_is_deepseek() else settings.grouping_gemini_model,
-                "mode": _grouping_model_name_label(),
+                "provider": (
+                    "tds_api_deepseek"
+                    if _grouping_provider_is_deepseek(db)
+                    else "tds_api_glm" if _grouping_provider_is_glm(db) else "tds_api_gemini"
+                ),
+                "model": (
+                    settings.deepseek_vision_model
+                    if _grouping_provider_is_deepseek(db)
+                    else settings.glm_vision_model if _grouping_provider_is_glm(db) else settings.grouping_gemini_model
+                ),
+                "mode": _grouping_model_name_label(db),
             },
         )
         repositories.finish_script_run(
@@ -5423,7 +5628,7 @@ def start_grouping_analysis_job(job: GroupingAnalysisQueued) -> ScriptExecutionR
             script_run_id=script_run_id,
             runner_job_id=None,
             script_name="grouping",
-            model_name=_grouping_model_name_label(),
+            model_name=_grouping_model_name_label(db),
             status="success",
             command=["tds_api_gemini", "grouping"],
             stdout=json.dumps(grouping_summary, default=str),
@@ -6199,10 +6404,13 @@ def _evaluate_carry_item_signal_with_ai(
         or not _as_boolish(carry_evidence["before_is_yellow_bag"])
         and _as_boolish(carry_evidence["after_is_yellow_bag"])
     )
-    use_deepseek = _grouping_provider_is_deepseek()
+    use_deepseek = _grouping_provider_is_deepseek(db)
+    use_glm = _grouping_provider_is_glm(db)
     model_name = (
         str(settings.deepseek_vision_model).strip()
         if use_deepseek
+        else str(settings.glm_vision_model).strip()
+        if use_glm
         else str(settings.grouping_gemini_model or "gemini-3.5-flash-lite").strip()
     )
     transaction_payload = _transaction_summary(transactions)
@@ -6254,6 +6462,13 @@ def _evaluate_carry_item_signal_with_ai(
                 model_name=model_name,
                 allow_text_only=True,
             )
+        elif use_glm:
+            result, meta = _call_glm_vision_summary(
+                prompt=prompt,
+                image_urls=[],
+                model_name=model_name,
+                allow_text_only=True,
+            )
         else:
             result, meta = _call_kiosk_gemini_summary(
                 prompt=prompt,
@@ -6261,7 +6476,12 @@ def _evaluate_carry_item_signal_with_ai(
                 model_name=model_name,
                 allow_text_only=True,
             )
-        cost_detail = _record_deepseek_cost(db, script_run_id, meta) if use_deepseek else _record_gemini_cost(db, script_run_id, meta)
+        if use_deepseek:
+            cost_detail = _record_deepseek_cost(db, script_run_id, meta)
+        elif use_glm:
+            cost_detail = _record_glm_cost(db, script_run_id, meta)
+        else:
+            cost_detail = _record_gemini_cost(db, script_run_id, meta)
         normalized = {
             "hit": _as_boolish(result.get("hit")),
             "insufficient_evidence": _as_boolish(result.get("insufficient_evidence")),

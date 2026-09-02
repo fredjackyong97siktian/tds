@@ -250,6 +250,15 @@ CREATE TABLE IF NOT EXISTS sesamedb.tds_worker_control (
         CHECK (paused IN (0, 1))
 );
 
+CREATE TABLE IF NOT EXISTS sesamedb.tds_app_setting (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    setting_key VARCHAR(80) NOT NULL,
+    setting_value TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_app_setting_key (setting_key)
+);
+
 CREATE TABLE IF NOT EXISTS sesamedb.tds_session_video_asset (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     session_id BIGINT NOT NULL,

@@ -1,10 +1,11 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..db import get_transaction_db
 from .. import repositories
+from ..services import workflow_service
 
 
 router = APIRouter(prefix="/api/v1/workers", tags=["workers"])
@@ -12,6 +13,10 @@ router = APIRouter(prefix="/api/v1/workers", tags=["workers"])
 
 class WorkerControlRequest(BaseModel):
     paused: bool
+
+
+class GroupingProviderRequest(BaseModel):
+    provider: str
 
 
 @router.get("/retrieval-status")
@@ -238,13 +243,15 @@ def get_grouping_status(db: Session = Depends(get_transaction_db)) -> dict:
         current["is_busy"] = current["running_count"] > 0
         current["running_batch_ids"].append(int(row["id"]))
 
+    provider = workflow_service._current_grouping_provider(db)  # noqa: SLF001
     return {
         "poll_seconds": settings.grouping_poll_seconds,
         "max_global_workers": settings.grouping_max_global_workers,
+        "provider": provider,
         "model": (
             settings.deepseek_vision_model
-            if str(settings.grouping_provider or "gemini").strip().lower() == "deepseek"
-            else settings.grouping_gemini_model
+            if provider == "deepseek"
+            else settings.glm_vision_model if provider == "glm" else settings.grouping_gemini_model
         ),
         "queued_count": len(pending_rows),
         "running_count": len(running_rows),
@@ -261,6 +268,23 @@ def update_grouping_control(payload: WorkerControlRequest, db: Session = Depends
         "ok": True,
         **state,
     }
+
+
+@router.get("/grouping-provider")
+def get_grouping_provider(db: Session = Depends(get_transaction_db)) -> dict:
+    return {"provider": workflow_service._current_grouping_provider(db)}  # noqa: SLF001
+
+
+@router.put("/grouping-provider")
+def update_grouping_provider(payload: GroupingProviderRequest, db: Session = Depends(get_transaction_db)) -> dict:
+    provider = payload.provider.strip().lower()
+    if provider not in workflow_service._GROUPING_PROVIDERS:  # noqa: SLF001
+        raise HTTPException(
+            status_code=400,
+            detail=f"provider must be one of {workflow_service._GROUPING_PROVIDERS}",  # noqa: SLF001
+        )
+    repositories.set_app_setting(db, "grouping_provider", provider)
+    return {"ok": True, "provider": provider}
 
 
 @router.get("/theft-confidence-status")
