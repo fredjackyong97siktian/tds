@@ -7959,7 +7959,11 @@ def _kickoff_kiosk_pipeline_for_session(
 
     windows: list[tuple[datetime, datetime]] = []
     for transaction in transactions:
-        transaction_time = _transaction_event_time(transaction)
+        # Use transaction_time specifically, not the generic _transaction_event_time
+        # helper (which prefers created_at/createdAt) - created_at on this row is a
+        # separate audit timestamp stored in UTC, while transaction_time is the
+        # actual local POS event time everything else in this pipeline relies on.
+        transaction_time = _coerce_datetime_value(transaction.get("transaction_time"))
         if transaction_time is None:
             continue
         windows.append(_build_transaction_window_bounds(transaction_time, _coerce_int(transaction.get("total_items"))))
