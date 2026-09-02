@@ -1361,8 +1361,51 @@ def _count_items_from_kiosk_vlm_result(result: Mapping[str, Any]) -> int:
     return total
 
 
+def _trigger_frame_image_urls_for_identity(db: Session, trigger_id: int | None, *, limit: int = 6) -> list[str]:
+    if trigger_id is None:
+        return []
+    try:
+        assets = repositories.list_trigger_frame_assets(db, limit=1, trigger_id=int(trigger_id))
+    except Exception:
+        logger.exception("Could not load frame asset for identity reference trigger_id=%s", trigger_id)
+        return []
+    if not assets:
+        return []
+    frames = sorted(
+        (frame for frame in (assets[0].get("frames") or []) if str(frame.get("status") or "").strip().lower() == "ok"),
+        key=lambda frame: frame.get("frame_index") or 0,
+    )
+    urls: list[str] = []
+    for frame in frames[: max(1, limit)]:
+        image_url = str(frame.get("image_url") or "").strip()
+        if image_url:
+            urls.append(image_url)
+    return urls
+
+
+def _identity_reference_image_urls_for_session(db: Session, session_id: int | None) -> list[str]:
+    # Entrance analysis used to build the customer gallery for kiosk matching;
+    # with it disabled, these entry/exit trigger stills (already captured for
+    # grouping) are given to Gemini instead so it can identify which candidate
+    # in the kiosk footage is actually this session's customer before counting
+    # items, rather than counting for whichever person the runner happened to
+    # group evidence around.
+    if session_id is None:
+        return []
+    try:
+        session_row = repositories.get_session(db, int(session_id))
+    except Exception:
+        logger.exception("Could not load session for identity reference session_id=%s", session_id)
+        return []
+    entry_urls = _trigger_frame_image_urls_for_identity(db, session_row.get("entry_trigger_id"))
+    exit_urls = _trigger_frame_image_urls_for_identity(db, session_row.get("exit_trigger_id"))
+    return entry_urls + exit_urls
+
+
 def _complete_kiosk_summary_with_tds_gemini(
     kiosk_summary: dict[str, Any] | None,
+    *,
+    identity_reference_image_urls: list[str] | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     if not kiosk_summary:
         return kiosk_summary, {
@@ -1430,8 +1473,21 @@ def _complete_kiosk_summary_with_tds_gemini(
                 },
             )
         if enriched_group.get("vlm_pending") and prompt and image_urls:
+            call_prompt = prompt
+            call_image_urls = image_urls
+            if identity_reference_image_urls:
+                call_image_urls = list(identity_reference_image_urls) + image_urls
+                call_prompt = (
+                    f"Images 1 to {len(identity_reference_image_urls)} show the store customer whose entry and "
+                    "exit are already confirmed - this is the specific customer you must evaluate. The remaining "
+                    "images are the kiosk/checkout evidence, which may show this customer alongside other people. "
+                    "First identify which person (if any) in the kiosk evidence is the same physical customer shown "
+                    "in the reference images, based on clothing, build, and hair - do not assume it is whichever "
+                    "person the evidence happens to be centered on. Only count items carried out by that confirmed "
+                    "customer; ignore items associated with any other person visible in the kiosk evidence. "
+                ) + prompt
             try:
-                vlm_result, vlm_meta = _call_kiosk_gemini_summary(prompt=prompt, image_urls=image_urls)
+                vlm_result, vlm_meta = _call_kiosk_gemini_summary(prompt=call_prompt, image_urls=call_image_urls)
             except Exception as exc:
                 diagnostics_group["status"] = "failed"
                 diagnostics_group["error"] = str(exc)
@@ -1924,7 +1980,11 @@ def _finalize_remote_kiosk_script_run(
             },
         )
     try:
-        completed_kiosk_summary, gemini_log = _complete_kiosk_summary_with_tds_gemini(remote_result.kiosk_summary)
+        identity_reference_image_urls = _identity_reference_image_urls_for_session(db, session_id)
+        completed_kiosk_summary, gemini_log = _complete_kiosk_summary_with_tds_gemini(
+            remote_result.kiosk_summary,
+            identity_reference_image_urls=identity_reference_image_urls,
+        )
         gemini_status = str(gemini_log.get("status") or "success")
         gemini_cost = (
             _record_gemini_log_cost(db, gemini_script_run_id, gemini_log)
@@ -7031,6 +7091,19 @@ def _run_theft_confidence_for_grouping_batch_locked(
                     grouping_id=batch_id,
                 )
                 created_session_ids.add(session_id)
+                kiosk_kickoff = _kickoff_kiosk_pipeline_for_session(
+                    db,
+                    session_id=session_id,
+                    location_id=location_id,
+                    transactions=transactions,
+                )
+                logger.info(
+                    "Kiosk pipeline kickoff group_key=%s session_id=%s status=%s video_asset_ids=%s",
+                    group_key,
+                    session_id,
+                    kiosk_kickoff.get("status"),
+                    kiosk_kickoff.get("video_asset_ids"),
+                )
                 for trigger_id in entry_trigger_ids:
                     trigger = next((row for row in trigger_rows if int(row.get("id") or 0) == trigger_id), None)
                     if trigger is None:
@@ -7858,6 +7931,69 @@ def _merge_time_windows(windows: list[tuple[datetime, datetime]]) -> list[tuple[
         current_start, current_end = start, end
     merged.append((current_start, current_end))
     return merged
+
+
+def _kickoff_kiosk_pipeline_for_session(
+    db: Session,
+    *,
+    session_id: int,
+    location_id: int,
+    transactions: list[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Starts the kiosk pipeline for a session confidence just flagged for deep
+    analysis - with entrance analysis disabled, nothing else does this anymore.
+    Reuses the same transaction-window logic the old kiosk retrieval already
+    used (_build_transaction_window_bounds + _merge_time_windows). Once a
+    kiosk video_asset is queued here, kiosk_analysis_worker already dispatches
+    it to RunPod on its own the moment the video is ready - no changes needed
+    there.
+    """
+    if not transactions:
+        repositories.update_session_fields(
+            db,
+            session_id=session_id,
+            status="need_review",
+            issue_reason="No paid transaction found between the entry and exit triggers.",
+        )
+        return {"status": "need_review", "reason": "no_paid_transaction", "video_asset_ids": []}
+
+    windows: list[tuple[datetime, datetime]] = []
+    for transaction in transactions:
+        transaction_time = _transaction_event_time(transaction)
+        if transaction_time is None:
+            continue
+        windows.append(_build_transaction_window_bounds(transaction_time, _coerce_int(transaction.get("total_items"))))
+
+    if not windows:
+        repositories.update_session_fields(
+            db,
+            session_id=session_id,
+            status="need_review",
+            issue_reason="Paid transactions were found but none had a usable timestamp.",
+        )
+        return {"status": "need_review", "reason": "no_usable_transaction_time", "video_asset_ids": []}
+
+    merged_windows = _merge_time_windows(windows)
+    video_asset_ids: list[int] = []
+    for window_start, window_end in merged_windows:
+        try:
+            queued = retrieve_kiosk_video_window(
+                db,
+                session_id=session_id,
+                location_id=location_id,
+                start_time=window_start,
+                end_time=window_end,
+            )
+        except Exception:
+            logger.exception(
+                "Could not queue kiosk video retrieval session_id=%s window_start=%s window_end=%s",
+                session_id,
+                window_start,
+                window_end,
+            )
+            continue
+        video_asset_ids.append(int(queued.video_asset_id))
+    return {"status": "queued", "video_windows": merged_windows, "video_asset_ids": video_asset_ids}
 
 
 def _maybe_close_session_and_prepare_kiosk(
