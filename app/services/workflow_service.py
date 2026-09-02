@@ -346,6 +346,7 @@ class RemoteRunnerResult:
     transaction_match_summary: dict[str, Any] | None = None
     grouping_summary: dict[str, Any] | None = None
     meta: dict[str, Any] | None = None
+    runpod_execution_time_ms: float | None = None
 
 
 @dataclass
@@ -796,6 +797,7 @@ def _remote_runner_result_from_runpod_body(body: dict[str, Any]) -> tuple[str, R
                 transaction_match_summary=output.get("transaction_match_summary"),
                 grouping_summary=output.get("grouping_summary"),
                 meta=output.get("meta") if isinstance(output.get("meta"), dict) else None,
+                runpod_execution_time_ms=_positive_float(body.get("executionTime")),
             ),
         )
 
@@ -817,6 +819,7 @@ def _remote_runner_result_from_runpod_body(body: dict[str, Any]) -> tuple[str, R
                 transaction_match_summary=output.get("transaction_match_summary"),
                 grouping_summary=output.get("grouping_summary"),
                 meta=output.get("meta") if isinstance(output.get("meta"), dict) else None,
+                runpod_execution_time_ms=_positive_float(body.get("executionTime")),
             ),
         )
     return (
@@ -827,6 +830,7 @@ def _remote_runner_result_from_runpod_body(body: dict[str, Any]) -> tuple[str, R
             stderr=str(error_detail),
             processed_video_object_key=None,
             processed_video_url=None,
+            runpod_execution_time_ms=_positive_float(body.get("executionTime")),
         ),
     )
 
@@ -873,11 +877,21 @@ def _remote_runner_cost(remote_result: RemoteRunnerResult) -> tuple[float | None
         if amount is not None:
             return amount, "runpod_returned"
 
-    duration_seconds = None
-    for key in ("duration_seconds", "job_seconds", "runtime_seconds", "execution_seconds"):
-        duration_seconds = _positive_float(meta.get(key))
-        if duration_seconds is not None:
-            break
+    # RunPod's own executionTime (from the job status response envelope, not
+    # the runner's self-reported meta) is the authoritative, actually-billed
+    # duration - prefer it over anything the runner itself estimates, since
+    # the runner's own wall-clock measurement of its script can't see RunPod's
+    # cold-start/container overhead that RunPod still bills for.
+    duration_seconds = (
+        remote_result.runpod_execution_time_ms / 1000
+        if _positive_float(remote_result.runpod_execution_time_ms) is not None
+        else None
+    )
+    if duration_seconds is None:
+        for key in ("duration_seconds", "job_seconds", "runtime_seconds", "execution_seconds"):
+            duration_seconds = _positive_float(meta.get(key))
+            if duration_seconds is not None:
+                break
     if duration_seconds is None:
         for key in ("executionTime", "execution_time_ms", "runtime_ms"):
             duration_milliseconds = _positive_float(meta.get(key))
