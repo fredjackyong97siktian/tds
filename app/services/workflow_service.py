@@ -7957,6 +7957,11 @@ def _kickoff_kiosk_pipeline_for_session(
         )
         return {"status": "need_review", "reason": "no_paid_transaction", "video_asset_ids": []}
 
+    # Persisted so get_transaction_total_items (used later by finalize_session_result
+    # to compare against Gemini's kiosk item count) has something real to sum -
+    # without this every session would read 0 items paid for and get falsely
+    # marked "detected" regardless of what was actually bought.
+    repositories.delete_session_transactions(db, session_id)
     windows: list[tuple[datetime, datetime]] = []
     for transaction in transactions:
         # Use transaction_time specifically, not the generic _transaction_event_time
@@ -7966,7 +7971,19 @@ def _kickoff_kiosk_pipeline_for_session(
         transaction_time = _coerce_datetime_value(transaction.get("transaction_time"))
         if transaction_time is None:
             continue
-        windows.append(_build_transaction_window_bounds(transaction_time, _coerce_int(transaction.get("total_items"))))
+        total_items = _coerce_int(transaction.get("total_items"))
+        repositories.create_transaction(
+            db,
+            session_id,
+            {
+                "receipt_number": str(transaction.get("receipt_number") or transaction.get("transaction_id") or ""),
+                "transaction_time": transaction_time,
+                "total_items": total_items,
+                "total_amount": transaction.get("total_amount"),
+                "raw_payload": dict(transaction),
+            },
+        )
+        windows.append(_build_transaction_window_bounds(transaction_time, total_items))
 
     if not windows:
         repositories.update_session_fields(
