@@ -984,6 +984,7 @@ def _compact_gemini_meta_for_log(gemini_meta: Mapping[str, Any]) -> dict[str, An
         "prompt_chars": len(prompt),
         "prompt_preview": prompt[:800],
         "raw_usage": gemini_meta.get("raw_usage") or {},
+        "raw_response": gemini_meta.get("raw_response"),
     }
     image_urls = gemini_meta.get("image_urls")
     if isinstance(image_urls, list):
@@ -2926,6 +2927,8 @@ def _repair_grouping_with_gemini(
                 "verification_cost_details": [
                     _usage_cost_for_call_meta(meta)[1] for meta in repair_verification_metas
                 ],
+                "main_call": _compact_gemini_meta_for_log(repair_meta),
+                "verification_calls": [_compact_gemini_meta_for_log(meta) for meta in repair_verification_metas],
             },
             indent=2,
             default=str,
@@ -4748,6 +4751,7 @@ def _run_grouping_adjacent_pass(
                 "identity_entry_count": len(pending_entry_groups),
                 "matched_groups": groups,
                 "remaining_trigger_ids": sorted(int(item["trigger_id"]) for item in remaining),
+                "calls": [_compact_gemini_meta_for_log(meta) for meta in metas],
             },
             indent=2,
             default=str,
