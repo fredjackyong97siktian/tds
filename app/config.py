@@ -134,6 +134,11 @@ class Settings(BaseSettings):
     # can be changed from the dashboard without a restart. This default only
     # applies when no app_setting row exists yet.
     grouping_provider: str = "gemini"
+    # Temporary diagnostic switch - when False, the chunk-scan stage is skipped
+    # entirely and everything adjacent didn't resolve falls straight through to
+    # repair instead. Restart-only (not live-toggleable), since this is meant
+    # for a short A/B test, not routine operation.
+    grouping_direct_enabled: bool = True
     deepseek_api_key: str | None = None
     deepseek_vision_model: str = "deepseek-v4-flash-vision-exp"
     deepseek_base_url: str = "https://api.deepseek.com"
