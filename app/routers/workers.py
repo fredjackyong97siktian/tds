@@ -244,15 +244,17 @@ def get_grouping_status(db: Session = Depends(get_transaction_db)) -> dict:
         current["running_batch_ids"].append(int(row["id"]))
 
     provider = workflow_service._current_grouping_provider(db)  # noqa: SLF001
+    provider_models = {
+        "gemini": settings.grouping_gemini_model,
+        "deepseek": settings.deepseek_vision_model,
+        "glm": settings.glm_vision_model,
+    }
     return {
         "poll_seconds": settings.grouping_poll_seconds,
         "max_global_workers": settings.grouping_max_global_workers,
         "provider": provider,
-        "model": (
-            settings.deepseek_vision_model
-            if provider == "deepseek"
-            else settings.glm_vision_model if provider == "glm" else settings.grouping_gemini_model
-        ),
+        "model": provider_models[provider],
+        "provider_models": provider_models,
         "queued_count": len(pending_rows),
         "running_count": len(running_rows),
         "remote_dispatch_busy": repositories.has_active_remote_analysis_script_run(db, script_names=["grouping"]),

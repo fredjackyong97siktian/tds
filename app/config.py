@@ -149,11 +149,12 @@ class Settings(BaseSettings):
     glm_base_url: str = "https://api.z.ai/api/paas/v4"
     glm_timeout_seconds: int = 180
     glm_image_scale: float = 0.5
-    # z.ai promotional rate, active until 2026-09-09 (UTC+8); reverts to
-    # 0.15 / 0.50 / 0.03 after that - update these once the promo ends.
-    glm_input_cost_per_1m_tokens_usd: float = 0.075
-    glm_output_cost_per_1m_tokens_usd: float = 0.25
-    glm_cached_input_cost_per_1m_tokens_usd: float = 0.015
+    # Standard (non-promotional) z.ai rate. A 50% promo (0.075 / 0.25 / 0.015)
+    # is active until 2026-09-09 (UTC+8) - override via env if you want to
+    # track the promo rate instead while it's running.
+    glm_input_cost_per_1m_tokens_usd: float = 0.15
+    glm_output_cost_per_1m_tokens_usd: float = 0.50
+    glm_cached_input_cost_per_1m_tokens_usd: float = 0.03
 
     model_config = SettingsConfigDict(
         env_prefix="THEFT_API_",
