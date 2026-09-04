@@ -2153,7 +2153,16 @@ def list_manual_grouping_ready_trigger_frame_assets(
             where te.location_id = :location_id
               and te.whitelist_hit = 0
               and te.status <> 'whitelisted'
-              and fa.status = 'retrieved'
+              and (
+                  fa.status = 'retrieved'
+                  -- mark_stale_open_entry_frame_assets_issue flips a perfectly
+                  -- good, already-retrieved asset to 'issue' purely because it
+                  -- sat too long without a match - its frames are fine, it was
+                  -- never a real retrieval failure. Excluding it here (the same
+                  -- query both the schedule and every manual rerun use) made it
+                  -- permanently unusable forever, even on retry.
+                  or (fa.status = 'issue' and fa.error = 'No matching exit found before the open-entry staleness cutoff.')
+              )
               and not exists (
                   select 1
                   from {grouping_item_table} gi
