@@ -5050,7 +5050,7 @@ def _verify_entry_groups_against_candidates_batch(
     return results_by_group, frame_presence_by_trigger, best_frames_by_trigger, meta
 
 
-_GROUPING_ADJACENT_LOOKAHEAD_COUNT = 3
+_GROUPING_ADJACENT_LOOKAHEAD_COUNT = 2
 _GROUPING_ADJACENT_LOOKAHEAD_MINUTES = 30
 
 
