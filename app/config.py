@@ -139,6 +139,15 @@ class Settings(BaseSettings):
     # repair instead. Restart-only (not live-toggleable), since this is meant
     # for a short A/B test, not routine operation.
     grouping_direct_enabled: bool = True
+    # Temporary diagnostic switch - when False, confidence analysis still runs
+    # and writes its normal filter_confidence_result (score, factors,
+    # need_deep_analysis) for every group, but stops short of creating an
+    # actual session/kiosk pipeline for any of them. Meant for watching
+    # grouping+confidence output in isolation without it cascading into real
+    # RunPod/kiosk cost. Restart-only (not live-toggleable). Note: the manual
+    # "Force Deep Analysis" button still expects a session and will error
+    # while this is off.
+    session_creation_enabled: bool = True
     deepseek_api_key: str | None = None
     deepseek_vision_model: str = "deepseek-v4-flash-vision-exp"
     deepseek_base_url: str = "https://api.deepseek.com"

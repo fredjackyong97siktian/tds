@@ -7193,6 +7193,15 @@ def _ensure_session_for_confidence_group(
     exit_trigger_ids: list[int],
     entry_has_identity: bool = True,
 ) -> dict[str, Any] | None:
+    if not settings.session_creation_enabled:
+        logger.info(
+            "Session creation temporarily disabled (session_creation_enabled=False) - skipping for "
+            "location_id=%s entry_trigger_ids=%s exit_trigger_ids=%s",
+            location_id,
+            entry_trigger_ids,
+            exit_trigger_ids,
+        )
+        return None
     trigger_rows: dict[int, dict[str, Any]] = {}
     for trigger_id in sorted(set(entry_trigger_ids + exit_trigger_ids)):
         try:
