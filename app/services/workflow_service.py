@@ -3064,12 +3064,17 @@ def _repair_grouping_with_gemini(
         "Carry observation rule: for every matched pair, describe what the customer visibly carries at entry and at exit. "
         "Count bags, plastic bags, woven/reusable bags, backpacks, boxes, cartons, bottles, and loose items only when visibly held, worn, or moving with the person. "
         "Record color, type, approximate size, count, and confidence. Use 0 count when the customer appears empty-handed. "
+        "Also, for every trigger listed below (entries and unknown triggers both), count how many distinct, separate "
+        "people appear together in that trigger's own images - usually 1, but count higher when a group of customers "
+        "clearly entered or exited together in the same trigger. Give your confidence in that count. "
         "Return strict JSON only with schema: "
         '{"groups":[{"entry":[integer],"exit":[integer],"confidence":number,"reason":string,'
         '"entry_carry":{"bag_count":integer,"item_count":integer,"items":[{"type":string,"color":string,"size":string,"count":integer,"confidence":number}],"summary":string},'
         '"exit_carry":{"bag_count":integer,"item_count":integer,"items":[{"type":string,"color":string,"size":string,"count":integer,"confidence":number}],"summary":string},'
         '"carry_change_summary":string}],'
-        '"unknown":[integer],"notes":[string]}. '
+        '"unknown":[integer],"notes":[string],'
+        '"trigger_customer_counts":[{"trigger_id":integer,"unique_customer_count":integer,"confidence":number}]}. '
+        "Include one trigger_customer_counts entry per trigger listed below. "
         f"Entries still waiting for an exit match: {json.dumps(open_entry_trigger_ids)}. "
         "Every id in that list is a CONFIRMED entry, already established by an earlier pass - do not relabel, "
         "reinterpret, or move any of them; only use them as the entry side of a pairing, exactly as given. "
@@ -3091,6 +3096,7 @@ def _repair_grouping_with_gemini(
             gemini_resize_scale=None,
         )
         repair_cost = _record_grouping_cost(db, repair_script_run_id, repair_meta)
+        _persist_trigger_unique_customer_counts(db, repair_result, source="repair")
     except Exception as exc:
         repositories.finish_script_run(
             db,
@@ -3122,6 +3128,19 @@ def _repair_grouping_with_gemini(
     repair_verification_notes: list[str] = []
     repair_verification_metas: list[dict[str, Any]] = []
     next_group_id = len(completed_groups) + 1
+    # grouping_adjacent's clearest-1-2-frame pick, persisted to the DB (see
+    # repositories.set_trigger_best_verification_frames) since repair runs as
+    # its own separate process/pass with no access to adjacent's in-memory
+    # results. A trigger with no entry here either never went through
+    # adjacent, or has no curated pick yet - falls back to frames_by_trigger's
+    # full list in that case.
+    try:
+        best_verification_frame_urls_by_trigger = repositories.list_best_verification_frame_urls_by_trigger(
+            db, candidate_trigger_ids
+        )
+    except Exception:
+        logger.exception("Could not load best-verification-frame selections for repair batch_id=%s", batch_id)
+        best_verification_frame_urls_by_trigger = {}
     for repaired in repair_result.get("groups") or []:
         if not isinstance(repaired, Mapping):
             continue
@@ -3130,7 +3149,15 @@ def _repair_grouping_with_gemini(
         if not entry_ids:
             continue
         entry_ids = entry_ids[:1]
-        exit_ids = [trigger_id for trigger_id in exit_ids if trigger_id not in entry_ids]
+        entry_trigger_id = entry_ids[0]
+        # trigger_id is assigned in the same chronological order as trigger_time, so a
+        # real exit can never have a smaller id than its own entry - the same free,
+        # no-cost check grouping_direct's chunk scan already applies (see
+        # _run_gemini_grouping_for_batch), which repair was missing entirely, letting
+        # structurally-impossible pairs consume a paid verification call for nothing.
+        exit_ids = [
+            trigger_id for trigger_id in exit_ids if trigger_id not in entry_ids and trigger_id > entry_trigger_id
+        ]
         if not exit_ids:
             continue
         confidence = _coerce_number(repaired.get("confidence"), 0.0)
@@ -3140,12 +3167,14 @@ def _repair_grouping_with_gemini(
         # main grouping pass gets, which was letting bad repair pairs (e.g. a
         # different person matched only on generic clothing similarity) through
         # unverified. Run the same focused re-check here before accepting one.
-        entry_trigger_input = {
-            "frames": [{"image_url": url} for url in frames_by_trigger.get(entry_ids[0], [])]
-        }
-        exit_trigger_input = {
-            "frames": [{"image_url": url} for url in frames_by_trigger.get(exit_ids[0], [])]
-        }
+        entry_verification_urls = (
+            best_verification_frame_urls_by_trigger.get(entry_ids[0]) or frames_by_trigger.get(entry_ids[0], [])
+        )
+        exit_verification_urls = (
+            best_verification_frame_urls_by_trigger.get(exit_ids[0]) or frames_by_trigger.get(exit_ids[0], [])
+        )
+        entry_trigger_input = {"frames": [{"image_url": url} for url in entry_verification_urls]}
+        exit_trigger_input = {"frames": [{"image_url": url} for url in exit_verification_urls]}
         verification, verification_meta = _verify_gemini_grouping_match(
             db,
             repair_script_run_id,
@@ -4773,6 +4802,35 @@ def _verify_gemini_grouping_matches_batch(
     return results_by_match, meta
 
 
+def _persist_trigger_unique_customer_counts(db: Session, result: Mapping[str, Any], *, source: str) -> None:
+    # Shared by adjacent/direct/repair's parsing - each asks the model for a
+    # "trigger_customer_counts" array (same shape) and persists every entry
+    # unconditionally (confidence included) so a low-confidence estimate is
+    # still visible for debugging, not silently dropped. Whether a later
+    # feature trusts a given count enough to act on it is a decision for
+    # whatever reads this data, not for this write path.
+    raw_counts = result.get("trigger_customer_counts") if isinstance(result.get("trigger_customer_counts"), list) else []
+    for entry in raw_counts:
+        if not isinstance(entry, Mapping) or entry.get("trigger_id") is None:
+            continue
+        try:
+            trigger_id = int(entry["trigger_id"])
+            count = int(entry.get("unique_customer_count") or 0)
+        except (TypeError, ValueError):
+            continue
+        if count <= 0:
+            continue
+        confidence = _coerce_number(entry.get("confidence"), 0.0)
+        try:
+            repositories.set_trigger_unique_customer_count(
+                db, trigger_id, count=count, confidence=confidence, source=source
+            )
+        except Exception:
+            logger.exception(
+                "Could not persist unique_customer_count for trigger_id=%s source=%s", trigger_id, source
+            )
+
+
 def _verify_entry_groups_against_candidates_batch(
     db: Session,
     script_run_id: int,
@@ -4872,6 +4930,9 @@ def _verify_entry_groups_against_candidates_batch(
         "most 2 of that trigger's images as best_for_verification=1 - whichever show the person's face/clothing "
         "most clearly with the least blur or occlusion. Every image with has_person=0 must be best_for_verification=0, "
         "and every other image for that trigger not among your top 2 clearest must also be best_for_verification=0. "
+        "Also, for every trigger listed above (both entries and candidates), count how many distinct, separate "
+        "people appear together in that trigger's own images - usually 1, but count higher when a group of "
+        "customers clearly entered or exited together in the same trigger. Give your confidence in that count. "
         "Carry observation rule: for every group, whether or not it matched, describe what the entry customer visibly "
         "carries in the entry image set, and - only if matched_candidate is not null - what they visibly carry in that "
         "matched candidate's images. Count bags, plastic bags, woven/reusable bags, backpacks, boxes, cartons, bottles, "
@@ -4884,9 +4945,11 @@ def _verify_entry_groups_against_candidates_batch(
         '"entry_carry":{"bag_count":integer,"item_count":integer,"items":[{"type":string,"color":string,"size":string,"count":integer,"confidence":number}],"summary":string},'
         '"exit_carry":{"bag_count":integer,"item_count":integer,"items":[{"type":string,"color":string,"size":string,"count":integer,"confidence":number}],"summary":string},'
         '"carry_change_summary":string}],'
-        '"image_presence":[{"image_number":integer,"has_person":0 or 1,"best_for_verification":0 or 1}]}. '
-        "Include exactly one result per group listed above, using its group_number, and one image_presence entry "
-        "per image number. matched_candidate is the candidate_number of the match within that group, or null if "
+        '"image_presence":[{"image_number":integer,"has_person":0 or 1,"best_for_verification":0 or 1}],'
+        '"trigger_customer_counts":[{"trigger_id":integer,"unique_customer_count":integer,"confidence":number}]}. '
+        "Include exactly one result per group listed above, using its group_number, one image_presence entry "
+        "per image number, and one trigger_customer_counts entry per trigger_id listed above (entries and "
+        "candidates both). matched_candidate is the candidate_number of the match within that group, or null if "
         "none match."
     )
     try:
@@ -4900,6 +4963,8 @@ def _verify_entry_groups_against_candidates_batch(
         _record_grouping_cost(db, script_run_id, meta)
     except Exception:
         return {}, {}, {}, None
+
+    _persist_trigger_unique_customer_counts(db, result, source="adjacent")
 
     # Fail-open per trigger: only mark a trigger person-absent if the model
     # actually said so for every one of its images we sent - a missing/partial
@@ -5540,13 +5605,27 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
         if len(best_list) != len(presence_list):
             best_list = [False] * len(presence_list)
         kept_frames = []
+        best_frame_indices: list[int] = []
         for frame, has_person, is_best in zip(frames, presence_list, best_list):
             if not has_person:
                 continue
             frame = dict(frame)
             frame["verification_selected"] = bool(is_best)
             kept_frames.append(frame)
+            if is_best and frame.get("index") is not None:
+                try:
+                    best_frame_indices.append(int(frame["index"]))
+                except (TypeError, ValueError):
+                    pass
         trigger_input["frames"] = kept_frames
+        # Persisted (not just kept in memory) so grouping_repair - a separate
+        # process with no access to this run's in-memory results - can still
+        # send a curated 1-2 frame subset to its own verification re-check
+        # instead of every frame for this trigger.
+        try:
+            repositories.set_trigger_best_verification_frames(db, trigger_id, best_frame_indices)
+        except Exception:
+            logger.exception("Could not persist best-verification-frame selection for trigger_id=%s", trigger_id)
         if not all(presence_list):
             notes.append(
                 f"Trigger {trigger_id}: kept {len(kept_frames)}/{len(frames)} frames that showed a "
@@ -5753,6 +5832,9 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
                     "Carry observation rule: for every grouped customer, describe what they visibly carry at entry and at exit. "
                     "Count bags, plastic bags, woven/reusable bags, backpacks, boxes, cartons, bottles, and loose items only when visibly held, worn, or moving with the person. "
                     "Record color, type, approximate size, count, and confidence. Use 0 count when the customer appears empty-handed. "
+                    "Also, for every trigger in this batch (grouped or not), count how many distinct, separate people appear together in "
+                    "that trigger's own images - usually 1, but count higher when a group of customers clearly entered or exited together "
+                    "in the same trigger. Give your confidence in that count. "
                     "Important: Do not create a separate group for every trigger, and do not create a group from two triggers that merely fit a plausible timeline. Only group "
                     "triggers when you have visually confirmed they show the same customer across time. "
                     "If the same customer appears in trigger 73 and later trigger 74, return entry [73], exit [74]. "
@@ -5767,7 +5849,9 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
                     '"entry_carry":{"bag_count":integer,"item_count":integer,"items":[{"type":string,"color":string,"size":string,"count":integer,"confidence":number}],"summary":string},'
                     '"exit_carry":{"bag_count":integer,"item_count":integer,"items":[{"type":string,"color":string,"size":string,"count":integer,"confidence":number}],"summary":string},'
                     '"carry_change_summary":string,"total_customer":integer}],'
-                    '"open_entries":[integer],"unknown":[integer],"notes":[string]}. '
+                    '"open_entries":[integer],"unknown":[integer],"notes":[string],'
+                    '"trigger_customer_counts":[{"trigger_id":integer,"unique_customer_count":integer,"confidence":number}]}. '
+                    "Include one trigger_customer_counts entry per trigger in this batch, grouped or not. "
                     f"Batch: {json.dumps({'batch_id': batch_id, 'location_id': batch.get('location_id'), 'period_code': batch.get('period_code'), 'window_start': batch.get('window_start'), 'window_end': batch.get('window_end'), 'chunk': chunk_index}, default=str)}. "
                     f"Triggers: {json.dumps(trigger_notes, default=str)}. "
                     f"Image mapping: {json.dumps(image_mapping, default=str)}."
@@ -5781,6 +5865,7 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
                         gemini_resize_scale=resize_scale,
                     )
                     _record_grouping_cost(db, script_run_id, meta)
+                    _persist_trigger_unique_customer_counts(db, result, source="direct")
                     # Recorded here, not once after the retry loop below - a retried
                     # attempt is charged for real the moment it's made, so its meta
                     # must be captured immediately or that real cost goes missing

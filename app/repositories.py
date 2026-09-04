@@ -1411,7 +1411,8 @@ def list_trigger_frame_assets(
     frame_result = db.execute(
         text(
             f"""
-            select id, frame_asset_id, trigger_id, frame_index, sample_time, image_url, status, created_at
+            select id, frame_asset_id, trigger_id, frame_index, sample_time, image_url, status,
+                   is_best_for_verification, created_at
             from {frame_table}
             where frame_asset_id in :asset_ids
               and status <> 'deleted'
@@ -1427,6 +1428,109 @@ def list_trigger_frame_assets(
     for asset in assets:
         asset["frames"] = frames_by_asset.get(int(asset["id"]), [])
     return assets
+
+
+def set_trigger_best_verification_frames(db: Session, trigger_id: int, frame_indices: list[int]) -> None:
+    # Persists grouping_adjacent's per-trigger "clearest 1-2 frames" pick so a
+    # later, separate process (grouping_repair, which runs in its own worker
+    # pass and has no access to adjacent's in-memory results) can still send a
+    # cheap, curated frame subset to its own verification re-check instead of
+    # every frame. Always resets the trigger's other frames to 0 first, so a
+    # re-run's new pick fully replaces any stale prior selection.
+    frame_table = _table("trigger_frame")
+    db.execute(
+        text(f"update {frame_table} set is_best_for_verification = 0 where trigger_id = :trigger_id"),
+        {"trigger_id": trigger_id},
+    )
+    if frame_indices:
+        db.execute(
+            text(
+                f"""
+                update {frame_table}
+                set is_best_for_verification = 1
+                where trigger_id = :trigger_id
+                  and frame_index in :frame_indices
+                """
+            ).bindparams(bindparam("frame_indices", expanding=True)),
+            {"trigger_id": trigger_id, "frame_indices": frame_indices},
+        )
+    db.commit()
+
+
+def list_best_verification_frame_urls_by_trigger(db: Session, trigger_ids: list[int]) -> dict[int, list[str]]:
+    # Read side of set_trigger_best_verification_frames - a trigger with no
+    # curated pick yet (never went through grouping_adjacent, or predates this
+    # feature) simply has no entry here; callers should fall back to that
+    # trigger's full frame list in that case, not treat an empty result as
+    # "no usable frames".
+    if not trigger_ids:
+        return {}
+    frame_table = _table("trigger_frame")
+    result = db.execute(
+        text(
+            f"""
+            select trigger_id, image_url
+            from {frame_table}
+            where trigger_id in :trigger_ids
+              and is_best_for_verification = 1
+              and status = 'ok'
+            order by trigger_id asc, frame_index asc
+            """
+        ).bindparams(bindparam("trigger_ids", expanding=True)),
+        {"trigger_ids": trigger_ids},
+    )
+    urls_by_trigger: dict[int, list[str]] = {}
+    for row in _fetch_all_dicts(result):
+        trigger_id = int(row["trigger_id"])
+        image_url = str(row.get("image_url") or "").strip()
+        if image_url:
+            urls_by_trigger.setdefault(trigger_id, []).append(image_url)
+    return urls_by_trigger
+
+
+def set_trigger_unique_customer_count(
+    db: Session,
+    trigger_id: int,
+    *,
+    count: int,
+    confidence: float,
+    source: str,
+) -> None:
+    # source is whichever grouping stage produced this estimate (adjacent,
+    # direct, or repair) - kept purely so a stale/odd count can be traced back
+    # to where it came from, not used to gate anything itself.
+    trigger_table = _table("trigger_event")
+    db.execute(
+        text(
+            f"""
+            update {trigger_table}
+            set unique_customer_count = :count,
+                unique_customer_count_confidence = :confidence,
+                unique_customer_count_source = :source
+            where id = :trigger_id
+            """
+        ),
+        {"trigger_id": trigger_id, "count": count, "confidence": confidence, "source": source},
+    )
+    db.commit()
+
+
+def get_trigger_unique_customer_counts(db: Session, trigger_ids: list[int]) -> dict[int, dict[str, Any]]:
+    if not trigger_ids:
+        return {}
+    trigger_table = _table("trigger_event")
+    result = db.execute(
+        text(
+            f"""
+            select id, unique_customer_count, unique_customer_count_confidence, unique_customer_count_source
+            from {trigger_table}
+            where id in :trigger_ids
+              and unique_customer_count is not null
+            """
+        ).bindparams(bindparam("trigger_ids", expanding=True)),
+        {"trigger_ids": trigger_ids},
+    )
+    return {int(row["id"]): dict(row) for row in _fetch_all_dicts(result)}
 
 
 def get_trigger_frame_asset(db: Session, frame_asset_id: int) -> dict[str, Any]:
