@@ -5602,7 +5602,11 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
         grouped_trigger_ids.update(adjacent_group["entry"])
         grouped_trigger_ids.update(adjacent_group["exit"])
     notes.extend(adjacent_notes)
-    raw_metas.extend(adjacent_metas)
+    # adjacent_metas is intentionally NOT folded into raw_metas here - adjacent
+    # now has its own independent script_run (adjacent_script_run_id) with its
+    # own "calls" log, so mixing its calls into direct's "chunks"/cost_details
+    # would just duplicate them under the wrong stage's diagnostics, making
+    # direct's raw responses look identical to adjacent's.
 
     # A trigger with a person in NONE of its checked frames has nothing usable
     # at all - pull it out entirely as an issue, off-limits to both
