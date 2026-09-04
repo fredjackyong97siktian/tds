@@ -123,6 +123,14 @@ class Settings(BaseSettings):
     grouping_gemini_image_scale: float = 0.35
     grouping_deepseek_image_scale: float = 0.5
     grouping_gemini_max_images_per_request: int = 36
+    # Low/zero temperature for grouping's vision calls (adjacent/direct/repair/
+    # carry-item-signal, every provider) - this is a "read these specific
+    # photos and answer factually" task, not a creative one, so the default
+    # non-zero sampling temperature most providers apply was just adding
+    # unnecessary run-to-run randomness (confirmed directly: the same model,
+    # same prompt, same images gave a different match/no-match answer on two
+    # separate calls).
+    grouping_temperature: float = 0.0
     kiosk_gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
     kiosk_gemini_timeout_seconds: int = 180
     gemini_input_cost_per_1m_tokens_usd: float = 0.0

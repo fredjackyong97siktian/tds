@@ -989,6 +989,12 @@ def _compact_gemini_meta_for_log(gemini_meta: Mapping[str, Any]) -> dict[str, An
     image_urls = gemini_meta.get("image_urls")
     if isinstance(image_urls, list):
         compact["image_urls"] = image_urls
+    # grouping_adjacent-only: which trigger_ids were the entry/candidates for
+    # each group_number in this call, so a raw_response's "group_number" can
+    # be traced back to real trigger ids without re-parsing the prompt text.
+    group_blocks = gemini_meta.get("group_blocks")
+    if isinstance(group_blocks, list):
+        compact["group_blocks"] = group_blocks
     chunks = gemini_meta.get("chunks")
     if isinstance(chunks, list):
         compact["chunks"] = [
@@ -1109,6 +1115,7 @@ def _call_kiosk_gemini_summary(
     model_name: str | None = None,
     image_resize_scale: float | None = None,
     allow_text_only: bool = False,
+    temperature: float | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     api_key = str(settings.gemini_api_key or os.environ.get("GEMINI_API_KEY") or "").strip()
     if not api_key:
@@ -1121,9 +1128,12 @@ def _call_kiosk_gemini_summary(
         parts.append(_download_image_for_gemini(image_url, resize_scale=image_resize_scale))
 
     selected_model = str(model_name or settings.kiosk_gemini_model).strip()
+    generation_config: dict[str, Any] = {"response_mime_type": "application/json"}
+    if temperature is not None:
+        generation_config["temperature"] = temperature
     request_body = {
         "contents": [{"role": "user", "parts": parts}],
-        "generationConfig": {"response_mime_type": "application/json"},
+        "generationConfig": generation_config,
     }
     url = (
         f"{str(settings.kiosk_gemini_base_url).rstrip('/')}/models/"
@@ -1196,6 +1206,7 @@ def _call_deepseek_vision_summary(
     model_name: str | None = None,
     allow_text_only: bool = False,
     image_resize_scale: float | None = None,
+    temperature: float | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     api_key = str(settings.deepseek_api_key or os.environ.get("DEEPSEEK_API_KEY") or "").strip()
     if not api_key:
@@ -1228,6 +1239,8 @@ def _call_deepseek_vision_summary(
         "messages": [{"role": "user", "content": content}],
         "response_format": {"type": "json_object"},
     }
+    if temperature is not None:
+        request_body["temperature"] = temperature
     url = f"{str(settings.deepseek_base_url).rstrip('/')}/chat/completions"
     request = Request(
         url,
@@ -1356,6 +1369,7 @@ def _call_glm_vision_summary(
     model_name: str | None = None,
     allow_text_only: bool = False,
     image_resize_scale: float | None = None,
+    temperature: float | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     api_key = str(settings.glm_api_key or os.environ.get("GLM_API_KEY") or "").strip()
     if not api_key:
@@ -1386,6 +1400,8 @@ def _call_glm_vision_summary(
         "messages": [{"role": "user", "content": content}],
         "response_format": {"type": "json_object"},
     }
+    if temperature is not None:
+        request_body["temperature"] = temperature
     url = f"{str(settings.glm_base_url).rstrip('/')}/chat/completions"
     request = Request(
         url,
@@ -1473,6 +1489,7 @@ def _call_openai_vision_summary(
     model_name: str | None = None,
     allow_text_only: bool = False,
     image_resize_scale: float | None = None,
+    temperature: float | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     api_key = str(settings.openai_api_key or os.environ.get("OPENAI_API_KEY") or "").strip()
     if not api_key:
@@ -1503,6 +1520,8 @@ def _call_openai_vision_summary(
         "messages": [{"role": "user", "content": content}],
         "response_format": {"type": "json_object"},
     }
+    if temperature is not None:
+        request_body["temperature"] = temperature
     url = f"{str(settings.openai_base_url).rstrip('/')}/chat/completions"
     request = Request(
         url,
@@ -1642,6 +1661,7 @@ def _call_openrouter_vision_summary(
     model_name: str,
     allow_text_only: bool = False,
     image_resize_scale: float | None = None,
+    temperature: float | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     api_key = str(settings.openrouter_api_key or os.environ.get("OPENROUTER_API_KEY") or "").strip()
     if not api_key:
@@ -1670,6 +1690,8 @@ def _call_openrouter_vision_summary(
         "messages": [{"role": "user", "content": content}],
         "response_format": {"type": "json_object"},
     }
+    if temperature is not None:
+        request_body["temperature"] = temperature
     url = f"{str(settings.openrouter_base_url).rstrip('/')}/chat/completions"
     request = Request(
         url,
@@ -3190,7 +3212,8 @@ def _repair_grouping_with_gemini(
         ):
             repair_verification_notes.append(
                 f"Verification rejected repaired match between entry {entry_ids[0]} and exit {exit_ids[0]}: "
-                f"{verification['conflicting_details'] or 'independent check could not confirm the same person'}."
+                "independent check could not confirm the same person "
+                f"(confidence {verification['confidence']:.2f})."
             )
             continue
         group_payload = {
@@ -4606,6 +4629,18 @@ def _select_verification_frames(trigger: Mapping[str, Any]) -> list[Mapping[str,
     return selected or frames
 
 
+def _coerce_same_person(value: Any) -> bool | None:
+    # Verification's schema asks for a literal 0/1 (not a boolean) to keep
+    # output tokens minimal - accepts a real bool too in case a provider
+    # answers that way anyway. Anything else (missing, malformed) stays None,
+    # which every caller already treats as fail-open, not "confirmed different".
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    return None
+
+
 def _verify_gemini_grouping_match(
     db: Session,
     script_run_id: int,
@@ -4642,8 +4677,6 @@ def _verify_gemini_grouping_match(
         return {
             "same_person": None,
             "confidence": 0.0,
-            "matching_details": "",
-            "conflicting_details": "",
             "error": "Missing entry or exit images for verification.",
         }, None
 
@@ -4659,10 +4692,9 @@ def _verify_gemini_grouping_match(
         "and any bags or items carried. Do not assume they match just because they were already paired for you - "
         "actively look for anything that would prove they are different people, such as a different clothing color, "
         "a different build, or a different number of people present. "
+        "Do not explain your reasoning - answer with just the two fields below. "
         "Return strict JSON only with schema: "
-        '{"same_person":boolean,"confidence":number,"matching_details":string,"conflicting_details":string}. '
-        "matching_details should cite the specific visual details that support your answer. conflicting_details "
-        "should cite any visual details that argue against your answer, or be an empty string if you found none."
+        '{"same_person":0 or 1,"confidence":number}.'
     )
     try:
         result, meta = _call_grouping_vision(
@@ -4677,18 +4709,13 @@ def _verify_gemini_grouping_match(
         return {
             "same_person": None,
             "confidence": 0.0,
-            "matching_details": "",
-            "conflicting_details": "",
             "error": str(exc),
         }, None
 
-    same_person_raw = result.get("same_person")
-    same_person = same_person_raw if isinstance(same_person_raw, bool) else None
+    same_person = _coerce_same_person(result.get("same_person"))
     return {
         "same_person": same_person,
         "confidence": _coerce_number(result.get("confidence"), 0.0),
-        "matching_details": str(result.get("matching_details") or ""),
-        "conflicting_details": str(result.get("conflicting_details") or ""),
         "error": None,
     }, meta
 
@@ -4761,13 +4788,10 @@ def _verify_gemini_grouping_matches_batch(
         "color and pattern, pants/skirt, shoes, hair, body build and height, and any bags or items carried. Do not "
         "assume they match just because they were already paired for you - actively look for anything that would "
         "prove they are different people, such as a different clothing color, a different build, or a different "
-        "number of people present. Keep matching_details and conflicting_details under 15 words each. "
+        "number of people present. Do not explain your reasoning - answer with just the fields below. "
         "Return strict JSON only with schema: "
-        '{"results":[{"match_number":integer,"same_person":boolean,"confidence":number,"matching_details":string,'
-        '"conflicting_details":string}]}. Include exactly one result per match listed above, using its '
-        "match_number. matching_details should cite the specific visual details that support your answer. "
-        "conflicting_details should cite any visual details that argue against your answer, or be an empty string "
-        "if you found none."
+        '{"results":[{"match_number":integer,"same_person":0 or 1,"confidence":number}]}. Include exactly one '
+        "result per match listed above, using its match_number."
     )
     try:
         result, meta = _call_grouping_vision(
@@ -4790,13 +4814,9 @@ def _verify_gemini_grouping_matches_batch(
             match_number = int(entry["match_number"])
         except (TypeError, ValueError):
             continue
-        same_person_raw = entry.get("same_person")
-        same_person = same_person_raw if isinstance(same_person_raw, bool) else None
         results_by_match[match_number] = {
-            "same_person": same_person,
+            "same_person": _coerce_same_person(entry.get("same_person")),
             "confidence": _coerce_number(entry.get("confidence"), 0.0),
-            "matching_details": str(entry.get("matching_details") or ""),
-            "conflicting_details": str(entry.get("conflicting_details") or ""),
             "error": None,
         }
     return results_by_match, meta
@@ -4960,6 +4980,8 @@ def _verify_entry_groups_against_candidates_batch(
             gemini_model_name=model_name,
             gemini_resize_scale=resize_scale,
         )
+        if meta is not None:
+            meta["group_blocks"] = group_blocks
         _record_grouping_cost(db, script_run_id, meta)
     except Exception:
         return {}, {}, {}, None
@@ -5326,6 +5348,7 @@ def _call_grouping_vision(
             model_name=settings.deepseek_vision_model,
             allow_text_only=allow_text_only,
             image_resize_scale=_grouping_deepseek_resize_scale(),
+            temperature=settings.grouping_temperature,
         )
     elif _grouping_provider_is_glm(db):
         result, meta = _call_glm_vision_summary(
@@ -5334,6 +5357,7 @@ def _call_grouping_vision(
             model_name=settings.glm_vision_model,
             allow_text_only=allow_text_only,
             image_resize_scale=_grouping_glm_resize_scale(),
+            temperature=settings.grouping_temperature,
         )
     elif _grouping_provider_is_openai(db):
         result, meta = _call_openai_vision_summary(
@@ -5342,6 +5366,7 @@ def _call_grouping_vision(
             model_name=_grouping_openai_model_name(db),
             allow_text_only=allow_text_only,
             image_resize_scale=_grouping_openai_resize_scale(),
+            temperature=settings.grouping_temperature,
         )
     elif _grouping_provider_is_openrouter(db):
         result, meta = _call_openrouter_vision_summary(
@@ -5350,6 +5375,7 @@ def _call_grouping_vision(
             model_name=_grouping_openrouter_model_name(db),
             allow_text_only=allow_text_only,
             image_resize_scale=_grouping_openrouter_resize_scale(),
+            temperature=settings.grouping_temperature,
         )
     else:
         result, meta = _call_kiosk_gemini_summary(
@@ -5357,6 +5383,7 @@ def _call_grouping_vision(
             image_urls=image_urls,
             model_name=_grouping_gemini_model_name(db, gemini_model_name),
             image_resize_scale=gemini_resize_scale,
+            temperature=settings.grouping_temperature,
         )
     return result, meta
 
@@ -6022,16 +6049,12 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
                         verification: dict[str, Any] = {
                             "same_person": None,
                             "confidence": 0.0,
-                            "matching_details": "",
-                            "conflicting_details": "",
                             "error": "Entry or exit trigger data was not available for verification.",
                         }
                     else:
                         verification = batch_verifications.get(index) or {
                             "same_person": None,
                             "confidence": 0.0,
-                            "matching_details": "",
-                            "conflicting_details": "",
                             "error": "Verification call failed or returned no result for this match.",
                         }
 
@@ -6045,7 +6068,8 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
                         normalized_open_entries.add(entry_trigger_id)
                         notes.append(
                             f"Verification rejected match between entry {entry_trigger_id} and exit(s) {sorted(exit_ids)}: "
-                            f"{verification['conflicting_details'] or 'independent check could not confirm the same person'}."
+                            "independent check could not confirm the same person "
+                            f"(confidence {verification['confidence']:.2f})."
                         )
                         continue
 
