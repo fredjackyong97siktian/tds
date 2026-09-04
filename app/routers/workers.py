@@ -252,6 +252,8 @@ def get_grouping_status(db: Session = Depends(get_transaction_db)) -> dict:
         "gpt-4.1-nano": "gpt-4.1-nano",
         "gpt-4o-mini": "gpt-4o-mini",
         "gpt-5-nano": "gpt-5-nano",
+        "openrouter-mimo-v2.5": "xiaomi/mimo-v2.5",
+        "openrouter-qwen3.8-flash": "qwen/qwen3.8-flash",
     }
     return {
         "poll_seconds": settings.grouping_poll_seconds,

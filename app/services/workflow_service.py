@@ -1524,6 +1524,18 @@ def _call_openai_vision_summary(
     message_content = str(((choices[0] or {}).get("message") or {}).get("content") or "") if choices else ""
     result = _extract_json_object(message_content)
     raw_usage = parsed.get("usage") or {}
+    # OpenAI's classic chat-completions usage object uses prompt_tokens/
+    # completion_tokens, but some newer model families echo back
+    # input_tokens/output_tokens instead (the Responses-API naming) even on
+    # this endpoint - check both rather than assuming one, since a name miss
+    # here silently zeroes out cost with no visible error.
+    input_tokens = raw_usage.get("prompt_tokens", raw_usage.get("input_tokens"))
+    output_tokens = raw_usage.get("completion_tokens", raw_usage.get("output_tokens"))
+    cached_tokens = (
+        (raw_usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+        if raw_usage.get("prompt_tokens_details") is not None
+        else (raw_usage.get("input_tokens_details") or {}).get("cached_tokens")
+    )
     return result, {
         "provider": "tds_api_openai",
         "model": selected_model,
@@ -1533,9 +1545,9 @@ def _call_openai_vision_summary(
         "raw_response": parsed,
         "raw_usage": raw_usage,
         "usage": {
-            "input_tokens": raw_usage.get("prompt_tokens"),
-            "output_tokens": raw_usage.get("completion_tokens"),
-            "cached_input_tokens": (raw_usage.get("prompt_tokens_details") or {}).get("cached_tokens"),
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cached_input_tokens": cached_tokens,
         },
     }
 
@@ -1565,7 +1577,20 @@ def _openai_usage_cost(openai_meta: Mapping[str, Any]) -> tuple[float | None, di
     input_tokens = _positive_float(usage.get("input_tokens")) or 0.0
     output_tokens = _positive_float(usage.get("output_tokens")) or 0.0
     cached_input_tokens = _positive_float(usage.get("cached_input_tokens")) or 0.0
-    input_rate, output_rate = _openai_model_cost_rates().get(model_name, (0.0, 0.0))
+    rates_by_model = _openai_model_cost_rates()
+    normalized_model = model_name.strip().lower()
+    matched_rates = next(
+        (rates for key, rates in rates_by_model.items() if key.lower() == normalized_model),
+        None,
+    )
+    if matched_rates is None:
+        logger.warning(
+            "No OpenAI cost rate configured for model=%r (known: %s); cost will record as 0.",
+            model_name,
+            sorted(rates_by_model.keys()),
+        )
+        matched_rates = (0.0, 0.0)
+    input_rate, output_rate = matched_rates
     # OpenAI's published cached-input discount is 50% off the input rate - no
     # separate cached rate is published per model, unlike DeepSeek/GLM.
     cached_rate = input_rate * 0.5
@@ -1599,6 +1624,124 @@ def _record_openai_cost(db: Session, script_run_id: int, openai_meta: Mapping[st
     return detail
 
 
+# Maps a grouping_provider enum value to the real "vendor/model" string
+# OpenRouter expects - adding a new OpenRouter-hosted model to test only
+# means adding a line here (plus the matching entries in _GROUPING_PROVIDERS
+# and the dashboard's PROVIDER_LABELS), not a new integration.
+_OPENROUTER_MODELS: dict[str, str] = {
+    "openrouter-mimo-v2.5": "xiaomi/mimo-v2.5",
+    "openrouter-qwen3.8-flash": "qwen/qwen3.8-flash",
+}
+
+
+def _call_openrouter_vision_summary(
+    *,
+    prompt: str,
+    image_urls: list[str],
+    model_name: str,
+    allow_text_only: bool = False,
+    image_resize_scale: float | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    api_key = str(settings.openrouter_api_key or os.environ.get("OPENROUTER_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("OpenRouter API key is not configured in tds_api. Set THEFT_API_OPENROUTER_API_KEY.")
+    if not image_urls and not allow_text_only:
+        raise RuntimeError("No image URLs were provided for the OpenRouter vision call.")
+
+    content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    if image_urls:
+        # Same OpenAI-compatible request shape as DeepSeek/GLM/OpenAI - reuses
+        # the same generic download/crop/resize/base64-embed helper.
+        with ThreadPoolExecutor(max_workers=min(8, len(image_urls))) as executor:
+            data_urls = list(
+                executor.map(
+                    lambda image_url: _download_image_data_url_for_deepseek(
+                        image_url, resize_scale=image_resize_scale
+                    ),
+                    image_urls,
+                )
+            )
+        for data_url in data_urls:
+            content.append({"type": "image_url", "image_url": {"url": data_url}})
+
+    request_body = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": content}],
+        "response_format": {"type": "json_object"},
+    }
+    url = f"{str(settings.openrouter_base_url).rstrip('/')}/chat/completions"
+    request = Request(
+        url,
+        data=json.dumps(request_body).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "X-Title": "TDS Grouping",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=settings.openrouter_timeout_seconds) as response:
+            raw_body = response.read().decode("utf-8", errors="replace")
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"OpenRouter request failed with HTTP {exc.code}: {detail[:1000]}") from exc
+
+    parsed = json.loads(raw_body)
+    choices = parsed.get("choices") or []
+    message_content = str(((choices[0] or {}).get("message") or {}).get("content") or "") if choices else ""
+    result = _extract_json_object(message_content)
+    raw_usage = parsed.get("usage") or {}
+    return result, {
+        "provider": "tds_api_openrouter",
+        "model": model_name,
+        "image_count": len(image_urls),
+        "prompt": prompt,
+        "image_urls": image_urls,
+        "raw_response": parsed,
+        "raw_usage": raw_usage,
+        # OpenRouter reports the real billed amount directly - no rate table
+        # needed, unlike _openai_usage_cost.
+        "usage": {
+            "input_tokens": raw_usage.get("prompt_tokens"),
+            "output_tokens": raw_usage.get("completion_tokens"),
+            "cached_input_tokens": (raw_usage.get("prompt_tokens_details") or {}).get("cached_tokens"),
+            "actual_cost_usd": raw_usage.get("cost"),
+        },
+    }
+
+
+def _openrouter_usage_cost(openrouter_meta: Mapping[str, Any]) -> tuple[float | None, dict[str, Any]]:
+    usage = openrouter_meta.get("usage") if isinstance(openrouter_meta.get("usage"), Mapping) else {}
+    model_name = str(openrouter_meta.get("model") or "")
+    amount = _positive_float(usage.get("actual_cost_usd"))
+    detail = {
+        "model": model_name,
+        "input_tokens": int(_positive_float(usage.get("input_tokens")) or 0.0),
+        "output_tokens": int(_positive_float(usage.get("output_tokens")) or 0.0),
+        "cached_input_tokens": int(_positive_float(usage.get("cached_input_tokens")) or 0.0),
+        "estimated_cost_usd": amount,
+        "cost_is_actual_not_estimated": True,
+    }
+    if not amount or amount <= 0:
+        return None, detail
+    return amount, detail
+
+
+def _record_openrouter_cost(db: Session, script_run_id: int, openrouter_meta: Mapping[str, Any]) -> dict[str, Any]:
+    amount, detail = _openrouter_usage_cost(openrouter_meta)
+    repositories.add_script_run_cost(
+        db,
+        script_run_id,
+        cost_amount=amount,
+        cost_currency="USD",
+        # Not "_estimate" - OpenRouter reports the real billed amount, this
+        # isn't a rate-table computation like the deepseek/glm/openai sources.
+        cost_source="openrouter_actual",
+    )
+    return detail
+
+
 def _usage_cost_for_call_meta(call_meta: Mapping[str, Any]) -> tuple[float | None, dict[str, Any]]:
     # Picks the right cost formula (and pricing) for a single chunk's own
     # provider, rather than always pricing it as if it were Gemini - a batch's
@@ -1610,6 +1753,8 @@ def _usage_cost_for_call_meta(call_meta: Mapping[str, Any]) -> tuple[float | Non
         return _glm_usage_cost(call_meta)
     if provider == "tds_api_openai":
         return _openai_usage_cost(call_meta)
+    if provider == "tds_api_openrouter":
+        return _openrouter_usage_cost(call_meta)
     return _gemini_usage_cost(call_meta)
 
 
@@ -3971,6 +4116,11 @@ def _grouping_openai_resize_scale() -> float | None:
     return scale if 0 < scale < 1 else None
 
 
+def _grouping_openrouter_resize_scale() -> float | None:
+    scale = _coerce_number(settings.openrouter_image_scale, 1.0)
+    return scale if 0 < scale < 1 else None
+
+
 def _first_trigger_frame_payload(frames: list[dict[str, Any]], limit: int | None = None) -> list[dict[str, Any]]:
     if limit is None:
         limit = _grouping_frames_per_trigger()
@@ -5012,7 +5162,14 @@ _GROUPING_PROVIDER_APP_SETTING_KEY = "grouping_provider"
 # a second, specific Gemini model for an accuracy comparison without touching
 # the .env-configured default. The gpt-* entries are literal OpenAI model
 # names, used directly as both the enum value and the API model string.
-_GROUPING_PROVIDERS = ("gemini", "deepseek", "glm", "gemini-2.5-flash-lite", *_OPENAI_GROUPING_MODELS)
+_GROUPING_PROVIDERS = (
+    "gemini",
+    "deepseek",
+    "glm",
+    "gemini-2.5-flash-lite",
+    *_OPENAI_GROUPING_MODELS,
+    *_OPENROUTER_MODELS.keys(),
+)
 
 
 def _current_grouping_provider(db: Session) -> str:
@@ -5057,9 +5214,18 @@ def _grouping_openai_model_name(db: Session) -> str:
     return provider if provider in _OPENAI_GROUPING_MODELS else "gpt-4o-mini"
 
 
+def _grouping_provider_is_openrouter(db: Session) -> bool:
+    return _current_grouping_provider(db) in _OPENROUTER_MODELS
+
+
+def _grouping_openrouter_model_name(db: Session) -> str:
+    provider = _current_grouping_provider(db)
+    return _OPENROUTER_MODELS.get(provider, next(iter(_OPENROUTER_MODELS.values())))
+
+
 def _grouping_stage_label(db: Session, stage: str) -> str:
     provider = _current_grouping_provider(db)
-    if provider in ("deepseek", "glm", *_OPENAI_GROUPING_MODELS, "gemini-2.5-flash-lite"):
+    if provider in ("deepseek", "glm", *_OPENAI_GROUPING_MODELS, "gemini-2.5-flash-lite", *_OPENROUTER_MODELS):
         return f"{provider}_grouping_{stage}"
     return f"gemini_grouping_{stage}"
 
@@ -5111,6 +5277,14 @@ def _call_grouping_vision(
             allow_text_only=allow_text_only,
             image_resize_scale=_grouping_openai_resize_scale(),
         )
+    elif _grouping_provider_is_openrouter(db):
+        result, meta = _call_openrouter_vision_summary(
+            prompt=prompt,
+            image_urls=image_urls,
+            model_name=_grouping_openrouter_model_name(db),
+            allow_text_only=allow_text_only,
+            image_resize_scale=_grouping_openrouter_resize_scale(),
+        )
     else:
         result, meta = _call_kiosk_gemini_summary(
             prompt=prompt,
@@ -5131,6 +5305,8 @@ def _record_grouping_cost(db: Session, script_run_id: int, call_meta: Mapping[st
         return _record_glm_cost(db, script_run_id, call_meta)
     if provider == "tds_api_openai":
         return _record_openai_cost(db, script_run_id, call_meta)
+    if provider == "tds_api_openrouter":
+        return _record_openrouter_cost(db, script_run_id, call_meta)
     return _record_gemini_cost(db, script_run_id, call_meta)
 
 
@@ -5143,6 +5319,8 @@ def _current_grouping_model_name(db: Session, default_gemini_model: str) -> str:
         return settings.glm_vision_model
     if _grouping_provider_is_openai(db):
         return _grouping_openai_model_name(db)
+    if _grouping_provider_is_openrouter(db):
+        return _grouping_openrouter_model_name(db)
     return _grouping_gemini_model_name(db, default_gemini_model) or default_gemini_model
 
 
@@ -5153,6 +5331,8 @@ def _current_grouping_provider_tag(db: Session) -> str:
         return "tds_api_glm"
     if _grouping_provider_is_openai(db):
         return "tds_api_openai"
+    if _grouping_provider_is_openrouter(db):
+        return "tds_api_openrouter"
     return "tds_api_gemini"
 
 

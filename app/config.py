@@ -175,6 +175,15 @@ class Settings(BaseSettings):
     openai_gpt_4_1_nano_output_cost_per_1m_tokens_usd: float = 0.40
     openai_gpt_5_nano_input_cost_per_1m_tokens_usd: float = 0.05
     openai_gpt_5_nano_output_cost_per_1m_tokens_usd: float = 0.40
+    # OpenRouter: one gateway in front of many providers (see
+    # workflow_service._OPENROUTER_MODELS for the vendor/model strings this
+    # maps grouping_provider values to). Unlike openai_* above, no per-model
+    # rate table is needed - OpenRouter reports the real billed cost directly
+    # in every response's usage.cost field.
+    openrouter_api_key: str | None = None
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    openrouter_timeout_seconds: int = 180
+    openrouter_image_scale: float = 0.5
 
     model_config = SettingsConfigDict(
         env_prefix="THEFT_API_",
