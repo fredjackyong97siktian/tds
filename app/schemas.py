@@ -146,6 +146,9 @@ class TriggerListItem(TriggerResponse):
     trigger_frames: list[dict[str, Any]] = Field(default_factory=list)
     can_retry: bool = False
     retry_to_status: str | None = None
+    unique_customer_count: int | None = None
+    unique_customer_count_confidence: float | None = None
+    unique_customer_count_source: str | None = None
     created_at: datetime
     updated_at: datetime
 

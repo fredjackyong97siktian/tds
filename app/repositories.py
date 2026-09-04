@@ -1052,7 +1052,8 @@ def get_trigger(db: Session, trigger_id: int) -> dict[str, Any]:
             f"""
             select id, location_id, phone_entry_id, credit_card_entry_id, aqara_event_id, trigger_source, trigger_time,
                    phone_entry_id, credit_card_entry_id, entry_source_type, entry_match_status,
-                   status, whitelist_hit, raw_payload, issue_reason, created_at, updated_at
+                   status, whitelist_hit, raw_payload, issue_reason, created_at, updated_at,
+                   unique_customer_count, unique_customer_count_confidence, unique_customer_count_source
             from {trigger_table}
             where id = :trigger_id
             """
