@@ -1070,7 +1070,8 @@ def _extract_json_object(text_value: str) -> dict[str, Any]:
         parsed = json.loads(text_value[start : end + 1])
         if isinstance(parsed, dict):
             return parsed
-    raise ValueError("Gemini response did not contain a JSON object.")
+    preview = text_value[:300] if text_value else "(empty response)"
+    raise ValueError(f"Model response did not contain a JSON object. Got: {preview!r}")
 
 
 def _download_image_for_gemini(image_url: str, *, resize_scale: float | None = None) -> dict[str, Any]:
