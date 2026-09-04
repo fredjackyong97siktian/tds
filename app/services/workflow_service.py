@@ -1462,6 +1462,143 @@ def _record_glm_cost(db: Session, script_run_id: int, glm_meta: Mapping[str, Any
     return detail
 
 
+_OPENAI_GROUPING_MODELS = ("gpt-4.1-nano", "gpt-4o-mini", "gpt-5-nano")
+
+
+def _call_openai_vision_summary(
+    *,
+    prompt: str,
+    image_urls: list[str],
+    model_name: str | None = None,
+    allow_text_only: bool = False,
+    image_resize_scale: float | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    api_key = str(settings.openai_api_key or os.environ.get("OPENAI_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("OpenAI API key is not configured in tds_api. Set THEFT_API_OPENAI_API_KEY.")
+    if not image_urls and not allow_text_only:
+        raise RuntimeError("No image URLs were provided for the OpenAI vision call.")
+
+    selected_model = str(model_name or "gpt-4o-mini").strip()
+    content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    if image_urls:
+        # Same OpenAI-compatible chat-completions shape as DeepSeek/GLM - reuses
+        # the same generic download/crop/resize/base64-embed helper rather than
+        # trusting OpenAI to fetch plain URLs itself.
+        with ThreadPoolExecutor(max_workers=min(8, len(image_urls))) as executor:
+            data_urls = list(
+                executor.map(
+                    lambda image_url: _download_image_data_url_for_deepseek(
+                        image_url, resize_scale=image_resize_scale
+                    ),
+                    image_urls,
+                )
+            )
+        for data_url in data_urls:
+            content.append({"type": "image_url", "image_url": {"url": data_url}})
+
+    request_body = {
+        "model": selected_model,
+        "messages": [{"role": "user", "content": content}],
+        "response_format": {"type": "json_object"},
+    }
+    url = f"{str(settings.openai_base_url).rstrip('/')}/chat/completions"
+    request = Request(
+        url,
+        data=json.dumps(request_body).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=settings.openai_timeout_seconds) as response:
+            raw_body = response.read().decode("utf-8", errors="replace")
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"OpenAI request failed with HTTP {exc.code}: {detail[:1000]}") from exc
+
+    parsed = json.loads(raw_body)
+    choices = parsed.get("choices") or []
+    message_content = str(((choices[0] or {}).get("message") or {}).get("content") or "") if choices else ""
+    result = _extract_json_object(message_content)
+    raw_usage = parsed.get("usage") or {}
+    return result, {
+        "provider": "tds_api_openai",
+        "model": selected_model,
+        "image_count": len(image_urls),
+        "prompt": prompt,
+        "image_urls": image_urls,
+        "raw_response": parsed,
+        "raw_usage": raw_usage,
+        "usage": {
+            "input_tokens": raw_usage.get("prompt_tokens"),
+            "output_tokens": raw_usage.get("completion_tokens"),
+            "cached_input_tokens": (raw_usage.get("prompt_tokens_details") or {}).get("cached_tokens"),
+        },
+    }
+
+
+def _openai_model_cost_rates() -> dict[str, tuple[float, float]]:
+    # Built lazily (not at module import time) so a live settings override is
+    # always reflected instead of a rate baked in at process start.
+    return {
+        "gpt-4.1-nano": (
+            settings.openai_gpt_4_1_nano_input_cost_per_1m_tokens_usd,
+            settings.openai_gpt_4_1_nano_output_cost_per_1m_tokens_usd,
+        ),
+        "gpt-4o-mini": (
+            settings.openai_gpt_4o_mini_input_cost_per_1m_tokens_usd,
+            settings.openai_gpt_4o_mini_output_cost_per_1m_tokens_usd,
+        ),
+        "gpt-5-nano": (
+            settings.openai_gpt_5_nano_input_cost_per_1m_tokens_usd,
+            settings.openai_gpt_5_nano_output_cost_per_1m_tokens_usd,
+        ),
+    }
+
+
+def _openai_usage_cost(openai_meta: Mapping[str, Any]) -> tuple[float | None, dict[str, Any]]:
+    usage = openai_meta.get("usage") if isinstance(openai_meta.get("usage"), Mapping) else {}
+    model_name = str(openai_meta.get("model") or "")
+    input_tokens = _positive_float(usage.get("input_tokens")) or 0.0
+    output_tokens = _positive_float(usage.get("output_tokens")) or 0.0
+    cached_input_tokens = _positive_float(usage.get("cached_input_tokens")) or 0.0
+    input_rate, output_rate = _openai_model_cost_rates().get(model_name, (0.0, 0.0))
+    # OpenAI's published cached-input discount is 50% off the input rate - no
+    # separate cached rate is published per model, unlike DeepSeek/GLM.
+    cached_rate = input_rate * 0.5
+    billable_input_tokens = max(0.0, input_tokens - cached_input_tokens)
+    amount = (billable_input_tokens * input_rate + output_tokens * output_rate) / 1_000_000
+    amount += cached_input_tokens * cached_rate / 1_000_000
+    detail = {
+        "model": model_name,
+        "input_tokens": int(input_tokens),
+        "output_tokens": int(output_tokens),
+        "cached_input_tokens": int(cached_input_tokens),
+        "input_cost_per_1m_tokens_usd": input_rate,
+        "output_cost_per_1m_tokens_usd": output_rate,
+        "cached_input_cost_per_1m_tokens_usd": cached_rate,
+        "estimated_cost_usd": amount,
+    }
+    if amount <= 0:
+        return None, detail
+    return amount, detail
+
+
+def _record_openai_cost(db: Session, script_run_id: int, openai_meta: Mapping[str, Any]) -> dict[str, Any]:
+    amount, detail = _openai_usage_cost(openai_meta)
+    repositories.add_script_run_cost(
+        db,
+        script_run_id,
+        cost_amount=amount,
+        cost_currency="USD",
+        cost_source="openai_estimate",
+    )
+    return detail
+
+
 def _usage_cost_for_call_meta(call_meta: Mapping[str, Any]) -> tuple[float | None, dict[str, Any]]:
     # Picks the right cost formula (and pricing) for a single chunk's own
     # provider, rather than always pricing it as if it were Gemini - a batch's
@@ -1471,6 +1608,8 @@ def _usage_cost_for_call_meta(call_meta: Mapping[str, Any]) -> tuple[float | Non
         return _deepseek_usage_cost(call_meta)
     if provider == "tds_api_glm":
         return _glm_usage_cost(call_meta)
+    if provider == "tds_api_openai":
+        return _openai_usage_cost(call_meta)
     return _gemini_usage_cost(call_meta)
 
 
@@ -2751,11 +2890,7 @@ def _repair_grouping_with_gemini(
         session_id=None,
         trigger_id=None,
         script_name="grouping",
-        model_name=(
-            "deepseek_grouping_repair"
-            if _grouping_provider_is_deepseek(db)
-            else "glm_grouping_repair" if _grouping_provider_is_glm(db) else "gemini_grouping_repair"
-        ),
+        model_name=_grouping_stage_label(db, "repair"),
         runner_payload={
             "batch_id": batch_id,
             "location_id": location_id,
@@ -2797,25 +2932,19 @@ def _repair_grouping_with_gemini(
         "Only create an exit match if the same person is clearly visible. If unsure, leave the trigger in unknown."
     )
     try:
-        if _grouping_provider_is_deepseek(db):
-            repair_result, repair_meta = _call_deepseek_vision_summary(
-                prompt=prompt,
-                image_urls=image_urls,
-                model_name=settings.deepseek_vision_model,
-                image_resize_scale=_grouping_deepseek_resize_scale(),
-            )
-            repair_cost = _record_deepseek_cost(db, repair_script_run_id, repair_meta)
-        elif _grouping_provider_is_glm(db):
-            repair_result, repair_meta = _call_glm_vision_summary(
-                prompt=prompt,
-                image_urls=image_urls,
-                model_name=settings.glm_vision_model,
-                image_resize_scale=_grouping_glm_resize_scale(),
-            )
-            repair_cost = _record_glm_cost(db, repair_script_run_id, repair_meta)
-        else:
-            repair_result, repair_meta = _call_kiosk_gemini_summary(prompt=prompt, image_urls=image_urls)
-            repair_cost = _record_gemini_cost(db, repair_script_run_id, repair_meta)
+        # Note: the gemini branch here has always fallen back to
+        # settings.kiosk_gemini_model (via _call_kiosk_gemini_summary's own
+        # default) rather than settings.grouping_gemini_model, unlike every
+        # other grouping call site - preserved as-is via an explicit
+        # gemini_model_name=None rather than silently "fixing" it here.
+        repair_result, repair_meta = _call_grouping_vision(
+            db,
+            prompt=prompt,
+            image_urls=image_urls,
+            gemini_model_name=None,
+            gemini_resize_scale=None,
+        )
+        repair_cost = _record_grouping_cost(db, repair_script_run_id, repair_meta)
     except Exception as exc:
         repositories.finish_script_run(
             db,
@@ -3837,6 +3966,11 @@ def _grouping_glm_resize_scale() -> float | None:
     return scale if 0 < scale < 1 else None
 
 
+def _grouping_openai_resize_scale() -> float | None:
+    scale = _coerce_number(settings.openai_image_scale, 1.0)
+    return scale if 0 < scale < 1 else None
+
+
 def _first_trigger_frame_payload(frames: list[dict[str, Any]], limit: int | None = None) -> list[dict[str, Any]]:
     if limit is None:
         limit = _grouping_frames_per_trigger()
@@ -4280,6 +4414,18 @@ def build_grouping_analysis_job_from_batch(db: Session, batch_id: int) -> Groupi
     )
 
 
+def _select_verification_frames(trigger: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    # Prefer the 1-2 frames grouping_adjacent already flagged as this trigger's
+    # clearest (see the "verification_selected" stamp applied right after
+    # _run_grouping_adjacent_pass runs) - re-checking a match doesn't need
+    # every frame the first pass looked at, just enough to confirm or refute
+    # it. Falls back to every frame when nothing was flagged (a trigger that
+    # never went through adjacent has no such stamp at all).
+    frames = [frame for frame in (trigger.get("frames") or []) if isinstance(frame, Mapping)]
+    selected = [frame for frame in frames if frame.get("verification_selected")]
+    return selected or frames
+
+
 def _verify_gemini_grouping_match(
     db: Session,
     script_run_id: int,
@@ -4300,18 +4446,14 @@ def _verify_gemini_grouping_match(
     already charged to script_run_id here either way.
     """
     entry_image_urls: list[str] = []
-    for frame in entry_trigger.get("frames") or []:
-        if not isinstance(frame, Mapping):
-            continue
+    for frame in _select_verification_frames(entry_trigger):
         image_url = str(frame.get("image_url") or "").strip()
         if image_url and image_url not in entry_image_urls:
             entry_image_urls.append(image_url)
 
     exit_image_urls: list[str] = []
     for exit_trigger in exit_triggers:
-        for frame in exit_trigger.get("frames") or []:
-            if not isinstance(frame, Mapping):
-                continue
+        for frame in _select_verification_frames(exit_trigger):
             image_url = str(frame.get("image_url") or "").strip()
             if image_url and image_url not in entry_image_urls and image_url not in exit_image_urls:
                 exit_image_urls.append(image_url)
@@ -4343,30 +4485,14 @@ def _verify_gemini_grouping_match(
         "should cite any visual details that argue against your answer, or be an empty string if you found none."
     )
     try:
-        if _grouping_provider_is_deepseek(db):
-            result, meta = _call_deepseek_vision_summary(
-                prompt=prompt,
-                image_urls=image_urls,
-                model_name=settings.deepseek_vision_model,
-                image_resize_scale=_grouping_deepseek_resize_scale(),
-            )
-            _record_deepseek_cost(db, script_run_id, meta)
-        elif _grouping_provider_is_glm(db):
-            result, meta = _call_glm_vision_summary(
-                prompt=prompt,
-                image_urls=image_urls,
-                model_name=settings.glm_vision_model,
-                image_resize_scale=_grouping_glm_resize_scale(),
-            )
-            _record_glm_cost(db, script_run_id, meta)
-        else:
-            result, meta = _call_kiosk_gemini_summary(
-                prompt=prompt,
-                image_urls=image_urls,
-                model_name=model_name,
-                image_resize_scale=resize_scale,
-            )
-            _record_gemini_cost(db, script_run_id, meta)
+        result, meta = _call_grouping_vision(
+            db,
+            prompt=prompt,
+            image_urls=image_urls,
+            gemini_model_name=model_name,
+            gemini_resize_scale=resize_scale,
+        )
+        _record_grouping_cost(db, script_run_id, meta)
     except Exception as exc:
         return {
             "same_person": None,
@@ -4387,6 +4513,115 @@ def _verify_gemini_grouping_match(
     }, meta
 
 
+def _verify_gemini_grouping_matches_batch(
+    db: Session,
+    script_run_id: int,
+    *,
+    match_candidates: list[dict[str, Any]],
+    model_name: str,
+    resize_scale: float | None,
+) -> tuple[dict[int, dict[str, Any]], dict[str, Any] | None]:
+    """Batched sibling of _verify_gemini_grouping_match: independently
+    re-checks several already-proposed entry/exit pairings in ONE call instead
+    of one call per pairing, the same way _verify_entry_groups_against_candidates_batch
+    already batches adjacent's checks. Each match_candidate is
+    {"match_number": int, "entry": Mapping, "exit_triggers": list[Mapping]}.
+    Returns (match_number -> verification result, meta) - meta is None when no
+    call was actually made (nothing had usable images) or it failed; callers
+    should fold a non-None meta into their own cost/diagnostics log, since the
+    cost is already charged to script_run_id here either way.
+    """
+    image_urls: list[str] = []
+    match_blocks: list[dict[str, Any]] = []
+
+    def _add_frames(trigger: Mapping[str, Any]) -> list[str]:
+        urls: list[str] = []
+        for frame in _select_verification_frames(trigger):
+            image_url = str(frame.get("image_url") or "").strip()
+            if not image_url:
+                continue
+            if image_url not in image_urls:
+                image_urls.append(image_url)
+            if image_url not in urls:
+                urls.append(image_url)
+        return urls
+
+    for match_candidate in match_candidates:
+        match_number = int(match_candidate["match_number"])
+        entry_trigger = match_candidate["entry"]
+        exit_triggers = match_candidate["exit_triggers"]
+
+        entry_urls = _add_frames(entry_trigger)
+        exit_urls: list[str] = []
+        for exit_trigger in exit_triggers:
+            for url in _add_frames(exit_trigger):
+                if url not in entry_urls and url not in exit_urls:
+                    exit_urls.append(url)
+        if not entry_urls or not exit_urls:
+            continue
+        match_blocks.append(
+            {
+                "match_number": match_number,
+                "entry_image_numbers": [image_urls.index(url) + 1 for url in entry_urls],
+                "exit_image_numbers": [image_urls.index(url) + 1 for url in exit_urls],
+            }
+        )
+
+    if not match_blocks:
+        return {}, None
+
+    prompt = (
+        "You are independently double-checking several completely unrelated proposed customer matches from a "
+        "retail door trigger grouping system, in one request. Never compare one match's images against a different "
+        f"match's images. Matches: {json.dumps(match_blocks)}. "
+        "For each match, image_entry_image_numbers shows a person at the store entrance for a trigger already "
+        "labeled as an entry, and exit_image_numbers shows a person at the store entrance for a trigger already "
+        "labeled as that same person's exit. Decide, based only on what is visibly present in these specific "
+        "images, whether the entry and exit images for that match show the same physical person. Compare clothing "
+        "color and pattern, pants/skirt, shoes, hair, body build and height, and any bags or items carried. Do not "
+        "assume they match just because they were already paired for you - actively look for anything that would "
+        "prove they are different people, such as a different clothing color, a different build, or a different "
+        "number of people present. Keep matching_details and conflicting_details under 15 words each. "
+        "Return strict JSON only with schema: "
+        '{"results":[{"match_number":integer,"same_person":boolean,"confidence":number,"matching_details":string,'
+        '"conflicting_details":string}]}. Include exactly one result per match listed above, using its '
+        "match_number. matching_details should cite the specific visual details that support your answer. "
+        "conflicting_details should cite any visual details that argue against your answer, or be an empty string "
+        "if you found none."
+    )
+    try:
+        result, meta = _call_grouping_vision(
+            db,
+            prompt=prompt,
+            image_urls=image_urls,
+            gemini_model_name=model_name,
+            gemini_resize_scale=resize_scale,
+        )
+        _record_grouping_cost(db, script_run_id, meta)
+    except Exception:
+        return {}, None
+
+    raw_results = result.get("results") if isinstance(result.get("results"), list) else []
+    results_by_match: dict[int, dict[str, Any]] = {}
+    for entry in raw_results:
+        if not isinstance(entry, Mapping) or entry.get("match_number") is None:
+            continue
+        try:
+            match_number = int(entry["match_number"])
+        except (TypeError, ValueError):
+            continue
+        same_person_raw = entry.get("same_person")
+        same_person = same_person_raw if isinstance(same_person_raw, bool) else None
+        results_by_match[match_number] = {
+            "same_person": same_person,
+            "confidence": _coerce_number(entry.get("confidence"), 0.0),
+            "matching_details": str(entry.get("matching_details") or ""),
+            "conflicting_details": str(entry.get("conflicting_details") or ""),
+            "error": None,
+        }
+    return results_by_match, meta
+
+
 def _verify_entry_groups_against_candidates_batch(
     db: Session,
     script_run_id: int,
@@ -4394,17 +4629,21 @@ def _verify_entry_groups_against_candidates_batch(
     entry_groups: list[dict[str, Any]],
     model_name: str,
     resize_scale: float | None,
-) -> tuple[dict[int, dict[str, Any]], dict[int, list[bool]], dict[str, Any] | None]:
+) -> tuple[dict[int, dict[str, Any]], dict[int, list[bool]], dict[int, list[bool]], dict[str, Any] | None]:
     """Check several independent confirmed entries, each against its own small
     set of nearby candidate exits, in ONE combined call - rather than one call
     per entry. Each entry_group is {"group_number": int, "entry": Mapping,
     "candidates": list[Mapping]}. Also asks the model to flag, per image,
-    whether a person is visible at all - a byproduct of this same call rather
-    than a separate dedicated pre-check pass. Returns (group_number -> match
-    result, trigger_id -> per-frame has-person list in the same order as that
-    trigger's own "frames" list, meta). A trigger with every frame false has
-    nothing usable at all; one with some false and some true can still be used
-    with just the true frames kept.
+    whether a person is visible at all, and which 1-2 images per trigger are
+    its clearest - both byproducts of this same call rather than separate
+    dedicated passes. Returns (group_number -> match result, trigger_id ->
+    per-frame has-person list, trigger_id -> per-frame best-for-verification
+    list, meta) - the two per-frame lists are in the same order as that
+    trigger's own "frames" list. A trigger with every frame false has nothing
+    usable at all; one with some false and some true can still be used with
+    just the true frames kept. The best-for-verification list lets a later,
+    separate re-check reuse a cheap 1-2 frame subset instead of resending every
+    frame.
     """
     image_urls: list[str] = []
     image_numbers_by_trigger: dict[int, list[int]] = {}
@@ -4463,7 +4702,7 @@ def _verify_entry_groups_against_candidates_batch(
         )
 
     if not group_blocks:
-        return {}, {}, None
+        return {}, {}, {}, None
 
     prompt = (
         "You are checking several completely independent confirmed store entries in one request, each against its "
@@ -4478,64 +4717,64 @@ def _verify_entry_groups_against_candidates_batch(
         "Separately, for every numbered image across all groups (1 to "
         f"{len(image_urls)}), also note whether a person is visibly present in that specific image at all - not "
         "just an empty scene, doorway, vehicle, or object. "
+        "Also, within each trigger's own images only (never compare across different triggers for this), mark at "
+        "most 2 of that trigger's images as best_for_verification=1 - whichever show the person's face/clothing "
+        "most clearly with the least blur or occlusion. Every image with has_person=0 must be best_for_verification=0, "
+        "and every other image for that trigger not among your top 2 clearest must also be best_for_verification=0. "
         "Carry observation rule: for every group, whether or not it matched, describe what the entry customer visibly "
         "carries in the entry image set, and - only if matched_candidate is not null - what they visibly carry in that "
         "matched candidate's images. Count bags, plastic bags, woven/reusable bags, backpacks, boxes, cartons, bottles, "
         "and loose items only when visibly held, worn, or moving with the person. Record color, type, approximate size, "
         "count, and confidence. Use 0 count when the customer appears empty-handed. If matched_candidate is null, still "
         "return entry_carry from the entry images, and leave exit_carry empty. "
+        "Keep reason under 15 words and summary/carry_change_summary under 20 words each - short, specific, no filler. "
         "Return strict JSON only with schema: "
         '{"results":[{"group_number":integer,"matched_candidate":integer or null,"confidence":number,"reason":string,'
         '"entry_carry":{"bag_count":integer,"item_count":integer,"items":[{"type":string,"color":string,"size":string,"count":integer,"confidence":number}],"summary":string},'
         '"exit_carry":{"bag_count":integer,"item_count":integer,"items":[{"type":string,"color":string,"size":string,"count":integer,"confidence":number}],"summary":string},'
         '"carry_change_summary":string}],'
-        '"image_presence":[{"image_number":integer,"has_person":0 or 1}]}. '
+        '"image_presence":[{"image_number":integer,"has_person":0 or 1,"best_for_verification":0 or 1}]}. '
         "Include exactly one result per group listed above, using its group_number, and one image_presence entry "
         "per image number. matched_candidate is the candidate_number of the match within that group, or null if "
         "none match."
     )
     try:
-        if _grouping_provider_is_deepseek(db):
-            result, meta = _call_deepseek_vision_summary(
-                prompt=prompt,
-                image_urls=image_urls,
-                model_name=settings.deepseek_vision_model,
-                image_resize_scale=_grouping_deepseek_resize_scale(),
-            )
-            _record_deepseek_cost(db, script_run_id, meta)
-        elif _grouping_provider_is_glm(db):
-            result, meta = _call_glm_vision_summary(
-                prompt=prompt,
-                image_urls=image_urls,
-                model_name=settings.glm_vision_model,
-                image_resize_scale=_grouping_glm_resize_scale(),
-            )
-            _record_glm_cost(db, script_run_id, meta)
-        else:
-            result, meta = _call_kiosk_gemini_summary(
-                prompt=prompt,
-                image_urls=image_urls,
-                model_name=model_name,
-                image_resize_scale=resize_scale,
-            )
-            _record_gemini_cost(db, script_run_id, meta)
+        result, meta = _call_grouping_vision(
+            db,
+            prompt=prompt,
+            image_urls=image_urls,
+            gemini_model_name=model_name,
+            gemini_resize_scale=resize_scale,
+        )
+        _record_grouping_cost(db, script_run_id, meta)
     except Exception:
-        return {}, {}, None
+        return {}, {}, {}, None
 
     # Fail-open per trigger: only mark a trigger person-absent if the model
     # actually said so for every one of its images we sent - a missing/partial
     # image_presence response must never cause real evidence to be discarded.
     raw_presence = result.get("image_presence") if isinstance(result.get("image_presence"), list) else []
     has_person_by_image: dict[int, bool] = {}
+    best_for_verification_by_image: dict[int, bool] = {}
     for entry in raw_presence:
         if not isinstance(entry, Mapping) or entry.get("image_number") is None:
             continue
         try:
-            has_person_by_image[int(entry["image_number"])] = bool(entry.get("has_person"))
+            image_number = int(entry["image_number"])
         except (TypeError, ValueError):
             continue
+        has_person_by_image[image_number] = bool(entry.get("has_person"))
+        best_for_verification_by_image[image_number] = bool(entry.get("best_for_verification"))
     frame_presence_by_trigger: dict[int, list[bool]] = {
         trigger_id: [has_person_by_image.get(image_number, True) for image_number in image_numbers]
+        for trigger_id, image_numbers in image_numbers_by_trigger.items()
+    }
+    # Fail-closed (default False) unlike presence above: if the model never
+    # names a "best" image for a trigger, downstream code should fall back to
+    # using all of that trigger's (person-showing) frames rather than treating
+    # an empty selection as "use none of them".
+    best_frames_by_trigger: dict[int, list[bool]] = {
+        trigger_id: [best_for_verification_by_image.get(image_number, False) for image_number in image_numbers]
         for trigger_id, image_numbers in image_numbers_by_trigger.items()
     }
 
@@ -4558,7 +4797,7 @@ def _verify_entry_groups_against_candidates_batch(
             "exit_carry": entry.get("exit_carry") if isinstance(entry.get("exit_carry"), Mapping) else None,
             "carry_change_summary": str(entry.get("carry_change_summary") or ""),
         }
-    return results_by_group, frame_presence_by_trigger, meta
+    return results_by_group, frame_presence_by_trigger, best_frames_by_trigger, meta
 
 
 _GROUPING_ADJACENT_LOOKAHEAD_COUNT = 3
@@ -4573,7 +4812,15 @@ def _run_grouping_adjacent_pass(
     trigger_inputs: list[dict[str, Any]],
     model_name: str,
     resize_scale: float | None,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str], list[dict[str, Any]], dict[int, list[bool]], int | None]:
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[str],
+    list[dict[str, Any]],
+    dict[int, list[bool]],
+    dict[int, list[bool]],
+    int | None,
+]:
     """Before any chunk scanning, try to close out confirmed entries (ones with
     a phone_entry_id or credit_card_entry_id) against just the next few
     chronologically-following triggers. Most real visits are short, and this
@@ -4594,6 +4841,7 @@ def _run_grouping_adjacent_pass(
     notes: list[str] = []
     metas: list[dict[str, Any]] = []
     frame_presence_by_trigger: dict[int, list[bool]] = {}
+    best_frames_by_trigger: dict[int, list[bool]] = {}
     next_group_id = 1
     lookahead_window = timedelta(minutes=_GROUPING_ADJACENT_LOOKAHEAD_MINUTES)
 
@@ -4633,7 +4881,7 @@ def _run_grouping_adjacent_pass(
         pending_entry_groups.append({"entry_id": entry_id, "entry": entry_trigger, "candidates": candidates})
 
     if not pending_entry_groups:
-        return trigger_inputs, groups, notes, metas, frame_presence_by_trigger, None
+        return trigger_inputs, groups, notes, metas, frame_presence_by_trigger, best_frames_by_trigger, None
 
     # Give this stage its own script_run instead of folding its calls into the
     # grouping_direct run's cost/activity - it needs to be independently
@@ -4643,11 +4891,7 @@ def _run_grouping_adjacent_pass(
         session_id=None,
         trigger_id=None,
         script_name="grouping",
-        model_name=(
-            "deepseek_grouping_adjacent"
-            if _grouping_provider_is_deepseek(db)
-            else "glm_grouping_adjacent" if _grouping_provider_is_glm(db) else "gemini_grouping_adjacent"
-        ),
+        model_name=_grouping_stage_label(db, "adjacent"),
         runner_payload={
             "batch_id": batch_id,
             "location_id": location_id,
@@ -4674,7 +4918,7 @@ def _run_grouping_adjacent_pass(
             {"group_number": index + 1, "entry": item["entry"], "candidates": item["candidates"]}
             for index, item in enumerate(batch)
         ]
-        results_by_group, batch_presence, meta = _verify_entry_groups_against_candidates_batch(
+        results_by_group, batch_presence, batch_best_frames, meta = _verify_entry_groups_against_candidates_batch(
             db,
             adjacent_script_run_id,
             entry_groups=numbered_groups,
@@ -4684,6 +4928,7 @@ def _run_grouping_adjacent_pass(
         if meta is not None:
             metas.append(meta)
         frame_presence_by_trigger.update(batch_presence)
+        best_frames_by_trigger.update(batch_best_frames)
         for index, item in enumerate(batch):
             group_number = index + 1
             entry_id = item["entry_id"]
@@ -4758,11 +5003,16 @@ def _run_grouping_adjacent_pass(
         ),
         stderr_log="",
     )
-    return remaining, groups, notes, metas, frame_presence_by_trigger, adjacent_script_run_id
+    return remaining, groups, notes, metas, frame_presence_by_trigger, best_frames_by_trigger, adjacent_script_run_id
 
 
 _GROUPING_PROVIDER_APP_SETTING_KEY = "grouping_provider"
-_GROUPING_PROVIDERS = ("gemini", "deepseek", "glm")
+# "gemini" and "gemini-2.5-flash-lite" both use the Gemini call path (see
+# _grouping_gemini_model_name) - the alt entry exists so the dashboard can pick
+# a second, specific Gemini model for an accuracy comparison without touching
+# the .env-configured default. The gpt-* entries are literal OpenAI model
+# names, used directly as both the enum value and the API model string.
+_GROUPING_PROVIDERS = ("gemini", "deepseek", "glm", "gemini-2.5-flash-lite", *_OPENAI_GROUPING_MODELS)
 
 
 def _current_grouping_provider(db: Session) -> str:
@@ -4787,13 +5037,123 @@ def _grouping_provider_is_glm(db: Session) -> bool:
     return _current_grouping_provider(db) == "glm"
 
 
-def _grouping_model_name_label(db: Session) -> str:
+def _grouping_provider_is_openai(db: Session) -> bool:
+    return _current_grouping_provider(db) in _OPENAI_GROUPING_MODELS
+
+
+def _grouping_provider_is_gemini_alt(db: Session) -> bool:
+    return _current_grouping_provider(db) == "gemini-2.5-flash-lite"
+
+
+def _grouping_gemini_model_name(db: Session, default_model_name: str | None) -> str | None:
+    # default_model_name is whatever the caller already resolved for the
+    # regular "gemini" case (usually settings.grouping_gemini_model, but kiosk
+    # identity calls etc. may pass their own) - only the alt entry overrides it.
+    return "gemini-2.5-flash-lite" if _grouping_provider_is_gemini_alt(db) else default_model_name
+
+
+def _grouping_openai_model_name(db: Session) -> str:
     provider = _current_grouping_provider(db)
-    if provider == "deepseek":
-        return "deepseek_grouping_direct"
-    if provider == "glm":
-        return "glm_grouping_direct"
-    return "gemini_grouping_direct"
+    return provider if provider in _OPENAI_GROUPING_MODELS else "gpt-4o-mini"
+
+
+def _grouping_stage_label(db: Session, stage: str) -> str:
+    provider = _current_grouping_provider(db)
+    if provider in ("deepseek", "glm", *_OPENAI_GROUPING_MODELS, "gemini-2.5-flash-lite"):
+        return f"{provider}_grouping_{stage}"
+    return f"gemini_grouping_{stage}"
+
+
+def _grouping_model_name_label(db: Session) -> str:
+    return _grouping_stage_label(db, "direct")
+
+
+def _call_grouping_vision(
+    db: Session,
+    *,
+    prompt: str,
+    image_urls: list[str],
+    gemini_model_name: str | None,
+    gemini_resize_scale: float | None,
+    allow_text_only: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Single dispatch point for every grouping-related vision call (chunk
+    scan, adjacent, verification, repair, carry-item-signal) - picks whichever
+    provider/model is currently selected (see _current_grouping_provider) and
+    records its cost against script_run_id. Replaces the old copy-pasted
+    if-deepseek/elif-glm/else-gemini block that used to live at each call site,
+    so adding a new provider (like the gpt-*/gemini-2.5-flash-lite entries)
+    only has to happen here, not at every caller. script_run_id may be None
+    when a caller doesn't yet have one (matches the old per-caller behavior of
+    skipping cost recording in that case).
+    """
+    if _grouping_provider_is_deepseek(db):
+        result, meta = _call_deepseek_vision_summary(
+            prompt=prompt,
+            image_urls=image_urls,
+            model_name=settings.deepseek_vision_model,
+            allow_text_only=allow_text_only,
+            image_resize_scale=_grouping_deepseek_resize_scale(),
+        )
+    elif _grouping_provider_is_glm(db):
+        result, meta = _call_glm_vision_summary(
+            prompt=prompt,
+            image_urls=image_urls,
+            model_name=settings.glm_vision_model,
+            allow_text_only=allow_text_only,
+            image_resize_scale=_grouping_glm_resize_scale(),
+        )
+    elif _grouping_provider_is_openai(db):
+        result, meta = _call_openai_vision_summary(
+            prompt=prompt,
+            image_urls=image_urls,
+            model_name=_grouping_openai_model_name(db),
+            allow_text_only=allow_text_only,
+            image_resize_scale=_grouping_openai_resize_scale(),
+        )
+    else:
+        result, meta = _call_kiosk_gemini_summary(
+            prompt=prompt,
+            image_urls=image_urls,
+            model_name=_grouping_gemini_model_name(db, gemini_model_name),
+            image_resize_scale=gemini_resize_scale,
+        )
+    return result, meta
+
+
+def _record_grouping_cost(db: Session, script_run_id: int, call_meta: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if call_meta is None:
+        return None
+    provider = str(call_meta.get("provider") or "")
+    if provider == "tds_api_deepseek":
+        return _record_deepseek_cost(db, script_run_id, call_meta)
+    if provider == "tds_api_glm":
+        return _record_glm_cost(db, script_run_id, call_meta)
+    if provider == "tds_api_openai":
+        return _record_openai_cost(db, script_run_id, call_meta)
+    return _record_gemini_cost(db, script_run_id, call_meta)
+
+
+def _current_grouping_model_name(db: Session, default_gemini_model: str) -> str:
+    # Descriptive-only resolver (no API call) for diagnostics/meta payloads -
+    # mirrors exactly what _call_grouping_vision would actually call.
+    if _grouping_provider_is_deepseek(db):
+        return settings.deepseek_vision_model
+    if _grouping_provider_is_glm(db):
+        return settings.glm_vision_model
+    if _grouping_provider_is_openai(db):
+        return _grouping_openai_model_name(db)
+    return _grouping_gemini_model_name(db, default_gemini_model) or default_gemini_model
+
+
+def _current_grouping_provider_tag(db: Session) -> str:
+    if _grouping_provider_is_deepseek(db):
+        return "tds_api_deepseek"
+    if _grouping_provider_is_glm(db):
+        return "tds_api_glm"
+    if _grouping_provider_is_openai(db):
+        return "tds_api_openai"
+    return "tds_api_gemini"
 
 
 _GROUPING_CHUNK_RETRY_MAX_ATTEMPTS = 3
@@ -4954,6 +5314,7 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
         adjacent_notes,
         adjacent_metas,
         adjacent_frame_presence_by_trigger,
+        adjacent_best_frames_by_trigger,
         adjacent_script_run_id,
     ) = _run_grouping_adjacent_pass(
         db,
@@ -4982,17 +5343,34 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
             continue
         if not any(presence_list):
             issue_trigger_ids.add(trigger_id)
-        elif not all(presence_list):
-            trigger_input = next((item for item in trigger_inputs if int(item["trigger_id"]) == trigger_id), None)
-            if trigger_input is None:
+            continue
+        trigger_input = next((item for item in trigger_inputs if int(item["trigger_id"]) == trigger_id), None)
+        if trigger_input is None:
+            continue
+        frames = trigger_input.get("frames") or []
+        if len(frames) != len(presence_list):
+            continue
+        # Stamp each surviving frame with whether adjacent flagged it as one of
+        # the trigger's 1-2 clearest, so a later verification re-check (see
+        # _verify_gemini_grouping_match) can send just those instead of every
+        # frame - falls back to "use all of them" when nothing was flagged
+        # (e.g. this trigger never went through adjacent at all).
+        best_list = adjacent_best_frames_by_trigger.get(trigger_id) or []
+        if len(best_list) != len(presence_list):
+            best_list = [False] * len(presence_list)
+        kept_frames = []
+        for frame, has_person, is_best in zip(frames, presence_list, best_list):
+            if not has_person:
                 continue
-            frames = trigger_input.get("frames") or []
-            if len(frames) == len(presence_list):
-                trigger_input["frames"] = [frame for frame, has_person in zip(frames, presence_list) if has_person]
-                notes.append(
-                    f"Trigger {trigger_id}: kept {len(trigger_input['frames'])}/{len(frames)} frames that showed a "
-                    "person, dropped the rest before the chunk scan."
-                )
+            frame = dict(frame)
+            frame["verification_selected"] = bool(is_best)
+            kept_frames.append(frame)
+        trigger_input["frames"] = kept_frames
+        if not all(presence_list):
+            notes.append(
+                f"Trigger {trigger_id}: kept {len(kept_frames)}/{len(frames)} frames that showed a "
+                "person, dropped the rest before the chunk scan."
+            )
 
     if issue_trigger_ids:
         trigger_inputs = [item for item in trigger_inputs if int(item["trigger_id"]) not in issue_trigger_ids]
@@ -5213,34 +5591,15 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
                     f"Triggers: {json.dumps(trigger_notes, default=str)}. "
                     f"Image mapping: {json.dumps(image_mapping, default=str)}."
                 )
-                use_deepseek = _grouping_provider_is_deepseek(db)
-                use_glm = _grouping_provider_is_glm(db)
-
                 def _call_chunk_vision() -> tuple[dict[str, Any], dict[str, Any]]:
-                    if use_deepseek:
-                        result, meta = _call_deepseek_vision_summary(
-                            prompt=prompt,
-                            image_urls=image_urls,
-                            model_name=settings.deepseek_vision_model,
-                            image_resize_scale=_grouping_deepseek_resize_scale(),
-                        )
-                        _record_deepseek_cost(db, script_run_id, meta)
-                    elif use_glm:
-                        result, meta = _call_glm_vision_summary(
-                            prompt=prompt,
-                            image_urls=image_urls,
-                            model_name=settings.glm_vision_model,
-                            image_resize_scale=_grouping_glm_resize_scale(),
-                        )
-                        _record_glm_cost(db, script_run_id, meta)
-                    else:
-                        result, meta = _call_kiosk_gemini_summary(
-                            prompt=prompt,
-                            image_urls=image_urls,
-                            model_name=model_name,
-                            image_resize_scale=resize_scale,
-                        )
-                        _record_gemini_cost(db, script_run_id, meta)
+                    result, meta = _call_grouping_vision(
+                        db,
+                        prompt=prompt,
+                        image_urls=image_urls,
+                        gemini_model_name=model_name,
+                        gemini_resize_scale=resize_scale,
+                    )
+                    _record_grouping_cost(db, script_run_id, meta)
                     # Recorded here, not once after the retry loop below - a retried
                     # attempt is charged for real the moment it's made, so its meta
                     # must be captured immediately or that real cost goes missing
@@ -5268,6 +5627,10 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
                 chunk_open_entries = gemini_result.get("open_entries") if isinstance(gemini_result.get("open_entries"), list) else []
                 chunk_unknown = gemini_result.get("unknown") if isinstance(gemini_result.get("unknown"), list) else []
                 chunk_grouped_trigger_ids: set[int] = set()
+                # Pass 1: pure, order-independent filtering (no exit_claims/disputed_exit_ids
+                # side effects yet) - just narrows chunk_groups down to structurally-plausible
+                # candidates and looks up their trigger inputs.
+                filtered_candidates: list[dict[str, Any]] = []
                 for group in chunk_groups:
                     if not isinstance(group, Mapping):
                         continue
@@ -5297,6 +5660,61 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
                     # discarding it, form the group and carry that fact through to the
                     # confidence result and session so a reviewer can see it plainly.
                     entry_has_identity = trigger_has_identity.get(entry_trigger_id, False)
+
+                    filtered_candidates.append(
+                        {
+                            "group": group,
+                            "entry_ids": entry_ids,
+                            "exit_ids": exit_ids,
+                            "entry_trigger_id": entry_trigger_id,
+                            "entry_has_identity": entry_has_identity,
+                            "entry_trigger_input": trigger_input_by_id.get(entry_trigger_id),
+                            "exit_trigger_inputs": [
+                                trigger_input_by_id[e] for e in exit_ids if e in trigger_input_by_id
+                            ],
+                        }
+                    )
+
+                # Pass 2: every structurally-plausible match this chunk found gets
+                # independently re-checked in ONE batched call instead of one call per
+                # match - same evidence, same independent re-check as
+                # _verify_gemini_grouping_match, just far fewer calls (see
+                # _verify_gemini_grouping_matches_batch). A candidate pass 3 later throws
+                # out for a dispute/conflict reason still gets verified here since that's
+                # cheaper than a second round-trip just to avoid it.
+                match_candidates = [
+                    {
+                        "match_number": index,
+                        "entry": candidate["entry_trigger_input"],
+                        "exit_triggers": candidate["exit_trigger_inputs"],
+                    }
+                    for index, candidate in enumerate(filtered_candidates)
+                    if candidate["entry_trigger_input"] is not None and candidate["exit_trigger_inputs"]
+                ]
+                batch_verifications: dict[int, dict[str, Any]] = {}
+                if match_candidates:
+                    batch_verifications, batch_verification_meta = _verify_gemini_grouping_matches_batch(
+                        db,
+                        script_run_id,
+                        match_candidates=match_candidates,
+                        model_name=model_name,
+                        resize_scale=resize_scale,
+                    )
+                    if batch_verification_meta is not None:
+                        verification_metas.append(batch_verification_meta)
+
+                # Pass 3: sequential and stateful, in original chunk_groups order - this is
+                # exactly the original single-pass logic's disputed/conflict/accept decisions,
+                # just consuming a pre-fetched verification result instead of calling live.
+                # Order matters here: an earlier candidate's acceptance (exit_claims) or
+                # rejection (disputed_exit_ids) must be visible to a later one in this same
+                # chunk, same as before.
+                for index, candidate in enumerate(filtered_candidates):
+                    group = candidate["group"]
+                    entry_ids = candidate["entry_ids"]
+                    exit_ids = candidate["exit_ids"]
+                    entry_trigger_id = candidate["entry_trigger_id"]
+                    entry_has_identity = candidate["entry_has_identity"]
 
                     # An exit that's already been fought over is permanently contested;
                     # don't spend another verification call re-litigating it.
@@ -5334,9 +5752,7 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
                         )
                         continue
 
-                    entry_trigger_input = trigger_input_by_id.get(entry_trigger_id)
-                    exit_trigger_inputs = [trigger_input_by_id[e] for e in exit_ids if e in trigger_input_by_id]
-                    if entry_trigger_input is None or not exit_trigger_inputs:
+                    if candidate["entry_trigger_input"] is None or not candidate["exit_trigger_inputs"]:
                         verification: dict[str, Any] = {
                             "same_person": None,
                             "confidence": 0.0,
@@ -5345,16 +5761,13 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
                             "error": "Entry or exit trigger data was not available for verification.",
                         }
                     else:
-                        verification, verification_meta = _verify_gemini_grouping_match(
-                            db,
-                            script_run_id,
-                            entry_trigger=entry_trigger_input,
-                            exit_triggers=exit_trigger_inputs,
-                            model_name=model_name,
-                            resize_scale=resize_scale,
-                        )
-                        if verification_meta is not None:
-                            verification_metas.append(verification_meta)
+                        verification = batch_verifications.get(index) or {
+                            "same_person": None,
+                            "confidence": 0.0,
+                            "matching_details": "",
+                            "conflicting_details": "",
+                            "error": "Verification call failed or returned no result for this match.",
+                        }
 
                     # Reject outright when the independent check says no, or hedges with low
                     # confidence - a same_person=None (call failed / malformed) fails open,
@@ -5485,11 +5898,7 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
             "diagnostics": {
                 "mode": _grouping_model_name_label(db),
                 "temporary_runpod_grouping_disabled": True,
-                "model": (
-                    settings.deepseek_vision_model
-                    if _grouping_provider_is_deepseek(db)
-                    else settings.glm_vision_model if _grouping_provider_is_glm(db) else model_name
-                ),
+                "model": _current_grouping_model_name(db, model_name),
                 "image_resize_scale": resize_scale,
                 "max_frames_per_trigger": _grouping_frames_per_trigger(),
                 "max_images_per_request": max_images,
@@ -5504,16 +5913,8 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
             },
         }
         return grouping_summary, {
-            "provider": (
-                "tds_api_deepseek"
-                if _grouping_provider_is_deepseek(db)
-                else "tds_api_glm" if _grouping_provider_is_glm(db) else "tds_api_gemini"
-            ),
-            "model": (
-                settings.deepseek_vision_model
-                if _grouping_provider_is_deepseek(db)
-                else settings.glm_vision_model if _grouping_provider_is_glm(db) else model_name
-            ),
+            "provider": _current_grouping_provider_tag(db),
+            "model": _current_grouping_model_name(db, model_name),
             "image_resize_scale": resize_scale,
             "chunk_count": len(chunks),
             "image_count": total_image_count,
@@ -5613,16 +6014,8 @@ def start_grouping_analysis_job(job: GroupingAnalysisQueued) -> ScriptExecutionR
                 "window_end": job.window_end.isoformat(),
                 "manifest_object_key": job.manifest_object_key,
                 "manifest_url": job.manifest_url,
-                "provider": (
-                    "tds_api_deepseek"
-                    if _grouping_provider_is_deepseek(db)
-                    else "tds_api_glm" if _grouping_provider_is_glm(db) else "tds_api_gemini"
-                ),
-                "model": (
-                    settings.deepseek_vision_model
-                    if _grouping_provider_is_deepseek(db)
-                    else settings.glm_vision_model if _grouping_provider_is_glm(db) else settings.grouping_gemini_model
-                ),
+                "provider": _current_grouping_provider_tag(db),
+                "model": _current_grouping_model_name(db, settings.grouping_gemini_model),
                 "mode": _grouping_model_name_label(db),
             },
         )
@@ -6424,15 +6817,7 @@ def _evaluate_carry_item_signal_with_ai(
         or not _as_boolish(carry_evidence["before_is_yellow_bag"])
         and _as_boolish(carry_evidence["after_is_yellow_bag"])
     )
-    use_deepseek = _grouping_provider_is_deepseek(db)
-    use_glm = _grouping_provider_is_glm(db)
-    model_name = (
-        str(settings.deepseek_vision_model).strip()
-        if use_deepseek
-        else str(settings.glm_vision_model).strip()
-        if use_glm
-        else str(settings.grouping_gemini_model or "gemini-3.5-flash-lite").strip()
-    )
+    model_name = _current_grouping_model_name(db, settings.grouping_gemini_model or "gemini-3.5-flash-lite")
     transaction_payload = _transaction_summary(transactions)
     runner_payload = {
         "batch_id": batch_id,
@@ -6475,39 +6860,21 @@ def _evaluate_carry_item_signal_with_ai(
         f"Input: {json.dumps(runner_payload, default=str)}"
     )
     try:
-        if use_deepseek:
-            result, meta = _call_deepseek_vision_summary(
-                prompt=prompt,
-                image_urls=[],
-                model_name=model_name,
-                allow_text_only=True,
-            )
-        elif use_glm:
-            result, meta = _call_glm_vision_summary(
-                prompt=prompt,
-                image_urls=[],
-                model_name=model_name,
-                allow_text_only=True,
-            )
-        else:
-            result, meta = _call_kiosk_gemini_summary(
-                prompt=prompt,
-                image_urls=[],
-                model_name=model_name,
-                allow_text_only=True,
-            )
-        if use_deepseek:
-            cost_detail = _record_deepseek_cost(db, script_run_id, meta)
-        elif use_glm:
-            cost_detail = _record_glm_cost(db, script_run_id, meta)
-        else:
-            cost_detail = _record_gemini_cost(db, script_run_id, meta)
+        result, meta = _call_grouping_vision(
+            db,
+            prompt=prompt,
+            image_urls=[],
+            gemini_model_name=model_name,
+            gemini_resize_scale=None,
+            allow_text_only=True,
+        )
+        cost_detail = _record_grouping_cost(db, script_run_id, meta)
         normalized = {
             "hit": _as_boolish(result.get("hit")),
             "insufficient_evidence": _as_boolish(result.get("insufficient_evidence")),
             "score": _coerce_number(result.get("score"), 0.0),
             "reason": str(result.get("reason") or "carry_ai"),
-            "source": "deepseek_carry_confidence" if use_deepseek else "gemini_carry_confidence",
+            "source": f"{_current_grouping_provider(db).replace('-', '_').replace('.', '_')}_carry_confidence",
             "entry_bag_count": _coerce_int(result.get("entry_bag_count"), 0),
             "exit_bag_count": _coerce_int(result.get("exit_bag_count"), 0),
             "reasonable_with_receipt": _as_boolish(result.get("reasonable_with_receipt")),

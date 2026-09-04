@@ -160,6 +160,21 @@ class Settings(BaseSettings):
     glm_input_cost_per_1m_tokens_usd: float = 0.15
     glm_output_cost_per_1m_tokens_usd: float = 0.50
     glm_cached_input_cost_per_1m_tokens_usd: float = 0.03
+    # Accuracy-comparison candidates for grouping - selectable the same way as
+    # gemini/deepseek/glm (see repositories.get_app_setting("grouping_provider")).
+    # gemini-2.5-flash-lite uses the existing Gemini call path with this exact
+    # model name; the three gpt-* entries use openai_* below.
+    grouping_gemini_alt_model: str = "gemini-2.5-flash-lite"
+    openai_api_key: str | None = None
+    openai_base_url: str = "https://api.openai.com/v1"
+    openai_timeout_seconds: int = 180
+    openai_image_scale: float = 0.5
+    openai_gpt_4o_mini_input_cost_per_1m_tokens_usd: float = 0.15
+    openai_gpt_4o_mini_output_cost_per_1m_tokens_usd: float = 0.60
+    openai_gpt_4_1_nano_input_cost_per_1m_tokens_usd: float = 0.10
+    openai_gpt_4_1_nano_output_cost_per_1m_tokens_usd: float = 0.40
+    openai_gpt_5_nano_input_cost_per_1m_tokens_usd: float = 0.05
+    openai_gpt_5_nano_output_cost_per_1m_tokens_usd: float = 0.40
 
     model_config = SettingsConfigDict(
         env_prefix="THEFT_API_",

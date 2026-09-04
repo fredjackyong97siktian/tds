@@ -248,12 +248,16 @@ def get_grouping_status(db: Session = Depends(get_transaction_db)) -> dict:
         "gemini": settings.grouping_gemini_model,
         "deepseek": settings.deepseek_vision_model,
         "glm": settings.glm_vision_model,
+        "gemini-2.5-flash-lite": "gemini-2.5-flash-lite",
+        "gpt-4.1-nano": "gpt-4.1-nano",
+        "gpt-4o-mini": "gpt-4o-mini",
+        "gpt-5-nano": "gpt-5-nano",
     }
     return {
         "poll_seconds": settings.grouping_poll_seconds,
         "max_global_workers": settings.grouping_max_global_workers,
         "provider": provider,
-        "model": provider_models[provider],
+        "model": provider_models.get(provider, provider),
         "provider_models": provider_models,
         "queued_count": len(pending_rows),
         "running_count": len(running_rows),
