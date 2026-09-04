@@ -3221,7 +3221,7 @@ def _repair_grouping_with_gemini(
             "entry": entry_ids,
             "exit": exit_ids[:1],
             "score": confidence,
-            "repair_source": "gemini",
+            "source": _grouping_stage_label(db, "repair"),
             "reason": str(repaired.get("reason") or "gemini_grouping_repair"),
             "verified": verification["same_person"] is True,
             "verification": verification,
