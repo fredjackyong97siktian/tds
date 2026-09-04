@@ -3207,13 +3207,15 @@ def _repair_grouping_with_gemini(
         )
         if verification_meta is not None:
             repair_verification_metas.append(verification_meta)
-        if verification["same_person"] is False or (
-            verification["same_person"] is True and verification["confidence"] < 0.5
-        ):
+        verification_confidence = verification["confidence"]
+        # A missing/failed verification call (confidence is None) fails open -
+        # that's a tooling problem, not evidence the match is wrong. A real
+        # score below the threshold is rejected outright.
+        if verification_confidence is not None and verification_confidence < _VERIFICATION_MATCH_CONFIDENCE_THRESHOLD:
             repair_verification_notes.append(
                 f"Verification rejected repaired match between entry {entry_ids[0]} and exit {exit_ids[0]}: "
-                "independent check could not confirm the same person "
-                f"(confidence {verification['confidence']:.2f})."
+                f"confidence-of-a-match was only {verification_confidence:.2f}, below the "
+                f"{_VERIFICATION_MATCH_CONFIDENCE_THRESHOLD:.2f} bar."
             )
             continue
         group_payload = {
@@ -3223,7 +3225,7 @@ def _repair_grouping_with_gemini(
             "score": confidence,
             "source": _grouping_stage_label(db, "repair"),
             "reason": str(repaired.get("reason") or "gemini_grouping_repair"),
-            "verified": verification["same_person"] is True,
+            "verified": verification_confidence is not None and verification_confidence >= _VERIFICATION_MATCH_CONFIDENCE_THRESHOLD,
             "verification": verification,
             "entry_carry": repaired.get("entry_carry") if isinstance(repaired.get("entry_carry"), Mapping) else None,
             "exit_carry": repaired.get("exit_carry") if isinstance(repaired.get("exit_carry"), Mapping) else None,
@@ -4629,15 +4631,25 @@ def _select_verification_frames(trigger: Mapping[str, Any]) -> list[Mapping[str,
     return selected or frames
 
 
-def _coerce_same_person(value: Any) -> bool | None:
-    # Verification's schema asks for a literal 0/1 (not a boolean) to keep
-    # output tokens minimal - accepts a real bool too in case a provider
-    # answers that way anyway. Anything else (missing, malformed) stays None,
-    # which every caller already treats as fail-open, not "confirmed different".
+# A verified match needs at least this much confidence-of-a-match to be
+# accepted; anything below (or a missing/failed call, handled separately as
+# fail-open) gets rejected. Deliberately stricter than the old effective 0.5
+# bar, now that this is a single, unambiguous "how likely is this a match"
+# score instead of a same_person flag plus a confidence-in-that-flag number.
+_VERIFICATION_MATCH_CONFIDENCE_THRESHOLD = 0.8
+
+
+def _coerce_verification_confidence(value: Any) -> float | None:
+    # Verification now reports a single confidence-of-a-match number (0 to 1)
+    # instead of a separate same_person flag - the caller's own threshold
+    # decides accept/reject from this one value. None (missing/malformed,
+    # not a real 0.0) is kept distinct from an actual low score so callers can
+    # fail open on a broken/empty response instead of treating it as "confirmed
+    # not a match".
     if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)) and value in (0, 1):
-        return bool(value)
+        return None
+    if isinstance(value, (int, float)):
+        return max(0.0, min(1.0, float(value)))
     return None
 
 
@@ -4675,8 +4687,7 @@ def _verify_gemini_grouping_match(
 
     if not entry_image_urls or not exit_image_urls:
         return {
-            "same_person": None,
-            "confidence": 0.0,
+            "confidence": None,
             "error": "Missing entry or exit images for verification.",
         }, None
 
@@ -4687,14 +4698,16 @@ def _verify_gemini_grouping_match(
         f"a trigger already labeled as an entry. Image set B (image numbers {len(entry_image_urls) + 1} to "
         f"{len(image_urls)}) shows a person at the store entrance for a trigger already labeled as that same "
         "person's exit. "
-        "Decide, based only on what is visibly present in these specific images, whether set A and set B show the "
-        "same physical person. Compare clothing color and pattern, pants/skirt, shoes, hair, body build and height, "
-        "and any bags or items carried. Do not assume they match just because they were already paired for you - "
-        "actively look for anything that would prove they are different people, such as a different clothing color, "
-        "a different build, or a different number of people present. "
-        "Do not explain your reasoning - answer with just the two fields below. "
+        "Decide, based only on what is visibly present in these specific images, how confident you are that set A "
+        "and set B show the same physical person. Compare clothing color and pattern, pants/skirt, shoes, hair, "
+        "body build and height, and any bags or items carried. Do not assume they match just because they were "
+        "already paired for you - actively look for anything that would prove they are different people, such as a "
+        "different clothing color, a different build, or a different number of people present. "
+        "Do not explain your reasoning - answer with just the field below. "
+        "confidence (0 to 1) is how confident you are that they are the SAME physical person - 1.0 means certain "
+        "they match, 0.0 means certain they do not match, 0.5 means genuinely unsure. "
         "Return strict JSON only with schema: "
-        '{"same_person":0 or 1,"confidence":number}.'
+        '{"confidence":number}.'
     )
     try:
         result, meta = _call_grouping_vision(
@@ -4707,15 +4720,12 @@ def _verify_gemini_grouping_match(
         _record_grouping_cost(db, script_run_id, meta)
     except Exception as exc:
         return {
-            "same_person": None,
-            "confidence": 0.0,
+            "confidence": None,
             "error": str(exc),
         }, None
 
-    same_person = _coerce_same_person(result.get("same_person"))
     return {
-        "same_person": same_person,
-        "confidence": _coerce_number(result.get("confidence"), 0.0),
+        "confidence": _coerce_verification_confidence(result.get("confidence")),
         "error": None,
     }, meta
 
@@ -4784,13 +4794,16 @@ def _verify_gemini_grouping_matches_batch(
         "For each match, image_entry_image_numbers shows a person at the store entrance for a trigger already "
         "labeled as an entry, and exit_image_numbers shows a person at the store entrance for a trigger already "
         "labeled as that same person's exit. Decide, based only on what is visibly present in these specific "
-        "images, whether the entry and exit images for that match show the same physical person. Compare clothing "
-        "color and pattern, pants/skirt, shoes, hair, body build and height, and any bags or items carried. Do not "
-        "assume they match just because they were already paired for you - actively look for anything that would "
-        "prove they are different people, such as a different clothing color, a different build, or a different "
-        "number of people present. Do not explain your reasoning - answer with just the fields below. "
+        "images, how confident you are that the entry and exit images for that match show the same physical person. "
+        "Compare clothing color and pattern, pants/skirt, shoes, hair, body build and height, and any bags or items "
+        "carried. Do not assume they match just because they were already paired for you - actively look for "
+        "anything that would prove they are different people, such as a different clothing color, a different "
+        "build, or a different number of people present. Do not explain your reasoning - answer with just the "
+        "fields below. "
+        "confidence (0 to 1) is how confident you are that a match's entry and exit are the SAME physical person - "
+        "1.0 means certain they match, 0.0 means certain they do not match, 0.5 means genuinely unsure. "
         "Return strict JSON only with schema: "
-        '{"results":[{"match_number":integer,"same_person":0 or 1,"confidence":number}]}. Include exactly one '
+        '{"results":[{"match_number":integer,"confidence":number}]}. Include exactly one '
         "result per match listed above, using its match_number."
     )
     try:
@@ -4815,8 +4828,7 @@ def _verify_gemini_grouping_matches_batch(
         except (TypeError, ValueError):
             continue
         results_by_match[match_number] = {
-            "same_person": _coerce_same_person(entry.get("same_person")),
-            "confidence": _coerce_number(entry.get("confidence"), 0.0),
+            "confidence": _coerce_verification_confidence(entry.get("confidence")),
             "error": None,
         }
     return results_by_match, meta
@@ -5196,9 +5208,6 @@ def _run_grouping_adjacent_pass(
                     "verification": {
                         "error": None,
                         "confidence": confidence,
-                        "same_person": True,
-                        "matching_details": str(result.get("reason") or ""),
-                        "conflicting_details": "",
                     },
                     "total_customer": 1,
                     "entry_has_identity": True,
@@ -6051,29 +6060,29 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
 
                     if candidate["entry_trigger_input"] is None or not candidate["exit_trigger_inputs"]:
                         verification: dict[str, Any] = {
-                            "same_person": None,
-                            "confidence": 0.0,
+                            "confidence": None,
                             "error": "Entry or exit trigger data was not available for verification.",
                         }
                     else:
                         verification = batch_verifications.get(index) or {
-                            "same_person": None,
-                            "confidence": 0.0,
+                            "confidence": None,
                             "error": "Verification call failed or returned no result for this match.",
                         }
 
-                    # Reject outright when the independent check says no, or hedges with low
-                    # confidence - a same_person=None (call failed / malformed) fails open,
-                    # since that's a tooling problem, not evidence the match is wrong.
-                    if verification["same_person"] is False or (
-                        verification["same_person"] is True and verification["confidence"] < 0.5
+                    # A missing/failed verification call (confidence is None) fails open -
+                    # that's a tooling problem, not evidence the match is wrong. A real
+                    # score below the threshold is rejected outright.
+                    verification_confidence = verification["confidence"]
+                    if (
+                        verification_confidence is not None
+                        and verification_confidence < _VERIFICATION_MATCH_CONFIDENCE_THRESHOLD
                     ):
                         normalized_unknown.update(exit_ids)
                         normalized_open_entries.add(entry_trigger_id)
                         notes.append(
                             f"Verification rejected match between entry {entry_trigger_id} and exit(s) {sorted(exit_ids)}: "
-                            "independent check could not confirm the same person "
-                            f"(confidence {verification['confidence']:.2f})."
+                            f"confidence-of-a-match was only {verification_confidence:.2f}, below the "
+                            f"{_VERIFICATION_MATCH_CONFIDENCE_THRESHOLD:.2f} bar."
                         )
                         continue
 
@@ -6102,7 +6111,10 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
                             "total_customer": _coerce_int(group.get("total_customer"), 0),
                             "source": "gemini_grouping_direct",
                             "chunk": chunk_index,
-                            "verified": verification["same_person"] is True,
+                            "verified": (
+                                verification_confidence is not None
+                                and verification_confidence >= _VERIFICATION_MATCH_CONFIDENCE_THRESHOLD
+                            ),
                             "verification": verification,
                             "entry_has_identity": entry_has_identity,
                         }
