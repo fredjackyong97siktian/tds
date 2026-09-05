@@ -11087,6 +11087,16 @@ def _run_video_retrieval_job(
 
 def start_trigger_frame_asset_retrieval_job(job: TriggerFrameAssetRetrievalQueued) -> None:
     db = TransactionalSessionLocal()
+    # Diagnostic-only: how late this retrieval is actually running compared to
+    # its own requested window, and compared to the trigger that caused it -
+    # lets us see retrieval/queue delay directly per job instead of having to
+    # reconstruct it later from raw trigger_time/start_time/end_time rows.
+    retrieval_started_at = _time_period_now()
+    trigger_time_for_delay: datetime | None = None
+    try:
+        trigger_time_for_delay = _coerce_datetime_value(repositories.get_trigger(db, job.trigger_id).get("trigger_time"))
+    except Exception:
+        logger.exception("Could not load trigger_time for delay diagnostics trigger_id=%s", job.trigger_id)
     script_run_id = repositories.create_script_run_started(
         db,
         session_id=None,
@@ -11100,6 +11110,15 @@ def start_trigger_frame_asset_retrieval_job(job: TriggerFrameAssetRetrievalQueue
             "location_id": job.location_id,
             "start_time": job.requested_start_time.isoformat(),
             "end_time": job.requested_end_time.isoformat(),
+            "retrieval_started_at": retrieval_started_at.isoformat(),
+            "delay_seconds_since_window_start": (retrieval_started_at - job.requested_start_time).total_seconds(),
+            "delay_seconds_since_window_end": (retrieval_started_at - job.requested_end_time).total_seconds(),
+            "trigger_time": trigger_time_for_delay.isoformat() if trigger_time_for_delay else None,
+            "delay_seconds_since_trigger_time": (
+                (retrieval_started_at - trigger_time_for_delay).total_seconds()
+                if trigger_time_for_delay is not None
+                else None
+            ),
         },
     )
     stdout_parts: list[str] = []
