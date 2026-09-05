@@ -1029,9 +1029,23 @@ def _create_gemini_script_run(
     )
 
 
+_PROVIDER_TAG_TO_COST_SOURCE: dict[str, str] = {
+    "tds_api_deepseek": "deepseek_estimate",
+    "tds_api_glm": "glm_estimate",
+    "tds_api_openai": "openai_estimate",
+    "tds_api_openrouter": "openrouter_actual",
+    "tds_api_gemini": "gemini_estimate",
+}
+
+
 def _record_gemini_log_cost(db: Session, script_run_id: int, gemini_log: Mapping[str, Any]) -> dict[str, Any]:
+    # Despite the name (kept for the existing gemini_log/diagnostics shape),
+    # this isn't Gemini-specific - kiosk can now run on any provider via
+    # _call_kiosk_vision, so cost has to be computed and labeled per the
+    # actual provider each group's call used, not assumed to be Gemini.
     cost_details: list[dict[str, Any]] = []
     total_amount = 0.0
+    cost_sources: set[str] = set()
     groups = gemini_log.get("groups") if isinstance(gemini_log.get("groups"), list) else []
     for group in groups:
         if not isinstance(group, Mapping):
@@ -1039,21 +1053,23 @@ def _record_gemini_log_cost(db: Session, script_run_id: int, gemini_log: Mapping
         meta = group.get("meta") if isinstance(group.get("meta"), Mapping) else None
         if not meta:
             continue
-        amount, detail = _gemini_usage_cost(meta)
+        amount, detail = _usage_cost_for_call_meta(meta)
         detail["group_id"] = group.get("group_id")
         cost_details.append(detail)
         if amount is not None:
             total_amount += amount
+        cost_sources.add(_PROVIDER_TAG_TO_COST_SOURCE.get(str(meta.get("provider") or ""), "gemini_estimate"))
+    cost_source = "+".join(sorted(cost_sources)) if cost_sources else "gemini_estimate"
     if total_amount > 0:
         repositories.add_script_run_cost(
             db,
             script_run_id,
             cost_amount=total_amount,
             cost_currency="USD",
-            cost_source="gemini_estimate",
+            cost_source=cost_source,
         )
     return {
-        "source": "gemini_estimate",
+        "source": cost_source,
         "currency": "USD",
         "amount": total_amount,
         "groups": cost_details,
@@ -1843,6 +1859,7 @@ def _identity_reference_image_urls_for_session(db: Session, session_id: int | No
 
 
 def _complete_kiosk_summary_with_tds_gemini(
+    db: Session,
     kiosk_summary: dict[str, Any] | None,
     *,
     identity_reference_image_urls: list[str] | None = None,
@@ -1927,7 +1944,7 @@ def _complete_kiosk_summary_with_tds_gemini(
                     "customer; ignore items associated with any other person visible in the kiosk evidence. "
                 ) + prompt
             try:
-                vlm_result, vlm_meta = _call_kiosk_gemini_summary(prompt=call_prompt, image_urls=call_image_urls)
+                vlm_result, vlm_meta = _call_kiosk_vision(db, prompt=call_prompt, image_urls=call_image_urls)
             except Exception as exc:
                 diagnostics_group["status"] = "failed"
                 diagnostics_group["error"] = str(exc)
@@ -2195,7 +2212,7 @@ def _finalize_remote_entry_script_run(
     )
     session_id = script_run.get("session_id")
     try:
-        completed_kiosk_summary = _complete_kiosk_summary_with_tds_gemini(remote_result.kiosk_summary)
+        completed_kiosk_summary = _complete_kiosk_summary_with_tds_gemini(db, remote_result.kiosk_summary)
     except Exception as exc:
         repositories.update_video_asset_status(db, video_asset_id, "issue")
         stderr = f"{result.stderr}\nTDS API Gemini kiosk summary failed: {exc}".strip()
@@ -2422,6 +2439,7 @@ def _finalize_remote_kiosk_script_run(
     try:
         identity_reference_image_urls = _identity_reference_image_urls_for_session(db, session_id)
         completed_kiosk_summary, gemini_log = _complete_kiosk_summary_with_tds_gemini(
+            db,
             remote_result.kiosk_summary,
             identity_reference_image_urls=identity_reference_image_urls,
         )
@@ -5454,6 +5472,131 @@ def _current_grouping_provider_tag(db: Session) -> str:
     return "tds_api_gemini"
 
 
+_KIOSK_PROVIDER_APP_SETTING_KEY = "kiosk_provider"
+# Independent of grouping's own selector - kiosk identity+item-counting calls
+# read this one instead, so testing a model for kiosk never affects grouping
+# and vice versa. Same candidate list as grouping since they're all the same
+# kind of vision call, just applied to a different task.
+_KIOSK_PROVIDERS = _GROUPING_PROVIDERS
+
+
+def _current_kiosk_provider(db: Session) -> str:
+    try:
+        stored = repositories.get_app_setting(db, _KIOSK_PROVIDER_APP_SETTING_KEY)
+    except Exception:
+        logger.exception("Could not read kiosk_provider app_setting; using .env default")
+        stored = None
+    provider = str(stored or settings.kiosk_provider or "gemini").strip().lower()
+    return provider if provider in _KIOSK_PROVIDERS else "gemini"
+
+
+def _kiosk_provider_is_deepseek(db: Session) -> bool:
+    return _current_kiosk_provider(db) == "deepseek"
+
+
+def _kiosk_provider_is_glm(db: Session) -> bool:
+    return _current_kiosk_provider(db) == "glm"
+
+
+def _kiosk_provider_is_openai(db: Session) -> bool:
+    return _current_kiosk_provider(db) in _OPENAI_GROUPING_MODELS
+
+
+def _kiosk_provider_is_openrouter(db: Session) -> bool:
+    return _current_kiosk_provider(db) in _OPENROUTER_MODELS
+
+
+def _kiosk_provider_is_gemini_alt(db: Session) -> bool:
+    return _current_kiosk_provider(db) == "gemini-2.5-flash-lite"
+
+
+def _kiosk_gemini_model_name(db: Session, default_model_name: str | None) -> str | None:
+    return "gemini-2.5-flash-lite" if _kiosk_provider_is_gemini_alt(db) else default_model_name
+
+
+def _kiosk_openai_model_name(db: Session) -> str:
+    provider = _current_kiosk_provider(db)
+    return provider if provider in _OPENAI_GROUPING_MODELS else "gpt-4o-mini"
+
+
+def _kiosk_openrouter_model_name(db: Session) -> str:
+    provider = _current_kiosk_provider(db)
+    return _OPENROUTER_MODELS.get(provider, next(iter(_OPENROUTER_MODELS.values())))
+
+
+def _call_kiosk_vision(
+    db: Session,
+    *,
+    prompt: str,
+    image_urls: list[str],
+    gemini_model_name: str | None = None,
+    gemini_resize_scale: float | None = None,
+    allow_text_only: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Single dispatch point for kiosk identity+item-counting calls - mirrors
+    _call_grouping_vision exactly but reads _current_kiosk_provider, so kiosk
+    and grouping can each be pointed at a different model independently.
+    """
+    if _kiosk_provider_is_deepseek(db):
+        result, meta = _call_deepseek_vision_summary(
+            prompt=prompt,
+            image_urls=image_urls,
+            model_name=settings.deepseek_vision_model,
+            allow_text_only=allow_text_only,
+            image_resize_scale=_grouping_deepseek_resize_scale(),
+            temperature=settings.grouping_temperature,
+        )
+    elif _kiosk_provider_is_glm(db):
+        result, meta = _call_glm_vision_summary(
+            prompt=prompt,
+            image_urls=image_urls,
+            model_name=settings.glm_vision_model,
+            allow_text_only=allow_text_only,
+            image_resize_scale=_grouping_glm_resize_scale(),
+            temperature=settings.grouping_temperature,
+        )
+    elif _kiosk_provider_is_openai(db):
+        result, meta = _call_openai_vision_summary(
+            prompt=prompt,
+            image_urls=image_urls,
+            model_name=_kiosk_openai_model_name(db),
+            allow_text_only=allow_text_only,
+            image_resize_scale=_grouping_openai_resize_scale(),
+            temperature=settings.grouping_temperature,
+        )
+    elif _kiosk_provider_is_openrouter(db):
+        result, meta = _call_openrouter_vision_summary(
+            prompt=prompt,
+            image_urls=image_urls,
+            model_name=_kiosk_openrouter_model_name(db),
+            allow_text_only=allow_text_only,
+            image_resize_scale=_grouping_openrouter_resize_scale(),
+            temperature=settings.grouping_temperature,
+        )
+    else:
+        result, meta = _call_kiosk_gemini_summary(
+            prompt=prompt,
+            image_urls=image_urls,
+            model_name=_kiosk_gemini_model_name(db, gemini_model_name or settings.kiosk_gemini_model),
+            image_resize_scale=gemini_resize_scale,
+            allow_text_only=allow_text_only,
+            temperature=settings.grouping_temperature,
+        )
+    return result, meta
+
+
+def _current_kiosk_model_name(db: Session) -> str:
+    if _kiosk_provider_is_deepseek(db):
+        return settings.deepseek_vision_model
+    if _kiosk_provider_is_glm(db):
+        return settings.glm_vision_model
+    if _kiosk_provider_is_openai(db):
+        return _kiosk_openai_model_name(db)
+    if _kiosk_provider_is_openrouter(db):
+        return _kiosk_openrouter_model_name(db)
+    return _kiosk_gemini_model_name(db, settings.kiosk_gemini_model) or settings.kiosk_gemini_model
+
+
 _GROUPING_CHUNK_RETRY_MAX_ATTEMPTS = 3
 _GROUPING_CHUNK_RETRY_INTERVAL_SECONDS = 5.0
 _GROUPING_CHUNK_CALL_INTERVAL_SECONDS = 2.5
@@ -6443,11 +6586,58 @@ def _refresh_grouping_item_frame_payloads(db: Session, *, batch: Mapping[str, An
     return refreshed_count
 
 
+# A batch stuck in pending/dispatching/running for longer than this is treated
+# as orphaned (e.g. a container killed mid-run by a deploy) rather than
+# genuinely in progress, so the retry button doesn't stay permanently disabled.
+_GROUPING_BATCH_STALE_MINUTES = 45
+
+
+def _grouping_batch_age_minutes(batch: dict[str, Any]) -> float | None:
+    anchor = _coerce_datetime_value(
+        batch.get("started_at") or batch.get("updated_at") or batch.get("created_at")
+    )
+    if anchor is None:
+        return None
+    if anchor.tzinfo is None:
+        anchor = anchor.replace(tzinfo=UTC)
+    return max(0.0, (datetime.now(UTC) - anchor).total_seconds() / 60.0)
+
+
+def _grouping_batch_is_stale(batch: dict[str, Any]) -> bool:
+    age_minutes = _grouping_batch_age_minutes(batch)
+    return age_minutes is not None and age_minutes >= _GROUPING_BATCH_STALE_MINUTES
+
+
 def retry_grouping_batch_now(db: Session, *, batch_id: int) -> dict[str, Any]:
     batch = repositories.get_grouping_batch(db, batch_id)
     status = str(batch.get("status") or "").strip().lower()
     if status in {"pending", "dispatching", "running"}:
-        raise ValueError(f"Grouping batch {batch_id} is {status or 'unknown'} and cannot be rerun yet.")
+        if not _grouping_batch_is_stale(batch):
+            raise ValueError(f"Grouping batch {batch_id} is {status or 'unknown'} and cannot be rerun yet.")
+        if repositories.has_active_remote_analysis_script_run(db, script_names=["grouping"]):
+            raise ValueError(
+                f"Grouping batch {batch_id} looks stale, but a grouping job is still actively running - wait for it to finish."
+            )
+        logger.warning(
+            "Auto-recovering stale grouping batch batch_id=%s status=%s age_minutes=%.1f "
+            "(no active grouping job found - likely orphaned by an interrupted deploy)",
+            batch_id,
+            status,
+            _grouping_batch_age_minutes(batch) or -1.0,
+        )
+        batch = repositories.update_grouping_batch(
+            db,
+            batch_id,
+            {
+                "status": "failed",
+                "issue_reason": (
+                    f"Auto-recovered: batch was stuck in '{status}' for over "
+                    f"{_GROUPING_BATCH_STALE_MINUTES} minutes with no active grouping job."
+                ),
+                "finished_at": datetime.now(UTC),
+            },
+        )
+        status = str(batch.get("status") or "").strip().lower()
     if status not in {"success", "failed", "issue", "cancel", "canceled", "cancelled"}:
         raise ValueError(f"Grouping batch {batch_id} is {status or 'unknown'} and cannot be rerun.")
     active_batches = [

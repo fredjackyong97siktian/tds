@@ -295,6 +295,39 @@ def update_grouping_provider(payload: GroupingProviderRequest, db: Session = Dep
     return {"ok": True, "provider": provider}
 
 
+@router.get("/kiosk-provider")
+def get_kiosk_provider(db: Session = Depends(get_transaction_db)) -> dict:
+    provider = workflow_service._current_kiosk_provider(db)  # noqa: SLF001
+    provider_models = {
+        "gemini": settings.kiosk_gemini_model,
+        "deepseek": settings.deepseek_vision_model,
+        "glm": settings.glm_vision_model,
+        "gemini-2.5-flash-lite": "gemini-2.5-flash-lite",
+        "gpt-4.1-nano": "gpt-4.1-nano",
+        "gpt-4o-mini": "gpt-4o-mini",
+        "gpt-5-nano": "gpt-5-nano",
+        "openrouter-mimo-v2.5": "xiaomi/mimo-v2.5",
+        "openrouter-qwen3.8-flash": "qwen/qwen3.8-flash",
+    }
+    return {
+        "provider": provider,
+        "model": provider_models.get(provider, provider),
+        "provider_models": provider_models,
+    }
+
+
+@router.put("/kiosk-provider")
+def update_kiosk_provider(payload: GroupingProviderRequest, db: Session = Depends(get_transaction_db)) -> dict:
+    provider = payload.provider.strip().lower()
+    if provider not in workflow_service._KIOSK_PROVIDERS:  # noqa: SLF001
+        raise HTTPException(
+            status_code=400,
+            detail=f"provider must be one of {workflow_service._KIOSK_PROVIDERS}",  # noqa: SLF001
+        )
+    repositories.set_app_setting(db, "kiosk_provider", provider)
+    return {"ok": True, "provider": provider}
+
+
 @router.get("/theft-confidence-status")
 def get_theft_confidence_status(db: Session = Depends(get_transaction_db)) -> dict:
     pending_rows = repositories.list_pending_theft_confidence_batches(
