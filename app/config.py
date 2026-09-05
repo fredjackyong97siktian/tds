@@ -77,6 +77,13 @@ class Settings(BaseSettings):
     filter_unusual_group_size: int = 2
     filter_unusual_group_size_min_history: int = 2
     filter_unusual_group_size_delta: int = 2
+    # "Prolonged Scan Low Purchase" factor: flags a paid transaction whose
+    # scan duration (initiatedAt -> Formatted Timestamp, i.e. start-scanning
+    # to finish-scanning/choose-payment-method) is unusually long for how few
+    # items (or how little value) were actually bought - reuses the same
+    # low-purchase criteria as long_stay_low_purchase, just measured against
+    # scan time instead of total store-visit duration.
+    filter_prolonged_scan_seconds: int = 90
     analysis_poll_seconds: int = 10
     analysis_max_global_workers: int = 1
     analysis_cooldown_seconds: int = 10
@@ -85,8 +92,10 @@ class Settings(BaseSettings):
     kiosk_analysis_cooldown_seconds: int = 10
     entrance_trigger_extra_before_seconds: int = 10
     entrance_trigger_extra_after_seconds: int = 40
+    # Padding applied on top of the initiatedAt/paymentAttemptAt (or Formatted
+    # Timestamp fallback) window bounds - see _build_transaction_window_bounds.
     kiosk_transaction_extra_before_seconds: int = 10
-    kiosk_transaction_extra_after_seconds: int = -10
+    kiosk_transaction_extra_after_seconds: int = 10
     whitelist_qrentry_table_name: str = "phonenumber"
     whitelist_qrentry_id_column: str = "id"
     whitelist_qrentry_value_column: str = "id"

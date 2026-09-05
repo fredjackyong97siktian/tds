@@ -59,6 +59,7 @@ KIOSK_OWNERSHIP_MIN_MARGIN_SECONDS = 10.0
 NO_KIOSK_VIDEO_REASON = "No kiosk video was queued because no paid transactions were found inside the session window."
 DEFAULT_FILTER_FACTORS: dict[str, dict[str, Any]] = {
     "long_stay_low_purchase": {"enabled": True},
+    "prolonged_scan_low_purchase": {"enabled": True},
     "transaction_issue_low_purchase": {"enabled": True},
     "multiple_transaction_issues": {"enabled": True},
     "multiple_minus_button_alert": {"enabled": True},
@@ -4005,6 +4006,21 @@ def _time_period_now() -> datetime:
     return datetime.now(_time_period_zoneinfo()).replace(tzinfo=None, microsecond=0)
 
 
+def _utc_naive_to_local(value: datetime | None) -> datetime | None:
+    # initiatedAt/paymentAttemptAt come back from the POS DB as UTC (naive,
+    # like everything else this codebase reads), while transaction_time
+    # ("Formatted Timestamp") is already Malaysia local time - mixing them
+    # without converting first is exactly the UTC-vs-local bug that broke
+    # kiosk video timing earlier (2:34am vs 10:34am). Every value this
+    # codebase otherwise works with is a naive datetime implicitly meaning
+    # Malaysia local time, so this normalizes to match that convention rather
+    # than introducing timezone-aware datetimes into the mix.
+    if value is None:
+        return None
+    aware_utc = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+    return aware_utc.astimezone(_time_period_zoneinfo()).replace(tzinfo=None)
+
+
 def _to_time_period_local_naive(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=None, microsecond=0)
@@ -7028,6 +7044,8 @@ def _transaction_summary(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "status": row.get("status"),
                 "created_at": row.get("created_at"),
                 "transaction_time": row.get("transaction_time"),
+                "initiated_at": row.get("initiated_at"),
+                "payment_attempt_at": row.get("payment_attempt_at"),
                 "total_amount": row.get("total_amount"),
                 "total_items": row.get("total_items"),
                 "details": [
@@ -7773,6 +7791,30 @@ def _run_theft_confidence_for_grouping_batch_locked(
                 if (issue_time := _transaction_event_time(row)) is not None
             )
         )
+        # Prolonged Scan Low Purchase: initiatedAt (start scanning) to
+        # Formatted Timestamp (finished scanning, chose payment method) took
+        # unusually long for how little was actually bought - reuses
+        # final_paid_is_low rather than a separate quantity check, since "low
+        # purchase" already means the same thing here. Reads transaction_time
+        # directly (NOT final_paid_time/_transaction_event_time, which prefers
+        # created_at - a separate UTC audit timestamp, not the local POS event
+        # time this scan-duration math needs).
+        final_paid_initiated_at = (
+            _utc_naive_to_local(_coerce_datetime_value(final_paid_receipt.get("initiated_at")))
+            if final_paid_receipt
+            else None
+        )
+        final_paid_scan_end = (
+            _coerce_datetime_value(final_paid_receipt.get("transaction_time")) if final_paid_receipt else None
+        )
+        scan_duration_seconds = (
+            max(0.0, (final_paid_scan_end - final_paid_initiated_at).total_seconds())
+            if final_paid_initiated_at and final_paid_scan_end
+            else None
+        )
+        prolonged_scan = (
+            scan_duration_seconds is not None and scan_duration_seconds >= settings.filter_prolonged_scan_seconds
+        )
         multiple_issue_hit, multiple_issue_evidence = _has_short_period_transaction_issues(
             issue_transactions,
             settings.filter_transaction_issue_short_period_seconds,
@@ -7819,6 +7861,21 @@ def _run_theft_confidence_for_grouping_batch_locked(
             },
         ):
             triggered_factors.append("long_stay_low_purchase")
+            should_continue_filtering = False
+        if should_continue_filtering and _apply_filter_factor(
+            reasons=reasons,
+            factor_details=factor_details,
+            factors=factor_settings,
+            factor_code="prolonged_scan_low_purchase",
+            hit=prolonged_scan and final_paid_is_low,
+            reason="prolonged_scan_low_purchase",
+            evidence={
+                "scan_duration_seconds": scan_duration_seconds,
+                "final_paid_receipt": _transaction_summary([final_paid_receipt])[0] if final_paid_receipt else None,
+                "final_paid_is_low": final_paid_is_low,
+            },
+        ):
+            triggered_factors.append("prolonged_scan_low_purchase")
             should_continue_filtering = False
         if should_continue_filtering and _apply_filter_factor(
             reasons=reasons,
@@ -8151,7 +8208,11 @@ def _prepare_session_kiosk_pipeline(
             continue
         total_items = int(transaction.get("total_items") or 0)
         total_transaction_items += total_items
-        window_start, window_end = _build_transaction_window_bounds(transaction_time, total_items)
+        window_start, window_end = _build_transaction_window_bounds(
+            initiated_at=_utc_naive_to_local(_coerce_datetime_value(transaction.get("initiated_at"))),
+            payment_attempt_at=_utc_naive_to_local(_coerce_datetime_value(transaction.get("payment_attempt_at"))),
+            fallback_time=transaction_time,
+        )
         raw_windows.append((window_start, window_end))
         transaction_summaries.append(
             {
@@ -8834,22 +8895,24 @@ def _coerce_datetime_value(value: Any) -> datetime | None:
 
 
 def _build_transaction_window_bounds(
-    transaction_time: datetime,
-    total_items: int,
+    *,
+    initiated_at: datetime | None,
+    payment_attempt_at: datetime | None,
+    fallback_time: datetime,
 ) -> tuple[datetime, datetime]:
-    extra_seconds = max(0, int(total_items) - 3) * 5
-    base_padding_seconds = min(15 + extra_seconds, 40)
-    before_padding_seconds = max(
-        0,
-        base_padding_seconds + int(settings.kiosk_transaction_extra_before_seconds),
-    )
-    after_padding_seconds = max(
-        0,
-        base_padding_seconds + int(settings.kiosk_transaction_extra_after_seconds),
-    )
+    # Brackets the window with the two real events that actually span the
+    # customer's kiosk interaction - initiatedAt (start scanning) to
+    # paymentAttemptAt (payment gateway responds) - instead of guessing a
+    # duration around one single anchor. fallback_time (Formatted Timestamp,
+    # i.e. finished scanning/chose payment method) covers whichever end is
+    # missing on a given transaction.
+    start_anchor = initiated_at or fallback_time
+    end_anchor = payment_attempt_at or fallback_time
+    before_padding_seconds = max(0, int(settings.kiosk_transaction_extra_before_seconds))
+    after_padding_seconds = max(0, int(settings.kiosk_transaction_extra_after_seconds))
     return (
-        transaction_time - timedelta(seconds=before_padding_seconds),
-        transaction_time + timedelta(seconds=after_padding_seconds),
+        start_anchor - timedelta(seconds=before_padding_seconds),
+        end_anchor + timedelta(seconds=after_padding_seconds),
     )
 
 
@@ -8919,7 +8982,13 @@ def _kickoff_kiosk_pipeline_for_session(
                 "raw_payload": dict(transaction),
             },
         )
-        windows.append(_build_transaction_window_bounds(transaction_time, total_items))
+        windows.append(
+            _build_transaction_window_bounds(
+                initiated_at=_utc_naive_to_local(_coerce_datetime_value(transaction.get("initiated_at"))),
+                payment_attempt_at=_utc_naive_to_local(_coerce_datetime_value(transaction.get("payment_attempt_at"))),
+                fallback_time=transaction_time,
+            )
+        )
 
     if not windows:
         repositories.update_session_fields(

@@ -4621,6 +4621,12 @@ def list_paid_transactions_for_session_window(
                 "receipt_number": receipt_number,
                 "transaction_time": row.get(PAID_TRANSACTION_TIME_COLUMN),
                 "created_at": _pick_first(row, "createdAt", "created_at", PAID_TRANSACTION_TIME_COLUMN),
+                # initiated_at: when the customer started scanning items.
+                # payment_attempt_at: the payment gateway's response - both
+                # None when the source table doesn't have these columns, in
+                # which case callers fall back to transaction_time.
+                "initiated_at": _pick_first(row, "initiatedAt", "initiated_at"),
+                "payment_attempt_at": _pick_first(row, "paymentAttemptAt", "payment_attempt_at"),
                 "location_id": row.get(settings.paid_transaction_location_id_column),
                 "status": row.get(settings.paid_transaction_status_column),
                 "total_amount": total_amount,
@@ -4633,6 +4639,10 @@ def list_paid_transactions_for_session_window(
             existing["created_at"] = _pick_first(row, "createdAt", "created_at", PAID_TRANSACTION_TIME_COLUMN)
         if row.get(PAID_TRANSACTION_TIME_COLUMN):
             existing["transaction_time"] = row.get(PAID_TRANSACTION_TIME_COLUMN)
+        if _pick_first(row, "initiatedAt", "initiated_at"):
+            existing["initiated_at"] = _pick_first(row, "initiatedAt", "initiated_at")
+        if _pick_first(row, "paymentAttemptAt", "payment_attempt_at"):
+            existing["payment_attempt_at"] = _pick_first(row, "paymentAttemptAt", "payment_attempt_at")
         try:
             existing_amount = float(existing.get("total_amount") or 0)
         except (TypeError, ValueError):
