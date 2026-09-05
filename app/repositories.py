@@ -5807,11 +5807,16 @@ def get_current_month_script_run_cost_summary(db: Session) -> dict[str, Any]:
                    ) as deepseek_total,
                    sum(
                        case
-                           -- The script_run's model_name is the real vendor
-                           -- string OpenRouter's API expects (see
-                           -- _OPENROUTER_MODELS), not the "openrouter-mimo-v2.5"
-                           -- provider-selector key - matching the old key here
-                           -- meant this bucket never matched any real run.
+                           -- Grouping's script_run rows store a stage label
+                           -- built from the provider-selector key itself
+                           -- (e.g. "openrouter-mimo-v2.5_grouping_direct" -
+                           -- see _grouping_stage_label), while the real
+                           -- OpenRouter vendor string ("xiaomi/mimo-v2.5")
+                           -- only ever appears inside the JSON diagnostics
+                           -- payload, not this column - match both so this
+                           -- bucket is correct regardless of which one a
+                           -- given script_run happens to carry.
+                           when cr.model_name like 'openrouter-mimo-v2.5%' then cr.cost_amount
                            when cr.model_name like 'xiaomi/mimo-v2.5%' then cr.cost_amount
                            else 0
                        end
@@ -5827,6 +5832,7 @@ def get_current_month_script_run_cost_summary(db: Session) -> dict[str, Any]:
                            -- toward deepseek_total only, not both, to avoid
                            -- double-counting the same dollar in two buckets.
                            when cr.cost_source like '%deepseek%' then 0
+                           when cr.model_name like 'openrouter-mimo-v2.5%' then 0
                            when cr.model_name like 'xiaomi/mimo-v2.5%' then 0
                            when cr.cost_source like '%gemini%' then cr.cost_amount
                            when cr.cost_source = ''
