@@ -199,9 +199,16 @@ def create_manual_session(payload: SessionManualCreateRequest, db: Session = Dep
     return SessionResponse(**repositories.get_session(db, int(session["id"])))
 
 
+def _attach_source_video_urls(rows: list[dict]) -> list[dict]:
+    for row in rows:
+        for video in row.get("session_videos") or []:
+            video["source_video_url"] = workflow_service.resolve_source_video_url(video.get("file_path"))
+    return rows
+
+
 @router.get("", response_model=list[SessionListItem])
 def list_sessions(limit: int = 50, offset: int = 0, db: Session = Depends(get_transaction_db)) -> list[SessionListItem]:
-    rows = repositories.list_sessions(db, limit=limit, offset=offset)
+    rows = _attach_source_video_urls(repositories.list_sessions(db, limit=limit, offset=offset))
     return [SessionListItem(**row) for row in rows]
 
 
@@ -212,7 +219,7 @@ def count_sessions(db: Session = Depends(get_transaction_db)) -> dict[str, int]:
 
 @router.get("/{session_id}", response_model=SessionListItem)
 def get_session_detail(session_id: int, db: Session = Depends(get_transaction_db)) -> SessionListItem:
-    rows = repositories.list_sessions(db, limit=1, session_id=session_id)
+    rows = _attach_source_video_urls(repositories.list_sessions(db, limit=1, session_id=session_id))
     if not rows:
         raise HTTPException(status_code=404, detail=f"Session {session_id} was not found.")
     return SessionListItem(**rows[0])

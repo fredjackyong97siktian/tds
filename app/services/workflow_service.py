@@ -415,6 +415,25 @@ def _spaces_download_url_for_object_key(object_key: str) -> str:
     return generate_presigned_download_url(object_key, expires_seconds=settings.runner_timeout_seconds)
 
 
+def resolve_source_video_url(file_path: str | None) -> str | None:
+    # video_asset.video_url gets overwritten to point at RunPod's processed
+    # (annotated) output once analysis finishes, but file_path keeps pointing
+    # at the raw, pre-processing source clip uploaded to Spaces beforehand
+    # (see _ensure_source_video_ready_for_runner / _apply_processed_video_upload_result) -
+    # this resolves that raw pointer into a viewable URL for the dashboard.
+    normalized = str(file_path or "").strip()
+    if not normalized.startswith("spaces://"):
+        return None
+    object_key = normalized.removeprefix("spaces://").lstrip("/")
+    if not object_key:
+        return None
+    try:
+        return _spaces_download_url_for_object_key(object_key)
+    except Exception:
+        logger.exception("Could not resolve source video URL for object_key=%s", object_key)
+        return None
+
+
 def _runner_input_object_key(
     *,
     kind: str,

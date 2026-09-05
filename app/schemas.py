@@ -215,6 +215,7 @@ class SessionVideoLink(BaseModel):
     video_status: str | None = None
     file_path: str | None = None
     video_url: str | None = None
+    source_video_url: str | None = None
 
 
 class SessionListItem(SessionResponse):

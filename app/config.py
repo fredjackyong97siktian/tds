@@ -95,7 +95,7 @@ class Settings(BaseSettings):
     # Padding applied on top of the initiatedAt/paymentAttemptAt (or Formatted
     # Timestamp fallback) window bounds - see _build_transaction_window_bounds.
     kiosk_transaction_extra_before_seconds: int = 10
-    kiosk_transaction_extra_after_seconds: int = 10
+    kiosk_transaction_extra_after_seconds: int = 20
     whitelist_qrentry_table_name: str = "phonenumber"
     whitelist_qrentry_id_column: str = "id"
     whitelist_qrentry_value_column: str = "id"
