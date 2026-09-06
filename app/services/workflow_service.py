@@ -1,5 +1,6 @@
 from __future__ import annotations
 import base64
+import http.client
 import json
 import logging
 import mimetypes
@@ -5549,6 +5550,10 @@ def _kiosk_openrouter_model_name(db: Session) -> str:
     return _OPENROUTER_MODELS.get(provider, next(iter(_OPENROUTER_MODELS.values())))
 
 
+_KIOSK_VISION_TRANSIENT_RETRY_ATTEMPTS = 3
+_KIOSK_VISION_TRANSIENT_RETRY_DELAY_SECONDS = 3.0
+
+
 def _call_kiosk_vision(
     db: Session,
     *,
@@ -5562,44 +5567,45 @@ def _call_kiosk_vision(
     _call_grouping_vision exactly but reads _current_kiosk_provider, so kiosk
     and grouping can each be pointed at a different model independently.
     """
-    if _kiosk_provider_is_deepseek(db):
-        result, meta = _call_deepseek_vision_summary(
-            prompt=prompt,
-            image_urls=image_urls,
-            model_name=settings.deepseek_vision_model,
-            allow_text_only=allow_text_only,
-            image_resize_scale=_grouping_deepseek_resize_scale(),
-            temperature=settings.grouping_temperature,
-        )
-    elif _kiosk_provider_is_glm(db):
-        result, meta = _call_glm_vision_summary(
-            prompt=prompt,
-            image_urls=image_urls,
-            model_name=settings.glm_vision_model,
-            allow_text_only=allow_text_only,
-            image_resize_scale=_grouping_glm_resize_scale(),
-            temperature=settings.grouping_temperature,
-        )
-    elif _kiosk_provider_is_openai(db):
-        result, meta = _call_openai_vision_summary(
-            prompt=prompt,
-            image_urls=image_urls,
-            model_name=_kiosk_openai_model_name(db),
-            allow_text_only=allow_text_only,
-            image_resize_scale=_grouping_openai_resize_scale(),
-            temperature=settings.grouping_temperature,
-        )
-    elif _kiosk_provider_is_openrouter(db):
-        result, meta = _call_openrouter_vision_summary(
-            prompt=prompt,
-            image_urls=image_urls,
-            model_name=_kiosk_openrouter_model_name(db),
-            allow_text_only=allow_text_only,
-            image_resize_scale=_grouping_openrouter_resize_scale(),
-            temperature=settings.grouping_temperature,
-        )
-    else:
-        result, meta = _call_kiosk_gemini_summary(
+
+    def _dispatch() -> tuple[dict[str, Any], dict[str, Any] | None]:
+        if _kiosk_provider_is_deepseek(db):
+            return _call_deepseek_vision_summary(
+                prompt=prompt,
+                image_urls=image_urls,
+                model_name=settings.deepseek_vision_model,
+                allow_text_only=allow_text_only,
+                image_resize_scale=_grouping_deepseek_resize_scale(),
+                temperature=settings.grouping_temperature,
+            )
+        if _kiosk_provider_is_glm(db):
+            return _call_glm_vision_summary(
+                prompt=prompt,
+                image_urls=image_urls,
+                model_name=settings.glm_vision_model,
+                allow_text_only=allow_text_only,
+                image_resize_scale=_grouping_glm_resize_scale(),
+                temperature=settings.grouping_temperature,
+            )
+        if _kiosk_provider_is_openai(db):
+            return _call_openai_vision_summary(
+                prompt=prompt,
+                image_urls=image_urls,
+                model_name=_kiosk_openai_model_name(db),
+                allow_text_only=allow_text_only,
+                image_resize_scale=_grouping_openai_resize_scale(),
+                temperature=settings.grouping_temperature,
+            )
+        if _kiosk_provider_is_openrouter(db):
+            return _call_openrouter_vision_summary(
+                prompt=prompt,
+                image_urls=image_urls,
+                model_name=_kiosk_openrouter_model_name(db),
+                allow_text_only=allow_text_only,
+                image_resize_scale=_grouping_openrouter_resize_scale(),
+                temperature=settings.grouping_temperature,
+            )
+        return _call_kiosk_gemini_summary(
             prompt=prompt,
             image_urls=image_urls,
             model_name=_kiosk_gemini_model_name(db, gemini_model_name or settings.kiosk_gemini_model),
@@ -5607,7 +5613,28 @@ def _call_kiosk_vision(
             allow_text_only=allow_text_only,
             temperature=settings.grouping_temperature,
         )
-    return result, meta
+
+    # A dropped/truncated connection mid-response (e.g. IncompleteRead) is a
+    # transient network blip, not a real failure of the call itself - retry a
+    # couple of times before giving up, instead of failing the whole kiosk
+    # item-counting summary on one bad read.
+    last_exc: Exception | None = None
+    for attempt in range(1, _KIOSK_VISION_TRANSIENT_RETRY_ATTEMPTS + 1):
+        try:
+            return _dispatch()
+        except (http.client.HTTPException, URLError, ConnectionError, TimeoutError) as exc:
+            last_exc = exc
+            if attempt >= _KIOSK_VISION_TRANSIENT_RETRY_ATTEMPTS:
+                break
+            logger.warning(
+                "Kiosk vision call hit a transient network error, retrying attempt=%s/%s error=%s",
+                attempt,
+                _KIOSK_VISION_TRANSIENT_RETRY_ATTEMPTS,
+                exc,
+            )
+            time.sleep(_KIOSK_VISION_TRANSIENT_RETRY_DELAY_SECONDS)
+    assert last_exc is not None
+    raise last_exc
 
 
 def _current_kiosk_model_name(db: Session) -> str:
