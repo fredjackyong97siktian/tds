@@ -282,6 +282,7 @@ def get_cctv_by_location_section(db: Session, *, location_id: int, section: str)
                    c.stream_name,
                    c.recorder_channel,
                    c.delayed_seconds,
+                   c.delayed_updated_at,
                    c.created_at,
                    c.updated_at
             from {cctv_table} c
@@ -293,6 +294,28 @@ def get_cctv_by_location_section(db: Session, *, location_id: int, section: str)
         {"location_id": location_id, "section": section},
     )
     return _fetch_one_dict(result)
+
+
+def update_cctv_delayed_seconds(
+    db: Session, *, cctv_id: int, delayed_seconds: int, delayed_updated_at: datetime
+) -> None:
+    cctv_table = _table("cctv")
+    db.execute(
+        text(
+            f"""
+            update {cctv_table}
+            set delayed_seconds = :delayed_seconds,
+                delayed_updated_at = :delayed_updated_at
+            where id = :cctv_id
+            """
+        ),
+        {
+            "cctv_id": cctv_id,
+            "delayed_seconds": delayed_seconds,
+            "delayed_updated_at": delayed_updated_at,
+        },
+    )
+    db.commit()
 
 
 def list_cctv(db: Session, location_id: int | None = None) -> list[dict[str, Any]]:

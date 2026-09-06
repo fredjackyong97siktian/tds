@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS sesamedb.tds_cctv (
     stream_name VARCHAR(255),
     recorder_channel VARCHAR(100),
     delayed_seconds INT NOT NULL DEFAULT 0,
+    delayed_updated_at DATETIME DEFAULT NULL COMMENT 'When delayed_seconds was last recalibrated against the NVR''s own clock - refreshed at most once per calendar day.',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     UNIQUE KEY idx_cctv_location_endpoint_section (location_endpoint_id, section),

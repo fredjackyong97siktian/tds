@@ -16,7 +16,13 @@ from pathlib import Path
 from typing import Any, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import (
+    HTTPDigestAuthHandler,
+    HTTPPasswordMgrWithDefaultRealm,
+    Request,
+    build_opener,
+    urlopen,
+)
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import text
@@ -3855,7 +3861,7 @@ def _build_kiosk_transaction_match_manifest(
     recorder_channel = str(cctv.get("recorder_channel") or "").strip()
     if not recorder_channel:
         raise ValueError("Kiosk CCTV record does not have a recorder_channel.")
-    delayed_seconds = int(cctv.get("delayed_seconds") or 0)
+    delayed_seconds = _current_delayed_seconds(db, location_id=location_id, section="kiosk", cctv=cctv)
 
     snapshot_root = build_session_workdir(location_id, session_id) / "kiosk" / "transaction_match_inputs"
     snapshot_root.mkdir(parents=True, exist_ok=True)
@@ -10247,6 +10253,84 @@ def _build_dahua_rtsp_playback_url(
     )
 
 
+def _query_dahua_nvr_current_time(*, host: str, username: str, password: str) -> datetime | None:
+    # Dahua's CGI API (same host/credentials as RTSP) reports the NVR's own
+    # clock - comparing this to our server's clock is how delayed_seconds
+    # gets recalibrated, since it's meant to compensate for the NVR's clock
+    # actually being ahead of or behind real time, not just a one-time guess.
+    url = f"http://{host}/cgi-bin/global.cgi?action=getCurrentTime"
+    password_manager = HTTPPasswordMgrWithDefaultRealm()
+    password_manager.add_password(None, url, username, password)
+    opener = build_opener(HTTPDigestAuthHandler(password_manager))
+    try:
+        with opener.open(url, timeout=10) as response:
+            body = response.read().decode("utf-8", errors="ignore").strip()
+    except (HTTPError, URLError, OSError) as exc:
+        logger.warning("Could not query Dahua NVR current time host=%s error=%s", host, exc)
+        return None
+    match = re.search(r"result=(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", body)
+    if not match:
+        logger.warning("Unexpected Dahua getCurrentTime response host=%s body=%s", host, body[:200])
+        return None
+    try:
+        return datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        logger.warning("Could not parse Dahua getCurrentTime response host=%s body=%s", host, body[:200])
+        return None
+
+
+def _current_delayed_seconds(db: Session, *, location_id: int, section: str, cctv: Mapping[str, Any]) -> int:
+    # Recalibrates tds_cctv.delayed_seconds against the NVR's own clock at
+    # most once per calendar day (per location+section camera) instead of on
+    # every single retrieval - delayed_updated_at tracks when this last ran.
+    stored_delayed_seconds = int(cctv.get("delayed_seconds") or 0)
+    delayed_updated_at = _coerce_datetime_value(cctv.get("delayed_updated_at"))
+    today = _time_period_now().date()
+    if delayed_updated_at is not None and delayed_updated_at.date() == today:
+        return stored_delayed_seconds
+
+    try:
+        location = repositories.get_location_endpoint(db, location_id)
+    except Exception:
+        logger.exception("Could not load location endpoint for delayed_seconds recalibration location_id=%s", location_id)
+        return stored_delayed_seconds
+    host = str(location.get("dahua_host") or "").strip()
+    username = str(location.get("dahua_username") or "").strip()
+    password_encrypted = str(location.get("dahua_password_encrypted") or "").strip()
+    if not host or not username or not password_encrypted:
+        return stored_delayed_seconds
+
+    our_time = _time_period_now()
+    nvr_time = _query_dahua_nvr_current_time(host=host, username=username, password=decrypt_secret(password_encrypted))
+    if nvr_time is None:
+        # Couldn't reach the NVR - leave delayed_updated_at untouched so this
+        # is retried on the next retrieval instead of being treated as
+        # "checked today" when it actually failed.
+        return stored_delayed_seconds
+
+    measured_delayed_seconds = int(round((our_time - nvr_time).total_seconds()))
+    try:
+        repositories.update_cctv_delayed_seconds(
+            db,
+            cctv_id=int(cctv["id"]),
+            delayed_seconds=measured_delayed_seconds,
+            delayed_updated_at=our_time,
+        )
+    except Exception:
+        logger.exception("Could not persist recalibrated delayed_seconds cctv_id=%s", cctv.get("id"))
+        return stored_delayed_seconds
+    logger.info(
+        "Recalibrated delayed_seconds location_id=%s section=%s old=%s new=%s nvr_time=%s our_time=%s",
+        location_id,
+        section,
+        stored_delayed_seconds,
+        measured_delayed_seconds,
+        nvr_time.isoformat(),
+        our_time.isoformat(),
+    )
+    return measured_delayed_seconds
+
+
 def _build_retrieval_command(rtsp_url: str, output_path: Path) -> list[str]:
     codec = settings.dahua_output_video_codec.strip()
     threads = str(max(1, int(settings.dahua_ffmpeg_threads)))
@@ -10344,7 +10428,7 @@ def _prepare_video_retrieval(
             )
         cctv = repositories.get_cctv_by_location_section(db, location_id=location_id, section=section)
         location = repositories.get_location_endpoint(db, location_id)
-        delayed_seconds = int(cctv.get("delayed_seconds") or 0)
+        delayed_seconds = _current_delayed_seconds(db, location_id=location_id, section=section, cctv=cctv)
         adjusted_start_time = start_time - timedelta(seconds=delayed_seconds)
         adjusted_end_time = end_time - timedelta(seconds=delayed_seconds)
         rtsp_url = _build_dahua_rtsp_playback_url(
@@ -10388,7 +10472,7 @@ def _prepare_video_retrieval(
         raise ValueError(f"Location {location_id} does not have complete Dahua host credentials configured.")
     dahua_password = decrypt_secret(dahua_password_encrypted)
     rtsp_port = int(location.get("rtsp_port") or settings.dahua_rtsp_port)
-    delayed_seconds = int(cctv.get("delayed_seconds") or 0)
+    delayed_seconds = _current_delayed_seconds(db, location_id=location_id, section=section, cctv=cctv)
     adjusted_start_time = start_time - timedelta(seconds=delayed_seconds)
     adjusted_end_time = end_time - timedelta(seconds=delayed_seconds)
 
@@ -10545,7 +10629,7 @@ def build_retrieval_job_from_video_asset(db: Session, video_asset_id: int) -> Vi
         raise ValueError(f"Location {location_id} does not have complete Dahua host credentials configured.")
     dahua_password = decrypt_secret(dahua_password_encrypted)
     rtsp_port = int(location.get("rtsp_port") or settings.dahua_rtsp_port)
-    delayed_seconds = int(cctv.get("delayed_seconds") or 0)
+    delayed_seconds = _current_delayed_seconds(db, location_id=location_id, section=section, cctv=cctv)
     adjusted_start_time = start_time - timedelta(seconds=delayed_seconds)
     adjusted_end_time = end_time - timedelta(seconds=delayed_seconds)
     rtsp_url = _build_dahua_rtsp_playback_url(
@@ -10616,7 +10700,7 @@ def build_retrieval_job_from_trigger_frame_asset(db: Session, frame_asset_id: in
         raise ValueError(f"Location {location_id} does not have complete Dahua host credentials configured.")
     dahua_password = decrypt_secret(dahua_password_encrypted)
     rtsp_port = int(location.get("rtsp_port") or settings.dahua_rtsp_port)
-    delayed_seconds = int(cctv.get("delayed_seconds") or 0)
+    delayed_seconds = _current_delayed_seconds(db, location_id=location_id, section=section, cctv=cctv)
     adjusted_start_time = start_time - timedelta(seconds=delayed_seconds)
     adjusted_end_time = end_time - timedelta(seconds=delayed_seconds)
     rtsp_url = _build_dahua_rtsp_playback_url(
