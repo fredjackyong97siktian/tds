@@ -7488,10 +7488,22 @@ def _evaluate_carry_item_signal_with_ai(
         "Exit carrying a normal plastic bag with several paid items that fit inside = usually reasonable. "
         "Yellow bag rule: if a yellow bag, yellow plastic bag, or any yellow-colored carried container is visible "
         "anywhere in the carry evidence, set hit=true - this overrides the usual receipt-reasonableness check. "
+        "Concealment-capable entry bag rule: if the customer enters already carrying a bag that could be used to "
+        "conceal small items - a backpack, drawstring bag, shopping tote, or similar closed/semi-closed bag - "
+        "even if that bag looks empty or unremarkable at entry, set entry_bag_conceal_risk=true and hit=true. "
+        "The customer had the opportunity to slip small items into that bag during the visit, so its mere presence "
+        "at entry is itself a risk factor, independent of what the receipt shows. "
+        "Bag-enlarged-in-hand rule: some customers enter holding a plastic bag or woven bag folded, scrunched, or "
+        "bunched up in their hand rather than open and hanging - watch for this. If that same bag appears visibly "
+        "larger, fuller, or more rigid/loaded by exit compared to how it looked folded in hand at entry, this is a "
+        "strong concealment sign - set bag_enlarged_at_exit=true and hit=true, even if the receipt could otherwise "
+        "seem to explain some items, since a bag carried folded like this is a common way to hide items rather than "
+        "purchases. "
         "Use item names, quantity, likely physical size, and total value. Be conservative when evidence is unclear. "
         "Return strict JSON only with schema: "
         '{"hit":true|false,"insufficient_evidence":true|false,"score":number,"reason":string,"entry_bag_count":integer,'
         '"exit_bag_count":integer,"reasonable_with_receipt":true|false,'
+        '"entry_bag_conceal_risk":true|false,"bag_enlarged_at_exit":true|false,'
         '"evidence_summary":string,"suspicious_objects":[string]}. '
         f"Input: {json.dumps(runner_payload, default=str)}"
     )
@@ -7514,6 +7526,8 @@ def _evaluate_carry_item_signal_with_ai(
             "entry_bag_count": _coerce_int(result.get("entry_bag_count"), 0),
             "exit_bag_count": _coerce_int(result.get("exit_bag_count"), 0),
             "reasonable_with_receipt": _as_boolish(result.get("reasonable_with_receipt")),
+            "entry_bag_conceal_risk": _as_boolish(result.get("entry_bag_conceal_risk")),
+            "bag_enlarged_at_exit": _as_boolish(result.get("bag_enlarged_at_exit")),
             "evidence_summary": result.get("evidence_summary"),
             "suspicious_objects": result.get("suspicious_objects") if isinstance(result.get("suspicious_objects"), list) else [],
             "evidence": carry_evidence,
