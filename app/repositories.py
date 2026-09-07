@@ -799,44 +799,12 @@ def list_whitelist_entries(db: Session) -> list[dict[str, Any]]:
     return _fetch_all_dicts(result)
 
 
-def _ensure_list_entry_not_conflicting(
-    db: Session,
-    *,
-    target_table: str,
-    target_label: str,
-    method: str,
-    entry_id: str,
-) -> None:
-    result = db.execute(
-        text(
-            f"""
-            select id
-            from {target_table}
-            where method = :method
-              and entry_id = :entry_id
-            limit 1
-            """
-        ),
-        {"method": method, "entry_id": entry_id},
-    )
-    if result.mappings().first():
-        raise ValueError(f"This entry is already active in the {target_label}. Remove it there before adding it here.")
-
-
 def create_whitelist_entry(db: Session, payload: Mapping[str, Any]) -> dict[str, Any]:
     whitelist_table = _table("whitelist_entry")
-    blacklist_table = _table("blacklist_entry")
     method = _validate_whitelist_method(str(payload.get("method") or ""))
     entry_id = str(payload.get("entry_id") or "").strip()
     if not entry_id:
         raise ValueError("Entry ID is required.")
-    _ensure_list_entry_not_conflicting(
-        db,
-        target_table=blacklist_table,
-        target_label="blacklist",
-        method=method,
-        entry_id=entry_id,
-    )
     result = db.execute(
         text(
             f"""
@@ -877,94 +845,84 @@ def delete_whitelist_entry(db: Session, whitelist_id: int) -> bool:
     return bool(result.rowcount)
 
 
-def list_blacklist_entries(db: Session) -> list[dict[str, Any]]:
-    blacklist_table = _table("blacklist_entry")
-    qrentry = _whitelist_source_config("qrentry")
-    entrylogs = _whitelist_source_config("entrylogs")
+# Blocking a phone number or credit card isn't a TDS-owned record - the
+# door-entry system (sharing this DB) already keys its own access decision
+# off a `status` column on its own phonenumber/fingerprint tables, so
+# blocking just means flipping that column rather than maintaining a
+# separate tds_blacklist_entry table nobody reads at the door.
+_BLOCK_STATUS_OPTIONS: dict[str, tuple[str, ...]] = {
+    "qrentry": ("ACCESS", "BLOCKED"),
+    "entrylogs": ("ACCESS", "BLOCKED", "DEMANDING"),
+}
 
-    result = db.execute(
-        text(
-            f"""
-            select b.id, b.method, b.entry_id, b.criteria, b.status, b.created_at, b.updated_at,
-                   case
-                       when b.method = 'qrentry' then (
-                           select cast(q.{qrentry["display_column"]} as char)
-                           from {qrentry["table_name"]} q
-                           where cast(q.{qrentry["value_column"]} as char) = b.entry_id
-                           limit 1
-                       )
-                       when b.method = 'entrylogs' then (
-                           select cast(e.{entrylogs["display_column"]} as char)
-                           from {entrylogs["table_name"]} e
-                           where cast(e.{entrylogs["value_column"]} as char) = b.entry_id
-                           limit 1
-                       )
-                       else null
-                   end as resolved_value
-            from {blacklist_table} b
-            order by b.created_at desc, b.id desc
-            """
+
+def _validate_block_status(method: str, status_value: str) -> str:
+    normalized = str(status_value or "").strip().upper()
+    allowed = _BLOCK_STATUS_OPTIONS.get(method, ())
+    if normalized not in allowed:
+        raise ValueError(f"Status must be one of {', '.join(allowed)} for this method.")
+    return normalized
+
+
+def list_blocked_entries(db: Session) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for method in ("qrentry", "entrylogs"):
+        source = _whitelist_source_config(method)
+        result = db.execute(
+            text(
+                f"""
+                select cast({source["id_column"]} as char) as entry_id,
+                       cast({source["display_column"]} as char) as display_value,
+                       upper(cast(status as char)) as status,
+                       :method as method
+                from {source["table_name"]}
+                where status is not null
+                  and upper(cast(status as char)) <> 'ACCESS'
+                order by {source["display_column"]} asc
+                """
+            ),
+            {"method": method},
         )
-    )
-    return _fetch_all_dicts(result)
+        rows.extend(_fetch_all_dicts(result))
+    return rows
 
 
-def create_blacklist_entry(db: Session, payload: Mapping[str, Any]) -> dict[str, Any]:
-    blacklist_table = _table("blacklist_entry")
-    whitelist_table = _table("whitelist_entry")
-    method = _validate_whitelist_method(str(payload.get("method") or ""))
-    entry_id = str(payload.get("entry_id") or "").strip()
-    criteria = str(payload.get("criteria") or "").strip()
+def update_entry_status(db: Session, *, method: str, entry_id: str, status_value: str) -> dict[str, Any]:
+    method = _validate_whitelist_method(method)
+    normalized_status = _validate_block_status(method, status_value)
+    entry_id = str(entry_id or "").strip()
     if not entry_id:
         raise ValueError("Entry ID is required.")
-    if not criteria:
-        raise ValueError("Blacklist criteria is required.")
-    _ensure_list_entry_not_conflicting(
-        db,
-        target_table=whitelist_table,
-        target_label="whitelist",
-        method=method,
-        entry_id=entry_id,
-    )
+    source = _whitelist_source_config(method)
     result = db.execute(
         text(
             f"""
-            insert into {blacklist_table} (
-                method, entry_id, criteria, status
-            )
-            values (
-                :method, :entry_id, :criteria, :status
-            )
+            update {source["table_name"]}
+            set status = :status
+            where cast({source["id_column"]} as char) = :entry_id
             """
         ),
-        {
-            "method": method,
-            "entry_id": entry_id,
-            "criteria": criteria,
-            "status": str(payload.get("status") or "active"),
-        },
+        {"status": normalized_status, "entry_id": entry_id},
     )
     db.commit()
-    blacklist_id = int(result.lastrowid)
-    rows = [row for row in list_blacklist_entries(db) if int(row["id"]) == blacklist_id]
-    if not rows:
-        raise ValueError("Blacklist entry not found after create.")
-    return rows[0]
-
-
-def delete_blacklist_entry(db: Session, blacklist_id: int) -> bool:
-    blacklist_table = _table("blacklist_entry")
-    result = db.execute(
+    if not result.rowcount:
+        raise ValueError("Entry not found.")
+    row = db.execute(
         text(
             f"""
-            delete from {blacklist_table}
-            where id = :blacklist_id
+            select cast({source["id_column"]} as char) as entry_id,
+                   cast({source["display_column"]} as char) as display_value,
+                   upper(cast(status as char)) as status
+            from {source["table_name"]}
+            where cast({source["id_column"]} as char) = :entry_id
+            limit 1
             """
         ),
-        {"blacklist_id": blacklist_id},
-    )
-    db.commit()
-    return bool(result.rowcount)
+        {"entry_id": entry_id},
+    ).mappings().first()
+    if not row:
+        raise ValueError("Entry not found after update.")
+    return {**dict(row), "method": method}
 
 
 def list_whitelist_source_options(
@@ -986,6 +944,7 @@ def list_whitelist_source_options(
                        when {source["display_column"]} = {source["label_column"]} then null
                        else cast({source["display_column"]} as char)
                    end as secondary_label,
+                   upper(cast(status as char)) as status,
                    :method as method
             from {source["table_name"]}
             where {source["value_column"]} is not null

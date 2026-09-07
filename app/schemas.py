@@ -68,28 +68,24 @@ class WhitelistEntryResponse(BaseModel):
     updated_at: datetime
 
 
-class BlacklistEntryCreate(BaseModel):
-    method: str = Field(pattern="^(qrentry|entrylogs)$")
-    entry_id: str
-    criteria: str = Field(min_length=1, max_length=5000)
-    status: str = Field(default="active", pattern="^(active|inactive)$")
-
-
-class BlacklistEntryResponse(BaseModel):
-    id: int
+class BlockedEntryResponse(BaseModel):
     method: str
     entry_id: str
-    criteria: str
+    display_value: str | None = None
     status: str
-    resolved_value: str | None = None
-    created_at: datetime
-    updated_at: datetime
+
+
+class UpdateEntryStatusRequest(BaseModel):
+    method: str = Field(pattern="^(qrentry|entrylogs)$")
+    entry_id: str
+    status: str = Field(pattern="^(ACCESS|BLOCKED|DEMANDING)$")
 
 
 class WhitelistSourceOption(BaseModel):
     value: str
     label: str
     secondary_label: str | None = None
+    status: str | None = None
     method: str | None = None
 
 

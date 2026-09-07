@@ -1,35 +1,32 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from .. import repositories
 from ..db import get_transaction_db
-from ..schemas import BlacklistEntryCreate, BlacklistEntryResponse, WhitelistSourceOption
+from ..schemas import BlockedEntryResponse, UpdateEntryStatusRequest, WhitelistSourceOption
 
 
 router = APIRouter(prefix="/api/v1/blacklist", tags=["blacklist"])
 
 
-@router.get("", response_model=list[BlacklistEntryResponse])
-def list_blacklist(db: Session = Depends(get_transaction_db)) -> list[BlacklistEntryResponse]:
-    rows = repositories.list_blacklist_entries(db)
-    return [BlacklistEntryResponse(**row) for row in rows]
+@router.get("", response_model=list[BlockedEntryResponse])
+def list_blacklist(db: Session = Depends(get_transaction_db)) -> list[BlockedEntryResponse]:
+    rows = repositories.list_blocked_entries(db)
+    return [BlockedEntryResponse(**row) for row in rows]
 
 
-@router.post("", response_model=BlacklistEntryResponse, status_code=status.HTTP_201_CREATED)
-def create_blacklist(payload: BlacklistEntryCreate, db: Session = Depends(get_transaction_db)) -> BlacklistEntryResponse:
+@router.patch("/status", response_model=BlockedEntryResponse)
+def update_status(payload: UpdateEntryStatusRequest, db: Session = Depends(get_transaction_db)) -> BlockedEntryResponse:
     try:
-        row = repositories.create_blacklist_entry(db, payload.model_dump())
+        row = repositories.update_entry_status(
+            db,
+            method=payload.method,
+            entry_id=payload.entry_id,
+            status_value=payload.status,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return BlacklistEntryResponse(**row)
-
-
-@router.delete("/{blacklist_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_blacklist(blacklist_id: int, db: Session = Depends(get_transaction_db)) -> Response:
-    deleted = repositories.delete_blacklist_entry(db, blacklist_id)
-    if not deleted:
-        raise HTTPException(status_code=404, detail="Blacklist entry not found.")
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+    return BlockedEntryResponse(**row)
 
 
 @router.get("/source-options", response_model=list[WhitelistSourceOption])
