@@ -2387,6 +2387,34 @@ def _finalize_remote_kiosk_script_run(
             },
         )
 
+    def sync_gemini_script_run_payload(target_script_run_id: int | None, payload: Mapping[str, Any]) -> None:
+        # finish_script_run() (used to close out gemini_script_run_id below)
+        # only ever writes stdout_log/stderr_log, never runner_payload - and
+        # get_session_pipeline_log_details/readGeminiLog specifically reads
+        # runner_payload.gemini_log off whichever "kiosk" script_run has the
+        # highest id (gemini_script_run_id, created after the original
+        # dispatch script_run_id). Without this, that field is never set on
+        # the row the UI actually resolves as "latest", even though
+        # persist_gemini_log correctly wrote it onto the older one.
+        if target_script_run_id is None:
+            return
+        try:
+            existing = repositories.get_script_run(db, target_script_run_id)
+        except Exception:
+            logger.exception(
+                "Could not load gemini script_run for payload sync script_run_id=%s", target_script_run_id
+            )
+            existing = {}
+        repositories.assign_script_run_runner_job(
+            db,
+            target_script_run_id,
+            runner_job_id=str(existing.get("runner_job_id") or ""),
+            runner_payload={
+                **dict(existing.get("runner_payload") or {}),
+                **dict(payload),
+            },
+        )
+
     if result.status != "success":
         repositories.update_video_asset_status(db, video_asset_id, "issue")
         if session_id is not None:
@@ -2494,16 +2522,16 @@ def _finalize_remote_kiosk_script_run(
                 stdout_log=json.dumps(gemini_log, indent=2, default=str),
                 stderr_log="" if gemini_status != "failed" else str(gemini_log.get("error") or "Gemini kiosk summary failed."),
             )
-        persist_gemini_log(
-            {
-                "gemini_log": {
-                    "script_run_id": gemini_script_run_id,
-                    "status": gemini_status,
-                    "cost": gemini_cost,
-                    **{key: value for key, value in gemini_log.items() if key != "status"},
-                }
+        gemini_summary_payload = {
+            "gemini_log": {
+                "script_run_id": gemini_script_run_id,
+                "status": gemini_status,
+                "cost": gemini_cost,
+                **{key: value for key, value in gemini_log.items() if key != "status"},
             }
-        )
+        }
+        persist_gemini_log(gemini_summary_payload)
+        sync_gemini_script_run_payload(gemini_script_run_id, gemini_summary_payload)
     except GeminiKioskSummaryError as exc:
         if gemini_script_run_id is not None:
             repositories.finish_script_run(
@@ -2513,16 +2541,16 @@ def _finalize_remote_kiosk_script_run(
                 stdout_log=json.dumps(dict(exc.diagnostics or {}), indent=2, default=str),
                 stderr_log=str(exc),
             )
-        persist_gemini_log(
-            {
-                "gemini_log": {
-                    "script_run_id": gemini_script_run_id,
-                    "status": "failed",
-                    "error": str(exc),
-                    **dict(exc.diagnostics or {}),
-                }
+        gemini_error_payload = {
+            "gemini_log": {
+                "script_run_id": gemini_script_run_id,
+                "status": "failed",
+                "error": str(exc),
+                **dict(exc.diagnostics or {}),
             }
-        )
+        }
+        persist_gemini_log(gemini_error_payload)
+        sync_gemini_script_run_payload(gemini_script_run_id, gemini_error_payload)
         repositories.update_video_asset_status(db, video_asset_id, "issue")
         stderr = f"{result.stderr}\nTDS API Gemini kiosk summary failed: {exc}".strip()
         repositories.revise_script_run(
@@ -2558,15 +2586,15 @@ def _finalize_remote_kiosk_script_run(
                 stdout_log="",
                 stderr_log=str(exc),
             )
-        persist_gemini_log(
-            {
-                "gemini_log": {
-                    "script_run_id": gemini_script_run_id,
-                    "status": "failed",
-                    "error": str(exc),
-                }
+        gemini_exception_payload = {
+            "gemini_log": {
+                "script_run_id": gemini_script_run_id,
+                "status": "failed",
+                "error": str(exc),
             }
-        )
+        }
+        persist_gemini_log(gemini_exception_payload)
+        sync_gemini_script_run_payload(gemini_script_run_id, gemini_exception_payload)
         repositories.update_video_asset_status(db, video_asset_id, "issue")
         stderr = f"{result.stderr}\nTDS API Gemini kiosk summary failed: {exc}".strip()
         repositories.revise_script_run(
