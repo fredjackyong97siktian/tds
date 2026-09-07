@@ -5781,7 +5781,11 @@ def get_current_month_script_run_cost_summary(db: Session) -> dict[str, Any]:
             "total": 0.0,
             "gemini_total": 0.0,
             "deepseek_total": 0.0,
+            "glm_total": 0.0,
+            "openai_total": 0.0,
+            "openrouter_total": 0.0,
             "runpod_total": 0.0,
+            "other_total": 0.0,
             "locations": [],
         }
 
@@ -5830,20 +5834,32 @@ def get_current_month_script_run_cost_summary(db: Session) -> dict[str, Any]:
                    ) as deepseek_total,
                    sum(
                        case
-                           -- Grouping's script_run rows store a stage label
-                           -- built from the provider-selector key itself
-                           -- (e.g. "openrouter-mimo-v2.5_grouping_direct" -
-                           -- see _grouping_stage_label), while the real
-                           -- OpenRouter vendor string ("xiaomi/mimo-v2.5")
-                           -- only ever appears inside the JSON diagnostics
-                           -- payload, not this column - match both so this
-                           -- bucket is correct regardless of which one a
-                           -- given script_run happens to carry.
-                           when cr.model_name like 'openrouter-mimo-v2.5%' then cr.cost_amount
-                           when cr.model_name like 'xiaomi/mimo-v2.5%' then cr.cost_amount
+                           when cr.cost_source like '%glm%' then cr.cost_amount
                            else 0
                        end
-                   ) as mimo_total,
+                   ) as glm_total,
+                   sum(
+                       case
+                           when cr.cost_source like '%openai%' then cr.cost_amount
+                           else 0
+                       end
+                   ) as openai_total,
+                   sum(
+                       case
+                           -- OpenRouter always writes this exact cost_source
+                           -- (see _record_openrouter_cost) regardless of which
+                           -- OpenRouter-hosted model actually ran - unlike
+                           -- model_name, which varies per model and even per
+                           -- call site (a provider-key label like
+                           -- "openrouter-mimo-v2.5_grouping_direct" for
+                           -- grouping/kiosk, or the raw vendor string like
+                           -- "xiaomi/mimo-v2.5" elsewhere) - so matching on
+                           -- cost_source is the one bucket that can't silently
+                           -- miss a model, current or future.
+                           when cr.cost_source = 'openrouter_actual' then cr.cost_amount
+                           else 0
+                       end
+                   ) as openrouter_total,
                    sum(
                        case
                            -- A batch's cost_source can be a combined
@@ -5855,8 +5871,9 @@ def get_current_month_script_run_cost_summary(db: Session) -> dict[str, Any]:
                            -- toward deepseek_total only, not both, to avoid
                            -- double-counting the same dollar in two buckets.
                            when cr.cost_source like '%deepseek%' then 0
-                           when cr.model_name like 'openrouter-mimo-v2.5%' then 0
-                           when cr.model_name like 'xiaomi/mimo-v2.5%' then 0
+                           when cr.cost_source like '%glm%' then 0
+                           when cr.cost_source like '%openai%' then 0
+                           when cr.cost_source = 'openrouter_actual' then 0
                            when cr.cost_source like '%gemini%' then cr.cost_amount
                            when cr.cost_source = ''
                              and (cr.model_name like 'gemini%' or cr.script_name in ('grouping', 'carry_confidence', 'grouping_repair'))
@@ -5871,7 +5888,28 @@ def get_current_month_script_run_cost_summary(db: Session) -> dict[str, Any]:
                            then cr.cost_amount
                            else 0
                        end
-                   ) as runpod_total
+                   ) as runpod_total,
+                   sum(
+                       case
+                           -- Safety net: anything not claimed by a bucket
+                           -- above still lands here instead of silently
+                           -- vanishing from the breakdown while still
+                           -- counting toward `total` (this is exactly how the
+                           -- old query hid glm/openai/qwen spend before this
+                           -- bucket existed - MM stayed $0 while total kept
+                           -- climbing).
+                           when cr.cost_source like '%deepseek%' then 0
+                           when cr.cost_source like '%glm%' then 0
+                           when cr.cost_source like '%openai%' then 0
+                           when cr.cost_source = 'openrouter_actual' then 0
+                           when cr.cost_source like '%gemini%' then 0
+                           when cr.cost_source = ''
+                             and (cr.model_name like 'gemini%' or cr.script_name in ('grouping', 'carry_confidence', 'grouping_repair'))
+                           then 0
+                           when cr.cost_source like '%runpod%' or cr.model_name = 'runpod_runner' then 0
+                           else cr.cost_amount
+                       end
+                   ) as other_total
             from cost_rows cr
             left join {location_table} l on l.{location_id_column} = cr.location_id
             group by cr.cost_currency, cr.location_id, l.{location_name_column}
@@ -5886,19 +5924,28 @@ def get_current_month_script_run_cost_summary(db: Session) -> dict[str, Any]:
     total = 0.0
     gemini_total = 0.0
     deepseek_total = 0.0
-    mimo_total = 0.0
+    glm_total = 0.0
+    openai_total = 0.0
+    openrouter_total = 0.0
     runpod_total = 0.0
+    other_total = 0.0
     for row in rows:
         row_total = float(row.get("total") or 0)
         row_gemini_total = float(row.get("gemini_total") or 0)
         row_deepseek_total = float(row.get("deepseek_total") or 0)
-        row_mimo_total = float(row.get("mimo_total") or 0)
+        row_glm_total = float(row.get("glm_total") or 0)
+        row_openai_total = float(row.get("openai_total") or 0)
+        row_openrouter_total = float(row.get("openrouter_total") or 0)
         row_runpod_total = float(row.get("runpod_total") or 0)
+        row_other_total = float(row.get("other_total") or 0)
         total += row_total
         gemini_total += row_gemini_total
         deepseek_total += row_deepseek_total
-        mimo_total += row_mimo_total
+        glm_total += row_glm_total
+        openai_total += row_openai_total
+        openrouter_total += row_openrouter_total
         runpod_total += row_runpod_total
+        other_total += row_other_total
         if row.get("location_id") is None:
             continue
         locations.append(
@@ -5908,8 +5955,11 @@ def get_current_month_script_run_cost_summary(db: Session) -> dict[str, Any]:
                 "total": row_total,
                 "gemini_total": row_gemini_total,
                 "deepseek_total": row_deepseek_total,
-                "mimo_total": row_mimo_total,
+                "glm_total": row_glm_total,
+                "openai_total": row_openai_total,
+                "openrouter_total": row_openrouter_total,
                 "runpod_total": row_runpod_total,
+                "other_total": row_other_total,
             }
         )
 
@@ -5919,8 +5969,11 @@ def get_current_month_script_run_cost_summary(db: Session) -> dict[str, Any]:
         "total": total,
         "gemini_total": gemini_total,
         "deepseek_total": deepseek_total,
-        "mimo_total": mimo_total,
+        "glm_total": glm_total,
+        "openai_total": openai_total,
+        "openrouter_total": openrouter_total,
         "runpod_total": runpod_total,
+        "other_total": other_total,
         "locations": locations,
     }
 

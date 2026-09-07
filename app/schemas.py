@@ -343,7 +343,11 @@ class ScriptRunLocationCostResponse(BaseModel):
     total: float = 0
     gemini_total: float = 0
     deepseek_total: float = 0
+    glm_total: float = 0
+    openai_total: float = 0
+    openrouter_total: float = 0
     runpod_total: float = 0
+    other_total: float = 0
 
 
 class ScriptRunMonthlyCostSummaryResponse(BaseModel):
@@ -352,7 +356,11 @@ class ScriptRunMonthlyCostSummaryResponse(BaseModel):
     total: float = 0
     gemini_total: float = 0
     deepseek_total: float = 0
+    glm_total: float = 0
+    openai_total: float = 0
+    openrouter_total: float = 0
     runpod_total: float = 0
+    other_total: float = 0
     locations: list[ScriptRunLocationCostResponse] = Field(default_factory=list)
 
 
