@@ -1895,11 +1895,31 @@ def _identity_reference_image_urls_for_session(db: Session, session_id: int | No
     return entry_urls + exit_urls
 
 
+def _entry_customer_count_for_session(db: Session, session_id: int | None) -> int | None:
+    # unique_customer_count is a grouping-stage estimate of how many distinct
+    # people were visible together in the entry trigger's own frames - a
+    # rough headcount hint for the kiosk model, not a guarantee (the kiosk
+    # footage itself is still the definitive source for who's actually there).
+    if session_id is None:
+        return None
+    try:
+        session_row = repositories.get_session(db, int(session_id))
+        entry_trigger_id = session_row.get("entry_trigger_id")
+        if entry_trigger_id is None:
+            return None
+        count = repositories.get_trigger(db, int(entry_trigger_id)).get("unique_customer_count")
+        return int(count) if count is not None else None
+    except Exception:
+        logger.exception("Could not load entry customer count for session_id=%s", session_id)
+        return None
+
+
 def _complete_kiosk_summary_with_tds_gemini(
     db: Session,
     kiosk_summary: dict[str, Any] | None,
     *,
     identity_reference_image_urls: list[str] | None = None,
+    expected_customer_count: int | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     if not kiosk_summary:
         return kiosk_summary, {
@@ -1971,6 +1991,14 @@ def _complete_kiosk_summary_with_tds_gemini(
             call_image_urls = image_urls
             if identity_reference_image_urls:
                 call_image_urls = list(identity_reference_image_urls) + image_urls
+                customer_count_hint = (
+                    f"Entrance analysis estimated approximately {expected_customer_count} customer"
+                    f"{'s' if expected_customer_count != 1 else ''} entered together in this group - use this only "
+                    "as a rough guide for how many distinct people to expect, not a guarantee; the kiosk footage "
+                    "itself is the definitive source for who is actually there. "
+                    if expected_customer_count is not None and expected_customer_count > 0
+                    else ""
+                )
                 call_prompt = (
                     f"Images 1 to {len(identity_reference_image_urls)} show the store customer whose entry and "
                     "exit are already confirmed - this is the specific customer you must evaluate. The remaining "
@@ -1979,6 +2007,7 @@ def _complete_kiosk_summary_with_tds_gemini(
                     "in the reference images, based on clothing, build, and hair - do not assume it is whichever "
                     "person the evidence happens to be centered on. Only count items carried out by that confirmed "
                     "customer; ignore items associated with any other person visible in the kiosk evidence. "
+                    + customer_count_hint
                 ) + prompt
             try:
                 vlm_result, vlm_meta = _call_kiosk_vision(db, prompt=call_prompt, image_urls=call_image_urls)
@@ -2503,10 +2532,12 @@ def _finalize_remote_kiosk_script_run(
         )
     try:
         identity_reference_image_urls = _identity_reference_image_urls_for_session(db, session_id)
+        expected_customer_count = _entry_customer_count_for_session(db, session_id)
         completed_kiosk_summary, gemini_log = _complete_kiosk_summary_with_tds_gemini(
             db,
             remote_result.kiosk_summary,
             identity_reference_image_urls=identity_reference_image_urls,
+            expected_customer_count=expected_customer_count,
         )
         gemini_status = str(gemini_log.get("status") or "success")
         gemini_cost = (
