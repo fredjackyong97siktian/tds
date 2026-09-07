@@ -1825,22 +1825,33 @@ def _usage_cost_for_call_meta(call_meta: Mapping[str, Any]) -> tuple[float | Non
 
 
 def _count_items_from_kiosk_vlm_result(result: Mapping[str, Any]) -> int:
-    for key in ("suspected_total_count", "confirmed_visible_count", "total_items_taken_out"):
+    # customers_left_with_items is the model's explicit per-customer "who
+    # carried what out" breakdown - the most directly attributable count, so
+    # it takes priority whenever present. Falling back to a top-level field
+    # first (as this used to) meant a response with a real, non-empty
+    # customer breakdown but a merely-present suspected_total_count of 0
+    # (a "no *additional hidden* items suspected" signal, not "nothing was
+    # taken") silently reported 0 regardless of what was actually confirmed.
+    has_customer_breakdown = False
+    total_from_customers = 0
+    for item in result.get("customers_left_with_items") or []:
+        if not isinstance(item, Mapping):
+            continue
+        has_customer_breakdown = True
+        try:
+            total_from_customers += max(0, int(item.get("carried_out_count") or 0))
+        except (TypeError, ValueError):
+            continue
+    if has_customer_breakdown:
+        return total_from_customers
+    for key in ("confirmed_visible_count", "total_items_taken_out", "suspected_total_count"):
         try:
             value = int(result.get(key) or 0)
             if value >= 0:
                 return value
         except (TypeError, ValueError):
             continue
-    total = 0
-    for item in result.get("customers_left_with_items") or []:
-        if not isinstance(item, Mapping):
-            continue
-        try:
-            total += max(0, int(item.get("carried_out_count") or 0))
-        except (TypeError, ValueError):
-            continue
-    return total
+    return 0
 
 
 def _trigger_frame_image_urls_for_identity(db: Session, trigger_id: int | None, *, limit: int = 6) -> list[str]:
