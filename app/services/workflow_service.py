@@ -2493,7 +2493,7 @@ def _finalize_remote_kiosk_script_run(
             session_id=int(session_id) if session_id is not None else None,
             trigger_id=None,
             script_name="kiosk",
-            model_name="gemini_kiosk_summary",
+            model_name=f"{_current_kiosk_model_name(db)}_kiosk_summary",
             runner_payload={
                 "parent_script_run_id": result.script_run_id,
                 "video_asset_id": video_asset_id,
