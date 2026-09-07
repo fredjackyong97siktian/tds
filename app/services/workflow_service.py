@@ -8365,11 +8365,25 @@ def _run_theft_confidence_for_grouping_batch_locked(
                     grouping_id=batch_id,
                 )
                 created_session_ids.add(session_id)
+                exit_trigger_time: datetime | None = None
+                for exit_trigger_id in exit_trigger_ids:
+                    try:
+                        candidate_time = _coerce_datetime_value(
+                            repositories.get_trigger(db, int(exit_trigger_id)).get("trigger_time")
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Could not load exit trigger time for kiosk window extension trigger_id=%s", exit_trigger_id
+                        )
+                        continue
+                    if candidate_time is not None and (exit_trigger_time is None or candidate_time > exit_trigger_time):
+                        exit_trigger_time = candidate_time
                 kiosk_kickoff = _kickoff_kiosk_pipeline_for_session(
                     db,
                     session_id=session_id,
                     location_id=location_id,
                     transactions=transactions,
+                    exit_trigger_time=exit_trigger_time,
                 )
                 logger.info(
                     "Kiosk pipeline kickoff group_key=%s session_id=%s status=%s video_asset_ids=%s",
@@ -8471,6 +8485,7 @@ def _prepare_session_kiosk_pipeline(
     location_id: int,
     session_start_time: datetime,
     session_end_time: datetime,
+    exit_trigger_time: datetime | None = None,
 ) -> tuple[int, dict[str, Any], list[tuple[datetime, datetime]]]:
     paid_transactions = repositories.list_paid_transactions_for_session_window(
         db,
@@ -8493,6 +8508,7 @@ def _prepare_session_kiosk_pipeline(
             initiated_at=_utc_naive_to_local(_coerce_datetime_value(transaction.get("initiated_at"))),
             payment_attempt_at=_utc_naive_to_local(_coerce_datetime_value(transaction.get("payment_attempt_at"))),
             fallback_time=transaction_time,
+            exit_trigger_time=exit_trigger_time,
         )
         raw_windows.append((window_start, window_end))
         transaction_summaries.append(
@@ -9180,6 +9196,7 @@ def _build_transaction_window_bounds(
     initiated_at: datetime | None,
     payment_attempt_at: datetime | None,
     fallback_time: datetime,
+    exit_trigger_time: datetime | None = None,
 ) -> tuple[datetime, datetime]:
     # Brackets the window with the two real events that actually span the
     # customer's kiosk interaction - initiatedAt (start scanning) to
@@ -9191,10 +9208,19 @@ def _build_transaction_window_bounds(
     end_anchor = payment_attempt_at or fallback_time
     before_padding_seconds = max(0, int(settings.kiosk_transaction_extra_before_seconds))
     after_padding_seconds = max(0, int(settings.kiosk_transaction_extra_after_seconds))
-    return (
-        start_anchor - timedelta(seconds=before_padding_seconds),
-        end_anchor + timedelta(seconds=after_padding_seconds),
-    )
+    window_start = start_anchor - timedelta(seconds=before_padding_seconds)
+    window_end = end_anchor + timedelta(seconds=after_padding_seconds)
+    # A later exit trigger means the customer was still around after payment -
+    # extend toward it, capped so a bogus/very-late exit trigger can't balloon
+    # the retrieval window. An exit trigger at or before window_end is either
+    # stale or simply not informative here, so it's ignored rather than
+    # shrinking the window back.
+    if exit_trigger_time is not None and exit_trigger_time > window_end:
+        max_extended_end = window_end + timedelta(
+            seconds=max(0, int(settings.kiosk_exit_trigger_extend_max_seconds))
+        )
+        window_end = min(exit_trigger_time, max_extended_end)
+    return (window_start, window_end)
 
 
 def _merge_time_windows(windows: list[tuple[datetime, datetime]]) -> list[tuple[datetime, datetime]]:
@@ -9219,6 +9245,7 @@ def _kickoff_kiosk_pipeline_for_session(
     session_id: int,
     location_id: int,
     transactions: list[Mapping[str, Any]],
+    exit_trigger_time: datetime | None = None,
 ) -> dict[str, Any]:
     """Starts the kiosk pipeline for a session confidence just flagged for deep
     analysis - with entrance analysis disabled, nothing else does this anymore.
@@ -9268,6 +9295,7 @@ def _kickoff_kiosk_pipeline_for_session(
                 initiated_at=_utc_naive_to_local(_coerce_datetime_value(transaction.get("initiated_at"))),
                 payment_attempt_at=_utc_naive_to_local(_coerce_datetime_value(transaction.get("payment_attempt_at"))),
                 fallback_time=transaction_time,
+                exit_trigger_time=exit_trigger_time,
             )
         )
 
@@ -9345,12 +9373,20 @@ def _maybe_close_session_and_prepare_kiosk(
         )
         return
 
+    exit_trigger_time: datetime | None = None
+    if exit_trigger_id is not None:
+        try:
+            exit_trigger_time = _coerce_datetime_value(repositories.get_trigger(db, int(exit_trigger_id)).get("trigger_time"))
+        except Exception:
+            logger.exception("Could not load exit trigger time for kiosk window extension trigger_id=%s", exit_trigger_id)
+
     total_transaction_items, session_close_summary, selected_windows = _prepare_session_kiosk_pipeline(
         db,
         session_id=session_id,
         location_id=int(session["location_id"]),
         session_start_time=session_start_time,
         session_end_time=session_end_time,
+        exit_trigger_time=exit_trigger_time,
     )
     repositories.update_session_fields(
         db,
@@ -11562,12 +11598,21 @@ def ensure_kiosk_video_assets_for_session(db: Session, session_id: int) -> list[
             )
             return []
 
+        exit_trigger_id = session.get("exit_trigger_id")
+        exit_trigger_time: datetime | None = None
+        if exit_trigger_id is not None:
+            try:
+                exit_trigger_time = _coerce_datetime_value(repositories.get_trigger(db, int(exit_trigger_id)).get("trigger_time"))
+            except Exception:
+                logger.exception("Could not load exit trigger time for kiosk window extension trigger_id=%s", exit_trigger_id)
+
         total_transaction_items, prepared_summary, recomputed_windows = _prepare_session_kiosk_pipeline(
             db,
             session_id=session_id,
             location_id=int(session["location_id"]),
             session_start_time=session_start_time,
             session_end_time=session_end_time,
+            exit_trigger_time=exit_trigger_time,
         )
         prepared_pipeline = dict(prepared_summary.get("session_close_pipeline") or {})
         if not recomputed_windows and prepared_pipeline.get("transaction_identification"):

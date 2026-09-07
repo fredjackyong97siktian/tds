@@ -96,6 +96,13 @@ class Settings(BaseSettings):
     # Timestamp fallback) window bounds - see _build_transaction_window_bounds.
     kiosk_transaction_extra_before_seconds: int = 10
     kiosk_transaction_extra_after_seconds: int = 20
+    # If the exit trigger fires after paymentAttemptAt + the padding above,
+    # extend the kiosk window end toward the exit trigger's own time (the
+    # customer may still be lingering/walking out) - but only ever by up to
+    # this many extra seconds, and only when the exit trigger is actually
+    # later than the already-computed end (a stale/earlier exit trigger is
+    # ignored rather than shrinking the window). See _build_transaction_window_bounds.
+    kiosk_exit_trigger_extend_max_seconds: int = 60
     whitelist_qrentry_table_name: str = "phonenumber"
     whitelist_qrentry_id_column: str = "id"
     whitelist_qrentry_value_column: str = "id"
