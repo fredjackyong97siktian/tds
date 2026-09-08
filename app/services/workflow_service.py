@@ -24,6 +24,7 @@ from urllib.request import (
     build_opener,
     urlopen,
 )
+from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import text
@@ -4777,6 +4778,77 @@ def create_self_grouping_batch(
         "ignored_count": len(available_trigger_ids - used_trigger_ids),
         "message": f"Self grouping batch #{batch_id} created.",
     }
+
+
+def add_manual_group_to_grouping_batch(
+    db: Session,
+    *,
+    batch_id: int,
+    entry_trigger_ids: list[Any],
+    exit_trigger_ids: list[Any],
+    total_customer: int = 1,
+) -> dict[str, Any]:
+    # For pairing an "Ungrouped Trigger" the model left in open_entries/unknown
+    # by hand from the dashboard, without redoing the AI pass over the whole
+    # batch (which would touch every other already-grouped trigger too).
+    batch = repositories.get_grouping_batch(db, batch_id)
+    grouping_summary = batch.get("result_payload")
+    if not isinstance(grouping_summary, Mapping):
+        raise ValueError(f"Grouping batch {batch_id} does not have a result payload yet.")
+    grouping_summary = dict(grouping_summary)
+
+    entry_ids = _group_trigger_id_list(entry_trigger_ids)
+    exit_ids = [trigger_id for trigger_id in _group_trigger_id_list(exit_trigger_ids) if trigger_id not in entry_ids]
+    if len(entry_ids) != 1:
+        raise ValueError("A manual group must have exactly one entry trigger.")
+
+    open_entries = _group_trigger_id_list(grouping_summary.get("open_entries"))
+    unknown = _group_trigger_id_list(grouping_summary.get("unknown"))
+    ungrouped_ids = set(open_entries) | set(unknown)
+    requested_ids = set(entry_ids) | set(exit_ids)
+    not_ungrouped = requested_ids - ungrouped_ids
+    if not_ungrouped:
+        raise ValueError(
+            f"Trigger(s) {sorted(not_ungrouped)} are not in this batch's open_entries/unknown list - "
+            "they may already be grouped or belong to a different batch."
+        )
+
+    existing_frame_payloads = {
+        int(item["trigger_id"]): item.get("frame_payload")
+        for item in repositories.list_grouping_items(db, batch_id)
+        if item.get("trigger_id") is not None
+    }
+
+    group_key = f"manual_{uuid4().hex[:8]}"
+    group = {
+        "group_id": group_key,
+        "entry": entry_ids,
+        "exit": exit_ids,
+        "score": 1.0,
+        "reason": "manually_grouped_by_user",
+        "source": "manual_add",
+        "total_customer": max(1, int(total_customer)),
+    }
+    for role, trigger_ids in (("entry", entry_ids), ("exit", exit_ids)):
+        for trigger_id in trigger_ids:
+            repositories.upsert_grouping_item(
+                db,
+                batch_id=batch_id,
+                trigger_id=trigger_id,
+                video_asset_id=None,
+                group_key=group_key,
+                role=role,
+                status="grouped",
+                score=1.0,
+                frame_payload=existing_frame_payloads.get(trigger_id),
+                result_payload=group,
+            )
+
+    grouping_summary["groups"] = [*(grouping_summary.get("groups") or []), group]
+    grouping_summary["open_entries"] = [trigger_id for trigger_id in open_entries if trigger_id not in requested_ids]
+    grouping_summary["unknown"] = [trigger_id for trigger_id in unknown if trigger_id not in requested_ids]
+    updated_batch = repositories.update_grouping_batch(db, batch_id, {"result_payload": grouping_summary})
+    return {"ok": True, "batch_id": batch_id, "batch": updated_batch, "group": group}
 
 
 def build_grouping_analysis_job_from_batch(db: Session, batch_id: int) -> GroupingAnalysisQueued:

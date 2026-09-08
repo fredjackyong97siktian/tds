@@ -63,6 +63,12 @@ class SelfGroupingPayload(BaseModel):
     groups: list[SelfGroupingGroupPayload]
 
 
+class ManualGroupPayload(BaseModel):
+    entry: list[int]
+    exit: list[int] = []
+    total_customer: int | None = None
+
+
 @router.get("/time-periods")
 def list_time_periods(db: Session = Depends(get_transaction_db)) -> list[dict[str, Any]]:
     return repositories.list_filter_time_periods(db)
@@ -341,6 +347,24 @@ def create_self_grouping(payload: SelfGroupingPayload, db: Session = Depends(get
             start_time=payload.start_time,
             end_time=payload.end_time,
             groups=[group.model_dump() for group in payload.groups],
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/grouping-batches/{batch_id}/manual-group")
+def add_manual_group(
+    batch_id: int,
+    payload: ManualGroupPayload,
+    db: Session = Depends(get_transaction_db),
+) -> dict[str, Any]:
+    try:
+        return workflow_service.add_manual_group_to_grouping_batch(
+            db,
+            batch_id=batch_id,
+            entry_trigger_ids=payload.entry,
+            exit_trigger_ids=payload.exit,
+            total_customer=payload.total_customer or 1,
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
