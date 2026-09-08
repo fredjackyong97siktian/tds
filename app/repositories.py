@@ -3038,17 +3038,26 @@ def reset_incorrectly_staled_frame_assets_outside_periods(
 
 def reset_all_issue_frame_assets_within_periods(
     db: Session, *, location_id: int, selected_periods: list[Mapping[str, Any]]
-) -> int:
-    # Unconditional: every trigger whose time-of-day falls inside one of this
-    # location's selected periods gets a fresh shot before grouping runs,
-    # regardless of status/error reason, no exceptions. Run every cycle,
-    # right before batch construction, so nothing sits stuck at 'issue' just
-    # because of what put it there.
+) -> dict[str, int]:
+    # Every trigger whose time-of-day falls inside a selected period gets a
+    # fresh shot before grouping runs - but which repair path depends on WHY
+    # it's 'issue':
+    #   - Flagged by the staleness sweep (STALE_OPEN_ENTRY_ISSUE_ERROR): the
+    #     frames themselves were already captured fine - "no matching exit
+    #     found" is a grouping outcome, not a retrieval failure - so it's
+    #     safe to put it straight back to 'retrieved' for grouping to
+    #     reconsider.
+    #   - 'issue' for any other reason (a genuine retrieval problem, e.g.
+    #     frames only partially captured): resetting straight to 'retrieved'
+    #     would claim frame data that doesn't really exist. Route it back to
+    #     'not_retrieved' instead so the retrieval worker actually attempts a
+    #     real re-capture - if that still fails, its own error handling
+    #     leaves it at 'issue' again rather than faking a 'retrieved' state.
     if not selected_periods:
-        return 0
+        return {"reset_to_retrieved": 0, "requeued_for_retrieval": 0}
     frame_asset_table = _table("trigger_frame_asset")
     period_clauses: list[str] = []
-    params: dict[str, Any] = {"location_id": location_id}
+    params: dict[str, Any] = {"location_id": location_id, "stale_error": STALE_OPEN_ENTRY_ISSUE_ERROR}
     for index, period in enumerate(selected_periods):
         start_key = f"period_start_{index}"
         end_key = f"period_end_{index}"
@@ -3061,11 +3070,31 @@ def reset_all_issue_frame_assets_within_periods(
             f")"
         )
     within_any_period_filter = " or ".join(period_clauses)
-    result = db.execute(
+    # Order matters: this UPDATE only touches the stale-flagged rows and
+    # flips them out of 'issue' first, so the second UPDATE below (which
+    # matches on status = 'issue' alone) naturally only reaches whatever's
+    # left - no need to re-exclude the stale ones explicitly.
+    reset_to_retrieved = db.execute(
         text(
             f"""
             update {frame_asset_table}
             set status = 'retrieved',
+                error = null,
+                updated_at = now()
+            where location_id = :location_id
+              and status = 'issue'
+              and error = :stale_error
+              and ({within_any_period_filter})
+            """
+        ),
+        params,
+    )
+    db.commit()
+    requeued_for_retrieval = db.execute(
+        text(
+            f"""
+            update {frame_asset_table}
+            set status = 'not_retrieved',
                 error = null,
                 updated_at = now()
             where location_id = :location_id
@@ -3076,7 +3105,10 @@ def reset_all_issue_frame_assets_within_periods(
         params,
     )
     db.commit()
-    return int(result.rowcount or 0)
+    return {
+        "reset_to_retrieved": int(reset_to_retrieved.rowcount or 0),
+        "requeued_for_retrieval": int(requeued_for_retrieval.rowcount or 0),
+    }
 
 
 def list_stale_open_entry_frame_assets(

@@ -4369,26 +4369,28 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
         if not selected_periods:
             continue
         # Give every trigger inside a selected period a fresh shot before
-        # grouping runs, regardless of why it's currently 'issue' - no
-        # exceptions. Runs BEFORE the staleness sweep below on purpose: a
-        # trigger that's genuinely too old (>30min, never grouped) gets
-        # re-flagged issue again immediately by that sweep, in this same
-        # cycle, before ready_assets is queried - so the give-up mechanism
-        # still holds for truly stale entries, but anything issue'd for a
-        # different, non-staleness reason (a retrieval hiccup, a prior
-        # "no visible person" false negative, etc.) gets re-included every
-        # cycle instead of sitting stuck.
-        reset_all_issue_count = repositories.reset_all_issue_frame_assets_within_periods(
+        # grouping runs, regardless of why it's currently 'issue' - staleness
+        # goes straight back to 'retrieved' (frames were already fine, only
+        # grouping gave up); anything else is genuinely re-queued for a real
+        # retrieval attempt instead of just claiming 'retrieved'. Runs BEFORE
+        # the staleness sweep below on purpose: a trigger that's genuinely
+        # too old (>30min, never grouped) gets re-flagged issue again
+        # immediately by that sweep, in this same cycle, before ready_assets
+        # is queried - so the give-up mechanism still holds for truly stale
+        # entries.
+        issue_reset_counts = repositories.reset_all_issue_frame_assets_within_periods(
             db,
             location_id=location_id,
             selected_periods=selected_periods,
         )
-        if reset_all_issue_count:
+        if issue_reset_counts["reset_to_retrieved"] or issue_reset_counts["requeued_for_retrieval"]:
             logger.info(
-                "Reset %s 'issue' trigger_frame_asset row(s) back to 'retrieved' at location_id=%s "
-                "ahead of this cycle's batch construction",
-                reset_all_issue_count,
+                "location_id=%s ahead of this cycle's batch construction: reset %s stale-flagged "
+                "trigger_frame_asset row(s) straight to 'retrieved', re-queued %s other 'issue' "
+                "row(s) for a real retrieval retry",
                 location_id,
+                issue_reset_counts["reset_to_retrieved"],
+                issue_reset_counts["requeued_for_retrieval"],
             )
         # An entry left open in a prior, already-finalized batch has no window
         # of its own left to be picked up in - without this, it (and whatever
