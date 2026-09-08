@@ -4406,6 +4406,22 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
             period_window_start, period_window_end = _last_completed_period_window(period, now=current)
             if not _is_recently_completed_grouping_window(period_window_end, current):
                 continue
+            # A window with a batch already built for it won't get a NEW one
+            # this cycle either (see "if existing is not None: continue"
+            # below) - resetting triggers for it here would be just as
+            # pointless as resetting for a wrong-calendar-day window: nothing
+            # will consume them, and the staleness sweep flags them right
+            # back before the next cycle. Only reset for a window that will
+            # genuinely get a fresh batch-build attempt this cycle.
+            period_code = str(period.get("period_code") or "period")
+            if repositories.get_grouping_batch_by_window(
+                db,
+                location_id=location_id,
+                period_code=period_code,
+                window_start=period_window_start,
+                window_end=period_window_end,
+            ):
+                continue
             due_windows.append(
                 (
                     period_window_start
