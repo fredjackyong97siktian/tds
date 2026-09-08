@@ -4902,6 +4902,16 @@ def add_manual_group_to_grouping_batch(
                 )
                 confidence_skipped_reason = "confidence_scoring_failed"
             finally:
+                # See the matching comment in run_theft_confidence_for_grouping_batch -
+                # without rolling back first, release_lock silently fails to run
+                # on a session left in a broken-transaction state, orphaning the
+                # lock on this connection forever.
+                try:
+                    db.rollback()
+                except Exception:
+                    logger.exception(
+                        "Could not roll back session before releasing theft-confidence lock batch_id=%s", batch_id
+                    )
                 db.execute(text("select release_lock(:lock_name)"), {"lock_name": lock_name})
 
     return {
@@ -7077,6 +7087,14 @@ def retry_grouping_batch_now(db: Session, *, batch_id: int) -> dict[str, Any]:
     try:
         return _retry_grouping_batch_now_locked(db, batch_id=batch_id)
     finally:
+        # See the matching comment in run_theft_confidence_for_grouping_batch -
+        # a DB error inside the locked call leaves this session's transaction
+        # broken, and release_lock would silently fail to run on it without
+        # rolling back first, orphaning the lock on this connection forever.
+        try:
+            db.rollback()
+        except Exception:
+            logger.exception("Could not roll back session before releasing theft-confidence lock batch_id=%s", batch_id)
         db.execute(text("select release_lock(:lock_name)"), {"lock_name": lock_name})
 
 
@@ -8308,6 +8326,18 @@ def run_theft_confidence_for_grouping_batch(
     try:
         return _run_theft_confidence_for_grouping_batch_locked(db, batch_id=batch_id)
     finally:
+        # If the locked call raised a real DB error, this session is left in a
+        # failed-transaction state - trying to run release_lock on it directly
+        # would itself fail (silently, from the caller's perspective), leaving
+        # the lock orphaned on whatever connection this session used, forever
+        # (named locks aren't tied to the transaction, so they survive the
+        # rollback and just sit there until that exact connection happens to
+        # be reused for this same call again, or the process restarts).
+        # Rolling back first guarantees release_lock always actually runs.
+        try:
+            db.rollback()
+        except Exception:
+            logger.exception("Could not roll back session before releasing theft-confidence lock batch_id=%s", batch_id)
         db.execute(text("select release_lock(:lock_name)"), {"lock_name": lock_name})
 
 
