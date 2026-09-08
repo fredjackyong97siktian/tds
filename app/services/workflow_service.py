@@ -6838,6 +6838,21 @@ def _finalize_remote_grouping_script_run(
     script_run: dict[str, Any],
     remote_result: RemoteRunnerResult,
 ) -> ScriptExecutionResult:
+    if (
+        str(script_run.get("status") or "").strip().lower() != "running"
+        and not _script_run_was_stale_timeout_forced(script_run)
+    ):
+        return ScriptExecutionResult(
+            script_run_id=int(script_run["id"]),
+            runner_job_id=str(script_run.get("runner_job_id") or ""),
+            script_name="grouping",
+            model_name=script_run.get("model_name"),
+            status=str(script_run.get("status") or "success"),
+            command=["runpod_serverless", "grouping"],
+            stdout=str(script_run.get("stdout_log") or ""),
+            stderr=str(script_run.get("stderr_log") or ""),
+            message="Runpod callback already processed for this script run.",
+        )
     script_run_id = int(script_run["id"])
     runner_payload = dict(script_run.get("runner_payload") or {})
     batch_id = int(runner_payload["batch_id"]) if runner_payload.get("batch_id") is not None else None
