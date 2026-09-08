@@ -13,11 +13,6 @@ from .config import settings
 PAID_TRANSACTION_ID_COLUMN = "receiptNumber"
 PAID_TRANSACTION_TIME_COLUMN = "Formatted Timestamp"
 PAID_TRANSACTION_DATABASE = "sesamedb"
-# Legacy error string: the staleness sweep that used to write this has been
-# removed (it caused a permanent reset/re-flag loop for some triggers).
-# list_stale_open_entry_frame_assets() still reads it back for any rows a
-# prior deploy already flagged this way, but nothing writes it anymore.
-STALE_OPEN_ENTRY_ISSUE_ERROR = "No matching exit found before the open-entry staleness cutoff."
 _COLUMN_EXISTS_CACHE: dict[tuple[str, str], bool] = {}
 
 
@@ -3038,52 +3033,6 @@ def reset_all_issue_frame_assets_within_periods(
     )
     db.commit()
     return int(result.rowcount or 0)
-
-
-def list_stale_open_entry_frame_assets(
-    db: Session,
-    *,
-    location_id: int | None = None,
-    start_time: Any = None,
-    end_time: Any = None,
-    limit: int = 200,
-) -> list[dict[str, Any]]:
-    frame_asset_table = _table("trigger_frame_asset")
-    trigger_table = _table("trigger_event")
-    location_clause = "and fa.location_id = :location_id" if location_id is not None else ""
-    window_clause = "and fa.start_time between :start_time and :end_time" if start_time is not None and end_time is not None else ""
-    result = db.execute(
-        text(
-            f"""
-            select fa.id as frame_asset_id,
-                   fa.trigger_id,
-                   fa.location_id,
-                   fa.start_time,
-                   fa.end_time,
-                   fa.error,
-                   fa.updated_at,
-                   te.trigger_time,
-                   te.phone_entry_id,
-                   te.credit_card_entry_id
-            from {frame_asset_table} fa
-            left join {trigger_table} te on te.id = fa.trigger_id
-            where fa.status = 'issue'
-              and fa.error = :error
-              {location_clause}
-              {window_clause}
-            order by fa.updated_at desc
-            limit :limit
-            """
-        ),
-        {
-            "error": STALE_OPEN_ENTRY_ISSUE_ERROR,
-            "location_id": location_id,
-            "start_time": start_time,
-            "end_time": end_time,
-            "limit": max(1, int(limit)),
-        },
-    )
-    return _fetch_all_dicts(result)
 
 
 def reset_recoverable_issue_frame_assets_for_window(
