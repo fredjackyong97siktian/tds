@@ -4385,20 +4385,38 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
         selected_periods = _selected_grouping_periods_for_location(periods, location_id)
         if not selected_periods:
             continue
-        # Give every trigger inside a selected period a fresh shot before
-        # grouping runs, regardless of why it's currently 'issue' - staleness
-        # goes straight back to 'retrieved' (frames were already fine, only
-        # grouping gave up); anything else is genuinely re-queued for a real
-        # retrieval attempt instead of just claiming 'retrieved'. Runs BEFORE
-        # the staleness sweep below on purpose: a trigger that's genuinely
-        # too old (>30min, never grouped) gets re-flagged issue again
-        # immediately by that sweep, in this same cycle, before ready_assets
-        # is queried - so the give-up mechanism still holds for truly stale
-        # entries.
+        # Give every trigger inside one of THIS cycle's actual due-batch
+        # windows a fresh shot before grouping runs, regardless of why it's
+        # currently 'issue' - staleness goes straight back to 'retrieved'
+        # (frames were already fine, only grouping gave up); anything else is
+        # genuinely re-queued for a real retrieval attempt instead of just
+        # claiming 'retrieved'. Scoped to real due windows (the same ones the
+        # per-period loop below computes) rather than "this time-of-day on
+        # any calendar day" - resetting a trigger whose calendar day has no
+        # due batch this cycle would just have it fail to be swept into
+        # anything, then get re-flagged 'issue' again by the staleness sweep
+        # a few lines down, in the same cycle - forever, with zero chance of
+        # ever actually reaching grouping. Runs BEFORE the staleness sweep on
+        # purpose: a trigger that's genuinely too old (>30min, never
+        # grouped) gets re-flagged issue again immediately by that sweep, in
+        # this same cycle, before ready_assets is queried - so the give-up
+        # mechanism still holds for truly stale entries.
+        due_windows: list[tuple[datetime, datetime]] = []
+        for period in selected_periods:
+            period_window_start, period_window_end = _last_completed_period_window(period, now=current)
+            if not _is_recently_completed_grouping_window(period_window_end, current):
+                continue
+            due_windows.append(
+                (
+                    period_window_start
+                    - timedelta(minutes=max(0, int(settings.grouping_carry_forward_buffer_minutes))),
+                    period_window_end,
+                )
+            )
         issue_reset_counts = repositories.reset_all_issue_frame_assets_within_periods(
             db,
             location_id=location_id,
-            selected_periods=selected_periods,
+            due_windows=due_windows,
         )
         if issue_reset_counts["reset_to_retrieved"] or issue_reset_counts["requeued_for_retrieval"]:
             logger.info(

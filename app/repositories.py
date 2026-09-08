@@ -3089,9 +3089,9 @@ def reset_incorrectly_staled_frame_assets_outside_periods(
 
 
 def reset_all_issue_frame_assets_within_periods(
-    db: Session, *, location_id: int, selected_periods: list[Mapping[str, Any]]
+    db: Session, *, location_id: int, due_windows: list[tuple[Any, Any]]
 ) -> dict[str, int]:
-    # Every trigger whose time-of-day falls inside a selected period gets a
+    # Every trigger inside one of THIS cycle's actual due-batch windows gets a
     # fresh shot before grouping runs - but which repair path depends on WHY
     # it's 'issue':
     #   - Flagged by the staleness sweep (STALE_OPEN_ENTRY_ISSUE_ERROR): the
@@ -3105,23 +3105,28 @@ def reset_all_issue_frame_assets_within_periods(
     #     'not_retrieved' instead so the retrieval worker actually attempts a
     #     real re-capture - if that still fails, its own error handling
     #     leaves it at 'issue' again rather than faking a 'retrieved' state.
-    if not selected_periods:
+    #
+    # Scoped to due_windows (the SAME concrete start/end datetimes batch
+    # construction itself will use this cycle), not just "this time-of-day on
+    # any calendar day": a trigger from a calendar day with no due batch this
+    # cycle would get reset here, fail to be swept into any batch, and then
+    # get re-flagged 'issue' again by the staleness sweep before the next
+    # cycle even starts - the exact same 662 rows resetting and re-flagging
+    # forever, in a tight loop, with zero chance of ever actually reaching
+    # grouping. Scoping to real due windows means a reset here always
+    # corresponds to a genuine attempt this cycle.
+    if not due_windows:
         return {"reset_to_retrieved": 0, "requeued_for_retrieval": 0}
     frame_asset_table = _table("trigger_frame_asset")
-    period_clauses: list[str] = []
+    window_clauses: list[str] = []
     params: dict[str, Any] = {"location_id": location_id, "stale_error": STALE_OPEN_ENTRY_ISSUE_ERROR}
-    for index, period in enumerate(selected_periods):
-        start_key = f"period_start_{index}"
-        end_key = f"period_end_{index}"
-        params[start_key] = period["start_time"]
-        params[end_key] = period["end_time"]
-        period_clauses.append(
-            f"("
-            f"(:{start_key} <= :{end_key} and time(start_time) between :{start_key} and :{end_key}) "
-            f"or (:{start_key} > :{end_key} and (time(start_time) >= :{start_key} or time(start_time) <= :{end_key}))"
-            f")"
-        )
-    within_any_period_filter = " or ".join(period_clauses)
+    for index, (window_start, window_end) in enumerate(due_windows):
+        start_key = f"window_start_{index}"
+        end_key = f"window_end_{index}"
+        params[start_key] = window_start
+        params[end_key] = window_end
+        window_clauses.append(f"(start_time >= :{start_key} and start_time < :{end_key})")
+    within_any_period_filter = " or ".join(window_clauses)
     # Order matters: this UPDATE only touches the stale-flagged rows and
     # flips them out of 'issue' first, so the second UPDATE below (which
     # matches on status = 'issue' alone) naturally only reaches whatever's
