@@ -5502,11 +5502,12 @@ def _run_grouping_adjacent_pass(
         if item.get("phone_entry_id") is not None or item.get("credit_card_entry_id") is not None
     ]
 
-    # Build every entry's candidate set up front, then pack as many of these
-    # independent (entry, candidates) checks as fit into one combined call
-    # (bounded by the same image budget as a normal chunk) instead of sending
-    # one call per entry - a batch of identity entries should cost roughly as
-    # many calls as a batch of chunks, not one call per entry.
+    # Build every entry's candidate set up front. Each one gets its own,
+    # separate verification call below - packing several unrelated (entry,
+    # candidates) checks into one combined call measurably hurt match
+    # accuracy (the model conflates people across groups when comparing more
+    # than one pairing at once), so this deliberately costs one call per
+    # entry rather than batching for fewer, larger calls.
     pending_entry_groups: list[dict[str, Any]] = []
     for entry_id in identity_entry_ids:
         entry_trigger = by_id[entry_id]
@@ -5550,16 +5551,7 @@ def _run_grouping_adjacent_pass(
         },
     )
 
-    max_images = _grouping_gemini_max_images_per_request()
-
-    def _image_count_for(entry_group: dict[str, Any]) -> int:
-        count = len(entry_group["entry"].get("frames") or [])
-        for candidate in entry_group["candidates"]:
-            count += len(candidate.get("frames") or [])
-        return count
-
     batch: list[dict[str, Any]] = []
-    batch_image_count = 0
 
     def _flush_batch() -> None:
         nonlocal next_group_id
@@ -5625,14 +5617,8 @@ def _run_grouping_adjacent_pass(
     for entry_group in pending_entry_groups:
         if entry_group["entry_id"] in consumed:
             continue
-        image_count = _image_count_for(entry_group)
-        if batch and batch_image_count + image_count > max_images:
-            _flush_batch()
-            batch = []
-            batch_image_count = 0
-        batch.append(entry_group)
-        batch_image_count += image_count
-    _flush_batch()
+        batch = [entry_group]
+        _flush_batch()
 
     remaining = [item for item in trigger_inputs if int(item["trigger_id"]) not in consumed]
     repositories.finish_script_run(
