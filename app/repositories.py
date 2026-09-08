@@ -3147,6 +3147,7 @@ def reset_all_issue_frame_assets_within_periods(
     if not due_windows:
         return {"reset_to_retrieved": 0, "requeued_for_retrieval": 0}
     frame_asset_table = _table("trigger_frame_asset")
+    trigger_table = _table("trigger_event")
     window_clauses: list[str] = []
     params: dict[str, Any] = {"location_id": location_id, "stale_error": STALE_OPEN_ENTRY_ISSUE_ERROR}
     for index, (window_start, window_end) in enumerate(due_windows):
@@ -3154,7 +3155,19 @@ def reset_all_issue_frame_assets_within_periods(
         end_key = f"window_end_{index}"
         params[start_key] = window_start
         params[end_key] = window_end
-        window_clauses.append(f"(start_time >= :{start_key} and start_time < :{end_key})")
+        # Matched against the SAME timestamp the batch-building loop uses to
+        # decide window membership (trigger_event.trigger_time, falling back
+        # to fa.start_time only when there's no trigger row) - see
+        # _grouping_time_from_trigger_frame_asset. Matching against
+        # fa.start_time instead let a row pass this window check while its
+        # actual trigger_time fell outside the batch loop's own window +
+        # carry-forward range, so it kept getting reset here every cycle
+        # without ever being eligible to actually join a batch - a permanent
+        # reset/re-flag loop for that row alone.
+        window_clauses.append(
+            f"(coalesce(te.trigger_time, fa.start_time) >= :{start_key} "
+            f"and coalesce(te.trigger_time, fa.start_time) < :{end_key})"
+        )
     within_any_period_filter = " or ".join(window_clauses)
     # Order matters: this UPDATE only touches the stale-flagged rows and
     # flips them out of 'issue' first, so the second UPDATE below (which
@@ -3163,13 +3176,14 @@ def reset_all_issue_frame_assets_within_periods(
     reset_to_retrieved = db.execute(
         text(
             f"""
-            update {frame_asset_table}
-            set status = 'retrieved',
-                error = null,
-                updated_at = now()
-            where location_id = :location_id
-              and status = 'issue'
-              and error = :stale_error
+            update {frame_asset_table} fa
+            left join {trigger_table} te on te.id = fa.trigger_id
+            set fa.status = 'retrieved',
+                fa.error = null,
+                fa.updated_at = now()
+            where fa.location_id = :location_id
+              and fa.status = 'issue'
+              and fa.error = :stale_error
               and ({within_any_period_filter})
             """
         ),
@@ -3179,12 +3193,13 @@ def reset_all_issue_frame_assets_within_periods(
     requeued_for_retrieval = db.execute(
         text(
             f"""
-            update {frame_asset_table}
-            set status = 'not_retrieved',
-                error = null,
-                updated_at = now()
-            where location_id = :location_id
-              and status = 'issue'
+            update {frame_asset_table} fa
+            left join {trigger_table} te on te.id = fa.trigger_id
+            set fa.status = 'not_retrieved',
+                fa.error = null,
+                fa.updated_at = now()
+            where fa.location_id = :location_id
+              and fa.status = 'issue'
               and ({within_any_period_filter})
             """
         ),
