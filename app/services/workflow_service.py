@@ -6744,8 +6744,14 @@ def _refresh_grouping_item_frame_payloads(db: Session, *, batch: Mapping[str, An
     refreshed_count = 0
     for row in frame_assets:
         trigger_id = int(row["trigger_id"])
-        if trigger_id not in existing_trigger_ids:
-            continue
+        # Used to skip any trigger_id not already in existing_trigger_ids,
+        # which meant a trigger that only just became 'retrieved' in this
+        # window - including one a stale-open-entry reset just made eligible
+        # again - could never actually join the batch: it has no
+        # filter_grouping_item row yet either, so a retry could never
+        # reconsider it. upsert_grouping_item() below creates the row fresh
+        # when it doesn't exist, so letting new trigger_ids through here too
+        # is safe.
         frames = _first_trigger_frame_payload(_frame_urls_from_trigger_frame_asset(row))
         if not frames:
             continue
