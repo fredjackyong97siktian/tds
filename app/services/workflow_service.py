@@ -3202,16 +3202,26 @@ def _repair_grouping_with_gemini(
             if image_url in image_urls:
                 continue
             image_urls.append(image_url)
-            known = known_appearances.get(trigger_id)
             image_notes.append(
                 {
                     "image_number": len(image_urls),
                     "trigger_id": trigger_id,
                     "role_hint": "open_entry" if trigger_id in open_entry_trigger_ids else "unknown",
-                    "known_appearance": known.get("appearance_description") if known else None,
-                    "known_direction": known.get("appearance_direction") if known else None,
                 }
             )
+
+    # One entry per trigger, not per image - image_notes above already has
+    # up to 4 rows per trigger, and repeating the same known_appearance
+    # string on every one of them just bloats the prompt for no benefit.
+    known_appearance_notes = [
+        {
+            "trigger_id": trigger_id,
+            "known_appearance": known.get("appearance_description"),
+            "known_direction": known.get("appearance_direction"),
+        }
+        for trigger_id in candidate_trigger_ids
+        if (known := known_appearances.get(trigger_id))
+    ]
 
     if len(candidate_trigger_ids) < 2 or not image_urls:
         grouping_summary["gemini_repair"] = {
@@ -3257,8 +3267,8 @@ def _repair_grouping_with_gemini(
         "Also, for every trigger listed below (entries and unknown triggers both), count how many distinct, separate "
         "people appear together in that trigger's own images - usually 1, but count higher when a group of customers "
         "clearly entered or exited together in the same trigger. Give your confidence in that count. "
-        "Known-appearance rule: the image mapping below may include known_appearance and known_direction for a trigger - a short description and "
-        "direction an EARLIER pass already concluded for it. Treat these as a hint to help you compare triggers faster, never as a substitute for "
+        "Known-appearance rule: the known appearances list below may give a known_appearance and known_direction for a trigger - a short description "
+        "and direction an EARLIER pass already concluded for it. Treat these as a hint to help you compare triggers faster, never as a substitute for "
         "looking at the actual images - the earlier pass can be wrong, so confirm or override it based on what you actually see. "
         "Appearance field rule: for every trigger listed below, give a SHORT, reusable description of its primary actor's appearance - clothing top, "
         "clothing bottom, footwear, and any carried item, in one short phrase under 15 words, using only concrete, distinguishing visual details, never "
@@ -3276,6 +3286,8 @@ def _repair_grouping_with_gemini(
         "Every id in that list is a CONFIRMED entry, already established by an earlier pass - do not relabel, "
         "reinterpret, or move any of them; only use them as the entry side of a pairing, exactly as given. "
         f"Unknown triggers: {json.dumps(unknown_trigger_ids)}. "
+        f"Known appearances from an earlier pass (one entry per trigger_id, may be wrong - confirm from images): "
+        f"{json.dumps(known_appearance_notes)}. "
         f"Image mapping: {json.dumps(image_notes)}. "
         "Only create an exit match if the same person is clearly visible. If unsure, leave the trigger in unknown."
     )
