@@ -2862,7 +2862,8 @@ def list_recent_grouping_batches(db: Session, limit: int = 50, *, offset: int = 
         text(
             f"""
             select id, location_id, period_code, window_start, window_end, script_run_id, status,
-                   manifest_url, manifest_object_key, result_payload, issue_reason, started_at, finished_at, created_at, updated_at
+                   manifest_url, manifest_object_key, result_payload, issue_reason, started_at, finished_at, created_at, updated_at,
+                   is_used_lock(concat('tds_theft_confidence_batch_', id)) is not null as confidence_running
             from {table_name}
             where status in ('success', 'failed', 'issue')
             order by coalesce(finished_at, updated_at, created_at) desc, id desc
@@ -2878,6 +2879,7 @@ def list_recent_grouping_batches(db: Session, limit: int = 50, *, offset: int = 
                 row["result_payload"] = json.loads(row["result_payload"])
             except json.JSONDecodeError:
                 pass
+        row["confidence_running"] = bool(row.get("confidence_running"))
     return rows
 
 

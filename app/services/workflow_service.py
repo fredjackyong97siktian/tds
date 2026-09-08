@@ -6995,6 +6995,29 @@ def _grouping_batch_is_stale(batch: dict[str, Any]) -> bool:
 
 
 def retry_grouping_batch_now(db: Session, *, batch_id: int) -> dict[str, Any]:
+    # Theft-confidence analysis reads this batch's result_payload once into
+    # memory, then spends minutes looping over it group-by-group calling AI
+    # models. A retry resets result_payload and deletes confidence results
+    # instantly - if that happens while a confidence run for this exact batch
+    # is still mid-loop, the still-running loop has no idea and keeps writing
+    # confidence rows for groups the batch no longer has, minutes after the
+    # retry already "cleaned up." Taking the same lock the confidence job
+    # holds for its whole run closes that race: either nothing is running
+    # (lock free, retry proceeds) or something is (fail fast instead of
+    # quietly corrupting its output).
+    lock_name = _theft_confidence_lock_name(batch_id)
+    lock_row = db.execute(text("select get_lock(:lock_name, 0) as acquired"), {"lock_name": lock_name}).mappings().first()
+    if int((lock_row or {}).get("acquired") or 0) != 1:
+        raise ValueError(
+            f"Theft-confidence analysis is still running for grouping batch {batch_id} - try retrying again shortly."
+        )
+    try:
+        return _retry_grouping_batch_now_locked(db, batch_id=batch_id)
+    finally:
+        db.execute(text("select release_lock(:lock_name)"), {"lock_name": lock_name})
+
+
+def _retry_grouping_batch_now_locked(db: Session, *, batch_id: int) -> dict[str, Any]:
     batch = repositories.get_grouping_batch(db, batch_id)
     status = str(batch.get("status") or "").strip().lower()
     if status in {"pending", "dispatching", "running"}:
@@ -8199,12 +8222,16 @@ def _queue_l1_video_for_trigger(
     return video_asset_id
 
 
+def _theft_confidence_lock_name(batch_id: int) -> str:
+    return f"tds_theft_confidence_batch_{int(batch_id)}"
+
+
 def run_theft_confidence_for_grouping_batch(
     db: Session,
     *,
     batch_id: int,
 ) -> dict[str, Any]:
-    lock_name = f"tds_theft_confidence_batch_{int(batch_id)}"
+    lock_name = _theft_confidence_lock_name(batch_id)
     lock_row = db.execute(text("select get_lock(:lock_name, 0) as acquired"), {"lock_name": lock_name}).mappings().first()
     if int((lock_row or {}).get("acquired") or 0) != 1:
         return {
