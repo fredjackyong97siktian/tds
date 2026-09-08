@@ -3188,6 +3188,12 @@ def _repair_grouping_with_gemini(
         if trigger_id not in candidate_trigger_ids:
             candidate_trigger_ids.append(trigger_id)
 
+    # Descriptions grouping_direct (or an earlier repair pass, on any batch)
+    # already wrote for these exact trigger ids - reused verbatim as a
+    # matching aid instead of making repair re-derive everything from raw
+    # pixels with no memory of what an earlier pass already concluded.
+    known_appearances = repositories.get_trigger_appearances(db, candidate_trigger_ids)
+
     image_urls: list[str] = []
     image_notes: list[dict[str, Any]] = []
     for trigger_id in candidate_trigger_ids:
@@ -3195,11 +3201,14 @@ def _repair_grouping_with_gemini(
             if image_url in image_urls:
                 continue
             image_urls.append(image_url)
+            known = known_appearances.get(trigger_id)
             image_notes.append(
                 {
                     "image_number": len(image_urls),
                     "trigger_id": trigger_id,
                     "role_hint": "open_entry" if trigger_id in open_entry_trigger_ids else "unknown",
+                    "known_appearance": known.get("appearance_description") if known else None,
+                    "known_direction": known.get("appearance_direction") if known else None,
                 }
             )
 
@@ -3247,14 +3256,21 @@ def _repair_grouping_with_gemini(
         "Also, for every trigger listed below (entries and unknown triggers both), count how many distinct, separate "
         "people appear together in that trigger's own images - usually 1, but count higher when a group of customers "
         "clearly entered or exited together in the same trigger. Give your confidence in that count. "
+        "Known-appearance rule: the image mapping below may include known_appearance and known_direction for a trigger - a short description and "
+        "direction an EARLIER pass already concluded for it. Treat these as a hint to help you compare triggers faster, never as a substitute for "
+        "looking at the actual images - the earlier pass can be wrong, so confirm or override it based on what you actually see. "
+        "Appearance field rule: for every trigger listed below, give a SHORT, reusable description of its primary actor's appearance - clothing top, "
+        "clothing bottom, footwear, and any carried item, in one short phrase under 15 words, using only concrete, distinguishing visual details, never "
+        "vague filler like 'a person'. Also state your best judgment of that trigger's own direction (entry, exit, or unclear) as a plain conclusion. "
         "Return strict JSON only with schema: "
         '{"groups":[{"entry":[integer],"exit":[integer],"confidence":number,"reason":string,'
         '"entry_carry":{"bag_count":integer,"item_count":integer,"items":[{"type":string,"color":string,"size":string,"count":integer,"confidence":number}],"summary":string},'
         '"exit_carry":{"bag_count":integer,"item_count":integer,"items":[{"type":string,"color":string,"size":string,"count":integer,"confidence":number}],"summary":string},'
         '"carry_change_summary":string}],'
         '"unknown":[integer],"notes":[string],'
-        '"trigger_customer_counts":[{"trigger_id":integer,"unique_customer_count":integer,"confidence":number}]}. '
-        "Include one trigger_customer_counts entry per trigger listed below. "
+        '"trigger_customer_counts":[{"trigger_id":integer,"unique_customer_count":integer,"confidence":number}],'
+        '"trigger_appearances":[{"trigger_id":integer,"direction":"entry"|"exit"|"unclear","description":string}]}. '
+        "Include one trigger_customer_counts entry AND one trigger_appearances entry per trigger listed below. "
         f"Entries still waiting for an exit match: {json.dumps(open_entry_trigger_ids)}. "
         "Every id in that list is a CONFIRMED entry, already established by an earlier pass - do not relabel, "
         "reinterpret, or move any of them; only use them as the entry side of a pairing, exactly as given. "
@@ -3277,6 +3293,7 @@ def _repair_grouping_with_gemini(
         )
         repair_cost = _record_grouping_cost(db, repair_script_run_id, repair_meta)
         _persist_trigger_unique_customer_counts(db, repair_result, source="repair")
+        _persist_trigger_appearances(db, repair_result, source="repair")
     except Exception as exc:
         repositories.finish_script_run(
             db,
@@ -5073,6 +5090,37 @@ def _persist_trigger_unique_customer_counts(db: Session, result: Mapping[str, An
             )
 
 
+_VALID_APPEARANCE_DIRECTIONS = {"entry", "exit", "unclear"}
+
+
+def _persist_trigger_appearances(db: Session, result: Mapping[str, Any], *, source: str) -> None:
+    # Mirrors _persist_trigger_unique_customer_counts above - each stage asks
+    # for a "trigger_appearances" array (same shape) and persists every entry
+    # unconditionally, per-trigger, so it survives past this one batch/chunk's
+    # lifecycle and can be reused as a matching aid by a later chunk, a later
+    # repair pass, or even a completely different batch.
+    raw_appearances = result.get("trigger_appearances") if isinstance(result.get("trigger_appearances"), list) else []
+    for entry in raw_appearances:
+        if not isinstance(entry, Mapping) or entry.get("trigger_id") is None:
+            continue
+        description = str(entry.get("description") or "").strip()
+        if not description:
+            continue
+        try:
+            trigger_id = int(entry["trigger_id"])
+        except (TypeError, ValueError):
+            continue
+        direction = str(entry.get("direction") or "").strip().lower()
+        if direction not in _VALID_APPEARANCE_DIRECTIONS:
+            direction = None
+        try:
+            repositories.set_trigger_appearance(
+                db, trigger_id, description=description[:255], direction=direction, source=source
+            )
+        except Exception:
+            logger.exception("Could not persist appearance for trigger_id=%s source=%s", trigger_id, source)
+
+
 def _verify_entry_groups_against_candidates_batch(
     db: Session,
     script_run_id: int,
@@ -6272,14 +6320,21 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
                     "decided - never your live reasoning process. Do not include self-corrections, hedging, or thinking-out-loud phrases such as 'wait', 'let me "
                     "check', 'hold on', 'actually', or 'let's re-verify'. If you are unsure, resolve the uncertainty internally first, then write only the final "
                     "answer you settled on. A note should read as a plain factual statement, not a narration of how you arrived at it. "
+                    "Appearance field rule: for every trigger in this batch (grouped or not), give a SHORT, reusable description of its primary actor's "
+                    "appearance - clothing top, clothing bottom, footwear, and any carried item, in one short phrase under 15 words. This description will be "
+                    "reused later by a separate pass that will NOT have these images, so it must stand on its own: include only concrete, distinguishing "
+                    "visual details (color, garment type, pattern) and never vague filler like 'a person' or 'normal clothes'. Also state your best judgment "
+                    "of that trigger's own direction - entry, exit, or unclear if genuinely ambiguous - even when it has no phone_entry_id or "
+                    "credit_card_entry_id and even if the trigger ends up in unknown. State this as a plain conclusion, not a hedge. "
                     "Return strict JSON only with schema: "
                     '{"groups":[{"entry":[integer],"exit":[integer],"confidence":number,"reason":string,'
                     '"entry_carry":{"bag_count":integer,"item_count":integer,"items":[{"type":string,"color":string,"size":string,"count":integer,"confidence":number}],"summary":string},'
                     '"exit_carry":{"bag_count":integer,"item_count":integer,"items":[{"type":string,"color":string,"size":string,"count":integer,"confidence":number}],"summary":string},'
                     '"carry_change_summary":string,"total_customer":integer}],'
                     '"open_entries":[integer],"unknown":[integer],"notes":[string],'
-                    '"trigger_customer_counts":[{"trigger_id":integer,"unique_customer_count":integer,"confidence":number}]}. '
-                    "Include one trigger_customer_counts entry per trigger in this batch, grouped or not. "
+                    '"trigger_customer_counts":[{"trigger_id":integer,"unique_customer_count":integer,"confidence":number}],'
+                    '"trigger_appearances":[{"trigger_id":integer,"direction":"entry"|"exit"|"unclear","description":string}]}. '
+                    "Include one trigger_customer_counts entry AND one trigger_appearances entry per trigger in this batch, grouped or not. "
                     f"Batch: {json.dumps({'batch_id': batch_id, 'location_id': batch.get('location_id'), 'period_code': batch.get('period_code'), 'window_start': batch.get('window_start'), 'window_end': batch.get('window_end'), 'chunk': chunk_index}, default=str)}. "
                     f"Triggers: {json.dumps(trigger_notes, default=str)}. "
                     f"Image mapping: {json.dumps(image_mapping, default=str)}."
@@ -6294,6 +6349,7 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
                     )
                     _record_grouping_cost(db, script_run_id, meta)
                     _persist_trigger_unique_customer_counts(db, result, source="direct")
+                    _persist_trigger_appearances(db, result, source="direct")
                     # Recorded here, not once after the retry loop below - a retried
                     # attempt is charged for real the moment it's made, so its meta
                     # must be captured immediately or that real cost goes missing

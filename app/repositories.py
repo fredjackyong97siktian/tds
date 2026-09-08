@@ -1527,6 +1527,58 @@ def get_trigger_unique_customer_counts(db: Session, trigger_ids: list[int]) -> d
     return {int(row["id"]): dict(row) for row in _fetch_all_dicts(result)}
 
 
+def set_trigger_appearance(
+    db: Session,
+    trigger_id: int,
+    *,
+    description: str,
+    direction: str | None,
+    source: str,
+) -> None:
+    # Persisted per-trigger (not per-batch) so it survives past this batch's
+    # own lifecycle - a later chunk, a later repair pass, or even a
+    # completely different batch can look this trigger up by id and reuse
+    # the same description instead of re-deriving it from scratch.
+    trigger_table = _table("trigger_event")
+    db.execute(
+        text(
+            f"""
+            update {trigger_table}
+            set appearance_description = :description,
+                appearance_direction = :direction,
+                appearance_source = :source,
+                appearance_updated_at = now()
+            where id = :trigger_id
+            """
+        ),
+        {
+            "trigger_id": trigger_id,
+            "description": description,
+            "direction": direction,
+            "source": source,
+        },
+    )
+    db.commit()
+
+
+def get_trigger_appearances(db: Session, trigger_ids: list[int]) -> dict[int, dict[str, Any]]:
+    if not trigger_ids:
+        return {}
+    trigger_table = _table("trigger_event")
+    result = db.execute(
+        text(
+            f"""
+            select id, appearance_description, appearance_direction, appearance_source, appearance_updated_at
+            from {trigger_table}
+            where id in :trigger_ids
+              and appearance_description is not null
+            """
+        ).bindparams(bindparam("trigger_ids", expanding=True)),
+        {"trigger_ids": trigger_ids},
+    )
+    return {int(row["id"]): dict(row) for row in _fetch_all_dicts(result)}
+
+
 def get_trigger_frame_asset(db: Session, frame_asset_id: int) -> dict[str, Any]:
     frame_asset_table = _table("trigger_frame_asset")
     result = db.execute(
