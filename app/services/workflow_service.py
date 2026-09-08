@@ -4816,20 +4816,33 @@ def add_manual_group_to_grouping_batch(
 
     open_entries = _group_trigger_id_list(grouping_summary.get("open_entries"))
     unknown = _group_trigger_id_list(grouping_summary.get("unknown"))
-    ungrouped_ids = set(open_entries) | set(unknown)
     requested_ids = set(entry_ids) | set(exit_ids)
-    not_ungrouped = requested_ids - ungrouped_ids
-    if not_ungrouped:
-        raise ValueError(
-            f"Trigger(s) {sorted(not_ungrouped)} are not in this batch's open_entries/unknown list - "
-            "they may already be grouped or belong to a different batch."
-        )
+    # Checked live against filter_grouping_item rather than requiring
+    # membership in THIS batch's own stored open_entries/unknown - a trigger
+    # from the carry-forward window just before this batch's period can be
+    # genuinely ungrouped (never made it into any batch's summary at all,
+    # e.g. its frames weren't ready when that batch was built) while still
+    # being a legitimate candidate to manually pair here.
+    already_grouped = repositories.list_grouped_trigger_ids(db, sorted(requested_ids))
+    if already_grouped:
+        raise ValueError(f"Trigger(s) {sorted(already_grouped)} are already part of another group.")
 
     existing_frame_payloads = {
         int(item["trigger_id"]): item.get("frame_payload")
         for item in repositories.list_grouping_items(db, batch_id)
         if item.get("trigger_id") is not None
     }
+    for trigger_id in requested_ids:
+        if existing_frame_payloads.get(trigger_id) is not None:
+            continue
+        # Not part of this batch yet (e.g. a carry-forward trigger pulled in
+        # from before its own window) - fetch its frames directly instead of
+        # relying on a grouping_item row that was never created for it here.
+        frame_assets = repositories.list_trigger_frame_assets(db, limit=1, trigger_id=trigger_id)
+        if frame_assets:
+            existing_frame_payloads[trigger_id] = {
+                "frames": _first_trigger_frame_payload(_frame_urls_from_trigger_frame_asset(frame_assets[0]))
+            }
 
     group_key = f"manual_{uuid4().hex[:8]}"
     group = {
@@ -4922,6 +4935,29 @@ def add_manual_group_to_grouping_batch(
         "confidence_result": confidence_result,
         "confidence_skipped_reason": confidence_skipped_reason,
     }
+
+
+def list_ungrouped_candidate_trigger_ids_before_batch_window(db: Session, *, batch_id: int) -> list[int]:
+    # Triggers just before this batch's own window that are still ungrouped -
+    # not necessarily because grouping looked at them and gave up (they might
+    # not be in this batch's open_entries/unknown at all, e.g. their frames
+    # weren't ready when this batch was built) - so the manual-group panel can
+    # offer them as candidates too, not just what this batch's own AI pass
+    # happened to record.
+    batch = repositories.get_grouping_batch(db, batch_id)
+    location_id = int(batch.get("location_id") or 0)
+    window_start = _coerce_datetime_value(batch.get("window_start"))
+    if location_id <= 0 or window_start is None:
+        return []
+    carry_forward_start = window_start - timedelta(
+        minutes=max(0, int(settings.grouping_carry_forward_buffer_minutes))
+    )
+    return repositories.list_ungrouped_trigger_ids_in_window(
+        db,
+        location_id=location_id,
+        window_start=carry_forward_start,
+        window_end=window_start,
+    )
 
 
 def build_grouping_analysis_job_from_batch(db: Session, batch_id: int) -> GroupingAnalysisQueued:

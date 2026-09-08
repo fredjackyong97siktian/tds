@@ -185,6 +185,11 @@ def get_grouping_batch(batch_id: int, db: Session = Depends(get_transaction_db))
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.get("/grouping-batches/{batch_id}/carry-forward-candidates")
+def list_carry_forward_candidates(batch_id: int, db: Session = Depends(get_transaction_db)) -> list[int]:
+    return workflow_service.list_ungrouped_candidate_trigger_ids_before_batch_window(db, batch_id=batch_id)
+
+
 @router.get("/confidence-results")
 def list_confidence_results(
     limit: int = 100,

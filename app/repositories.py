@@ -2258,6 +2258,67 @@ def list_manual_grouping_ready_trigger_frame_assets(
     return rows
 
 
+def list_ungrouped_trigger_ids_in_window(
+    db: Session, *, location_id: int, window_start: Any, window_end: Any
+) -> list[int]:
+    # Same "not grouped or in-progress anywhere" check as
+    # list_manual_grouping_ready_trigger_frame_assets, but scoped to a
+    # concrete time window instead of every ready trigger location-wide -
+    # used to surface triggers just before a batch's own window that never
+    # made it into that batch's open_entries/unknown at all (e.g. their
+    # frames weren't ready yet when the batch was built).
+    frame_asset_table = _table("trigger_frame_asset")
+    trigger_table = _table("trigger_event")
+    grouping_item_table = _table("filter_grouping_item")
+    grouping_batch_table = _table("filter_grouping_batch")
+    result = db.execute(
+        text(
+            f"""
+            select distinct te.id as trigger_id
+            from {trigger_table} te
+            join {frame_asset_table} fa on fa.trigger_id = te.id
+            where te.location_id = :location_id
+              and te.whitelist_hit = 0
+              and te.status <> 'whitelisted'
+              and fa.status = 'retrieved'
+              and coalesce(te.trigger_time, fa.start_time) >= :window_start
+              and coalesce(te.trigger_time, fa.start_time) < :window_end
+              and not exists (
+                  select 1
+                  from {grouping_item_table} gi
+                  join {grouping_batch_table} gb on gb.id = gi.batch_id
+                  where gi.trigger_id = te.id
+                    and (
+                        gb.status in ('pending', 'dispatching', 'running')
+                        or gi.status = 'grouped'
+                    )
+              )
+            order by coalesce(te.trigger_time, fa.start_time) asc
+            """
+        ),
+        {"location_id": location_id, "window_start": window_start, "window_end": window_end},
+    )
+    return [int(row["trigger_id"]) for row in _fetch_all_dicts(result)]
+
+
+def list_grouped_trigger_ids(db: Session, trigger_ids: list[int]) -> set[int]:
+    if not trigger_ids:
+        return set()
+    grouping_item_table = _table("filter_grouping_item")
+    result = db.execute(
+        text(
+            f"""
+            select distinct trigger_id
+            from {grouping_item_table}
+            where trigger_id in :trigger_ids
+              and status = 'grouped'
+            """
+        ).bindparams(bindparam("trigger_ids", expanding=True)),
+        {"trigger_ids": trigger_ids},
+    )
+    return {int(row["trigger_id"]) for row in _fetch_all_dicts(result)}
+
+
 def list_filter_time_periods(db: Session, *, selected_only: bool = False) -> list[dict[str, Any]]:
     table_name = _table("filter_time_period")
     where_selected = "where selected = 1" if selected_only else ""
