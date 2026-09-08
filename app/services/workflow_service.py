@@ -4848,7 +4848,58 @@ def add_manual_group_to_grouping_batch(
     grouping_summary["open_entries"] = [trigger_id for trigger_id in open_entries if trigger_id not in requested_ids]
     grouping_summary["unknown"] = [trigger_id for trigger_id in unknown if trigger_id not in requested_ids]
     updated_batch = repositories.update_grouping_batch(db, batch_id, {"result_payload": grouping_summary})
-    return {"ok": True, "batch_id": batch_id, "batch": updated_batch, "group": group}
+
+    # If this batch has never been confidence-analyzed at all yet, leave the
+    # new group alone - the periodic worker will pick up the WHOLE batch
+    # (including this group) on its one and only pass. But that pass only
+    # ever runs once (it's gated on "this batch has zero confidence results
+    # so far"), so if the batch already went through it, this group would
+    # otherwise sit unscored forever. Score just this one group directly in
+    # that case, under the same lock retry uses, so it can't race an
+    # in-flight full-batch run.
+    confidence_result: dict[str, Any] | None = None
+    confidence_skipped_reason: str | None = None
+    location_id = int(batch.get("location_id") or 0)
+    if location_id <= 0:
+        confidence_skipped_reason = "missing_location_id"
+    elif repositories.count_filter_confidence_results(db, batch_id=batch_id) == 0:
+        confidence_skipped_reason = "batch_not_yet_confidence_analyzed"
+    else:
+        lock_name = _theft_confidence_lock_name(batch_id)
+        lock_row = db.execute(text("select get_lock(:lock_name, 5) as acquired"), {"lock_name": lock_name}).mappings().first()
+        if int((lock_row or {}).get("acquired") or 0) != 1:
+            confidence_skipped_reason = "theft_confidence_batch_already_running"
+        else:
+            try:
+                factor_settings = _load_filter_factor_settings(db, location_id)
+                confidence_result = score_confidence_for_single_group(
+                    db,
+                    batch_id=batch_id,
+                    location_id=location_id,
+                    group=group,
+                    group_index=len(grouping_summary["groups"]),
+                    factor_settings=factor_settings,
+                    created_session_ids=set(),
+                    queued_video_asset_ids=set(),
+                )
+            except Exception:
+                logger.exception(
+                    "Could not score theft-confidence for manual group batch_id=%s group_key=%s",
+                    batch_id,
+                    group_key,
+                )
+                confidence_skipped_reason = "confidence_scoring_failed"
+            finally:
+                db.execute(text("select release_lock(:lock_name)"), {"lock_name": lock_name})
+
+    return {
+        "ok": True,
+        "batch_id": batch_id,
+        "batch": updated_batch,
+        "group": group,
+        "confidence_result": confidence_result,
+        "confidence_skipped_reason": confidence_skipped_reason,
+    }
 
 
 def build_grouping_analysis_job_from_batch(db: Session, batch_id: int) -> GroupingAnalysisQueued:
@@ -8802,6 +8853,481 @@ def _run_theft_confidence_for_grouping_batch_locked(
         "session_ids": sorted(created_session_ids),
         "queued_video_asset_ids": sorted(queued_video_asset_ids),
     }
+
+
+def score_confidence_for_single_group(
+    db: Session,
+    *,
+    batch_id: int,
+    location_id: int,
+    group: Mapping[str, Any],
+    group_index: int,
+    factor_settings: Any,
+    created_session_ids: set[int],
+    queued_video_asset_ids: set[int],
+) -> dict[str, int]:
+    # Scores exactly one group and writes its filter_confidence_result -
+    # duplicated from the per-group body of
+    # _run_theft_confidence_for_grouping_batch_locked() (rather than shared)
+    # so a manually-added group can be scored immediately via
+    # add_manual_group_to_grouping_batch(), without touching or risking the
+    # existing whole-batch pipeline that every other batch depends on.
+    if not isinstance(group, Mapping):
+        return {"analyzed_count": 0, "promoted_count": 0}
+    group_key = str(group.get("group_id") or group.get("id") or group_index)
+    entry_trigger_ids = _group_trigger_id_list(group.get("entry"))
+    exit_trigger_ids = _group_trigger_id_list(group.get("exit"))
+    entry_has_identity = bool(group.get("entry_has_identity", True))
+    trigger_ids = entry_trigger_ids + exit_trigger_ids
+    if not trigger_ids:
+        repositories.upsert_filter_confidence_result(
+            db,
+            batch_id=batch_id,
+            group_key=group_key,
+            location_id=location_id,
+            score=0,
+            need_deep_analysis=False,
+            reason="no_trigger_ids",
+            factor_payload={"group": dict(group)},
+        )
+        return {"analyzed_count": 1, "promoted_count": 0}
+    trigger_rows: list[dict[str, Any]] = []
+    for trigger_id in trigger_ids:
+        try:
+            trigger_rows.append(repositories.get_trigger(db, trigger_id))
+        except Exception:
+            logger.exception("Could not load trigger for confidence analysis trigger_id=%s", trigger_id)
+    trigger_times = [
+        _coerce_datetime_value(row.get("trigger_time"))
+        for row in trigger_rows
+        if row.get("trigger_time") is not None
+    ]
+    trigger_times = [value for value in trigger_times if value is not None]
+    if len(trigger_times) < 2:
+        repositories.upsert_filter_confidence_result(
+            db,
+            batch_id=batch_id,
+            group_key=group_key,
+            location_id=location_id,
+            score=0,
+            need_deep_analysis=False,
+            reason="insufficient_trigger_times",
+            factor_payload={"trigger_ids": trigger_ids},
+        )
+        return {"analyzed_count": 1, "promoted_count": 0}
+    start_time = min(trigger_times)
+    end_time = max(trigger_times)
+    transactions = repositories.list_paid_transactions_for_session_window(
+        db,
+        location_id=location_id,
+        start_time=start_time,
+        end_time=end_time,
+    )
+    issue_transactions = repositories.list_non_paid_transactions_for_session_window(
+        db,
+        location_id=location_id,
+        start_time=start_time,
+        end_time=end_time,
+    )
+    minus_alerts = repositories.list_minus_button_alerts_for_window(
+        db,
+        location_id=location_id,
+        start_time=start_time,
+        end_time=end_time,
+    )
+    total_quantity = sum(_coerce_int(row.get("total_items")) for row in transactions)
+    total_value = 0.0
+    for row in transactions:
+        total_value += _coerce_number(row.get("total_amount"), 0.0)
+    duration_seconds = max(0.0, (end_time - start_time).total_seconds())
+    carry_score = _coerce_number(
+        _read_group_value(group, "carry_something_from_store_score", "carry_score"),
+        0.0,
+    )
+    before_is_yellow_bag = _read_group_value(group, "before_is_yellow_bag")
+    after_is_yellow_bag = _read_group_value(group, "after_is_yellow_bag")
+
+    paid_transaction_count = len(transactions)
+    issue_transaction_count = len(issue_transactions)
+    low_purchase = (
+        paid_transaction_count == 0
+        or total_quantity <= settings.filter_low_purchase_quantity
+        or (0 < total_value <= settings.filter_low_purchase_value)
+    )
+    final_paid_receipt = transactions[-1] if transactions else None
+    final_paid_time = _transaction_event_time(final_paid_receipt) if final_paid_receipt else None
+    final_paid_is_low = bool(
+        final_paid_receipt
+        and (
+            _coerce_int(final_paid_receipt.get("total_items")) <= settings.filter_low_purchase_quantity
+            or (
+                0
+                < _coerce_number(final_paid_receipt.get("total_amount"), 0.0)
+                <= settings.filter_low_purchase_value
+            )
+        )
+    )
+    issue_before_final_paid = bool(
+        final_paid_time
+        and any(
+            _seconds_between(final_paid_time, issue_time) >= 0
+            for row in issue_transactions
+            if (issue_time := _transaction_event_time(row)) is not None
+        )
+    )
+    final_paid_initiated_at = (
+        _utc_naive_to_local(_coerce_datetime_value(final_paid_receipt.get("initiated_at")))
+        if final_paid_receipt
+        else None
+    )
+    final_paid_scan_end = (
+        _coerce_datetime_value(final_paid_receipt.get("transaction_time")) if final_paid_receipt else None
+    )
+    scan_duration_seconds = (
+        max(0.0, (final_paid_scan_end - final_paid_initiated_at).total_seconds())
+        if final_paid_initiated_at and final_paid_scan_end
+        else None
+    )
+    prolonged_scan = (
+        scan_duration_seconds is not None and scan_duration_seconds >= settings.filter_prolonged_scan_seconds
+    )
+    multiple_issue_hit, multiple_issue_evidence = _has_short_period_transaction_issues(
+        issue_transactions,
+        settings.filter_transaction_issue_short_period_seconds,
+    )
+    related_minus_alert_ids = _match_alert_ids_near_transactions(
+        minus_alerts,
+        issue_transactions,
+        settings.filter_transaction_issue_short_period_seconds,
+    )
+    long_stay = duration_seconds >= settings.filter_long_stay_seconds
+    total_customer = _coerce_int(_read_group_value(group, "total_customer", "customer_count"), 0)
+    unusual_group_size_result = (
+        _evaluate_unusual_group_size(
+            db,
+            batch_id=batch_id,
+            location_id=location_id,
+            trigger_rows=trigger_rows,
+            entry_trigger_ids=entry_trigger_ids,
+            total_customer=total_customer,
+        )
+        if _filter_factor_enabled(factor_settings, "unusual_group_size")
+        else {"hit": False, "reason": "unusual_group_size_disabled", "current_total_customer": total_customer}
+    )
+    country_code_result: dict[str, Any] = {"hit": False, "reason": "not_evaluated"}
+    carry_ai_result: dict[str, Any] = {"hit": False, "reason": "not_evaluated"}
+
+    reasons: list[str] = []
+    factor_details: dict[str, Any] = {}
+    triggered_factors: list[str] = []
+    should_continue_filtering = True
+
+    if should_continue_filtering and _apply_filter_factor(
+        reasons=reasons,
+        factor_details=factor_details,
+        factors=factor_settings,
+        factor_code="long_stay_low_purchase",
+        hit=long_stay and low_purchase,
+        reason="long_stay_low_purchase",
+        evidence={
+            "duration_seconds": duration_seconds,
+            "paid_transaction_count": paid_transaction_count,
+            "total_quantity": total_quantity,
+            "total_value": total_value,
+        },
+    ):
+        triggered_factors.append("long_stay_low_purchase")
+        should_continue_filtering = False
+    if should_continue_filtering and _apply_filter_factor(
+        reasons=reasons,
+        factor_details=factor_details,
+        factors=factor_settings,
+        factor_code="prolonged_scan_low_purchase",
+        hit=prolonged_scan and final_paid_is_low,
+        reason="prolonged_scan_low_purchase",
+        evidence={
+            "scan_duration_seconds": scan_duration_seconds,
+            "final_paid_receipt": _transaction_summary([final_paid_receipt])[0] if final_paid_receipt else None,
+            "final_paid_is_low": final_paid_is_low,
+        },
+    ):
+        triggered_factors.append("prolonged_scan_low_purchase")
+        should_continue_filtering = False
+    if should_continue_filtering and _apply_filter_factor(
+        reasons=reasons,
+        factor_details=factor_details,
+        factors=factor_settings,
+        factor_code="transaction_issue_low_purchase",
+        hit=issue_before_final_paid and final_paid_is_low,
+        reason="transaction_issue_low_purchase",
+        evidence={
+            "issue_transaction_count": issue_transaction_count,
+            "paid_transaction_count": paid_transaction_count,
+            "total_quantity": total_quantity,
+            "total_value": total_value,
+            "final_paid_receipt": _transaction_summary([final_paid_receipt])[0] if final_paid_receipt else None,
+            "issue_before_final_paid": issue_before_final_paid,
+        },
+    ):
+        triggered_factors.append("transaction_issue_low_purchase")
+        should_continue_filtering = False
+    if should_continue_filtering and _apply_filter_factor(
+        reasons=reasons,
+        factor_details=factor_details,
+        factors=factor_settings,
+        factor_code="multiple_transaction_issues",
+        hit=multiple_issue_hit,
+        reason="multiple_transaction_issues",
+        evidence={
+            **multiple_issue_evidence,
+            "related_minus_alert_ids": related_minus_alert_ids,
+            "issue_transactions": _transaction_summary(issue_transactions),
+        },
+    ):
+        triggered_factors.append("multiple_transaction_issues")
+        should_continue_filtering = False
+    if should_continue_filtering and _apply_filter_factor(
+        reasons=reasons,
+        factor_details=factor_details,
+        factors=factor_settings,
+        factor_code="multiple_minus_button_alert",
+        hit=len(minus_alerts) > 0,
+        reason="multiple_minus_button_alert",
+        evidence={"alert_count": len(minus_alerts), "alert_ids": [row.get("id") for row in minus_alerts]},
+    ):
+        triggered_factors.append("multiple_minus_button_alert")
+        should_continue_filtering = False
+    if should_continue_filtering and _apply_filter_factor(
+        reasons=reasons,
+        factor_details=factor_details,
+        factors=factor_settings,
+        factor_code="unusual_group_size",
+        hit=_as_boolish(unusual_group_size_result.get("hit")),
+        reason="unusual_group_size",
+        evidence=unusual_group_size_result,
+    ):
+        triggered_factors.append("unusual_group_size")
+        should_continue_filtering = False
+    if should_continue_filtering and _apply_filter_factor(
+        reasons=reasons,
+        factor_details=factor_details,
+        factors=factor_settings,
+        factor_code="customer_risk_history",
+        hit=False,
+        reason="customer_risk_history",
+        evidence={"implemented": False, "message": "Skipped until grouping returns stable customer identity."},
+    ):
+        triggered_factors.append("customer_risk_history")
+        should_continue_filtering = False
+
+    if should_continue_filtering and _filter_factor_enabled(factor_settings, "country_code_check"):
+        country_code_result = _evaluate_country_code_check(
+            db,
+            location_id=location_id,
+            trigger_rows=trigger_rows,
+        )
+    elif not should_continue_filtering:
+        _mark_filter_factor_skipped(
+            factor_details=factor_details,
+            factors=factor_settings,
+            factor_code="country_code_check",
+            reason="skipped_after_previous_factor_hit",
+        )
+    if should_continue_filtering and _apply_filter_factor(
+        reasons=reasons,
+        factor_details=factor_details,
+        factors=factor_settings,
+        factor_code="country_code_check",
+        hit=_as_boolish(country_code_result.get("hit")),
+        reason="country_code_check",
+        evidence=country_code_result,
+    ):
+        triggered_factors.append("country_code_check")
+        should_continue_filtering = False
+
+    if should_continue_filtering:
+        carry_signal = (
+            carry_score >= settings.filter_carry_score_threshold
+            or not _as_boolish(before_is_yellow_bag)
+            and _as_boolish(after_is_yellow_bag)
+        )
+        carry_ai_result = (
+            _evaluate_carry_item_signal_with_ai(
+                db,
+                batch_id=batch_id,
+                group_key=group_key,
+                location_id=location_id,
+                trigger_ids=trigger_ids,
+                group=group,
+                transactions=transactions,
+                total_quantity=total_quantity,
+                total_value=total_value,
+            )
+            if _filter_factor_enabled(factor_settings, "carry_item_signal")
+            else {
+                "hit": carry_signal,
+                "score": carry_score,
+                "reason": "carry_item_signal_disabled",
+                "source": "legacy_carry_skipped_disabled",
+                "evidence": _group_carry_evidence(group),
+            }
+        )
+    else:
+        _mark_filter_factor_skipped(
+            factor_details=factor_details,
+            factors=factor_settings,
+            factor_code="carry_item_signal",
+            reason="skipped_after_previous_factor_hit",
+        )
+    if should_continue_filtering and _apply_filter_factor(
+        reasons=reasons,
+        factor_details=factor_details,
+        factors=factor_settings,
+        factor_code="carry_item_signal",
+        # Insufficient evidence means we couldn't clear this case, not that
+        # it's confirmed innocent - route it to deep analysis the same as a
+        # real hit rather than letting an unclear case pass silently.
+        hit=_as_boolish(carry_ai_result.get("hit")) or _as_boolish(carry_ai_result.get("insufficient_evidence")),
+        reason="carry_item_signal",
+        evidence=carry_ai_result,
+    ):
+        triggered_factors.append("carry_item_signal")
+
+    score = float(len(triggered_factors))
+    need_deep_analysis = bool(triggered_factors)
+    repositories.upsert_filter_confidence_result(
+        db,
+        batch_id=batch_id,
+        group_key=group_key,
+        location_id=location_id,
+        score=score,
+        need_deep_analysis=need_deep_analysis,
+        reason=", ".join(reasons) if reasons else "low_confidence",
+        factor_payload={
+            "duration_seconds": duration_seconds,
+            "transaction_count": len(transactions),
+            "issue_transaction_count": issue_transaction_count,
+            "minus_button_alert_count": len(minus_alerts),
+            "total_quantity": total_quantity,
+            "total_value": total_value,
+            "low_purchase": low_purchase,
+            "final_paid_is_low": final_paid_is_low,
+            "issue_before_final_paid": issue_before_final_paid,
+            "carry_something_from_store_score": carry_score,
+            "before_is_yellow_bag": before_is_yellow_bag,
+            "after_is_yellow_bag": after_is_yellow_bag,
+            "carry_ai_result": carry_ai_result,
+            "country_code_result": country_code_result,
+            "unusual_group_size_result": unusual_group_size_result,
+            "total_customer": total_customer,
+            "transactions": _transaction_summary(transactions),
+            "issue_transactions": _transaction_summary(issue_transactions),
+            "minus_alerts": [
+                {
+                    "id": row.get("id"),
+                    "method": row.get("method"),
+                    "detail": row.get("detail"),
+                    "created_at": row.get("created_at"),
+                }
+                for row in minus_alerts
+            ],
+            "trigger_ids": trigger_ids,
+            "entry_trigger_ids": entry_trigger_ids,
+            "exit_trigger_ids": exit_trigger_ids,
+            "entry_has_identity": entry_has_identity,
+            "session_window_start": start_time.isoformat(),
+            "session_window_end": end_time.isoformat(),
+            "factor_settings": factor_settings,
+            "factor_details": factor_details,
+            "triggered_factors": triggered_factors,
+            "decision_rule": "any_enabled_factor_hit",
+        },
+    )
+    promoted_count_total = 0
+    if need_deep_analysis:
+        session = _ensure_session_for_confidence_group(
+            db,
+            location_id=location_id,
+            entry_trigger_ids=entry_trigger_ids,
+            exit_trigger_ids=exit_trigger_ids,
+            entry_has_identity=entry_has_identity,
+        )
+        if session:
+            session_id = int(session["id"])
+            session = repositories.update_session_grouping_link(
+                db,
+                session_id=session_id,
+                grouping_id=batch_id,
+            )
+            created_session_ids.add(session_id)
+            exit_trigger_time: datetime | None = None
+            for exit_trigger_id in exit_trigger_ids:
+                try:
+                    candidate_time = _coerce_datetime_value(
+                        repositories.get_trigger(db, int(exit_trigger_id)).get("trigger_time")
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not load exit trigger time for kiosk window extension trigger_id=%s", exit_trigger_id
+                    )
+                    continue
+                if candidate_time is not None and (exit_trigger_time is None or candidate_time > exit_trigger_time):
+                    exit_trigger_time = candidate_time
+            kiosk_kickoff = _kickoff_kiosk_pipeline_for_session(
+                db,
+                session_id=session_id,
+                location_id=location_id,
+                transactions=transactions,
+                exit_trigger_time=exit_trigger_time,
+            )
+            logger.info(
+                "Kiosk pipeline kickoff group_key=%s session_id=%s status=%s video_asset_ids=%s",
+                group_key,
+                session_id,
+                kiosk_kickoff.get("status"),
+                kiosk_kickoff.get("video_asset_ids"),
+            )
+            for trigger_id in entry_trigger_ids:
+                trigger = next((row for row in trigger_rows if int(row.get("id") or 0) == trigger_id), None)
+                if trigger is None:
+                    continue
+                video_asset_id = _queue_l1_video_for_trigger(
+                    db,
+                    session_id=session_id,
+                    location_id=location_id,
+                    trigger=trigger,
+                    video_section="entrance",
+                    link_section="entry",
+                )
+                if video_asset_id is not None:
+                    queued_video_asset_ids.add(video_asset_id)
+            for trigger_id in exit_trigger_ids:
+                trigger = next((row for row in trigger_rows if int(row.get("id") or 0) == trigger_id), None)
+                if trigger is None:
+                    continue
+                video_asset_id = _queue_l1_video_for_trigger(
+                    db,
+                    session_id=session_id,
+                    location_id=location_id,
+                    trigger=trigger,
+                    video_section="entrance",
+                    link_section="exit",
+                )
+                if video_asset_id is not None:
+                    queued_video_asset_ids.add(video_asset_id)
+        promoted_count = repositories.promote_trigger_video_assets_to_full_retrieval(db, trigger_ids)
+        promoted_count_total += promoted_count
+        logger.info(
+            "Layer 0 confidence promoted group_key=%s batch_id=%s trigger_ids=%s session_id=%s queued_video_assets=%s promoted_count=%s score=%.2f",
+            group_key,
+            batch_id,
+            trigger_ids,
+            session.get("id") if session else None,
+            sorted(queued_video_asset_ids),
+            promoted_count,
+            score,
+        )
+    return {"analyzed_count": 1, "promoted_count": promoted_count_total}
 
 
 def run_pending_theft_confidence_batches(db: Session, *, limit: int = 10) -> dict[str, Any]:
