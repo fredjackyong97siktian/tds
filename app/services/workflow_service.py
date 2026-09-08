@@ -61,6 +61,16 @@ from ..storage import (
 
 UTC = timezone.utc
 SCRIPT_RUN_COMMAND_REDACTED = "[redacted]"
+# Written to stderr_log by reconcile_running_remote_analysis_script_runs()
+# when it force-fails a script_run stuck 'running' too long (see
+# runpod_stale_running_script_run_seconds). A late webhook/status poll can
+# still arrive after that and carry a genuinely valid result - the
+# per-script-type finalize functions check for this exact prefix to allow
+# that late result to overwrite the force-fail rather than discarding it, but
+# only once: once a real finalize (from either path) overwrites stderr_log
+# with the real remote_result, a duplicate webhook delivery no longer sees
+# this prefix and correctly treats the row as already processed.
+STALE_RUNNING_FORCE_FAIL_STDERR_PREFIX = "Force-failed: stuck at status='running'"
 logger = logging.getLogger("tds.workflow_service")
 KIOSK_OWNERSHIP_MIN_MARGIN_SECONDS = 10.0
 NO_KIOSK_VIDEO_REASON = "No kiosk video was queued because no paid transactions were found inside the session window."
@@ -2118,7 +2128,10 @@ def _finalize_remote_entry_script_run(
     script_run: dict[str, Any],
     remote_result: RemoteRunnerResult,
 ) -> ScriptExecutionResult:
-    if str(script_run.get("status") or "").strip().lower() != "running":
+    if (
+        str(script_run.get("status") or "").strip().lower() != "running"
+        and not _script_run_was_stale_timeout_forced(script_run)
+    ):
         return ScriptExecutionResult(
             script_run_id=int(script_run["id"]),
             runner_job_id=str(script_run.get("runner_job_id") or ""),
@@ -2355,7 +2368,10 @@ def _finalize_remote_kiosk_script_run(
     script_run: dict[str, Any],
     remote_result: RemoteRunnerResult,
 ) -> ScriptExecutionResult:
-    if str(script_run.get("status") or "").strip().lower() != "running":
+    if (
+        str(script_run.get("status") or "").strip().lower() != "running"
+        and not _script_run_was_stale_timeout_forced(script_run)
+    ):
         return ScriptExecutionResult(
             script_run_id=int(script_run["id"]),
             runner_job_id=str(script_run.get("runner_job_id") or ""),
@@ -2678,7 +2694,10 @@ def _finalize_remote_kiosk_match_script_run(
     script_run: dict[str, Any],
     remote_result: RemoteRunnerResult,
 ) -> ScriptExecutionResult:
-    if str(script_run.get("status") or "").strip().lower() != "running":
+    if (
+        str(script_run.get("status") or "").strip().lower() != "running"
+        and not _script_run_was_stale_timeout_forced(script_run)
+    ):
         return ScriptExecutionResult(
             script_run_id=int(script_run["id"]),
             runner_job_id=str(script_run.get("runner_job_id") or ""),
@@ -2950,6 +2969,10 @@ def _fetch_runpod_status_with_retries(
     return last_body
 
 
+def _script_run_was_stale_timeout_forced(script_run: Mapping[str, Any]) -> bool:
+    return str(script_run.get("stderr_log") or "").startswith(STALE_RUNNING_FORCE_FAIL_STDERR_PREFIX)
+
+
 def reconcile_running_remote_analysis_script_runs(db: Session) -> list[dict[str, Any]]:
     reconciled: list[dict[str, Any]] = []
     for stale_run in repositories.list_stale_running_remote_analysis_script_runs(
@@ -2961,7 +2984,7 @@ def reconcile_running_remote_analysis_script_runs(db: Session) -> list[dict[str,
             status="failed",
             stdout_log="",
             stderr_log=(
-                f"Force-failed: stuck at status='running' for over "
+                f"{STALE_RUNNING_FORCE_FAIL_STDERR_PREFIX} for over "
                 f"{settings.runpod_stale_running_script_run_seconds}s with no terminal status ever reported by "
                 "RunPod for this job."
             ),
