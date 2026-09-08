@@ -6021,7 +6021,7 @@ def assign_script_run_runner_job(
     db: Session,
     script_run_id: int,
     *,
-    runner_job_id: str,
+    runner_job_id: str | None,
     runner_payload: Mapping[str, Any] | None = None,
 ) -> None:
     script_run_table = _table("script_run")
@@ -6029,13 +6029,23 @@ def assign_script_run_runner_job(
         text(
             f"""
             update {script_run_table}
-            set runner_job_id = :runner_job_id,
+            set runner_job_id = coalesce(nullif(:runner_job_id, ''), runner_job_id),
                 runner_payload = coalesce(:runner_payload, runner_payload)
             where id = :script_run_id
             """
         ),
         {
             "script_run_id": script_run_id,
+            # None/'' both mean "nothing new to set" - preserve whatever the row
+            # already has rather than writing '' (or NULL over a real value).
+            # tds_script_run.uq_script_run_runner_job_id is a unique key, and
+            # MySQL treats '' as a real, colliding value (unlike NULL, where
+            # multiple rows are always distinct) - a caller that only wants to
+            # merge runner_payload onto a row with no real job id (e.g. a
+            # gemini-enrichment or local API script_run) used to write '' here
+            # and could collide with any other such row, raising
+            # IntegrityError on uq_script_run_runner_job_id and aborting the
+            # whole reconciliation pass that was calling it.
             "runner_job_id": runner_job_id,
             "runner_payload": _json_dumps(runner_payload) if runner_payload is not None else None,
         },
