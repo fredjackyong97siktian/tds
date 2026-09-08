@@ -3671,6 +3671,56 @@ def list_running_video_asset_analyses(
     return _fetch_all_dicts(result)
 
 
+def reset_orphaned_processing_kiosk_video_assets(db: Session) -> list[int]:
+    # A kiosk video_asset can get stuck at status='processing' forever if its
+    # dispatch thread dies without reaching its own except-block cleanup (for
+    # example, a second exception - a DB hiccup - raised while handling the
+    # first one, before it could flip the row to 'issue'). Once that happens,
+    # kiosk_analysis_worker's "is anything already running" gate sees this row
+    # forever and refuses to dispatch anything else queued, even though
+    # nothing is actually running behind it. Detect that: 'processing' with no
+    # backing 'running' kiosk script_run left to explain it, and clear it so
+    # the queue can move again.
+    video_asset_table = _table("video_asset")
+    session_video_asset_table = _table("session_video_asset")
+    script_run_table = _table("script_run")
+    result = db.execute(
+        text(
+            f"""
+            select va.id
+            from {video_asset_table} va
+            where va.section = 'kiosk'
+              and va.status = 'processing'
+              and not exists (
+                  select 1
+                  from {script_run_table} sr
+                  join {session_video_asset_table} sva
+                       on sva.session_id = sr.session_id
+                      and sva.video_asset_id = va.id
+                      and sva.section = 'kiosk'
+                  where sr.script_name = 'kiosk'
+                    and sr.status = 'running'
+              )
+            """
+        )
+    )
+    orphaned_ids = [int(row["id"]) for row in _fetch_all_dicts(result)]
+    if not orphaned_ids:
+        return []
+    db.execute(
+        text(
+            f"""
+            update {video_asset_table}
+            set status = 'issue'
+            where id in :orphaned_ids
+            """
+        ).bindparams(bindparam("orphaned_ids", expanding=True)),
+        {"orphaned_ids": orphaned_ids},
+    )
+    db.commit()
+    return orphaned_ids
+
+
 def claim_video_asset_for_analysis(db: Session, video_asset_id: int) -> bool:
     video_asset_table = _table("video_asset")
     result = db.execute(

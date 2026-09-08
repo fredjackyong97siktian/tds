@@ -96,6 +96,12 @@ class KioskAnalysisWorker:
                     item["runpod_status"],
                     item["status"],
                 )
+            orphaned_ids = repositories.reset_orphaned_processing_kiosk_video_assets(db)
+            for video_asset_id in orphaned_ids:
+                logger.warning(
+                    "Reset orphaned kiosk video_asset_id=%s stuck at status='processing' with no running script_run behind it",
+                    video_asset_id,
+                )
             if repositories.is_worker_paused(db, "kiosk_analysis"):
                 return
             if repositories.has_active_remote_analysis_script_run(db, script_names=["kiosk"]):
