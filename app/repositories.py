@@ -3015,6 +3015,7 @@ def mark_stale_open_entry_frame_assets_issue(
             f")"
         )
     period_filter = " or ".join(period_clauses)
+    grouping_batch_table = _table("filter_grouping_batch")
     result = db.execute(
         text(
             f"""
@@ -3029,8 +3030,12 @@ def mark_stale_open_entry_frame_assets_issue(
               and not exists (
                   select 1
                   from {grouping_item_table} grouped_gi
+                  join {grouping_batch_table} gb on gb.id = grouped_gi.batch_id
                   where grouped_gi.trigger_id = fa.trigger_id
-                    and grouped_gi.status = 'grouped'
+                    and (
+                        grouped_gi.status = 'grouped'
+                        or gb.status in ('pending', 'dispatching', 'running')
+                    )
               )
             """
         ),

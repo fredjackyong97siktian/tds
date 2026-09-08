@@ -4392,15 +4392,14 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
         # genuinely re-queued for a real retrieval attempt instead of just
         # claiming 'retrieved'. Scoped to real due windows (the same ones the
         # per-period loop below computes) rather than "this time-of-day on
-        # any calendar day" - resetting a trigger whose calendar day has no
-        # due batch this cycle would just have it fail to be swept into
-        # anything, then get re-flagged 'issue' again by the staleness sweep
-        # a few lines down, in the same cycle - forever, with zero chance of
-        # ever actually reaching grouping. Runs BEFORE the staleness sweep on
-        # purpose: a trigger that's genuinely too old (>30min, never
-        # grouped) gets re-flagged issue again immediately by that sweep, in
-        # this same cycle, before ready_assets is queried - so the give-up
-        # mechanism still holds for truly stale entries.
+        # any calendar day", so we don't bother resetting a trigger whose
+        # calendar day has no due batch this cycle anyway. The staleness
+        # sweep that could re-flag a row this same function just reset now
+        # runs LAST, after the per-period batch-building loop below - so a
+        # freshly-reset row gets a real chance to be picked up by
+        # ready_assets and swept into a fresh batch before staleness is
+        # re-evaluated, instead of being flagged 'issue' again in the same
+        # cycle before grouping ever got a shot at it.
         due_windows: list[tuple[datetime, datetime]] = []
         for period in selected_periods:
             period_window_start, period_window_end = _last_completed_period_window(period, now=current)
@@ -4443,36 +4442,20 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
                 issue_reset_counts["reset_to_retrieved"],
                 issue_reset_counts["requeued_for_retrieval"],
             )
-        # An entry left open in a prior, already-finalized batch has no window
-        # of its own left to be picked up in - without this, it (and whatever
-        # exit trigger is waiting for it) would be orphaned forever. Give up on
-        # genuinely stale ones instead of carrying them forward indefinitely.
-        repositories.mark_stale_open_entry_frame_assets_issue(
-            db,
-            location_id=location_id,
-            cutoff_time=stale_cutoff,
-            selected_periods=selected_periods,
-        )
-        reset_count = repositories.reset_incorrectly_staled_frame_assets_outside_periods(
-            db,
-            location_id=location_id,
-            selected_periods=selected_periods,
-        )
-        if reset_count:
-            logger.warning(
-                "Un-flagged %s trigger_frame_asset row(s) at location_id=%s that a prior, "
-                "not-period-scoped staleness sweep incorrectly marked issue",
-                reset_count,
-                location_id,
-            )
+        # The staleness sweep runs AFTER batch-building below, not here - a
+        # trigger reset to 'retrieved' just above needs a real chance to be
+        # queried by list_manual_grouping_ready_trigger_frame_assets() and
+        # actually added to a fresh batch first. Running it here, before that
+        # query, re-flagged it 'issue' again before it was ever even
+        # considered - confirmed live: the same handful of rows resetting and
+        # re-flagging every cycle with zero actual grouping attempt in
+        # between.
         ready_assets = repositories.list_manual_grouping_ready_trigger_frame_assets(
             db,
             location_id=location_id,
             limit=1000,
         )
-        if not ready_assets:
-            continue
-        for period in selected_periods:
+        for period in selected_periods if ready_assets else []:
             window_start, window_end = _last_completed_period_window(period, now=current)
             if not _is_recently_completed_grouping_window(window_end, current):
                 continue
@@ -4555,6 +4538,30 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
                 len(trigger_assets),
                 len(carried_over_rows),
                 batch.get("id"),
+            )
+        # Runs LAST, after this cycle's batch-building above has had its shot
+        # at sweeping any freshly-reset trigger into a real batch. A trigger
+        # flagged 'issue' with the staleness error is simple: it's still
+        # 'retrieved' and inside a due window right now, so put it back to
+        # 'retrieved' - if grouping picks it up above great, if it's still
+        # genuinely too old next cycle it'll just get flagged again then.
+        repositories.mark_stale_open_entry_frame_assets_issue(
+            db,
+            location_id=location_id,
+            cutoff_time=stale_cutoff,
+            selected_periods=selected_periods,
+        )
+        reset_count = repositories.reset_incorrectly_staled_frame_assets_outside_periods(
+            db,
+            location_id=location_id,
+            selected_periods=selected_periods,
+        )
+        if reset_count:
+            logger.warning(
+                "Un-flagged %s trigger_frame_asset row(s) at location_id=%s that a prior, "
+                "not-period-scoped staleness sweep incorrectly marked issue",
+                reset_count,
+                location_id,
             )
     return prepared
 
