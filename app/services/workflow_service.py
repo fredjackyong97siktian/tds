@@ -6837,10 +6837,10 @@ def retry_grouping_batch_now(db: Session, *, batch_id: int) -> dict[str, Any]:
         batch_id,
         error="Rerun queued for grouping batch.",
     )
-    reset_stale_open_entry_count = 0
+    reset_issue_count = 0
     batch_location_id = batch.get("location_id")
     if batch_location_id is not None:
-        reset_stale_open_entry_count = repositories.reset_stale_open_entry_frame_assets_for_location(
+        reset_issue_count = repositories.reset_recoverable_issue_frame_assets_for_window(
             db,
             location_id=int(batch_location_id),
             start_time=batch.get("window_start"),
@@ -6857,7 +6857,7 @@ def retry_grouping_batch_now(db: Session, *, batch_id: int) -> dict[str, Any]:
         "message": "Grouping batch queued for background rerun.",
         "refreshed_frame_payload_count": refreshed_count,
         "deleted_confidence_result_count": deleted_confidence_count,
-        "reset_stale_open_entry_count": reset_stale_open_entry_count,
+        "reset_issue_frame_asset_count": reset_issue_count,
     }
 
 

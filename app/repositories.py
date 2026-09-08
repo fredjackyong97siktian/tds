@@ -3085,36 +3085,44 @@ def list_stale_open_entry_frame_assets(
     return _fetch_all_dicts(result)
 
 
-def reset_stale_open_entry_frame_assets_for_location(
+def reset_recoverable_issue_frame_assets_for_window(
     db: Session, *, location_id: int, start_time: Any = None, end_time: Any = None
 ) -> int:
-    # A retry should give a stale-flagged trigger another chance at being
-    # matched, not leave it permanently excluded - mark_grouping_batch_frame_
-    # assets_retrieved() can't reach these because they were never part of
-    # any batch's filter_grouping_item rows in the first place (that's
-    # exactly why they went stale). Reset them back to 'retrieved' so the
-    # next prepare_due_grouping_batches() pass picks them up again. Scoped to
-    # the retried batch's own window (not just its location) so a retry only
-    # reconsiders entries from that same period, matching what the dashboard
-    # displays for it.
+    # A retry should give EVERY trigger in this period another real chance,
+    # not just ones the staleness sweep specifically flagged - a trigger can
+    # land at status='issue' for other reasons too (e.g. a retrieval hiccup),
+    # and mark_grouping_batch_frame_assets_retrieved() can't reach any of
+    # them: it only resets 'processing' rows tied to this batch's EXISTING
+    # filter_grouping_item rows, and an 'issue' trigger was never part of
+    # those in the first place (that's exactly why it's stuck).
+    #
+    # Only reset one that actually has a usable captured frame - a genuine
+    # "retrieval never produced any real image" failure won't be fixed by
+    # giving grouping another look, so leave those alone rather than
+    # resetting them to 'retrieved' with nothing behind them.
     frame_asset_table = _table("trigger_frame_asset")
-    window_clause = "and start_time between :start_time and :end_time" if start_time is not None and end_time is not None else ""
+    frame_table = _table("trigger_frame")
+    window_clause = "and fa.start_time between :start_time and :end_time" if start_time is not None and end_time is not None else ""
     result = db.execute(
         text(
             f"""
-            update {frame_asset_table}
-            set status = 'retrieved',
-                error = null,
-                updated_at = now()
-            where location_id = :location_id
-              and status = 'issue'
-              and error = :error
+            update {frame_asset_table} fa
+            set fa.status = 'retrieved',
+                fa.error = null,
+                fa.updated_at = now()
+            where fa.location_id = :location_id
+              and fa.status = 'issue'
               {window_clause}
+              and exists (
+                  select 1
+                  from {frame_table} tf
+                  where tf.frame_asset_id = fa.id
+                    and tf.status = 'ok'
+              )
             """
         ),
         {
             "location_id": location_id,
-            "error": STALE_OPEN_ENTRY_ISSUE_ERROR,
             "start_time": start_time,
             "end_time": end_time,
         },
