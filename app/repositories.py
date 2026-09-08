@@ -3036,6 +3036,49 @@ def reset_incorrectly_staled_frame_assets_outside_periods(
     return int(result.rowcount or 0)
 
 
+def reset_all_issue_frame_assets_within_periods(
+    db: Session, *, location_id: int, selected_periods: list[Mapping[str, Any]]
+) -> int:
+    # Unconditional: every trigger whose time-of-day falls inside one of this
+    # location's selected periods gets a fresh shot before grouping runs,
+    # regardless of status/error reason, no exceptions. Run every cycle,
+    # right before batch construction, so nothing sits stuck at 'issue' just
+    # because of what put it there.
+    if not selected_periods:
+        return 0
+    frame_asset_table = _table("trigger_frame_asset")
+    period_clauses: list[str] = []
+    params: dict[str, Any] = {"location_id": location_id}
+    for index, period in enumerate(selected_periods):
+        start_key = f"period_start_{index}"
+        end_key = f"period_end_{index}"
+        params[start_key] = period["start_time"]
+        params[end_key] = period["end_time"]
+        period_clauses.append(
+            f"("
+            f"(:{start_key} <= :{end_key} and time(start_time) between :{start_key} and :{end_key}) "
+            f"or (:{start_key} > :{end_key} and (time(start_time) >= :{start_key} or time(start_time) <= :{end_key}))"
+            f")"
+        )
+    within_any_period_filter = " or ".join(period_clauses)
+    result = db.execute(
+        text(
+            f"""
+            update {frame_asset_table}
+            set status = 'retrieved',
+                error = null,
+                updated_at = now()
+            where location_id = :location_id
+              and status = 'issue'
+              and ({within_any_period_filter})
+            """
+        ),
+        params,
+    )
+    db.commit()
+    return int(result.rowcount or 0)
+
+
 def list_stale_open_entry_frame_assets(
     db: Session,
     *,
