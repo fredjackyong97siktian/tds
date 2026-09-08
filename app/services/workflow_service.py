@@ -5822,6 +5822,28 @@ def _confirm_trigger_frame_retrieval_terminal(db: Session, trigger_id: int) -> t
     return status in {"retrieved", "processed", "issue"}, ok_frame_count
 
 
+def _mark_open_entry_or_unknown(
+    trigger_id: int,
+    *,
+    trigger_has_identity: Mapping[int, bool],
+    normalized_open_entries: set[int],
+    normalized_unknown: set[int],
+) -> None:
+    # "Open entries" is meant to read as CONFIRMED entry, just missing an
+    # exit - true for an identity-bearing trigger (phone/credit card id is
+    # authoritative, per the grouping prompt's own identity rule), but not
+    # for one the model only inferred was an entry from walking direction or
+    # framing. That inference can be wrong about the entry call itself, not
+    # just about whether an exit exists yet - conflating the two overstates
+    # confidence on the dashboard's "Open Entries" panel. Route a
+    # non-identity trigger to "unknown" instead, which already means exactly
+    # this: unclear/unconfirmed, not a rejected match.
+    if trigger_has_identity.get(trigger_id):
+        normalized_open_entries.add(trigger_id)
+    else:
+        normalized_unknown.add(trigger_id)
+
+
 def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[str, Any], dict[str, Any], int]:
     batch = repositories.get_grouping_batch(db, batch_id)
     # A trigger's stored frame_payload snapshot can predate retrieval finishing -
@@ -6080,7 +6102,12 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
                 return
             for trigger_id in released["entry"]:
                 grouped_trigger_ids.discard(trigger_id)
-                normalized_open_entries.add(trigger_id)
+                _mark_open_entry_or_unknown(
+                    trigger_id,
+                    trigger_has_identity=trigger_has_identity,
+                    normalized_open_entries=normalized_open_entries,
+                    normalized_unknown=normalized_unknown,
+                )
                 trigger_input = trigger_input_by_id.get(trigger_id)
                 if trigger_input is not None:
                     carry_forward_entries[trigger_id] = trigger_input
@@ -6295,7 +6322,12 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
                     # earlier, unrelated visit) without spending a verification call on it.
                     exit_ids = [exit_id for exit_id in exit_ids if exit_id > entry_trigger_id]
                     if not exit_ids:
-                        normalized_open_entries.add(entry_trigger_id)
+                        _mark_open_entry_or_unknown(
+                            entry_trigger_id,
+                            trigger_has_identity=trigger_has_identity,
+                            normalized_open_entries=normalized_open_entries,
+                            normalized_unknown=normalized_unknown,
+                        )
                         continue
 
                     # A visually confirmed entry without a phone/credit card id is still a
@@ -6363,7 +6395,12 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
                     # don't spend another verification call re-litigating it.
                     if any(exit_id in disputed_exit_ids for exit_id in exit_ids):
                         normalized_unknown.update(exit_ids)
-                        normalized_open_entries.add(entry_trigger_id)
+                        _mark_open_entry_or_unknown(
+                            entry_trigger_id,
+                            trigger_has_identity=trigger_has_identity,
+                            normalized_open_entries=normalized_open_entries,
+                            normalized_unknown=normalized_unknown,
+                        )
                         notes.append(
                             f"Entry {entry_trigger_id} matched exit(s) {sorted(exit_ids)}, but that exit is already "
                             "disputed by another entry; held for review instead of guessing."
@@ -6388,7 +6425,12 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
                             _release_group(conflicting_group_id)
                         normalized_unknown.update(exit_ids)
                         disputed_exit_ids.update(exit_ids)
-                        normalized_open_entries.add(entry_trigger_id)
+                        _mark_open_entry_or_unknown(
+                            entry_trigger_id,
+                            trigger_has_identity=trigger_has_identity,
+                            normalized_open_entries=normalized_open_entries,
+                            normalized_unknown=normalized_unknown,
+                        )
                         notes.append(
                             f"Conflicting exit claim: entries {sorted(set(conflicting_entries + [entry_trigger_id]))} all "
                             f"matched exit(s) {sorted(exit_ids)}; held for review instead of guessing which is correct."
@@ -6415,7 +6457,12 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
                         and verification_confidence < _VERIFICATION_MATCH_CONFIDENCE_THRESHOLD
                     ):
                         normalized_unknown.update(exit_ids)
-                        normalized_open_entries.add(entry_trigger_id)
+                        _mark_open_entry_or_unknown(
+                            entry_trigger_id,
+                            trigger_has_identity=trigger_has_identity,
+                            normalized_open_entries=normalized_open_entries,
+                            normalized_unknown=normalized_unknown,
+                        )
                         notes.append(
                             f"Verification rejected match between entry {entry_trigger_id} and exit(s) {sorted(exit_ids)}: "
                             f"confidence-of-a-match was only {verification_confidence:.2f}, below the "
@@ -6461,7 +6508,12 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
                 for trigger_id in _group_trigger_id_list(chunk_open_entries):
                     if trigger_id in grouped_trigger_ids:
                         continue
-                    normalized_open_entries.add(trigger_id)
+                    _mark_open_entry_or_unknown(
+                        trigger_id,
+                        trigger_has_identity=trigger_has_identity,
+                        normalized_open_entries=normalized_open_entries,
+                        normalized_unknown=normalized_unknown,
+                    )
                 normalized_unknown.update(_group_trigger_id_list(chunk_unknown))
                 if isinstance(gemini_result.get("notes"), list):
                     notes.extend(str(note) for note in gemini_result.get("notes") or [])
