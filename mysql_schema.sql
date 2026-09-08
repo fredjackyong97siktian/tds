@@ -188,6 +188,7 @@ CREATE TABLE IF NOT EXISTS sesamedb.tds_video_asset (
     status VARCHAR(30) NOT NULL DEFAULT 'not_retrieved' COMMENT 'Video lifecycle: not_retrieved, retrieving, 10_frames_retrieved, ready, deleted, or issue.',
     metadata JSON,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     KEY idx_video_asset_trigger_id (trigger_id),
     KEY idx_video_asset_section_sequence (section, sequence_no),
     KEY idx_video_asset_retention_until (retention_until),

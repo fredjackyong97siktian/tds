@@ -96,6 +96,12 @@ class VideoRetrievalWorker:
             )
             if stale_count:
                 logger.warning("Reset %s stale trigger frame retrieval job(s)", stale_count)
+            stale_video_count = repositories.reset_stale_video_asset_retrievals(
+                db,
+                settings.retrieval_stale_seconds,
+            )
+            if stale_video_count:
+                logger.warning("Reset %s stale video asset retrieval job(s)", stale_video_count)
             # Include already-running rows from DB so a restarted worker does not double-book a location.
             for row in repositories.list_running_video_asset_retrievals(db):
                 location_id = row.get("location_id")

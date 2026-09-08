@@ -1931,6 +1931,30 @@ def claim_video_asset_for_retrieval(db: Session, video_asset_id: int) -> bool:
     return bool(result.rowcount)
 
 
+def reset_stale_video_asset_retrievals(db: Session, stale_seconds: int) -> int:
+    # A video_asset claimed for retrieval (status='retrieving') with no worker
+    # actually holding it anymore - e.g. the process was killed mid-job by a
+    # deploy - sits in that status forever with nothing to reclaim it. Since
+    # retrieval_max_per_location caps at 1 concurrent job per location, one
+    # such stuck row permanently blocks every other video AND frame retrieval
+    # for that location, not just itself. Mirrors
+    # reset_stale_trigger_frame_asset_retrievals for frame assets.
+    video_asset_table = _table("video_asset")
+    result = db.execute(
+        text(
+            f"""
+            update {video_asset_table}
+            set status = 'not_retrieved'
+            where status = 'retrieving'
+              and timestampdiff(second, updated_at, now()) > :stale_seconds
+            """
+        ),
+        {"stale_seconds": max(1, int(stale_seconds))},
+    )
+    db.commit()
+    return int(result.rowcount or 0)
+
+
 def list_ready_trigger_frame_assets_for_window(
     db: Session,
     *,
