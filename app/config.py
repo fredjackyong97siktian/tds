@@ -50,6 +50,12 @@ class Settings(BaseSettings):
     runpod_webhook_base_url: str | None = None
     runpod_webhook_secret: str | None = None
     runpod_cost_per_second_usd: float = 0.0
+    # Safety net for a script_run stuck at status='running' because its
+    # RunPod job died without ever reaching a terminal status RunPod itself
+    # reports (so polling /status forever returns something non-terminal) -
+    # force-fail it after this long regardless, since no entry/kiosk/grouping
+    # job should legitimately take this long.
+    runpod_stale_running_script_run_seconds: int = 1800
     retrieval_poll_seconds: int = 10
     retrieval_max_global_workers: int = 1
     retrieval_max_per_location: int = 1

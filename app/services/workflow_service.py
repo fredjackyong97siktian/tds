@@ -2952,6 +2952,26 @@ def _fetch_runpod_status_with_retries(
 
 def reconcile_running_remote_analysis_script_runs(db: Session) -> list[dict[str, Any]]:
     reconciled: list[dict[str, Any]] = []
+    for stale_run in repositories.list_stale_running_remote_analysis_script_runs(
+        db, stale_seconds=settings.runpod_stale_running_script_run_seconds
+    ):
+        repositories.finish_script_run(
+            db,
+            int(stale_run["id"]),
+            status="failed",
+            stdout_log="",
+            stderr_log=(
+                f"Force-failed: stuck at status='running' for over "
+                f"{settings.runpod_stale_running_script_run_seconds}s with no terminal status ever reported by "
+                "RunPod for this job."
+            ),
+        )
+        logger.warning(
+            "Force-failed stale remote script_run_id=%s script=%s runner_job_id=%s (stuck 'running' too long)",
+            stale_run.get("id"),
+            stale_run.get("script_name"),
+            stale_run.get("runner_job_id"),
+        )
     for script_run in repositories.list_running_remote_analysis_script_runs(db):
         job_id = str(script_run.get("runner_job_id") or "").strip()
         script_name = str(script_run.get("script_name") or "").strip().lower()

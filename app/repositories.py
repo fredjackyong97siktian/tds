@@ -6228,6 +6228,33 @@ def has_active_remote_analysis_script_run(
     return result.first() is not None
 
 
+def list_stale_running_remote_analysis_script_runs(db: Session, *, stale_seconds: int) -> list[dict[str, Any]]:
+    # has_active_remote_analysis_script_run() treats ANY 'running' row across
+    # all four remote script types as a global single-flight lock - if a
+    # RunPod job dies without RunPod's own API ever reporting a terminal
+    # status (so /status keeps returning something non-terminal forever),
+    # that lock never releases and nothing new gets dispatched to RunPod
+    # again, even though RunPod itself sits idle. Surface anything that's
+    # been 'running' far longer than any real job should take.
+    script_run_table = _table("script_run")
+    result = db.execute(
+        text(
+            f"""
+            select id, session_id, trigger_id, script_name, model_name, runner_job_id
+            from {script_run_table}
+            where script_name in ('entry', 'kiosk', 'kiosk_match', 'grouping')
+              and status = 'running'
+              and runner_job_id is not null
+              and started_at is not null
+              and timestampdiff(second, started_at, utc_timestamp()) > :stale_seconds
+            order by id asc
+            """
+        ),
+        {"stale_seconds": max(1, int(stale_seconds))},
+    )
+    return _fetch_all_dicts(result)
+
+
 def list_running_remote_analysis_script_runs(db: Session) -> list[dict[str, Any]]:
     script_run_table = _table("script_run")
     cost_select = _script_run_cost_select(db, script_run_table)
