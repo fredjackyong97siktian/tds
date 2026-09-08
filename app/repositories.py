@@ -2961,11 +2961,20 @@ def mark_stale_open_entry_frame_assets_issue(
 
 
 def list_stale_open_entry_frame_assets(
-    db: Session, *, location_id: int | None = None, limit: int = 200
+    db: Session,
+    *,
+    location_id: int | None = None,
+    start_time: Any = None,
+    end_time: Any = None,
+    limit: int = 200,
 ) -> list[dict[str, Any]]:
     frame_asset_table = _table("trigger_frame_asset")
     trigger_table = _table("trigger_event")
     location_clause = "and fa.location_id = :location_id" if location_id is not None else ""
+    # fa.start_time is the same field mark_stale_open_entry_frame_assets_issue()
+    # itself compares against the staleness cutoff, so filtering on it here
+    # keeps this consistent with what actually made the trigger stale.
+    window_clause = "and fa.start_time between :start_time and :end_time" if start_time is not None and end_time is not None else ""
     result = db.execute(
         text(
             f"""
@@ -2984,23 +2993,36 @@ def list_stale_open_entry_frame_assets(
             where fa.status = 'issue'
               and fa.error = :error
               {location_clause}
+              {window_clause}
             order by fa.updated_at desc
             limit :limit
             """
         ),
-        {"error": STALE_OPEN_ENTRY_ISSUE_ERROR, "location_id": location_id, "limit": max(1, int(limit))},
+        {
+            "error": STALE_OPEN_ENTRY_ISSUE_ERROR,
+            "location_id": location_id,
+            "start_time": start_time,
+            "end_time": end_time,
+            "limit": max(1, int(limit)),
+        },
     )
     return _fetch_all_dicts(result)
 
 
-def reset_stale_open_entry_frame_assets_for_location(db: Session, *, location_id: int) -> int:
+def reset_stale_open_entry_frame_assets_for_location(
+    db: Session, *, location_id: int, start_time: Any = None, end_time: Any = None
+) -> int:
     # A retry should give a stale-flagged trigger another chance at being
     # matched, not leave it permanently excluded - mark_grouping_batch_frame_
     # assets_retrieved() can't reach these because they were never part of
     # any batch's filter_grouping_item rows in the first place (that's
     # exactly why they went stale). Reset them back to 'retrieved' so the
-    # next prepare_due_grouping_batches() pass picks them up again.
+    # next prepare_due_grouping_batches() pass picks them up again. Scoped to
+    # the retried batch's own window (not just its location) so a retry only
+    # reconsiders entries from that same period, matching what the dashboard
+    # displays for it.
     frame_asset_table = _table("trigger_frame_asset")
+    window_clause = "and start_time between :start_time and :end_time" if start_time is not None and end_time is not None else ""
     result = db.execute(
         text(
             f"""
@@ -3011,9 +3033,15 @@ def reset_stale_open_entry_frame_assets_for_location(db: Session, *, location_id
             where location_id = :location_id
               and status = 'issue'
               and error = :error
+              {window_clause}
             """
         ),
-        {"location_id": location_id, "error": STALE_OPEN_ENTRY_ISSUE_ERROR},
+        {
+            "location_id": location_id,
+            "error": STALE_OPEN_ENTRY_ISSUE_ERROR,
+            "start_time": start_time,
+            "end_time": end_time,
+        },
     )
     db.commit()
     return int(result.rowcount or 0)

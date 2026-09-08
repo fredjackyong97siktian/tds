@@ -6822,7 +6822,10 @@ def retry_grouping_batch_now(db: Session, *, batch_id: int) -> dict[str, Any]:
     batch_location_id = batch.get("location_id")
     if batch_location_id is not None:
         reset_stale_open_entry_count = repositories.reset_stale_open_entry_frame_assets_for_location(
-            db, location_id=int(batch_location_id)
+            db,
+            location_id=int(batch_location_id),
+            start_time=batch.get("window_start"),
+            end_time=batch.get("window_end"),
         )
     deleted_confidence_count = repositories.delete_filter_confidence_results_for_batch(db, batch_id)
     repositories.reset_grouping_batch_for_retry(db, batch_id)
