@@ -4376,7 +4376,20 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
             db,
             location_id=location_id,
             cutoff_time=stale_cutoff,
+            selected_periods=selected_periods,
         )
+        reset_count = repositories.reset_incorrectly_staled_frame_assets_outside_periods(
+            db,
+            location_id=location_id,
+            selected_periods=selected_periods,
+        )
+        if reset_count:
+            logger.warning(
+                "Un-flagged %s trigger_frame_asset row(s) at location_id=%s that a prior, "
+                "not-period-scoped staleness sweep incorrectly marked issue",
+                reset_count,
+                location_id,
+            )
         ready_assets = repositories.list_manual_grouping_ready_trigger_frame_assets(
             db,
             location_id=location_id,

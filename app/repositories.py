@@ -2927,6 +2927,7 @@ def mark_stale_open_entry_frame_assets_issue(
     *,
     location_id: int,
     cutoff_time: Any,
+    selected_periods: list[Mapping[str, Any]],
 ) -> int:
     # Catches any retrieved-but-never-resolved frame asset past the cutoff,
     # regardless of whether it ever made it into a completed batch - a trigger
@@ -2934,8 +2935,34 @@ def mark_stale_open_entry_frame_assets_issue(
     # successful batch at all previously fell through this check entirely
     # (no qualifying prior grouping_item row to match against) and would sit
     # as "ready" and keep getting pulled into every future batch forever.
+    #
+    # Only a trigger whose time-of-day actually falls inside one of this
+    # location's SELECTED periods can ever be picked up by
+    # list_manual_grouping_ready_trigger_frame_assets() in the first place -
+    # grouping never attempts one outside all selected periods, so it can
+    # never have "no matching exit found," and must not be swept here either.
+    if not selected_periods:
+        return 0
     frame_asset_table = _table("trigger_frame_asset")
     grouping_item_table = _table("filter_grouping_item")
+    period_clauses: list[str] = []
+    params: dict[str, Any] = {
+        "location_id": location_id,
+        "cutoff_time": cutoff_time,
+        "error": STALE_OPEN_ENTRY_ISSUE_ERROR,
+    }
+    for index, period in enumerate(selected_periods):
+        start_key = f"period_start_{index}"
+        end_key = f"period_end_{index}"
+        params[start_key] = period["start_time"]
+        params[end_key] = period["end_time"]
+        period_clauses.append(
+            f"("
+            f"(:{start_key} <= :{end_key} and time(fa.start_time) between :{start_key} and :{end_key}) "
+            f"or (:{start_key} > :{end_key} and (time(fa.start_time) >= :{start_key} or time(fa.start_time) <= :{end_key}))"
+            f")"
+        )
+    period_filter = " or ".join(period_clauses)
     result = db.execute(
         text(
             f"""
@@ -2946,6 +2973,7 @@ def mark_stale_open_entry_frame_assets_issue(
             where fa.location_id = :location_id
               and fa.status = 'retrieved'
               and fa.start_time < :cutoff_time
+              and ({period_filter})
               and not exists (
                   select 1
                   from {grouping_item_table} grouped_gi
@@ -2954,7 +2982,55 @@ def mark_stale_open_entry_frame_assets_issue(
               )
             """
         ),
-        {"location_id": location_id, "cutoff_time": cutoff_time, "error": STALE_OPEN_ENTRY_ISSUE_ERROR},
+        params,
+    )
+    db.commit()
+    return int(result.rowcount or 0)
+
+
+def reset_incorrectly_staled_frame_assets_outside_periods(
+    db: Session, *, location_id: int, selected_periods: list[Mapping[str, Any]]
+) -> int:
+    # One-time (per call) self-heal for damage done by the staleness sweep
+    # before it was scoped to selected periods: it used to mark ANY
+    # retrieved-but-ungrouped trigger stale, including ones whose time-of-day
+    # falls entirely outside every selected period - triggers grouping was
+    # never going to look at in the first place, so "no matching exit found"
+    # was never a true statement about them. Un-flag those back to
+    # 'retrieved' so they just sit out of scope again instead of showing as
+    # an incident.
+    frame_asset_table = _table("trigger_frame_asset")
+    params: dict[str, Any] = {"location_id": location_id, "error": STALE_OPEN_ENTRY_ISSUE_ERROR}
+    if selected_periods:
+        period_clauses: list[str] = []
+        for index, period in enumerate(selected_periods):
+            start_key = f"period_start_{index}"
+            end_key = f"period_end_{index}"
+            params[start_key] = period["start_time"]
+            params[end_key] = period["end_time"]
+            period_clauses.append(
+                f"("
+                f"(:{start_key} <= :{end_key} and time(start_time) between :{start_key} and :{end_key}) "
+                f"or (:{start_key} > :{end_key} and (time(start_time) >= :{start_key} or time(start_time) <= :{end_key}))"
+                f")"
+            )
+        outside_all_periods_filter = f"not ({' or '.join(period_clauses)})"
+    else:
+        outside_all_periods_filter = "1 = 1"
+    result = db.execute(
+        text(
+            f"""
+            update {frame_asset_table}
+            set status = 'retrieved',
+                error = null,
+                updated_at = now()
+            where location_id = :location_id
+              and status = 'issue'
+              and error = :error
+              and {outside_all_periods_filter}
+            """
+        ),
+        params,
     )
     db.commit()
     return int(result.rowcount or 0)
