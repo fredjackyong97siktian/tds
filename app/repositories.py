@@ -2960,9 +2960,12 @@ def mark_stale_open_entry_frame_assets_issue(
     return int(result.rowcount or 0)
 
 
-def list_stale_open_entry_frame_assets(db: Session, *, limit: int = 200) -> list[dict[str, Any]]:
+def list_stale_open_entry_frame_assets(
+    db: Session, *, location_id: int | None = None, limit: int = 200
+) -> list[dict[str, Any]]:
     frame_asset_table = _table("trigger_frame_asset")
     trigger_table = _table("trigger_event")
+    location_clause = "and fa.location_id = :location_id" if location_id is not None else ""
     result = db.execute(
         text(
             f"""
@@ -2980,13 +2983,40 @@ def list_stale_open_entry_frame_assets(db: Session, *, limit: int = 200) -> list
             left join {trigger_table} te on te.id = fa.trigger_id
             where fa.status = 'issue'
               and fa.error = :error
+              {location_clause}
             order by fa.updated_at desc
             limit :limit
             """
         ),
-        {"error": STALE_OPEN_ENTRY_ISSUE_ERROR, "limit": max(1, int(limit))},
+        {"error": STALE_OPEN_ENTRY_ISSUE_ERROR, "location_id": location_id, "limit": max(1, int(limit))},
     )
     return _fetch_all_dicts(result)
+
+
+def reset_stale_open_entry_frame_assets_for_location(db: Session, *, location_id: int) -> int:
+    # A retry should give a stale-flagged trigger another chance at being
+    # matched, not leave it permanently excluded - mark_grouping_batch_frame_
+    # assets_retrieved() can't reach these because they were never part of
+    # any batch's filter_grouping_item rows in the first place (that's
+    # exactly why they went stale). Reset them back to 'retrieved' so the
+    # next prepare_due_grouping_batches() pass picks them up again.
+    frame_asset_table = _table("trigger_frame_asset")
+    result = db.execute(
+        text(
+            f"""
+            update {frame_asset_table}
+            set status = 'retrieved',
+                error = null,
+                updated_at = now()
+            where location_id = :location_id
+              and status = 'issue'
+              and error = :error
+            """
+        ),
+        {"location_id": location_id, "error": STALE_OPEN_ENTRY_ISSUE_ERROR},
+    )
+    db.commit()
+    return int(result.rowcount or 0)
 
 
 def _script_run_list_filters(
