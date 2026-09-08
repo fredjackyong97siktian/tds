@@ -13,9 +13,10 @@ from .config import settings
 PAID_TRANSACTION_ID_COLUMN = "receiptNumber"
 PAID_TRANSACTION_TIME_COLUMN = "Formatted Timestamp"
 PAID_TRANSACTION_DATABASE = "sesamedb"
-# Written by mark_stale_open_entry_frame_assets_issue() and read back by
-# list_stale_open_entry_frame_assets() - a single shared constant so the two
-# can never drift apart.
+# Legacy error string: the staleness sweep that used to write this has been
+# removed (it caused a permanent reset/re-flag loop for some triggers).
+# list_stale_open_entry_frame_assets() still reads it back for any rows a
+# prior deploy already flagged this way, but nothing writes it anymore.
 STALE_OPEN_ENTRY_ISSUE_ERROR = "No matching exit found before the open-entry staleness cutoff."
 _COLUMN_EXISTS_CACHE: dict[tuple[str, str], bool] = {}
 
@@ -2222,16 +2223,7 @@ def list_manual_grouping_ready_trigger_frame_assets(
             where te.location_id = :location_id
               and te.whitelist_hit = 0
               and te.status <> 'whitelisted'
-              and (
-                  fa.status = 'retrieved'
-                  -- mark_stale_open_entry_frame_assets_issue flips a perfectly
-                  -- good, already-retrieved asset to 'issue' purely because it
-                  -- sat too long without a match - its frames are fine, it was
-                  -- never a real retrieval failure. Excluding it here (the same
-                  -- query both the schedule and every manual rerun use) made it
-                  -- permanently unusable forever, even on retry.
-                  or (fa.status = 'issue' and fa.error = 'No matching exit found before the open-entry staleness cutoff.')
-              )
+              and fa.status = 'retrieved'
               and not exists (
                   select 1
                   from {grouping_item_table} gi
@@ -2998,199 +2990,38 @@ def mark_grouping_batch_frame_assets_retrieved(db: Session, batch_id: int, *, er
     return int(result.rowcount or 0)
 
 
-def mark_stale_open_entry_frame_assets_issue(
-    db: Session,
-    *,
-    location_id: int,
-    cutoff_time: Any,
-    selected_periods: list[Mapping[str, Any]],
-) -> int:
-    # Catches any retrieved-but-never-resolved frame asset past the cutoff,
-    # regardless of whether it ever made it into a completed batch - a trigger
-    # that was retrieved but, for whatever reason, never got swept into a
-    # successful batch at all previously fell through this check entirely
-    # (no qualifying prior grouping_item row to match against) and would sit
-    # as "ready" and keep getting pulled into every future batch forever.
-    #
-    # Only a trigger whose time-of-day actually falls inside one of this
-    # location's SELECTED periods can ever be picked up by
-    # list_manual_grouping_ready_trigger_frame_assets() in the first place -
-    # grouping never attempts one outside all selected periods, so it can
-    # never have "no matching exit found," and must not be swept here either.
-    if not selected_periods:
-        return 0
-    frame_asset_table = _table("trigger_frame_asset")
-    grouping_item_table = _table("filter_grouping_item")
-    period_clauses: list[str] = []
-    params: dict[str, Any] = {
-        "location_id": location_id,
-        "cutoff_time": cutoff_time,
-        "error": STALE_OPEN_ENTRY_ISSUE_ERROR,
-    }
-    for index, period in enumerate(selected_periods):
-        start_key = f"period_start_{index}"
-        end_key = f"period_end_{index}"
-        params[start_key] = period["start_time"]
-        params[end_key] = period["end_time"]
-        period_clauses.append(
-            f"("
-            f"(:{start_key} <= :{end_key} and time(fa.start_time) between :{start_key} and :{end_key}) "
-            f"or (:{start_key} > :{end_key} and (time(fa.start_time) >= :{start_key} or time(fa.start_time) <= :{end_key}))"
-            f")"
-        )
-    period_filter = " or ".join(period_clauses)
-    grouping_batch_table = _table("filter_grouping_batch")
-    result = db.execute(
-        text(
-            f"""
-            update {frame_asset_table} fa
-            set fa.status = 'issue',
-                fa.error = :error,
-                fa.updated_at = now()
-            where fa.location_id = :location_id
-              and fa.status = 'retrieved'
-              and fa.start_time < :cutoff_time
-              and ({period_filter})
-              and not exists (
-                  select 1
-                  from {grouping_item_table} grouped_gi
-                  join {grouping_batch_table} gb on gb.id = grouped_gi.batch_id
-                  where grouped_gi.trigger_id = fa.trigger_id
-                    and (
-                        grouped_gi.status = 'grouped'
-                        or gb.status in ('pending', 'dispatching', 'running')
-                    )
-              )
-            """
-        ),
-        params,
-    )
-    db.commit()
-    return int(result.rowcount or 0)
-
-
-def reset_incorrectly_staled_frame_assets_outside_periods(
-    db: Session, *, location_id: int, selected_periods: list[Mapping[str, Any]]
-) -> int:
-    # One-time (per call) self-heal for damage done by the staleness sweep
-    # before it was scoped to selected periods: it used to mark ANY
-    # retrieved-but-ungrouped trigger stale, including ones whose time-of-day
-    # falls entirely outside every selected period - triggers grouping was
-    # never going to look at in the first place, so "no matching exit found"
-    # was never a true statement about them. Un-flag those back to
-    # 'retrieved' so they just sit out of scope again instead of showing as
-    # an incident.
-    frame_asset_table = _table("trigger_frame_asset")
-    params: dict[str, Any] = {"location_id": location_id, "error": STALE_OPEN_ENTRY_ISSUE_ERROR}
-    if selected_periods:
-        period_clauses: list[str] = []
-        for index, period in enumerate(selected_periods):
-            start_key = f"period_start_{index}"
-            end_key = f"period_end_{index}"
-            params[start_key] = period["start_time"]
-            params[end_key] = period["end_time"]
-            period_clauses.append(
-                f"("
-                f"(:{start_key} <= :{end_key} and time(start_time) between :{start_key} and :{end_key}) "
-                f"or (:{start_key} > :{end_key} and (time(start_time) >= :{start_key} or time(start_time) <= :{end_key}))"
-                f")"
-            )
-        outside_all_periods_filter = f"not ({' or '.join(period_clauses)})"
-    else:
-        outside_all_periods_filter = "1 = 1"
-    result = db.execute(
-        text(
-            f"""
-            update {frame_asset_table}
-            set status = 'retrieved',
-                error = null,
-                updated_at = now()
-            where location_id = :location_id
-              and status = 'issue'
-              and error = :error
-              and {outside_all_periods_filter}
-            """
-        ),
-        params,
-    )
-    db.commit()
-    return int(result.rowcount or 0)
-
-
 def reset_all_issue_frame_assets_within_periods(
     db: Session, *, location_id: int, due_windows: list[tuple[Any, Any]]
-) -> dict[str, int]:
+) -> int:
     # Every trigger inside one of THIS cycle's actual due-batch windows gets a
-    # fresh shot before grouping runs - but which repair path depends on WHY
-    # it's 'issue':
-    #   - Flagged by the staleness sweep (STALE_OPEN_ENTRY_ISSUE_ERROR): the
-    #     frames themselves were already captured fine - "no matching exit
-    #     found" is a grouping outcome, not a retrieval failure - so it's
-    #     safe to put it straight back to 'retrieved' for grouping to
-    #     reconsider.
-    #   - 'issue' for any other reason (a genuine retrieval problem, e.g.
-    #     frames only partially captured): resetting straight to 'retrieved'
-    #     would claim frame data that doesn't really exist. Route it back to
-    #     'not_retrieved' instead so the retrieval worker actually attempts a
-    #     real re-capture - if that still fails, its own error handling
-    #     leaves it at 'issue' again rather than faking a 'retrieved' state.
+    # fresh shot before grouping runs: route it back to 'not_retrieved' so the
+    # retrieval worker actually re-attempts it - if that still fails, its own
+    # error handling leaves it at 'issue' again.
     #
     # Scoped to due_windows (the SAME concrete start/end datetimes batch
-    # construction itself will use this cycle), not just "this time-of-day on
-    # any calendar day": a trigger from a calendar day with no due batch this
-    # cycle would get reset here, fail to be swept into any batch, and then
-    # get re-flagged 'issue' again by the staleness sweep before the next
-    # cycle even starts - the exact same 662 rows resetting and re-flagging
-    # forever, in a tight loop, with zero chance of ever actually reaching
-    # grouping. Scoping to real due windows means a reset here always
-    # corresponds to a genuine attempt this cycle.
+    # construction itself will use this cycle, matched against the same
+    # trigger_time it uses - see _grouping_time_from_trigger_frame_asset),
+    # not just "this time-of-day on any calendar day": a trigger from a
+    # calendar day with no due batch this cycle would get reset here and fail
+    # to be swept into any batch. Scoping to real due windows means a reset
+    # here always corresponds to a genuine attempt this cycle.
     if not due_windows:
-        return {"reset_to_retrieved": 0, "requeued_for_retrieval": 0}
+        return 0
     frame_asset_table = _table("trigger_frame_asset")
     trigger_table = _table("trigger_event")
     window_clauses: list[str] = []
-    params: dict[str, Any] = {"location_id": location_id, "stale_error": STALE_OPEN_ENTRY_ISSUE_ERROR}
+    params: dict[str, Any] = {"location_id": location_id}
     for index, (window_start, window_end) in enumerate(due_windows):
         start_key = f"window_start_{index}"
         end_key = f"window_end_{index}"
         params[start_key] = window_start
         params[end_key] = window_end
-        # Matched against the SAME timestamp the batch-building loop uses to
-        # decide window membership (trigger_event.trigger_time, falling back
-        # to fa.start_time only when there's no trigger row) - see
-        # _grouping_time_from_trigger_frame_asset. Matching against
-        # fa.start_time instead let a row pass this window check while its
-        # actual trigger_time fell outside the batch loop's own window +
-        # carry-forward range, so it kept getting reset here every cycle
-        # without ever being eligible to actually join a batch - a permanent
-        # reset/re-flag loop for that row alone.
         window_clauses.append(
             f"(coalesce(te.trigger_time, fa.start_time) >= :{start_key} "
             f"and coalesce(te.trigger_time, fa.start_time) < :{end_key})"
         )
     within_any_period_filter = " or ".join(window_clauses)
-    # Order matters: this UPDATE only touches the stale-flagged rows and
-    # flips them out of 'issue' first, so the second UPDATE below (which
-    # matches on status = 'issue' alone) naturally only reaches whatever's
-    # left - no need to re-exclude the stale ones explicitly.
-    reset_to_retrieved = db.execute(
-        text(
-            f"""
-            update {frame_asset_table} fa
-            left join {trigger_table} te on te.id = fa.trigger_id
-            set fa.status = 'retrieved',
-                fa.error = null,
-                fa.updated_at = now()
-            where fa.location_id = :location_id
-              and fa.status = 'issue'
-              and fa.error = :stale_error
-              and ({within_any_period_filter})
-            """
-        ),
-        params,
-    )
-    db.commit()
-    requeued_for_retrieval = db.execute(
+    result = db.execute(
         text(
             f"""
             update {frame_asset_table} fa
@@ -3206,10 +3037,7 @@ def reset_all_issue_frame_assets_within_periods(
         params,
     )
     db.commit()
-    return {
-        "reset_to_retrieved": int(reset_to_retrieved.rowcount or 0),
-        "requeued_for_retrieval": int(requeued_for_retrieval.rowcount or 0),
-    }
+    return int(result.rowcount or 0)
 
 
 def list_stale_open_entry_frame_assets(
@@ -3223,9 +3051,6 @@ def list_stale_open_entry_frame_assets(
     frame_asset_table = _table("trigger_frame_asset")
     trigger_table = _table("trigger_event")
     location_clause = "and fa.location_id = :location_id" if location_id is not None else ""
-    # fa.start_time is the same field mark_stale_open_entry_frame_assets_issue()
-    # itself compares against the staleness cutoff, so filtering on it here
-    # keeps this consistent with what actually made the trigger stale.
     window_clause = "and fa.start_time between :start_time and :end_time" if start_time is not None and end_time is not None else ""
     result = db.execute(
         text(

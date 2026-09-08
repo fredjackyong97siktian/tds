@@ -66,7 +66,6 @@ class Settings(BaseSettings):
     trigger_frame_fps: int = 25
     trigger_frame_crop_left_fraction: float = 0.50
     trigger_frame_crop_right_fraction: float = 0.15
-    grouping_open_entry_stale_minutes: int = 30
     grouping_open_entry_max_wait_minutes: int = 30
     grouping_carry_forward_buffer_minutes: int = 30
     grouping_window_grace_minutes: int = 60
