@@ -179,6 +179,14 @@ def get_grouping_batch(batch_id: int, db: Session = Depends(get_transaction_db))
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.get("/stale-open-entries")
+def list_stale_open_entries(
+    limit: int = 200,
+    db: Session = Depends(get_transaction_db),
+) -> list[dict[str, Any]]:
+    return repositories.list_stale_open_entry_frame_assets(db, limit=max(1, min(limit, 500)))
+
+
 @router.get("/confidence-results")
 def list_confidence_results(
     limit: int = 100,

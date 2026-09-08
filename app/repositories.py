@@ -13,6 +13,10 @@ from .config import settings
 PAID_TRANSACTION_ID_COLUMN = "receiptNumber"
 PAID_TRANSACTION_TIME_COLUMN = "Formatted Timestamp"
 PAID_TRANSACTION_DATABASE = "sesamedb"
+# Written by mark_stale_open_entry_frame_assets_issue() and read back by
+# list_stale_open_entry_frame_assets() - a single shared constant so the two
+# can never drift apart.
+STALE_OPEN_ENTRY_ISSUE_ERROR = "No matching exit found before the open-entry staleness cutoff."
 _COLUMN_EXISTS_CACHE: dict[tuple[str, str], bool] = {}
 
 
@@ -2937,7 +2941,7 @@ def mark_stale_open_entry_frame_assets_issue(
             f"""
             update {frame_asset_table} fa
             set fa.status = 'issue',
-                fa.error = 'No matching exit found before the open-entry staleness cutoff.',
+                fa.error = :error,
                 fa.updated_at = now()
             where fa.location_id = :location_id
               and fa.status = 'retrieved'
@@ -2950,10 +2954,39 @@ def mark_stale_open_entry_frame_assets_issue(
               )
             """
         ),
-        {"location_id": location_id, "cutoff_time": cutoff_time},
+        {"location_id": location_id, "cutoff_time": cutoff_time, "error": STALE_OPEN_ENTRY_ISSUE_ERROR},
     )
     db.commit()
     return int(result.rowcount or 0)
+
+
+def list_stale_open_entry_frame_assets(db: Session, *, limit: int = 200) -> list[dict[str, Any]]:
+    frame_asset_table = _table("trigger_frame_asset")
+    trigger_table = _table("trigger_event")
+    result = db.execute(
+        text(
+            f"""
+            select fa.id as frame_asset_id,
+                   fa.trigger_id,
+                   fa.location_id,
+                   fa.start_time,
+                   fa.end_time,
+                   fa.error,
+                   fa.updated_at,
+                   te.trigger_time,
+                   te.phone_entry_id,
+                   te.credit_card_entry_id
+            from {frame_asset_table} fa
+            left join {trigger_table} te on te.id = fa.trigger_id
+            where fa.status = 'issue'
+              and fa.error = :error
+            order by fa.updated_at desc
+            limit :limit
+            """
+        ),
+        {"error": STALE_OPEN_ENTRY_ISSUE_ERROR, "limit": max(1, int(limit))},
+    )
+    return _fetch_all_dicts(result)
 
 
 def _script_run_list_filters(
