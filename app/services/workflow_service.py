@@ -4363,7 +4363,7 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
     location_ids = [int(row["id"]) for row in locations if row.get("id") is not None]
     prepared: list[dict[str, Any]] = []
     current = _time_period_now()
-    stale_cutoff = current - timedelta(hours=max(1, int(settings.grouping_open_entry_stale_hours)))
+    stale_cutoff = current - timedelta(minutes=max(1, int(settings.grouping_open_entry_stale_minutes)))
     for location_id in location_ids:
         selected_periods = _selected_grouping_periods_for_location(periods, location_id)
         if not selected_periods:
