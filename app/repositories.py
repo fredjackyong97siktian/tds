@@ -868,6 +868,13 @@ def list_blocked_entries(db: Session) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for method in ("qrentry", "entrylogs"):
         source = _whitelist_source_config(method)
+        # qrentry's status column is only ever ACCESS/BLOCKED, so "not ACCESS"
+        # is exactly "BLOCKED". entrylogs's fingerprint table is shared with
+        # the payment side and carries other status values unrelated to
+        # blocking - filtering "not ACCESS" there pulls in that unrelated
+        # noise (and would also surface DEMANDING, which isn't a block), so
+        # only an exact BLOCKED match belongs on this list for that method.
+        status_filter = "upper(cast(status as char)) <> 'ACCESS'" if method == "qrentry" else "upper(cast(status as char)) = 'BLOCKED'"
         result = db.execute(
             text(
                 f"""
@@ -877,7 +884,7 @@ def list_blocked_entries(db: Session) -> list[dict[str, Any]]:
                        :method as method
                 from {source["table_name"]}
                 where status is not null
-                  and upper(cast(status as char)) <> 'ACCESS'
+                  and {status_filter}
                 order by {source["display_column"]} asc
                 """
             ),
