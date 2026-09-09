@@ -427,15 +427,23 @@ def get_dashboard_activity_timeseries(db: Session, *, hours: int = 24) -> list[d
     )
     theft_counts = {int(row["bucket_index"]): int(row["count"]) for row in _fetch_all_dicts(theft_result)}
 
-    # Every entry trigger gets a session row regardless of theft outcome (see
-    # _get_or_create_session_for_entry_trigger), so counting all of them here
-    # (no status filter) is a count of shopper visits, not just theft ones.
+    # Sums each grouped entry's own AI-estimated headcount (unique_customer_count,
+    # defaulting to 1 when a trigger hasn't been estimated yet) rather than
+    # counting session rows - a session only gets created once a group clears
+    # theft-confidence scoring and its deep-analysis step succeeds, which can
+    # lag well behind grouping (or fail outright), silently undercounting
+    # customers who plainly did walk in. This reuses group_count's own grouped
+    # entries, which have no such dependency.
     customer_result = db.execute(
         text(
             f"""
-            select timestampdiff(hour, start_time, :anchor) as bucket_index, count(*) as count
-            from {session_table}
-            where start_time >= :start_boundary and start_time < :anchor
+            select timestampdiff(hour, te.trigger_time, :anchor) as bucket_index,
+                   sum(coalesce(te.unique_customer_count, 1)) as count
+            from {grouping_item_table} gi
+            join {trigger_table} te on te.id = gi.trigger_id
+            where gi.role = 'entry'
+              and gi.status = 'grouped'
+              and te.trigger_time >= :start_boundary and te.trigger_time < :anchor
             group by bucket_index
             """
         ),
@@ -461,24 +469,24 @@ def get_dashboard_activity_timeseries(db: Session, *, hours: int = 24) -> list[d
 
 
 def get_customer_group_type_breakdown(db: Session, *, hours: int = 24) -> dict[str, int]:
-    # Same window/population as get_dashboard_activity_timeseries's customer_count
-    # (one row per session, regardless of theft outcome), broken down by the
-    # entry trigger's AI-classified customer_group_type. A session whose entry
-    # trigger hasn't been through a grouping pass yet (or wasn't classified)
-    # falls under "unclassified" rather than being silently dropped.
+    # Same grouped-entries population as get_dashboard_activity_timeseries's
+    # customer_count (see the comment there) - deliberately not session-based,
+    # since session creation can lag or fail independently of grouping.
     hours = max(1, min(int(hours), 168))
     anchor = datetime.now().replace(minute=0, second=0, microsecond=0)
     start_boundary = anchor - timedelta(hours=hours)
 
-    session_table = _table("session")
+    grouping_item_table = _table("filter_grouping_item")
     trigger_table = _table("trigger_event")
     result = db.execute(
         text(
             f"""
             select coalesce(te.customer_group_type, 'unclassified') as group_type, count(*) as count
-            from {session_table} s
-            join {trigger_table} te on te.id = s.entry_trigger_id
-            where s.start_time >= :start_boundary and s.start_time < :anchor
+            from {grouping_item_table} gi
+            join {trigger_table} te on te.id = gi.trigger_id
+            where gi.role = 'entry'
+              and gi.status = 'grouped'
+              and te.trigger_time >= :start_boundary and te.trigger_time < :anchor
             group by group_type
             """
         ),
