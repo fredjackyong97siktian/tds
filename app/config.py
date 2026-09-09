@@ -140,7 +140,7 @@ class Settings(BaseSettings):
     gemini_api_key: str | None = None
     kiosk_gemini_model: str = "gemini-3-flash-preview"
     grouping_gemini_model: str = "gemini-3.5-flash-lite"
-    grouping_gemini_frames_per_trigger: int = 5
+    grouping_gemini_frames_per_trigger: int = 6
     grouping_gemini_image_scale: float = 0.35
     grouping_deepseek_image_scale: float = 0.5
     grouping_gemini_max_images_per_request: int = 36
