@@ -947,12 +947,19 @@ def list_blocked_entries(db: Session) -> list[dict[str, Any]]:
     for method in ("qrentry", "entrylogs"):
         source = _whitelist_source_config(method)
         # qrentry's status column is only ever ACCESS/BLOCKED, so "not ACCESS"
-        # is exactly "BLOCKED". entrylogs's fingerprint table is shared with
-        # the payment side and carries other status values unrelated to
-        # blocking - filtering "not ACCESS" there pulls in that unrelated
-        # noise (and would also surface DEMANDING, which isn't a block), so
-        # only an exact BLOCKED match belongs on this list for that method.
-        status_filter = "upper(cast(status as char)) <> 'ACCESS'" if method == "qrentry" else "upper(cast(status as char)) = 'BLOCKED'"
+        # is exactly "BLOCKED". entrylogs's fingerprint table (sesamedb.fingerprint)
+        # is shared with the payment side and also carries plain transaction
+        # outcomes (SUCCEEDED, FAILED, etc.) in this same column - those are
+        # unrelated noise, not access-control states, so "not ACCESS" would
+        # wrongly pull them in. BLOCKED and DEMANDING are both real
+        # access-control states there (DEMANDING is not a block, but it is
+        # still a flagged state operators need to see and manage here) -
+        # match those two explicitly instead of excluding just ACCESS.
+        status_filter = (
+            "upper(cast(status as char)) <> 'ACCESS'"
+            if method == "qrentry"
+            else "upper(cast(status as char)) in ('BLOCKED', 'DEMANDING')"
+        )
         result = db.execute(
             text(
                 f"""
