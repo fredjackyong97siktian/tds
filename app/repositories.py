@@ -366,31 +366,35 @@ def list_cctv(db: Session, location_id: int | None = None) -> list[dict[str, Any
 
 
 def get_dashboard_activity_timeseries(db: Session, *, days: int = 30) -> list[dict[str, Any]]:
-    # One row per calendar day, oldest first, always including zero-count
-    # days (a chart with gaps for quiet days is misleading) - built by
-    # generating the full day range in Python and merging in whatever each
-    # query actually found, rather than relying on MySQL to synthesize
-    # missing rows.
+    # Rolling 24-hour windows anchored to the current hour, not calendar
+    # days - a plain "GROUP BY DATE(...)" bucket for "today" is only ever a
+    # partial day (e.g. just 3pm-3pm if it's 3pm now), which always looks
+    # artificially low next to a full previous day. Anchoring to the current
+    # hour instead means the most recent bucket is always a genuine, complete
+    # 24-hour window ending now, and every earlier bucket is the same size.
     days = max(1, min(int(days), 180))
-    start_date = (datetime.now() - timedelta(days=days - 1)).date()
+    anchor = datetime.now().replace(minute=0, second=0, microsecond=0)
+    start_boundary = anchor - timedelta(hours=24 * days)
 
     trigger_table = _table("trigger_event")
     grouping_item_table = _table("filter_grouping_item")
     session_table = _table("session")
-    params: dict[str, Any] = {"start_date": start_date}
+    params: dict[str, Any] = {"anchor": anchor, "start_boundary": start_boundary}
 
+    # bucket_index 0 = the most recent 24h window [anchor-24h, anchor);
+    # bucket_index 1 = the one before that [anchor-48h, anchor-24h); etc.
     trigger_result = db.execute(
         text(
             f"""
-            select date(trigger_time) as day, count(*) as count
+            select floor(timestampdiff(hour, trigger_time, :anchor) / 24) as bucket_index, count(*) as count
             from {trigger_table}
-            where trigger_time >= :start_date
-            group by day
+            where trigger_time >= :start_boundary and trigger_time < :anchor
+            group by bucket_index
             """
         ),
         params,
     )
-    trigger_counts = {row["day"]: int(row["count"]) for row in _fetch_all_dicts(trigger_result)}
+    trigger_counts = {int(row["bucket_index"]): int(row["count"]) for row in _fetch_all_dicts(trigger_result)}
 
     # One row per group (an entry always exists exactly once per group), not
     # per grouping_item - a group has an entry row and usually an exit row
@@ -399,42 +403,44 @@ def get_dashboard_activity_timeseries(db: Session, *, days: int = 30) -> list[di
     group_result = db.execute(
         text(
             f"""
-            select date(te.trigger_time) as day, count(*) as count
+            select floor(timestampdiff(hour, te.trigger_time, :anchor) / 24) as bucket_index, count(*) as count
             from {grouping_item_table} gi
             join {trigger_table} te on te.id = gi.trigger_id
             where gi.role = 'entry'
               and gi.status = 'grouped'
-              and te.trigger_time >= :start_date
-            group by day
+              and te.trigger_time >= :start_boundary and te.trigger_time < :anchor
+            group by bucket_index
             """
         ),
         params,
     )
-    group_counts = {row["day"]: int(row["count"]) for row in _fetch_all_dicts(group_result)}
+    group_counts = {int(row["bucket_index"]): int(row["count"]) for row in _fetch_all_dicts(group_result)}
 
     theft_result = db.execute(
         text(
             f"""
-            select date(start_time) as day, count(*) as count
+            select floor(timestampdiff(hour, start_time, :anchor) / 24) as bucket_index, count(*) as count
             from {session_table}
             where status = 'detected'
-              and start_time >= :start_date
-            group by day
+              and start_time >= :start_boundary and start_time < :anchor
+            group by bucket_index
             """
         ),
         params,
     )
-    theft_counts = {row["day"]: int(row["count"]) for row in _fetch_all_dicts(theft_result)}
+    theft_counts = {int(row["bucket_index"]): int(row["count"]) for row in _fetch_all_dicts(theft_result)}
 
     buckets: list[dict[str, Any]] = []
-    for offset in range(days):
-        day = start_date + timedelta(days=offset)
+    for bucket_index in range(days - 1, -1, -1):
+        period_end = anchor - timedelta(hours=24 * bucket_index)
+        period_start = period_end - timedelta(hours=24)
         buckets.append(
             {
-                "date": day.isoformat(),
-                "trigger_count": trigger_counts.get(day, 0),
-                "group_count": group_counts.get(day, 0),
-                "theft_count": theft_counts.get(day, 0),
+                "period_start": period_start.isoformat(),
+                "period_end": period_end.isoformat(),
+                "trigger_count": trigger_counts.get(bucket_index, 0),
+                "group_count": group_counts.get(bucket_index, 0),
+                "theft_count": theft_counts.get(bucket_index, 0),
             }
         )
     return buckets
