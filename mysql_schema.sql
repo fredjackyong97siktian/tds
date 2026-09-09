@@ -79,6 +79,8 @@ CREATE TABLE IF NOT EXISTS sesamedb.tds_trigger_event (
     unique_customer_count SMALLINT DEFAULT NULL COMMENT 'Model-estimated count of distinct people visible together in this trigger''s own frames - NULL until some grouping stage has estimated it.',
     unique_customer_count_confidence FLOAT DEFAULT NULL,
     unique_customer_count_source VARCHAR(20) DEFAULT NULL COMMENT 'Which grouping stage produced the estimate: adjacent, direct, or repair.',
+    customer_group_type VARCHAR(20) DEFAULT NULL COMMENT 'Model-estimated relationship of the people in this trigger: solo, couple, family, or friends - from the same estimate as unique_customer_count.',
+    age_brackets JSON DEFAULT NULL COMMENT 'Model-estimated age bracket per distinct person in this trigger, e.g. ["adult","child"].',
     appearance_description VARCHAR(255) DEFAULT NULL COMMENT 'Short, reusable description of this trigger''s primary actor (clothing/footwear/carried items) from the grouping model - carried forward into later stages/batches as a matching aid.',
     appearance_direction VARCHAR(10) DEFAULT NULL COMMENT 'Grouping model''s own entry/exit/unclear read for this trigger, independent of identity.',
     appearance_source VARCHAR(20) DEFAULT NULL COMMENT 'Which grouping stage produced appearance_description/appearance_direction: adjacent, direct, or repair.',

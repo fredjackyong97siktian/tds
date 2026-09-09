@@ -195,6 +195,8 @@ class SessionResponse(BaseModel):
     actual_items_brought: int = 0
     transaction_total_items: int = 0
     total_customer: int = 0
+    customer_group_type: str | None = None
+    age_brackets: list[str] | None = None
     issue_reason: str | None = None
     result_summary: dict[str, Any] | None = None
 

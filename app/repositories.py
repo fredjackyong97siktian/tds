@@ -427,6 +427,22 @@ def get_dashboard_activity_timeseries(db: Session, *, hours: int = 24) -> list[d
     )
     theft_counts = {int(row["bucket_index"]): int(row["count"]) for row in _fetch_all_dicts(theft_result)}
 
+    # Every entry trigger gets a session row regardless of theft outcome (see
+    # _get_or_create_session_for_entry_trigger), so counting all of them here
+    # (no status filter) is a count of shopper visits, not just theft ones.
+    customer_result = db.execute(
+        text(
+            f"""
+            select timestampdiff(hour, start_time, :anchor) as bucket_index, count(*) as count
+            from {session_table}
+            where start_time >= :start_boundary and start_time < :anchor
+            group by bucket_index
+            """
+        ),
+        params,
+    )
+    customer_counts = {int(row["bucket_index"]): int(row["count"]) for row in _fetch_all_dicts(customer_result)}
+
     buckets: list[dict[str, Any]] = []
     for bucket_index in range(hours - 1, -1, -1):
         period_end = anchor - timedelta(hours=bucket_index)
@@ -438,9 +454,37 @@ def get_dashboard_activity_timeseries(db: Session, *, hours: int = 24) -> list[d
                 "trigger_count": trigger_counts.get(bucket_index, 0),
                 "group_count": group_counts.get(bucket_index, 0),
                 "theft_count": theft_counts.get(bucket_index, 0),
+                "customer_count": customer_counts.get(bucket_index, 0),
             }
         )
     return buckets
+
+
+def get_customer_group_type_breakdown(db: Session, *, hours: int = 24) -> dict[str, int]:
+    # Same window/population as get_dashboard_activity_timeseries's customer_count
+    # (one row per session, regardless of theft outcome), broken down by the
+    # entry trigger's AI-classified customer_group_type. A session whose entry
+    # trigger hasn't been through a grouping pass yet (or wasn't classified)
+    # falls under "unclassified" rather than being silently dropped.
+    hours = max(1, min(int(hours), 168))
+    anchor = datetime.now().replace(minute=0, second=0, microsecond=0)
+    start_boundary = anchor - timedelta(hours=hours)
+
+    session_table = _table("session")
+    trigger_table = _table("trigger_event")
+    result = db.execute(
+        text(
+            f"""
+            select coalesce(te.customer_group_type, 'unclassified') as group_type, count(*) as count
+            from {session_table} s
+            join {trigger_table} te on te.id = s.entry_trigger_id
+            where s.start_time >= :start_boundary and s.start_time < :anchor
+            group by group_type
+            """
+        ),
+        {"start_boundary": start_boundary, "anchor": anchor},
+    )
+    return {str(row["group_type"]): int(row["count"]) for row in _fetch_all_dicts(result)}
 
 
 def list_theft_transactions(db: Session, limit: int = 50) -> list[dict[str, Any]]:
@@ -1570,10 +1614,14 @@ def set_trigger_unique_customer_count(
     count: int,
     confidence: float,
     source: str,
+    group_type: str | None = None,
+    age_brackets: list[str] | None = None,
 ) -> None:
     # source is whichever grouping stage produced this estimate (adjacent,
     # direct, or repair) - kept purely so a stale/odd count can be traced back
-    # to where it came from, not used to gate anything itself.
+    # to where it came from, not used to gate anything itself. group_type and
+    # age_brackets come from the same AI estimate as count/confidence, so they
+    # don't get their own separate confidence/source columns.
     trigger_table = _table("trigger_event")
     db.execute(
         text(
@@ -1581,11 +1629,20 @@ def set_trigger_unique_customer_count(
             update {trigger_table}
             set unique_customer_count = :count,
                 unique_customer_count_confidence = :confidence,
-                unique_customer_count_source = :source
+                unique_customer_count_source = :source,
+                customer_group_type = :group_type,
+                age_brackets = :age_brackets
             where id = :trigger_id
             """
         ),
-        {"trigger_id": trigger_id, "count": count, "confidence": confidence, "source": source},
+        {
+            "trigger_id": trigger_id,
+            "count": count,
+            "confidence": confidence,
+            "source": source,
+            "group_type": group_type,
+            "age_brackets": json.dumps(age_brackets) if age_brackets else None,
+        },
     )
     db.commit()
 
@@ -1597,7 +1654,8 @@ def get_trigger_unique_customer_counts(db: Session, trigger_ids: list[int]) -> d
     result = db.execute(
         text(
             f"""
-            select id, unique_customer_count, unique_customer_count_confidence, unique_customer_count_source
+            select id, unique_customer_count, unique_customer_count_confidence, unique_customer_count_source,
+                   customer_group_type, age_brackets
             from {trigger_table}
             where id in :trigger_ids
               and unique_customer_count is not null
@@ -1605,7 +1663,14 @@ def get_trigger_unique_customer_counts(db: Session, trigger_ids: list[int]) -> d
         ).bindparams(bindparam("trigger_ids", expanding=True)),
         {"trigger_ids": trigger_ids},
     )
-    return {int(row["id"]): dict(row) for row in _fetch_all_dicts(result)}
+    rows = {int(row["id"]): dict(row) for row in _fetch_all_dicts(result)}
+    for row in rows.values():
+        if isinstance(row.get("age_brackets"), str):
+            try:
+                row["age_brackets"] = json.loads(row["age_brackets"])
+            except json.JSONDecodeError:
+                pass
+    return rows
 
 
 def set_trigger_appearance(
@@ -4302,22 +4367,30 @@ def restart_video_asset_analysis(db: Session, video_asset_id: int) -> dict[str, 
 
 def get_session(db: Session, session_id: int) -> dict[str, Any]:
     session_table = _table("session")
+    trigger_table = _table("trigger_event")
     has_grouping_id = _column_exists(db, session_table, "grouping_id")
-    grouping_id_select = ", grouping_id" if has_grouping_id else ""
+    grouping_id_select = ", s.grouping_id" if has_grouping_id else ""
     result = db.execute(
         text(
             f"""
-            select id, entry_trigger_id, exit_trigger_id, location_id, status, start_time, end_time,
-                   total_item_brought, actual_items_brought, transaction_total_items, total_customer,
-                   result_summary, issue_reason
+            select s.id, s.entry_trigger_id, s.exit_trigger_id, s.location_id, s.status, s.start_time, s.end_time,
+                   s.total_item_brought, s.actual_items_brought, s.transaction_total_items, s.total_customer,
+                   s.result_summary, s.issue_reason,
+                   te.customer_group_type, te.age_brackets
                    {grouping_id_select}
-            from {session_table}
-            where id = :session_id
+            from {session_table} s
+            left join {trigger_table} te on te.id = s.entry_trigger_id
+            where s.id = :session_id
             """
         ),
         {"session_id": session_id},
     )
     row = _fetch_one_dict(result)
+    if isinstance(row.get("age_brackets"), str):
+        try:
+            row["age_brackets"] = json.loads(row["age_brackets"])
+        except json.JSONDecodeError:
+            pass
     if isinstance(row.get("result_summary"), str):
         try:
             row["result_summary"] = json.loads(row["result_summary"])
@@ -4633,6 +4706,7 @@ def list_sessions(
     db: Session, limit: int = 50, *, offset: int = 0, session_id: int | None = None
 ) -> list[dict[str, Any]]:
     session_table = _table("session")
+    trigger_table = _table("trigger_event")
     location_table = settings.location_table_name
     location_id_column = settings.location_id_column
     location_name_column = settings.location_name_column
@@ -4645,12 +4719,14 @@ def list_sessions(
             select s.id, s.entry_trigger_id, s.exit_trigger_id, s.location_id, s.status,
                    s.start_time, s.end_time, s.total_item_brought, s.actual_items_brought,
                    s.transaction_total_items, s.total_customer, s.issue_reason, s.result_summary{grouping_id_select},
+                   te.customer_group_type, te.age_brackets,
                    l.{location_name_column} as location_name,
                    case when s.status in ('issue', 'closed', 'need_review')
                           or (s.status = 'pending' and s.end_time is not null)
                         then true else false end as can_retry,
                    s.created_at, s.updated_at
             from {session_table} s
+            left join {trigger_table} te on te.id = s.entry_trigger_id
             left join {location_table} l on l.{location_id_column} = s.location_id
             {where_sql}
             order by s.id desc
@@ -4664,6 +4740,11 @@ def list_sessions(
         if isinstance(row.get("result_summary"), str):
             try:
                 row["result_summary"] = json.loads(row["result_summary"])
+            except json.JSONDecodeError:
+                pass
+        if isinstance(row.get("age_brackets"), str):
+            try:
+                row["age_brackets"] = json.loads(row["age_brackets"])
             except json.JSONDecodeError:
                 pass
         row["session_videos"] = list_session_video_assets(db, session_id=int(row["id"]))

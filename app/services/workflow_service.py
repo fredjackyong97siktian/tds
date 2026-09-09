@@ -3268,6 +3268,10 @@ def _repair_grouping_with_gemini(
         "Also, for every trigger listed below (entries and unknown triggers both), count how many distinct, separate "
         "people appear together in that trigger's own images - usually 1, but count higher when a group of customers "
         "clearly entered or exited together in the same trigger. Give your confidence in that count. "
+        "Also classify that trigger's customer_group_type as one of solo, couple, family, or friends, based on how "
+        "many people appear together and visible cues like relative age and interaction - use solo for a single "
+        "person. Also give age_brackets: one entry per distinct person you counted, each one of child, adult, or "
+        "senior, based only on visible appearance. "
         "Known-appearance rule: the known appearances list below may give a known_appearance and known_direction for a trigger - a short description "
         "and direction an EARLIER pass already concluded for it. Treat these as a hint to help you compare triggers faster, never as a substitute for "
         "looking at the actual images - the earlier pass can be wrong, so confirm or override it based on what you actually see. "
@@ -3280,7 +3284,8 @@ def _repair_grouping_with_gemini(
         '"exit_carry":{"bag_count":integer,"item_count":integer,"items":[{"type":string,"color":string,"size":string,"count":integer,"confidence":number}],"summary":string},'
         '"carry_change_summary":string}],'
         '"unknown":[integer],"notes":[string],'
-        '"trigger_customer_counts":[{"trigger_id":integer,"unique_customer_count":integer,"confidence":number}],'
+        '"trigger_customer_counts":[{"trigger_id":integer,"unique_customer_count":integer,"confidence":number,'
+        '"customer_group_type":"solo"|"couple"|"family"|"friends","age_brackets":[string]}],'
         '"trigger_appearances":[{"trigger_id":integer,"direction":"entry"|"exit"|"unclear","description":string}]}. '
         "Include one trigger_customer_counts entry AND one trigger_appearances entry per trigger listed below. "
         f"Entries still waiting for an exit match: {json.dumps(open_entry_trigger_ids)}. "
@@ -5343,6 +5348,9 @@ def _verify_gemini_grouping_matches_batch(
     return results_by_match, meta
 
 
+_CUSTOMER_GROUP_TYPES = {"solo", "couple", "family", "friends"}
+
+
 def _persist_trigger_unique_customer_counts(db: Session, result: Mapping[str, Any], *, source: str) -> None:
     # Shared by adjacent/direct/repair's parsing - each asks the model for a
     # "trigger_customer_counts" array (same shape) and persists every entry
@@ -5362,9 +5370,24 @@ def _persist_trigger_unique_customer_counts(db: Session, result: Mapping[str, An
         if count <= 0:
             continue
         confidence = _coerce_number(entry.get("confidence"), 0.0)
+        group_type = str(entry.get("customer_group_type") or "").strip().lower() or None
+        if group_type not in _CUSTOMER_GROUP_TYPES:
+            group_type = None
+        raw_age_brackets = entry.get("age_brackets")
+        age_brackets = (
+            [str(bracket).strip() for bracket in raw_age_brackets if str(bracket).strip()]
+            if isinstance(raw_age_brackets, list)
+            else None
+        )
         try:
             repositories.set_trigger_unique_customer_count(
-                db, trigger_id, count=count, confidence=confidence, source=source
+                db,
+                trigger_id,
+                count=count,
+                confidence=confidence,
+                source=source,
+                group_type=group_type,
+                age_brackets=age_brackets,
             )
         except Exception:
             logger.exception(
@@ -5505,6 +5528,10 @@ def _verify_entry_groups_against_candidates_batch(
         "Also, for every trigger listed above (both entries and candidates), count how many distinct, separate "
         "people appear together in that trigger's own images - usually 1, but count higher when a group of "
         "customers clearly entered or exited together in the same trigger. Give your confidence in that count. "
+        "Also classify that trigger's customer_group_type as one of solo, couple, family, or friends, based on how "
+        "many people appear together and visible cues like relative age and interaction - use solo for a single "
+        "person. Also give age_brackets: one entry per distinct person you counted, each one of child, adult, or "
+        "senior, based only on visible appearance. "
         "Carry observation rule: for every group, whether or not it matched, describe what the entry customer visibly "
         "carries in the entry image set, and - only if matched_candidate is not null - what they visibly carry in that "
         "matched candidate's images. Count bags, plastic bags, woven/reusable bags, backpacks, boxes, cartons, bottles, "
@@ -5518,7 +5545,8 @@ def _verify_entry_groups_against_candidates_batch(
         '"exit_carry":{"bag_count":integer,"item_count":integer,"items":[{"type":string,"color":string,"size":string,"count":integer,"confidence":number}],"summary":string},'
         '"carry_change_summary":string}],'
         '"image_presence":[{"image_number":integer,"has_person":0 or 1,"best_for_verification":0 or 1}],'
-        '"trigger_customer_counts":[{"trigger_id":integer,"unique_customer_count":integer,"confidence":number}]}. '
+        '"trigger_customer_counts":[{"trigger_id":integer,"unique_customer_count":integer,"confidence":number,'
+        '"customer_group_type":"solo"|"couple"|"family"|"friends","age_brackets":[string]}]}. '
         "Include exactly one result per group listed above, using its group_number, one image_presence entry "
         "per image number, and one trigger_customer_counts entry per trigger_id listed above (entries and "
         "candidates both). matched_candidate is the candidate_number of the match within that group, or null if "
@@ -6591,6 +6619,9 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
                     "Also, for every trigger in this batch (grouped or not), count how many distinct, separate people appear together in "
                     "that trigger's own images - usually 1, but count higher when a group of customers clearly entered or exited together "
                     "in the same trigger. Give your confidence in that count. "
+                    "Also classify that trigger's customer_group_type as one of solo, couple, family, or friends, based on how many people "
+                    "appear together and visible cues like relative age and interaction - use solo for a single person. Also give "
+                    "age_brackets: one entry per distinct person you counted, each one of child, adult, or senior, based only on visible appearance. "
                     "Important: Do not create a separate group for every trigger, and do not create a group from two triggers that merely fit a plausible timeline. Only group "
                     "triggers when you have visually confirmed they show the same customer across time. "
                     "If the same customer appears in trigger 73 and later trigger 74, return entry [73], exit [74]. "
@@ -6612,7 +6643,8 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
                     '"exit_carry":{"bag_count":integer,"item_count":integer,"items":[{"type":string,"color":string,"size":string,"count":integer,"confidence":number}],"summary":string},'
                     '"carry_change_summary":string,"total_customer":integer}],'
                     '"open_entries":[integer],"unknown":[integer],"notes":[string],'
-                    '"trigger_customer_counts":[{"trigger_id":integer,"unique_customer_count":integer,"confidence":number}],'
+                    '"trigger_customer_counts":[{"trigger_id":integer,"unique_customer_count":integer,"confidence":number,'
+                    '"customer_group_type":"solo"|"couple"|"family"|"friends","age_brackets":[string]}],'
                     '"trigger_appearances":[{"trigger_id":integer,"direction":"entry"|"exit"|"unclear","description":string}]}. '
                     "Include one trigger_customer_counts entry AND one trigger_appearances entry per trigger in this batch, grouped or not. "
                     f"Batch: {json.dumps({'batch_id': batch_id, 'location_id': batch.get('location_id'), 'period_code': batch.get('period_code'), 'window_start': batch.get('window_start'), 'window_end': batch.get('window_end'), 'chunk': chunk_index}, default=str)}. "
