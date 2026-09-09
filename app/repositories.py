@@ -1013,10 +1013,22 @@ def debug_entrylogs_status_counts(db: Session) -> dict[str, Any]:
     }
 
 
+def _created_at_select_expr(db: Session, table_name: str) -> str:
+    # phonenumber/fingerprint are external tables this app doesn't own, so the
+    # timestamp column's exact name/casing isn't guaranteed - check what's
+    # actually there instead of assuming. They store UTC while the store's
+    # own timezone is UTC+8, so shift it here rather than in the frontend.
+    for candidate in ("createdAt", "created_at"):
+        if _column_exists(db, table_name, candidate):
+            return f"date_add({candidate}, interval 8 hour)"
+    return "null"
+
+
 def list_blocked_entries(db: Session) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for method in ("qrentry", "entrylogs"):
         source = _whitelist_source_config(method)
+        created_at_expr = _created_at_select_expr(db, source["table_name"])
         # qrentry's status column is only ever ACCESS/BLOCKED, so "not ACCESS"
         # is exactly "BLOCKED". entrylogs's fingerprint table (sesamedb.fingerprint)
         # is shared with the payment side and also carries plain transaction
@@ -1037,6 +1049,7 @@ def list_blocked_entries(db: Session) -> list[dict[str, Any]]:
                 select cast({source["id_column"]} as char) as entry_id,
                        cast({source["display_column"]} as char) as display_value,
                        upper(cast(status as char)) as status,
+                       cast({created_at_expr} as char) as created_at,
                        :method as method
                 from {source["table_name"]}
                 where status is not null

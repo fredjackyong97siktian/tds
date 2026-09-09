@@ -73,6 +73,7 @@ class BlockedEntryResponse(BaseModel):
     entry_id: str
     display_value: str | None = None
     status: str
+    created_at: str | None = None
 
 
 class UpdateEntryStatusRequest(BaseModel):
