@@ -4347,7 +4347,22 @@ def _frame_urls_from_trigger_frame_asset(row: Mapping[str, Any]) -> list[dict[st
     return payload
 
 
-def _grouping_frames_per_trigger() -> int:
+_GROUPING_FRAMES_PER_TRIGGER_APP_SETTING_KEY = "grouping_frames_per_trigger"
+
+
+def _grouping_frames_per_trigger(db: Session | None = None) -> int:
+    # Live-adjustable from the Settings page via app_setting when a db
+    # session is available, falling back to the .env default otherwise (a
+    # few call sites - e.g. _first_trigger_frame_payload's bare default -
+    # don't have a session handy, and a stale display-cap fallback there is
+    # low-stakes enough not to force one through).
+    if db is not None:
+        stored = repositories.get_app_setting(db, _GROUPING_FRAMES_PER_TRIGGER_APP_SETTING_KEY)
+        if stored:
+            try:
+                return max(1, int(stored))
+            except (TypeError, ValueError):
+                pass
     return max(1, int(settings.grouping_gemini_frames_per_trigger or 5))
 
 
@@ -4477,7 +4492,7 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
             # are still mid-retrieval, or only partially retrieved (fewer than the
             # expected frame count) - wait (up to the grace window above) for
             # everything to finish first, rather than snapshotting a partial batch.
-            expected_frame_count = _grouping_frames_per_trigger()
+            expected_frame_count = _grouping_frames_per_trigger(db)
             repositories.requeue_incomplete_trigger_frame_assets_in_window(
                 db,
                 location_id=location_id,
@@ -5979,6 +5994,18 @@ def _kiosk_provider_is_openai(db: Session) -> bool:
     return _current_kiosk_provider(db) in _OPENAI_GROUPING_MODELS
 
 
+_KIOSK_ANALYSIS_DISABLED_APP_SETTING_KEY = "kiosk_analysis_disabled"
+
+
+def _is_kiosk_analysis_disabled(db: Session) -> bool:
+    try:
+        stored = repositories.get_app_setting(db, _KIOSK_ANALYSIS_DISABLED_APP_SETTING_KEY)
+    except Exception:
+        logger.exception("Could not read kiosk_analysis_disabled app_setting; defaulting to enabled")
+        return False
+    return str(stored or "").strip().lower() in {"1", "true", "yes"}
+
+
 def _kiosk_provider_is_openrouter(db: Session) -> bool:
     return _current_kiosk_provider(db) in _OPENROUTER_MODELS
 
@@ -6928,7 +6955,7 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
                 "temporary_runpod_grouping_disabled": True,
                 "model": _current_grouping_model_name(db, model_name),
                 "image_resize_scale": resize_scale,
-                "max_frames_per_trigger": _grouping_frames_per_trigger(),
+                "max_frames_per_trigger": _grouping_frames_per_trigger(db),
                 "max_images_per_request": max_images,
                 "chunk_count": len(chunks),
                 "trigger_count": len(all_trigger_ids),
@@ -10345,6 +10372,13 @@ def _kickoff_kiosk_pipeline_for_session(
     it to RunPod on its own the moment the video is ready - no changes needed
     there.
     """
+    if _is_kiosk_analysis_disabled(db):
+        # Deliberately different from the kiosk_analysis worker pause toggle,
+        # which only holds already-queued video_assets until resumed. This
+        # setting means "ignore" - nothing is ever queued for this session in
+        # the first place, so re-enabling later does not retroactively sweep
+        # up a backlog of sessions from while it was off.
+        return {"status": "skipped", "reason": "kiosk_analysis_disabled", "video_asset_ids": []}
     if not transactions:
         repositories.update_session_fields(
             db,
@@ -12056,10 +12090,10 @@ def _build_frame_capture_command(rtsp_url: str, offset_seconds: float, output_pa
     return command
 
 
-def _selected_trigger_frame_offsets(duration_seconds: float) -> tuple[list[float], int]:
+def _selected_trigger_frame_offsets(duration_seconds: float, db: Session | None = None) -> tuple[list[float], int]:
     # Fixed-interval sampling from the start of the window (offset 0), not spread
     # across the whole window - e.g. 6 frames, 1 second apart: [0, 1, 2, 3, 4, 5].
-    frame_count = _grouping_frames_per_trigger()
+    frame_count = _grouping_frames_per_trigger(db)
     interval_seconds = max(0.01, _coerce_number(settings.trigger_frame_interval_seconds, 1.0))
     duration_seconds = max(0.0, float(duration_seconds))
     offsets = [min(duration_seconds, index * interval_seconds) for index in range(frame_count)]
@@ -12098,7 +12132,7 @@ def _run_trigger_frame_retrieval_job(
         frame_root = Path(output_path).with_suffix("") / "frames"
         frame_root.mkdir(parents=True, exist_ok=True)
         duration_seconds = max(0.0, (end_time - start_time).total_seconds())
-        offsets, planned_frame_count = _selected_trigger_frame_offsets(duration_seconds)
+        offsets, planned_frame_count = _selected_trigger_frame_offsets(duration_seconds, db)
         frame_count = len(offsets)
         gap_seconds = max(0.04, offsets[1] - offsets[0] if len(offsets) > 1 else duration_seconds or 1.0)
 
@@ -12406,7 +12440,7 @@ def start_trigger_frame_asset_retrieval_job(job: TriggerFrameAssetRetrievalQueue
         output_dir = Path(job.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         duration_seconds = max(0.0, (job.requested_end_time - job.requested_start_time).total_seconds())
-        offsets, planned_frame_count = _selected_trigger_frame_offsets(duration_seconds)
+        offsets, planned_frame_count = _selected_trigger_frame_offsets(duration_seconds, db)
         frame_count = len(offsets)
         gap_seconds = max(0.04, offsets[1] - offsets[0] if len(offsets) > 1 else duration_seconds or 1.0)
 

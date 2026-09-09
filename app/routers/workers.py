@@ -280,7 +280,23 @@ def update_grouping_control(payload: WorkerControlRequest, db: Session = Depends
 
 @router.get("/grouping-provider")
 def get_grouping_provider(db: Session = Depends(get_transaction_db)) -> dict:
-    return {"provider": workflow_service._current_grouping_provider(db)}  # noqa: SLF001
+    provider = workflow_service._current_grouping_provider(db)  # noqa: SLF001
+    provider_models = {
+        "gemini": settings.grouping_gemini_model,
+        "deepseek": settings.deepseek_vision_model,
+        "glm": settings.glm_vision_model,
+        "gemini-2.5-flash-lite": "gemini-2.5-flash-lite",
+        "gpt-4.1-nano": "gpt-4.1-nano",
+        "gpt-4o-mini": "gpt-4o-mini",
+        "gpt-5-nano": "gpt-5-nano",
+        "openrouter-mimo-v2.5": "xiaomi/mimo-v2.5",
+        "openrouter-qwen3.8-flash": "qwen/qwen3.8-flash",
+    }
+    return {
+        "provider": provider,
+        "model": provider_models.get(provider, provider),
+        "provider_models": provider_models,
+    }
 
 
 @router.put("/grouping-provider")

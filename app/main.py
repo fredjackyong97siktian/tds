@@ -10,6 +10,7 @@ from .routers.health import router as health_router
 from .routers.locations import router as locations_router
 from .routers.runpod import router as runpod_router
 from .routers.sessions import router as sessions_router
+from .routers.settings import router as settings_router
 from .routers.theft import router as theft_router
 from .routers.triggers import router as triggers_router
 from .routers.vector import router as vector_router
@@ -36,6 +37,7 @@ app.include_router(runpod_router)
 app.include_router(whitelist_router)
 app.include_router(triggers_router)
 app.include_router(sessions_router)
+app.include_router(settings_router)
 app.include_router(theft_router)
 app.include_router(videos_router)
 app.include_router(vector_router)
