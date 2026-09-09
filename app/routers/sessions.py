@@ -217,6 +217,11 @@ def count_sessions(db: Session = Depends(get_transaction_db)) -> dict[str, int]:
     return {"total": repositories.count_sessions(db)}
 
 
+@router.get("/dashboard-stats")
+def get_dashboard_session_stats(month: str, db: Session = Depends(get_transaction_db)) -> dict:
+    return repositories.get_dashboard_session_stats(db, month=month)
+
+
 @router.get("/{session_id}", response_model=SessionListItem)
 def get_session_detail(session_id: int, db: Session = Depends(get_transaction_db)) -> SessionListItem:
     rows = _attach_source_video_urls(repositories.list_sessions(db, limit=1, session_id=session_id))

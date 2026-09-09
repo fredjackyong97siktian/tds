@@ -4807,6 +4807,51 @@ def count_sessions(db: Session) -> int:
     return int(row.get("total") or 0)
 
 
+_ANALYZED_SESSION_STATUSES = ("detected", "not_detected", "need_review", "closed", "issue", "whitelisted")
+
+
+def get_dashboard_session_stats(db: Session, *, month: str) -> dict[str, Any]:
+    # The dashboard used to call list_sessions(1000) just to compute a couple
+    # of counts - that pays list_sessions' per-row session_videos/
+    # confidence_result_id lookups (2 extra queries per row) for every one of
+    # up to 1000 rows, none of which the dashboard actually uses. Aggregate
+    # directly in SQL instead.
+    session_table = _table("session")
+    detected_by_location_result = db.execute(
+        text(
+            f"""
+            select location_id, count(*) as count
+            from {session_table}
+            where status = 'detected'
+            group by location_id
+            """
+        )
+    )
+    detected_by_location = {
+        int(row["location_id"]): int(row["count"]) for row in _fetch_all_dicts(detected_by_location_result)
+    }
+
+    monthly_result = db.execute(
+        text(
+            f"""
+            select status, count(*) as count
+            from {session_table}
+            where date_format(coalesce(updated_at, created_at), '%Y-%m') = :month
+            group by status
+            """
+        ),
+        {"month": month},
+    )
+    status_counts = {str(row["status"]): int(row["count"]) for row in _fetch_all_dicts(monthly_result)}
+    return {
+        "detected_by_location": detected_by_location,
+        "monthly_analyzed_count": sum(
+            count for status, count in status_counts.items() if status in _ANALYZED_SESSION_STATUSES
+        ),
+        "monthly_detected_count": status_counts.get("detected", 0),
+    }
+
+
 def get_transaction_total_items(db: Session, session_id: int) -> int:
     transaction_table = _table("session_transaction")
     result = db.execute(
