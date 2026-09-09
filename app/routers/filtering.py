@@ -383,6 +383,18 @@ def add_manual_group(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.post("/grouping-batches/{batch_id}/groups/{group_key}/score-confidence")
+def score_confidence_for_group(
+    batch_id: int,
+    group_key: str,
+    db: Session = Depends(get_transaction_db),
+) -> dict[str, Any]:
+    try:
+        return workflow_service.score_confidence_for_existing_group(db, batch_id=batch_id, group_key=group_key)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.post("/grouping-batches/{batch_id}/retry")
 def retry_grouping_batch(batch_id: int, db: Session = Depends(get_transaction_db)) -> dict[str, Any]:
     try:

@@ -4950,6 +4950,51 @@ def list_ungrouped_candidate_trigger_ids_before_batch_window(db: Session, *, bat
     )
 
 
+def score_confidence_for_existing_group(db: Session, *, batch_id: int, group_key: str) -> dict[str, Any]:
+    # For a group that's grouped but never got scored - most commonly a
+    # manually-added group created after this batch's one-and-only automatic
+    # confidence pass already ran (so nothing will ever come back for it on
+    # its own; see add_manual_group_to_grouping_batch's
+    # batch_not_yet_confidence_analyzed/confidence_skipped_reason logic).
+    # Works for any group_key though, not just manual ones.
+    batch = repositories.get_grouping_batch(db, batch_id)
+    grouping_summary = batch.get("result_payload")
+    if not isinstance(grouping_summary, Mapping):
+        raise ValueError(f"Grouping batch {batch_id} does not have a result payload yet.")
+    groups = grouping_summary.get("groups") or []
+    if not isinstance(groups, list):
+        groups = []
+    group = next(
+        (item for item in groups if isinstance(item, Mapping) and str(item.get("group_id") or "") == str(group_key)),
+        None,
+    )
+    if group is None:
+        raise ValueError(f"Group {group_key!r} was not found in grouping batch {batch_id}.")
+    location_id = int(batch.get("location_id") or 0)
+    if location_id <= 0:
+        raise ValueError(f"Grouping batch {batch_id} does not have a location_id.")
+
+    lock_conn = _try_acquire_theft_confidence_lock(batch_id, wait_seconds=5)
+    if lock_conn is None:
+        raise ValueError(
+            f"Theft-confidence analysis is currently running for grouping batch {batch_id} - try again shortly."
+        )
+    try:
+        factor_settings = _load_filter_factor_settings(db, location_id)
+        return score_confidence_for_single_group(
+            db,
+            batch_id=batch_id,
+            location_id=location_id,
+            group=group,
+            group_index=len(groups),
+            factor_settings=factor_settings,
+            created_session_ids=set(),
+            queued_video_asset_ids=set(),
+        )
+    finally:
+        _release_theft_confidence_lock(lock_conn, batch_id)
+
+
 def build_grouping_analysis_job_from_batch(db: Session, batch_id: int) -> GroupingAnalysisQueued:
     batch = repositories.get_grouping_batch(db, batch_id)
     items = repositories.list_grouping_items(db, batch_id)
