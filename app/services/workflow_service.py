@@ -3137,6 +3137,9 @@ def _person_frame_urls_by_trigger(db: Session, batch_id: int | None) -> dict[int
     return frames_by_trigger
 
 
+_MAX_REPAIR_ATTEMPTS = 3
+
+
 def _repair_grouping_with_gemini(
     db: Session,
     *,
@@ -3146,7 +3149,19 @@ def _repair_grouping_with_gemini(
     grouping_summary: dict[str, Any],
 ) -> dict[str, Any]:
     existing_repair = grouping_summary.get("gemini_repair")
-    if isinstance(existing_repair, Mapping) and existing_repair.get("status"):
+    existing_repair_status = existing_repair.get("status") if isinstance(existing_repair, Mapping) else None
+    existing_repair_attempt = int(existing_repair.get("attempt", 1)) if isinstance(existing_repair, Mapping) else 0
+    # "skipped" (genuinely nothing to repair) and "success" are terminal - never
+    # redone. "failed" (a real API/parse error, as opposed to a hang, which
+    # never reaches this stored state at all - see the caller, which only
+    # persists this dict after the whole function returns) is NOT terminal:
+    # without this, one transient failure (rate limit, malformed response,
+    # etc.) permanently disabled repair for that batch forever, since nothing
+    # else ever retries it automatically. Retry it a bounded number of times
+    # instead of leaving it stuck.
+    if existing_repair_status in ("skipped", "success"):
+        return grouping_summary
+    if existing_repair_status == "failed" and existing_repair_attempt >= _MAX_REPAIR_ATTEMPTS:
         return grouping_summary
     groups = grouping_summary.get("groups") or grouping_summary.get("Groups") or []
     if not isinstance(groups, list):
@@ -3331,6 +3346,7 @@ def _repair_grouping_with_gemini(
         )
         grouping_summary["gemini_repair"] = {
             "status": "failed",
+            "attempt": existing_repair_attempt + 1,
             "script_run_id": repair_script_run_id,
             "error": str(exc),
             "candidate_trigger_ids": candidate_trigger_ids,
