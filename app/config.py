@@ -74,6 +74,7 @@ class Settings(BaseSettings):
     grouping_max_global_workers: int = 1
     theft_confidence_poll_seconds: int = 30
     theft_confidence_max_global_workers: int = 1
+    theft_confidence_stale_process_seconds: int = 900
     filter_long_stay_seconds: int = 300
     filter_low_purchase_quantity: int = 1
     filter_low_purchase_value: int = 1000

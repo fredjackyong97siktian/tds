@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 import logging
+import subprocess
+import sys
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from threading import Lock
 
 from .. import repositories
 from ..config import settings
 from ..db import TransactionalSessionLocal
-from ..services import workflow_service
 
 
 logger = logging.getLogger("tds.theft_confidence_worker")
@@ -17,27 +17,39 @@ logger = logging.getLogger("tds.theft_confidence_worker")
 
 @dataclass
 class RunningJob:
-    future: Future[dict]
+    process: subprocess.Popen
     batch_id: int
     location_id: int
+    started_at: float = field(default_factory=time.monotonic)
 
 
 class TheftConfidenceWorker:
+    # Batches used to run as a submitted callable on a ThreadPoolExecutor. A
+    # hang inside one batch (e.g. a stuck grouping-repair verification loop)
+    # occupied that thread forever - Python cannot forcibly cancel a thread
+    # blocked in a native/HTTP call, so with max_workers=1 (the default) one
+    # stuck batch permanently starved every other batch, including their own
+    # repair passes. Running each batch as its own OS subprocess instead means
+    # a hung one can always be force-killed at the OS level after a timeout,
+    # freeing the slot for the next batch no matter what it was stuck on.
     def __init__(self) -> None:
-        self._executor = ThreadPoolExecutor(max_workers=max(1, settings.theft_confidence_max_global_workers))
+        self._max_workers = max(1, settings.theft_confidence_max_global_workers)
+        self._stale_seconds = max(60, settings.theft_confidence_stale_process_seconds)
         self._running: dict[int, RunningJob] = {}
         self._lock = Lock()
 
     def run_forever(self) -> None:
         poll_seconds = max(1, settings.theft_confidence_poll_seconds)
         logger.info(
-            "Theft confidence worker started with poll=%ss max_global=%s",
+            "Theft confidence worker started with poll=%ss max_global=%s stale_timeout=%ss",
             poll_seconds,
-            settings.theft_confidence_max_global_workers,
+            self._max_workers,
+            self._stale_seconds,
         )
         while True:
             try:
                 self._reap_finished_jobs()
+                self._kill_stale_jobs()
                 self._fill_available_slots()
             except Exception:
                 logger.exception("Theft confidence worker loop failed")
@@ -48,19 +60,18 @@ class TheftConfidenceWorker:
         with self._lock:
             items = list(self._running.items())
         for batch_id, job in items:
-            if not job.future.done():
+            exit_code = job.process.poll()
+            if exit_code is None:
                 continue
-            try:
-                result = job.future.result()
-                logger.info(
-                    "Theft confidence completed batch_id=%s location_id=%s analyzed=%s promoted=%s",
+            if exit_code == 0:
+                logger.info("Theft confidence process finished batch_id=%s location_id=%s", job.batch_id, job.location_id)
+            else:
+                logger.error(
+                    "Theft confidence process exited non-zero batch_id=%s location_id=%s exit_code=%s",
                     job.batch_id,
                     job.location_id,
-                    result.get("analyzed_count"),
-                    result.get("promoted_count"),
+                    exit_code,
                 )
-            except Exception:
-                logger.exception("Theft confidence crashed for batch_id=%s", job.batch_id)
             finished_ids.append(batch_id)
         if not finished_ids:
             return
@@ -68,10 +79,29 @@ class TheftConfidenceWorker:
             for batch_id in finished_ids:
                 self._running.pop(batch_id, None)
 
+    def _kill_stale_jobs(self) -> None:
+        now = time.monotonic()
+        with self._lock:
+            items = list(self._running.items())
+        for batch_id, job in items:
+            if now - job.started_at < self._stale_seconds:
+                continue
+            logger.error(
+                "Theft confidence process stuck for over %ss, killing batch_id=%s location_id=%s pid=%s",
+                self._stale_seconds,
+                job.batch_id,
+                job.location_id,
+                job.process.pid,
+            )
+            job.process.kill()
+            job.process.wait()
+            with self._lock:
+                self._running.pop(batch_id, None)
+
     def _fill_available_slots(self) -> None:
         with self._lock:
             running_jobs = list(self._running.values())
-        available_slots = max(0, settings.theft_confidence_max_global_workers - len(running_jobs))
+        available_slots = max(0, self._max_workers - len(running_jobs))
         if available_slots <= 0:
             return
 
@@ -81,7 +111,7 @@ class TheftConfidenceWorker:
                 return
             candidates = repositories.list_pending_theft_confidence_batches(
                 db,
-                limit=max(settings.theft_confidence_max_global_workers * 10, 20),
+                limit=max(self._max_workers * 10, 20),
             )
             for candidate in candidates:
                 if available_slots <= 0:
@@ -90,25 +120,19 @@ class TheftConfidenceWorker:
                 if batch_id in self._running:
                     continue
                 location_id = int(candidate["location_id"])
-                future = self._executor.submit(_run_batch, batch_id)
+                process = subprocess.Popen(
+                    [sys.executable, "-m", "app.workers.run_theft_confidence_batch", str(batch_id)]
+                )
                 with self._lock:
                     self._running[batch_id] = RunningJob(
-                        future=future,
+                        process=process,
                         batch_id=batch_id,
                         location_id=location_id,
                     )
                 available_slots -= 1
-                logger.info("Claimed theft confidence batch_id=%s location_id=%s", batch_id, location_id)
+                logger.info("Claimed theft confidence batch_id=%s location_id=%s pid=%s", batch_id, location_id, process.pid)
         finally:
             db.close()
-
-
-def _run_batch(batch_id: int) -> dict:
-    db = TransactionalSessionLocal()
-    try:
-        return workflow_service.run_theft_confidence_for_grouping_batch(db, batch_id=batch_id)
-    finally:
-        db.close()
 
 
 def main() -> None:
