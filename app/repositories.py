@@ -365,6 +365,81 @@ def list_cctv(db: Session, location_id: int | None = None) -> list[dict[str, Any
     return _fetch_all_dicts(result)
 
 
+def get_dashboard_activity_timeseries(db: Session, *, days: int = 30) -> list[dict[str, Any]]:
+    # One row per calendar day, oldest first, always including zero-count
+    # days (a chart with gaps for quiet days is misleading) - built by
+    # generating the full day range in Python and merging in whatever each
+    # query actually found, rather than relying on MySQL to synthesize
+    # missing rows.
+    days = max(1, min(int(days), 180))
+    start_date = (datetime.now() - timedelta(days=days - 1)).date()
+
+    trigger_table = _table("trigger_event")
+    grouping_item_table = _table("filter_grouping_item")
+    session_table = _table("session")
+    params: dict[str, Any] = {"start_date": start_date}
+
+    trigger_result = db.execute(
+        text(
+            f"""
+            select date(trigger_time) as day, count(*) as count
+            from {trigger_table}
+            where trigger_time >= :start_date
+            group by day
+            """
+        ),
+        params,
+    )
+    trigger_counts = {row["day"]: int(row["count"]) for row in _fetch_all_dicts(trigger_result)}
+
+    # One row per group (an entry always exists exactly once per group), not
+    # per grouping_item - a group has an entry row and usually an exit row
+    # sharing the same (batch_id, group_key), so counting entry rows avoids
+    # double-counting the same group.
+    group_result = db.execute(
+        text(
+            f"""
+            select date(te.trigger_time) as day, count(*) as count
+            from {grouping_item_table} gi
+            join {trigger_table} te on te.id = gi.trigger_id
+            where gi.role = 'entry'
+              and gi.status = 'grouped'
+              and te.trigger_time >= :start_date
+            group by day
+            """
+        ),
+        params,
+    )
+    group_counts = {row["day"]: int(row["count"]) for row in _fetch_all_dicts(group_result)}
+
+    theft_result = db.execute(
+        text(
+            f"""
+            select date(start_time) as day, count(*) as count
+            from {session_table}
+            where status = 'detected'
+              and start_time >= :start_date
+            group by day
+            """
+        ),
+        params,
+    )
+    theft_counts = {row["day"]: int(row["count"]) for row in _fetch_all_dicts(theft_result)}
+
+    buckets: list[dict[str, Any]] = []
+    for offset in range(days):
+        day = start_date + timedelta(days=offset)
+        buckets.append(
+            {
+                "date": day.isoformat(),
+                "trigger_count": trigger_counts.get(day, 0),
+                "group_count": group_counts.get(day, 0),
+                "theft_count": theft_counts.get(day, 0),
+            }
+        )
+    return buckets
+
+
 def list_theft_transactions(db: Session, limit: int = 50) -> list[dict[str, Any]]:
     table_name = _quote_identifier(settings.theft_transaction_table_name)
     status_column = _quote_identifier(settings.theft_transaction_status_column)

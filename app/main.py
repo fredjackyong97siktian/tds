@@ -4,6 +4,7 @@ from .config import settings
 from .routers.alerts import router as alerts_router
 from .routers.blacklist import router as blacklist_router
 from .routers.cctv import router as cctv_router
+from .routers.dashboard import router as dashboard_router
 from .routers.filtering import router as filtering_router
 from .routers.frames import router as frames_router
 from .routers.health import router as health_router
@@ -30,6 +31,7 @@ app.include_router(health_router)
 app.include_router(alerts_router)
 app.include_router(blacklist_router)
 app.include_router(cctv_router)
+app.include_router(dashboard_router)
 app.include_router(filtering_router)
 app.include_router(frames_router)
 app.include_router(locations_router)
