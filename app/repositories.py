@@ -4781,7 +4781,28 @@ def list_paid_transactions_for_session_window(
     transactions = _fetch_all_dicts(txn_result)
     if not transactions:
         return []
+    return _transactions_with_item_details_by_receipt(
+        db,
+        transactions,
+        detail_table=detail_table,
+        detail_transaction_id_column=detail_transaction_id_column,
+        detail_transaction_id_name=detail_transaction_id_name,
+    )
 
+
+def _transactions_with_item_details_by_receipt(
+    db: Session,
+    transactions: list[dict[str, Any]],
+    *,
+    detail_table: str,
+    detail_transaction_id_column: str,
+    detail_transaction_id_name: str,
+) -> list[dict[str, Any]]:
+    # Shared by both paid and non-paid transaction lookups - a failed or
+    # pending transaction still has the same scanned-item detail rows as a
+    # successful one (the customer scanned items before payment
+    # failed/never completed), so both deserve the same item breakdown
+    # instead of only paid transactions getting one.
     transaction_ids = [
         row.get(PAID_TRANSACTION_ID_COLUMN)
         for row in transactions
@@ -4902,10 +4923,13 @@ def list_non_paid_transactions_for_session_window(
     end_time,
 ) -> list[dict[str, Any]]:
     transaction_table = _qualified_paid_table(settings.paid_transaction_table_name)
+    detail_table = _qualified_paid_table(settings.paid_transaction_detail_table_name)
     transaction_id_column = _quote_identifier(PAID_TRANSACTION_ID_COLUMN)
     location_id_column = _quote_identifier(settings.paid_transaction_location_id_column)
     transaction_time_column = _quote_identifier(PAID_TRANSACTION_TIME_COLUMN)
     transaction_status_column = _quote_identifier(settings.paid_transaction_status_column)
+    detail_transaction_id_name = settings.paid_transaction_detail_transaction_id_column
+    detail_transaction_id_column = _quote_identifier(detail_transaction_id_name)
     result = db.execute(
         text(
             f"""
@@ -4924,22 +4948,16 @@ def list_non_paid_transactions_for_session_window(
             "end_time": end_time,
         },
     )
-    rows = _fetch_all_dicts(result)
-    payload: list[dict[str, Any]] = []
-    for row in rows:
-        payload.append(
-            {
-                "transaction_id": row.get(PAID_TRANSACTION_ID_COLUMN),
-                "receipt_number": row.get(settings.paid_transaction_receipt_column),
-                "transaction_time": row.get(PAID_TRANSACTION_TIME_COLUMN),
-                "created_at": _pick_first(row, "createdAt", "created_at", PAID_TRANSACTION_TIME_COLUMN),
-                "location_id": row.get(settings.paid_transaction_location_id_column),
-                "status": row.get(settings.paid_transaction_status_column),
-                "total_amount": row.get(settings.paid_transaction_total_amount_column),
-                "raw_payload": row,
-            }
-        )
-    return payload
+    transactions = _fetch_all_dicts(result)
+    if not transactions:
+        return []
+    return _transactions_with_item_details_by_receipt(
+        db,
+        transactions,
+        detail_table=detail_table,
+        detail_transaction_id_column=detail_transaction_id_column,
+        detail_transaction_id_name=detail_transaction_id_name,
+    )
 
 
 def list_minus_button_alerts_for_window(
