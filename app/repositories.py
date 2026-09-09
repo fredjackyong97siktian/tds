@@ -3417,6 +3417,7 @@ def list_filter_confidence_results(
     *,
     offset: int = 0,
     batch_id: int | None = None,
+    confidence_result_id: int | None = None,
 ) -> list[dict[str, Any]]:
     confidence_table = _table("filter_confidence_result")
     batch_table = _table("filter_grouping_batch")
@@ -3429,6 +3430,9 @@ def list_filter_confidence_results(
     if batch_id is not None:
         where_clauses.append("c.batch_id = :batch_id")
         params["batch_id"] = batch_id
+    if confidence_result_id is not None:
+        where_clauses.append("c.id = :confidence_result_id")
+        params["confidence_result_id"] = confidence_result_id
     where_sql = f"where {' and '.join(where_clauses)}" if where_clauses else ""
     result = db.execute(
         text(
@@ -3600,6 +3604,17 @@ def list_filter_confidence_results(
                 row["session_window_start"] = row.get("session_window_start") or min(fallback_times)
                 row["session_window_end"] = max(fallback_times)
     return rows
+
+
+def get_filter_confidence_result_detail(db: Session, confidence_result_id: int) -> dict[str, Any] | None:
+    # Reuses list_filter_confidence_results' full enrichment (grouping-item
+    # fallback trigger ids, session window, location name, etc.) for a single
+    # row - the dashboard's detail page used to instead fetch the 500 most
+    # recently created confidence results system-wide and search that list
+    # for a matching id, which silently 404'd for anything older than the
+    # most recent 500 across every location and batch combined.
+    rows = list_filter_confidence_results(db, limit=1, confidence_result_id=confidence_result_id)
+    return rows[0] if rows else None
 
 
 def get_filter_confidence_result(db: Session, confidence_result_id: int) -> dict[str, Any] | None:

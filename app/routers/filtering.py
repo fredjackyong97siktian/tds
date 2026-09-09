@@ -213,6 +213,14 @@ def count_confidence_results(
     return {"total": repositories.count_filter_confidence_results(db, batch_id=batch_id)}
 
 
+@router.get("/confidence-results/{confidence_result_id}")
+def get_confidence_result(confidence_result_id: int, db: Session = Depends(get_transaction_db)) -> dict[str, Any]:
+    result = repositories.get_filter_confidence_result_detail(db, confidence_result_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"Confidence result {confidence_result_id} was not found.")
+    return result
+
+
 @router.post("/confidence-results/{confidence_result_id}/retry")
 def retry_confidence_result(confidence_result_id: int, db: Session = Depends(get_transaction_db)) -> dict[str, Any]:
     try:
