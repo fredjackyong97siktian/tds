@@ -986,6 +986,33 @@ def _validate_block_status(method: str, status_value: str) -> str:
     return normalized
 
 
+def debug_entrylogs_status_counts(db: Session) -> dict[str, Any]:
+    # Temporary diagnostic: list_blocked_entries() finds plenty of BLOCKED
+    # phone numbers but zero BLOCKED fingerprints, even though a direct SQL
+    # query against the operator's own client shows BLOCKED fingerprint rows
+    # existing. This settles, in one call, whether this app's own DB
+    # connection is even looking at a database that has any BLOCKED
+    # fingerprint rows at all - if the counts below show 0 BLOCKED, this
+    # app's connection point to a different database/table than the one the
+    # operator queried directly.
+    source = _whitelist_source_config("entrylogs")
+    db_result = db.execute(text("select database() as db_name")).mappings().first()
+    counts_result = db.execute(
+        text(
+            f"""
+            select upper(cast(status as char)) as status, count(*) as count
+            from {source["table_name"]}
+            group by status
+            """
+        )
+    )
+    return {
+        "database": db_result["db_name"] if db_result else None,
+        "table": source["table_name"],
+        "status_counts": {str(row["status"]): int(row["count"]) for row in _fetch_all_dicts(counts_result)},
+    }
+
+
 def list_blocked_entries(db: Session) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for method in ("qrentry", "entrylogs"):

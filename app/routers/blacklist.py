@@ -9,6 +9,11 @@ from ..schemas import BlockedEntryResponse, UpdateEntryStatusRequest, WhitelistS
 router = APIRouter(prefix="/api/v1/blacklist", tags=["blacklist"])
 
 
+@router.get("/_debug/entrylogs-status-counts")
+def debug_entrylogs_status_counts(db: Session = Depends(get_transaction_db)) -> dict:
+    return repositories.debug_entrylogs_status_counts(db)
+
+
 @router.get("", response_model=list[BlockedEntryResponse])
 def list_blacklist(db: Session = Depends(get_transaction_db)) -> list[BlockedEntryResponse]:
     rows = repositories.list_blocked_entries(db)
