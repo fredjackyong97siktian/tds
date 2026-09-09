@@ -365,28 +365,25 @@ def list_cctv(db: Session, location_id: int | None = None) -> list[dict[str, Any
     return _fetch_all_dicts(result)
 
 
-def get_dashboard_activity_timeseries(db: Session, *, days: int = 30) -> list[dict[str, Any]]:
-    # Rolling 24-hour windows anchored to the current hour, not calendar
-    # days - a plain "GROUP BY DATE(...)" bucket for "today" is only ever a
-    # partial day (e.g. just 3pm-3pm if it's 3pm now), which always looks
-    # artificially low next to a full previous day. Anchoring to the current
-    # hour instead means the most recent bucket is always a genuine, complete
-    # 24-hour window ending now, and every earlier bucket is the same size.
-    days = max(1, min(int(days), 180))
+def get_dashboard_activity_timeseries(db: Session, *, hours: int = 24) -> list[dict[str, Any]]:
+    # One-hour buckets across a single rolling window ending now (e.g. 3pm
+    # yesterday through 3pm today for the default 24 hours) - not calendar
+    # days, and not several days of daily buckets. bucket_index 0 is the
+    # most recent hour [anchor-1h, anchor); bucket_index 1 is the hour
+    # before that; etc.
+    hours = max(1, min(int(hours), 168))
     anchor = datetime.now().replace(minute=0, second=0, microsecond=0)
-    start_boundary = anchor - timedelta(hours=24 * days)
+    start_boundary = anchor - timedelta(hours=hours)
 
     trigger_table = _table("trigger_event")
     grouping_item_table = _table("filter_grouping_item")
     session_table = _table("session")
     params: dict[str, Any] = {"anchor": anchor, "start_boundary": start_boundary}
 
-    # bucket_index 0 = the most recent 24h window [anchor-24h, anchor);
-    # bucket_index 1 = the one before that [anchor-48h, anchor-24h); etc.
     trigger_result = db.execute(
         text(
             f"""
-            select floor(timestampdiff(hour, trigger_time, :anchor) / 24) as bucket_index, count(*) as count
+            select timestampdiff(hour, trigger_time, :anchor) as bucket_index, count(*) as count
             from {trigger_table}
             where trigger_time >= :start_boundary and trigger_time < :anchor
             group by bucket_index
@@ -403,7 +400,7 @@ def get_dashboard_activity_timeseries(db: Session, *, days: int = 30) -> list[di
     group_result = db.execute(
         text(
             f"""
-            select floor(timestampdiff(hour, te.trigger_time, :anchor) / 24) as bucket_index, count(*) as count
+            select timestampdiff(hour, te.trigger_time, :anchor) as bucket_index, count(*) as count
             from {grouping_item_table} gi
             join {trigger_table} te on te.id = gi.trigger_id
             where gi.role = 'entry'
@@ -419,7 +416,7 @@ def get_dashboard_activity_timeseries(db: Session, *, days: int = 30) -> list[di
     theft_result = db.execute(
         text(
             f"""
-            select floor(timestampdiff(hour, start_time, :anchor) / 24) as bucket_index, count(*) as count
+            select timestampdiff(hour, start_time, :anchor) as bucket_index, count(*) as count
             from {session_table}
             where status = 'detected'
               and start_time >= :start_boundary and start_time < :anchor
@@ -431,9 +428,9 @@ def get_dashboard_activity_timeseries(db: Session, *, days: int = 30) -> list[di
     theft_counts = {int(row["bucket_index"]): int(row["count"]) for row in _fetch_all_dicts(theft_result)}
 
     buckets: list[dict[str, Any]] = []
-    for bucket_index in range(days - 1, -1, -1):
-        period_end = anchor - timedelta(hours=24 * bucket_index)
-        period_start = period_end - timedelta(hours=24)
+    for bucket_index in range(hours - 1, -1, -1):
+        period_end = anchor - timedelta(hours=bucket_index)
+        period_start = period_end - timedelta(hours=1)
         buckets.append(
             {
                 "period_start": period_start.isoformat(),
