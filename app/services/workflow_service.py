@@ -8863,10 +8863,16 @@ def _run_theft_confidence_for_grouping_batch_locked(
             factor_details=factor_details,
             factors=factor_settings,
             factor_code="carry_item_signal",
-            # Insufficient evidence means we couldn't clear this case, not that
-            # it's confirmed innocent - route it to deep analysis the same as a
-            # real hit rather than letting an unclear case pass silently.
-            hit=_as_boolish(carry_ai_result.get("hit")) or _as_boolish(carry_ai_result.get("insufficient_evidence")),
+            # Insufficient evidence alone used to always count as a hit,
+            # which fired on almost every weak-angle/partial-occlusion case
+            # regardless of how much the customer actually bought - too
+            # noisy in practice. Now only escalates it when the customer
+            # also barely bought anything: "couldn't confirm what they left
+            # with, AND they paid for almost nothing" is worth a second
+            # look; "couldn't quite see the bag, but they bought a full
+            # basket" usually isn't.
+            hit=_as_boolish(carry_ai_result.get("hit"))
+            or (_as_boolish(carry_ai_result.get("insufficient_evidence")) and low_purchase),
             reason="carry_item_signal",
             evidence=carry_ai_result,
         ):
@@ -9366,10 +9372,11 @@ def score_confidence_for_single_group(
         factor_details=factor_details,
         factors=factor_settings,
         factor_code="carry_item_signal",
-        # Insufficient evidence means we couldn't clear this case, not that
-        # it's confirmed innocent - route it to deep analysis the same as a
-        # real hit rather than letting an unclear case pass silently.
-        hit=_as_boolish(carry_ai_result.get("hit")) or _as_boolish(carry_ai_result.get("insufficient_evidence")),
+        # See the matching comment in _run_theft_confidence_for_grouping_batch_locked -
+        # insufficient_evidence alone only escalates to a hit when the
+        # customer also barely bought anything.
+        hit=_as_boolish(carry_ai_result.get("hit"))
+        or (_as_boolish(carry_ai_result.get("insufficient_evidence")) and low_purchase),
         reason="carry_item_signal",
         evidence=carry_ai_result,
     ):
