@@ -2819,6 +2819,22 @@ def delete_grouping_items_for_batch(db: Session, batch_id: int) -> int:
     return int(result.rowcount or 0)
 
 
+def delete_grouping_items_for_group(db: Session, *, batch_id: int, group_key: str) -> int:
+    table_name = _table("filter_grouping_item")
+    result = db.execute(
+        text(
+            f"""
+            delete from {table_name}
+            where batch_id = :batch_id
+              and group_key = :group_key
+            """
+        ),
+        {"batch_id": batch_id, "group_key": group_key},
+    )
+    db.commit()
+    return int(result.rowcount or 0)
+
+
 def upsert_grouping_item(
     db: Session,
     *,

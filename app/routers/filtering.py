@@ -240,7 +240,7 @@ def force_deep_analysis(confidence_result_id: int, db: Session = Depends(get_tra
 @router.delete("/confidence-results/{confidence_result_id}")
 def delete_confidence_result(confidence_result_id: int, db: Session = Depends(get_transaction_db)) -> dict[str, Any]:
     try:
-        return repositories.delete_filter_confidence_result(db, confidence_result_id)
+        return workflow_service.delete_confidence_result_and_ungroup(db, confidence_result_id)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

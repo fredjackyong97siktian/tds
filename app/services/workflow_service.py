@@ -4995,6 +4995,59 @@ def score_confidence_for_existing_group(db: Session, *, batch_id: int, group_key
         _release_theft_confidence_lock(lock_conn, batch_id)
 
 
+def delete_confidence_result_and_ungroup(db: Session, confidence_result_id: int) -> dict[str, Any]:
+    # Deleting only the filter_confidence_result row left the group itself
+    # (its filter_grouping_item rows, and the entry in the batch's own
+    # result_payload.groups) untouched - the group would just come right
+    # back the next time anything looked, e.g. it would immediately reappear
+    # under "Groups Awaiting Confidence Analysis" since it's still grouped,
+    # just unscored again. Delete actually means "undo this pairing": drop
+    # the grouping_item rows for this group, remove it from
+    # result_payload.groups, and put its trigger ids back into "unknown" so
+    # they're available to re-pair (manually or automatically) instead of
+    # vanishing.
+    result_row = repositories.get_filter_confidence_result(db, confidence_result_id)
+    if result_row is None:
+        raise ValueError(f"Confidence result {confidence_result_id} was not found.")
+    batch_id = int(result_row["batch_id"])
+    group_key = str(result_row.get("group_key") or "")
+
+    ungrouped_trigger_ids: list[int] = []
+    batch = repositories.get_grouping_batch(db, batch_id)
+    grouping_summary = batch.get("result_payload")
+    if isinstance(grouping_summary, Mapping) and group_key:
+        grouping_summary = dict(grouping_summary)
+        groups = grouping_summary.get("groups")
+        if isinstance(groups, list):
+            remaining_groups: list[Any] = []
+            for group in groups:
+                if isinstance(group, Mapping) and str(group.get("group_id") or "") == group_key:
+                    ungrouped_trigger_ids = _group_trigger_id_list(group.get("entry")) + _group_trigger_id_list(
+                        group.get("exit")
+                    )
+                    continue
+                remaining_groups.append(group)
+            if ungrouped_trigger_ids:
+                grouping_summary["groups"] = remaining_groups
+                unknown = _group_trigger_id_list(grouping_summary.get("unknown"))
+                for trigger_id in ungrouped_trigger_ids:
+                    if trigger_id not in unknown:
+                        unknown.append(trigger_id)
+                grouping_summary["unknown"] = unknown
+                repositories.update_grouping_batch(db, batch_id, {"result_payload": grouping_summary})
+
+    if group_key:
+        repositories.delete_grouping_items_for_group(db, batch_id=batch_id, group_key=group_key)
+    repositories.delete_filter_confidence_result(db, confidence_result_id)
+    return {
+        "ok": True,
+        "confidence_result_id": confidence_result_id,
+        "batch_id": batch_id,
+        "group_key": group_key,
+        "ungrouped_trigger_ids": sorted(set(ungrouped_trigger_ids)),
+    }
+
+
 def build_grouping_analysis_job_from_batch(db: Session, batch_id: int) -> GroupingAnalysisQueued:
     batch = repositories.get_grouping_batch(db, batch_id)
     items = repositories.list_grouping_items(db, batch_id)
