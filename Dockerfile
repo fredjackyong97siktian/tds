@@ -20,7 +20,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY requirements.txt /app/tds/requirements.txt
 
+# This service runs on a CPU-only host (actual GPU inference happens on the
+# separate RunPod tds_runner service) - installing torch/torchvision from the
+# default PyPI index pulls in several GB of unused NVIDIA CUDA runtime
+# libraries per image, across 6 worker containers built from this same
+# Dockerfile. Installing the CPU-only build first means requirements.txt's
+# other torch-dependent packages (ultralytics, transformers, torchreid, etc.)
+# reuse it instead of each pulling their own CUDA-enabled copy.
 RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cpu && \
     pip install --no-cache-dir -r /app/tds/requirements.txt
 
 COPY . /app/tds

@@ -8,3 +8,6 @@ __pycache__
 models/*.pt
 models/**/*.pt
 models/reid/*.pt
+*.mp4
+*.mov
+*.avi
