@@ -72,6 +72,7 @@ class Settings(BaseSettings):
     time_period_timezone: str = "Asia/Kuala_Lumpur"
     grouping_poll_seconds: int = 30
     grouping_max_global_workers: int = 1
+    grouping_stale_process_seconds: int = 900
     theft_confidence_poll_seconds: int = 30
     theft_confidence_max_global_workers: int = 1
     theft_confidence_stale_process_seconds: int = 900
