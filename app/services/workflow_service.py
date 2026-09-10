@@ -4422,6 +4422,9 @@ def _first_trigger_frame_payload(frames: list[dict[str, Any]], limit: int | None
     return frames[: max(1, int(limit))]
 
 
+_warned_missed_grouping_windows: set[tuple[int, str, str]] = set()
+
+
 def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
     periods = repositories.list_filter_time_periods(db, selected_only=False)
     if not periods:
@@ -4445,6 +4448,28 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
         for period in selected_periods:
             period_window_start, period_window_end = _last_completed_period_window(period, now=current)
             if not _is_recently_completed_grouping_window(period_window_end, current):
+                # Two different things collapse into this one branch: the window
+                # hasn't closed yet (normal, happens on almost every cycle), or it
+                # closed so long ago (past grouping_window_grace_minutes - usually
+                # because the worker itself was down/redeploying through the whole
+                # grace period) that it will now NEVER get an automatic batch. The
+                # second case used to be entirely silent - logged once per missed
+                # window so a gap like this is visible instead of only noticed
+                # later from an empty schedule.
+                period_code = str(period.get("period_code") or "period")
+                if period_window_end <= current:
+                    warn_key = (location_id, period_code, period_window_end.isoformat())
+                    if warn_key not in _warned_missed_grouping_windows:
+                        _warned_missed_grouping_windows.add(warn_key)
+                        logger.warning(
+                            "Missed grouping window (past %sm grace, no automatic batch will be created): "
+                            "location_id=%s period_code=%s window_start=%s window_end=%s",
+                            settings.grouping_window_grace_minutes,
+                            location_id,
+                            period_code,
+                            period_window_start,
+                            period_window_end,
+                        )
                 continue
             # A window with a batch already built for it won't get a NEW one
             # this cycle either (see "if existing is not None: continue"
