@@ -4447,6 +4447,21 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
         due_windows: list[tuple[datetime, datetime]] = []
         for period in selected_periods:
             period_window_start, period_window_end = _last_completed_period_window(period, now=current)
+            period_code = str(period.get("period_code") or "period")
+            # Checked unconditionally, up front, so both branches below can tell
+            # a genuinely-missed window apart from one that already got a batch
+            # (built earlier this same day, while still within grace) - without
+            # this, re-evaluating the SAME "last completed" window on every poll
+            # for the rest of the day would keep flagging an already-successful
+            # window as "missed" the moment it later fell outside the grace
+            # period, which is exactly what happened before this fix.
+            existing_batch = repositories.get_grouping_batch_by_window(
+                db,
+                location_id=location_id,
+                period_code=period_code,
+                window_start=period_window_start,
+                window_end=period_window_end,
+            )
             if not _is_recently_completed_grouping_window(period_window_end, current):
                 # Two different things collapse into this one branch: the window
                 # hasn't closed yet (normal, happens on almost every cycle), or it
@@ -4456,8 +4471,7 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
                 # second case used to be entirely silent - logged once per missed
                 # window so a gap like this is visible instead of only noticed
                 # later from an empty schedule.
-                period_code = str(period.get("period_code") or "period")
-                if period_window_end <= current:
+                if existing_batch is None and period_window_end <= current:
                     warn_key = (location_id, period_code, period_window_end.isoformat())
                     if warn_key not in _warned_missed_grouping_windows:
                         _warned_missed_grouping_windows.add(warn_key)
@@ -4478,14 +4492,7 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
             # will consume them, and the staleness sweep flags them right
             # back before the next cycle. Only reset for a window that will
             # genuinely get a fresh batch-build attempt this cycle.
-            period_code = str(period.get("period_code") or "period")
-            if repositories.get_grouping_batch_by_window(
-                db,
-                location_id=location_id,
-                period_code=period_code,
-                window_start=period_window_start,
-                window_end=period_window_end,
-            ):
+            if existing_batch:
                 continue
             due_windows.append(
                 (
