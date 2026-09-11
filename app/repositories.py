@@ -1804,6 +1804,7 @@ def retry_trigger_frame_asset_issue(db: Session, frame_asset_id: int) -> dict[st
             update {frame_asset_table}
             set status = 'not_retrieved',
                 error = null,
+                retry_count = 0,
                 updated_at = now()
             where id = :frame_asset_id
               and status in ('issue', 'retrieved')
@@ -1817,6 +1818,9 @@ def retry_trigger_frame_asset_issue(db: Session, frame_asset_id: int) -> dict[st
     return get_trigger_frame_asset(db, frame_asset_id)
 
 
+MAX_FRAME_RETRIEVAL_ATTEMPTS = 2
+
+
 def list_pending_trigger_frame_asset_retrievals(db: Session, limit: int = 50) -> list[dict[str, Any]]:
     frame_asset_table = _table("trigger_frame_asset")
     trigger_table = _table("trigger_event")
@@ -1828,12 +1832,13 @@ def list_pending_trigger_frame_asset_retrievals(db: Session, limit: int = 50) ->
             from {frame_asset_table} fa
             left join {trigger_table} te on te.id = fa.trigger_id
             where fa.status = 'not_retrieved'
+              and fa.retry_count < :max_attempts
               and (te.id is null or (te.whitelist_hit = 0 and te.status <> 'whitelisted'))
             order by fa.start_time asc, fa.id asc
             limit :limit
             """
         ),
-        {"limit": limit},
+        {"limit": limit, "max_attempts": MAX_FRAME_RETRIEVAL_ATTEMPTS},
     )
     return _fetch_all_dicts(result)
 
@@ -1854,7 +1859,27 @@ def list_running_trigger_frame_asset_retrievals(db: Session) -> list[dict[str, A
 
 
 def reset_stale_trigger_frame_asset_retrievals(db: Session, stale_seconds: int) -> int:
+    # retry_count was already incremented when this row was claimed (see
+    # claim_trigger_frame_asset_for_retrieval), so a stale attempt counts
+    # toward the same cap as a cleanly-failed one - a row that's already used
+    # up its attempts gets parked at 'issue' for good instead of being handed
+    # a fresh 'not_retrieved' shot it's no longer entitled to.
     frame_asset_table = _table("trigger_frame_asset")
+    params = {"stale_seconds": max(1, int(stale_seconds)), "max_attempts": MAX_FRAME_RETRIEVAL_ATTEMPTS}
+    exhausted_result = db.execute(
+        text(
+            f"""
+            update {frame_asset_table}
+            set status = 'issue',
+                error = concat('Gave up after ', retry_count, ' stale retrieval attempt(s).'),
+                updated_at = now()
+            where status = 'retrieving'
+              and retry_count >= :max_attempts
+              and timestampdiff(second, updated_at, now()) > :stale_seconds
+            """
+        ),
+        params,
+    )
     result = db.execute(
         text(
             f"""
@@ -1863,13 +1888,14 @@ def reset_stale_trigger_frame_asset_retrievals(db: Session, stale_seconds: int) 
                 error = concat('Reset stale retrieval after ', :stale_seconds, ' seconds.'),
                 updated_at = now()
             where status = 'retrieving'
+              and retry_count < :max_attempts
               and timestampdiff(second, updated_at, now()) > :stale_seconds
             """
         ),
-        {"stale_seconds": max(1, int(stale_seconds))},
+        params,
     )
     db.commit()
-    return int(result.rowcount or 0)
+    return int(result.rowcount or 0) + int(exhausted_result.rowcount or 0)
 
 
 def claim_trigger_frame_asset_for_retrieval(db: Session, frame_asset_id: int) -> bool:
@@ -1880,6 +1906,7 @@ def claim_trigger_frame_asset_for_retrieval(db: Session, frame_asset_id: int) ->
             update {frame_asset_table}
             set status = 'retrieving',
                 error = null,
+                retry_count = retry_count + 1,
                 updated_at = now()
             where id = :frame_asset_id and status = 'not_retrieved'
             """
@@ -3293,6 +3320,12 @@ def reset_all_issue_frame_assets_within_periods(
             f"and coalesce(te.trigger_time, fa.start_time) < :{end_key})"
         )
     within_any_period_filter = " or ".join(window_clauses)
+    # A row that's already used up MAX_FRAME_RETRIEVAL_ATTEMPTS is left alone
+    # here rather than requeued yet again - without this, a permanently-
+    # unretrievable trigger (camera genuinely has nothing for that moment)
+    # got revived on every single cycle forever, each attempt just failing
+    # straight back to 'issue', with nothing ever calling it done.
+    params["max_attempts"] = MAX_FRAME_RETRIEVAL_ATTEMPTS
     result = db.execute(
         text(
             f"""
@@ -3303,6 +3336,7 @@ def reset_all_issue_frame_assets_within_periods(
                 fa.updated_at = now()
             where fa.location_id = :location_id
               and fa.status = 'issue'
+              and fa.retry_count < :max_attempts
               and ({within_any_period_filter})
             """
         ),

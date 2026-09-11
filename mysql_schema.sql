@@ -210,6 +210,7 @@ CREATE TABLE IF NOT EXISTS sesamedb.tds_trigger_frame_asset (
     end_time DATETIME NOT NULL,
     status VARCHAR(30) NOT NULL DEFAULT 'not_retrieved',
     error TEXT,
+    retry_count INT NOT NULL DEFAULT 0 COMMENT 'Incremented on every retrieval attempt claimed - once it reaches MAX_FRAME_RETRIEVAL_ATTEMPTS, the row is left at issue for good instead of being requeued forever.',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     KEY idx_trigger_frame_asset_trigger_id (trigger_id),
