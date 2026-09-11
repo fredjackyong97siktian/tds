@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import sys
 
+from .. import repositories
 from ..db import TransactionalSessionLocal
 from ..services import workflow_service
 
@@ -31,7 +32,16 @@ def main() -> int:
     batch_id = int(sys.argv[1])
     db = TransactionalSessionLocal()
     try:
-        job = workflow_service.build_grouping_analysis_job_from_batch(db, batch_id)
+        try:
+            job = workflow_service.build_grouping_analysis_job_from_batch(db, batch_id)
+        except Exception as exc:
+            # Building the job is a fast, synchronous, non-network step - a
+            # failure here is a real data/logic error, not a hang, so it's
+            # reported the same specific way the worker always has rather
+            # than falling through to the generic crash handler.
+            logger.exception("Could not build grouping job for batch_id=%s", batch_id)
+            repositories.update_grouping_batch(db, batch_id, {"status": "issue", "issue_reason": str(exc)})
+            return 1
         result = workflow_service.start_grouping_analysis_job(job)
         logger.info(
             "Grouping dispatch finished batch_id=%s location_id=%s status=%s runner_job_id=%s",
