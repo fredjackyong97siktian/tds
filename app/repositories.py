@@ -2374,6 +2374,13 @@ def requeue_incomplete_trigger_frame_assets_in_window(
     # frames, rate-limited so a persistently-broken trigger (e.g. the camera
     # genuinely had nothing for that offset) doesn't get re-run every single
     # poll tick for the whole grace window.
+    #
+    # Also capped by retry_count, same as the other requeue paths - without
+    # this a row already at the cap (excluded from candidate selection once
+    # it's 'not_retrieved') got kicked BACK to 'not_retrieved' by this
+    # uncapped path with nothing left to ever pick it up or mark it 'issue' -
+    # a permanent dead end. Past the cap it just keeps whatever partial
+    # frames it already has instead of chasing completeness forever.
     trigger_table = _table("trigger_event")
     frame_asset_table = _table("trigger_frame_asset")
     frame_table = _table("trigger_frame")
@@ -2397,6 +2404,7 @@ def requeue_incomplete_trigger_frame_assets_in_window(
               and te.whitelist_hit = 0
               and te.status <> 'whitelisted'
               and fa.status = 'retrieved'
+              and fa.retry_count < :max_attempts
               and coalesce(okc.ok_count, 0) < :min_frame_count
               and fa.updated_at < date_sub(now(), interval :cooldown_seconds second)
             """
@@ -2407,6 +2415,7 @@ def requeue_incomplete_trigger_frame_assets_in_window(
             "window_end": window_end,
             "min_frame_count": max(1, int(min_frame_count)),
             "cooldown_seconds": max(1, int(cooldown_seconds)),
+            "max_attempts": MAX_FRAME_RETRIEVAL_ATTEMPTS,
         },
     )
     db.commit()
