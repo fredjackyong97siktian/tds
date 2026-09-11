@@ -50,7 +50,7 @@ def run_kiosk(
     result = workflow_service.run_kiosk_for_session(
         db,
         session_id=session_id,
-        video_path=payload.video_path,
+        video_paths=[payload.video_path],
         model_name=payload.model_name,
         output_dir=payload.output_dir,
         gallery_state_path=payload.gallery_state_path,

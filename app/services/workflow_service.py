@@ -331,11 +331,16 @@ class EntranceAnalysisQueued:
 
 
 @dataclass
-class KioskAnalysisQueued:
+class KioskVideoAssetInput:
     video_asset_id: int
+    video_path: str
+
+
+@dataclass
+class KioskAnalysisQueued:
     session_id: int
     location_id: int
-    video_path: str
+    videos: list[KioskVideoAssetInput]
     model_name: str | None = None
 
 
@@ -358,6 +363,11 @@ class RemoteRunnerResult:
     stderr: str
     processed_video_object_key: str | None
     processed_video_url: str | None
+    # Kiosk jobs now process every video for one session in a single call, so
+    # there's a processed-video result per video_asset_id instead of one -
+    # the singular fields above stay unused for kiosk and are only read by
+    # the other job kinds (entry/grouping), which are still one-video-per-job.
+    processed_videos: list[dict[str, Any]] | None = None
     log_object_key: str | None = None
     log_url: str | None = None
     tracking_summary: dict[str, Any] | None = None
@@ -828,6 +838,7 @@ def _remote_runner_result_from_runpod_body(body: dict[str, Any]) -> tuple[str, R
                 stderr=str(output.get("stderr") or ""),
                 processed_video_object_key=output.get("processed_video_object_key"),
                 processed_video_url=output.get("processed_video_url"),
+                processed_videos=output.get("processed_videos") if isinstance(output.get("processed_videos"), list) else None,
                 log_object_key=output.get("log_object_key"),
                 log_url=output.get("log_url"),
                 tracking_summary=output.get("tracking_summary"),
@@ -850,6 +861,7 @@ def _remote_runner_result_from_runpod_body(body: dict[str, Any]) -> tuple[str, R
                 stderr=str(output.get("stderr") or error_detail),
                 processed_video_object_key=output.get("processed_video_object_key"),
                 processed_video_url=output.get("processed_video_url"),
+                processed_videos=output.get("processed_videos") if isinstance(output.get("processed_videos"), list) else None,
                 log_object_key=output.get("log_object_key"),
                 log_url=output.get("log_url"),
                 tracking_summary=output.get("tracking_summary"),
@@ -1926,6 +1938,60 @@ def _entry_customer_count_for_session(db: Session, session_id: int | None) -> in
         return None
 
 
+_KIOSK_BATCH_SCHEMA_INSTRUCTIONS = (
+    "You are reviewing evidence images for retail loss analysis, covering several completely independent customer "
+    "groups in one request - each group's own instructions below apply ONLY to that group's own numbered image "
+    "range; never compare one group's images or conclusions against another group's. "
+    "Return strict JSON only with schema: "
+    '{"groups":[{"group_id":integer,"left_store":true|false,"confirmed_visible_count":integer,'
+    '"suspected_total_count":integer,"visible_items":[{"type":string,"count":integer,"confidence":number}],'
+    '"per_person_items":[{"person_id":integer|null,"status":string,'
+    '"visible_items":[{"type":string,"count":integer,"confidence":number}],"suspected_hidden_count":integer,'
+    '"carried_out_count":integer,"confidence":number}],'
+    '"customers_left_with_items":[{"person_id":integer|null,"carried_out_count":integer,"confidence":number}],'
+    '"hidden_item_suspected":true|false,"confidence":number,"reasoning_summary":string}]}. '
+    "Include exactly one entry per group listed below, using its group_id."
+)
+
+
+def _build_kiosk_group_call_block(
+    *,
+    group_id: Any,
+    prompt: str,
+    image_count: int,
+    image_offset: int,
+    identity_reference_image_count: int,
+    expected_customer_count: int | None,
+) -> str:
+    range_start = image_offset + 1
+    range_end = image_offset + image_count
+    reference_note = ""
+    if identity_reference_image_count:
+        customer_count_hint = (
+            f"Entrance analysis estimated approximately {expected_customer_count} customer"
+            f"{'s' if expected_customer_count != 1 else ''} entered together in this group - use this only as a "
+            "rough guide for how many distinct people to expect, not a guarantee; the kiosk footage itself is the "
+            "definitive source for who is actually there. "
+            if expected_customer_count is not None and expected_customer_count > 0
+            else ""
+        )
+        reference_note = (
+            f"Images 1 to {identity_reference_image_count} (shared across every group in this request) show the "
+            "store customer whose entry and exit are already confirmed - this is the specific customer you must "
+            "evaluate for THIS group. First identify which person (if any) in this group's own images below is the "
+            "same physical customer shown in those reference images, based on clothing, build, and hair - do not "
+            "assume it is whichever person the evidence happens to be centered on. Only count items carried out by "
+            "that confirmed customer; ignore items associated with any other person visible in this group's "
+            "evidence. " + customer_count_hint
+        )
+    return (
+        f"=== Group {group_id} (use images {range_start} to {range_end} ONLY for this group) ===\n"
+        f"{reference_note}"
+        "This group's own instructions (ignore any image numbering mentioned inside them - the range above is "
+        f"authoritative for this combined request):\n{prompt}\n"
+    )
+
+
 def _complete_kiosk_summary_with_tds_gemini(
     db: Session,
     kiosk_summary: dict[str, Any] | None,
@@ -1933,6 +1999,12 @@ def _complete_kiosk_summary_with_tds_gemini(
     identity_reference_image_urls: list[str] | None = None,
     expected_customer_count: int | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    # Every group that still needs Gemini analysis is sent in ONE combined
+    # call instead of one call per group - a session's kiosk videos can
+    # produce several groups (one per tracked customer per video, now
+    # possibly across several videos batched into one job - see
+    # run_kiosk_for_session), and batching avoids paying a separate Gemini
+    # request (and its fixed prompt/instruction overhead) per group.
     if not kiosk_summary:
         return kiosk_summary, {
             "status": "skipped",
@@ -1951,14 +2023,19 @@ def _complete_kiosk_summary_with_tds_gemini(
             "detected_total_items": 0,
         }
 
-    detected_total = 0
-    completed_groups: list[dict[str, Any]] = []
+    enriched_groups: list[dict[str, Any]] = []
     diagnostics_groups: list[dict[str, Any]] = []
     match_diagnostics = (
         dict(kiosk_summary.get("match_diagnostics") or {})
         if isinstance(kiosk_summary.get("match_diagnostics"), Mapping)
         else {}
     )
+
+    # First pass: resolve each group's prompt/image_urls and split into
+    # "needs a call" vs "already resolved" (skipped/failed by the runner
+    # before it even reached Gemini) - identical validation to before, just
+    # deferring the actual dispatch until every group has been collected.
+    pending_calls: list[tuple[dict[str, Any], dict[str, Any], str, list[str]]] = []
     for group in groups:
         if not isinstance(group, dict):
             continue
@@ -1995,46 +2072,72 @@ def _complete_kiosk_summary_with_tds_gemini(
                 diagnostics={
                     "provider": "tds_api_gemini",
                     "groups": diagnostics_groups,
-                    "detected_total_items": detected_total,
+                    "detected_total_items": 0,
                 },
             )
         if enriched_group.get("vlm_pending") and prompt and image_urls:
-            call_prompt = prompt
-            call_image_urls = image_urls
-            if identity_reference_image_urls:
-                call_image_urls = list(identity_reference_image_urls) + image_urls
-                customer_count_hint = (
-                    f"Entrance analysis estimated approximately {expected_customer_count} customer"
-                    f"{'s' if expected_customer_count != 1 else ''} entered together in this group - use this only "
-                    "as a rough guide for how many distinct people to expect, not a guarantee; the kiosk footage "
-                    "itself is the definitive source for who is actually there. "
-                    if expected_customer_count is not None and expected_customer_count > 0
-                    else ""
+            pending_calls.append((enriched_group, diagnostics_group, prompt, image_urls))
+        else:
+            meta_status = str((enriched_group.get("vlm_meta") or {}).get("status") or "").strip()
+            diagnostics_group["status"] = "skipped"
+            diagnostics_group["skip_reason"] = meta_status or "runner_completed_without_tds_gemini"
+            diagnostics_group["result"] = (enriched_group.get("kiosk_event_summary") or {}).get("vlm_result")
+            diagnostics_group["meta"] = enriched_group.get("vlm_meta")
+            enriched_groups.append(enriched_group)
+            diagnostics_groups.append(diagnostics_group)
+
+    if pending_calls:
+        reference_images = list(identity_reference_image_urls or [])
+        call_image_urls = list(reference_images)
+        call_blocks: list[str] = []
+        offset = len(reference_images)
+        for enriched_group, _diagnostics_group, prompt, image_urls in pending_calls:
+            call_blocks.append(
+                _build_kiosk_group_call_block(
+                    group_id=enriched_group.get("group_id"),
+                    prompt=prompt,
+                    image_count=len(image_urls),
+                    image_offset=offset,
+                    identity_reference_image_count=len(reference_images),
+                    expected_customer_count=expected_customer_count,
                 )
-                call_prompt = (
-                    f"Images 1 to {len(identity_reference_image_urls)} show the store customer whose entry and "
-                    "exit are already confirmed - this is the specific customer you must evaluate. The remaining "
-                    "images are the kiosk/checkout evidence, which may show this customer alongside other people. "
-                    "First identify which person (if any) in the kiosk evidence is the same physical customer shown "
-                    "in the reference images, based on clothing, build, and hair - do not assume it is whichever "
-                    "person the evidence happens to be centered on. Only count items carried out by that confirmed "
-                    "customer; ignore items associated with any other person visible in the kiosk evidence. "
-                    + customer_count_hint
-                ) + prompt
-            try:
-                vlm_result, vlm_meta = _call_kiosk_vision(db, prompt=call_prompt, image_urls=call_image_urls)
-            except Exception as exc:
+            )
+            call_image_urls.extend(image_urls)
+            offset += len(image_urls)
+        call_prompt = _KIOSK_BATCH_SCHEMA_INSTRUCTIONS + "\n\n" + "\n".join(call_blocks)
+
+        try:
+            batch_result, vlm_meta = _call_kiosk_vision(db, prompt=call_prompt, image_urls=call_image_urls)
+        except Exception as exc:
+            for _enriched_group, diagnostics_group, _prompt, _image_urls in pending_calls:
                 diagnostics_group["status"] = "failed"
                 diagnostics_group["error"] = str(exc)
                 diagnostics_groups.append(diagnostics_group)
-                raise GeminiKioskSummaryError(
-                    f"TDS Gemini failed for kiosk group {enriched_group.get('group_id')}: {exc}",
-                    diagnostics={
-                        "provider": "tds_api_gemini",
-                        "groups": diagnostics_groups,
-                        "detected_total_items": detected_total,
-                    },
-                ) from exc
+            raise GeminiKioskSummaryError(
+                f"TDS Gemini failed for a batch of {len(pending_calls)} kiosk group(s): {exc}",
+                diagnostics={
+                    "provider": "tds_api_gemini",
+                    "groups": diagnostics_groups,
+                    "detected_total_items": 0,
+                },
+            ) from exc
+
+        results_by_group_id = {
+            str(entry.get("group_id")): entry
+            for entry in (batch_result.get("groups") or [])
+            if isinstance(entry, Mapping)
+        }
+        for enriched_group, diagnostics_group, _prompt, _image_urls in pending_calls:
+            group_key = str(enriched_group.get("group_id"))
+            vlm_result = results_by_group_id.get(group_key)
+            if vlm_result is None:
+                diagnostics_group["status"] = "failed"
+                diagnostics_group["error"] = (
+                    f"Gemini's batched response did not include a result for group_id={group_key}."
+                )
+                diagnostics_groups.append(diagnostics_group)
+                enriched_groups.append(enriched_group)
+                continue
             enriched_group["vlm_result"] = vlm_result
             enriched_group["vlm_meta"] = vlm_meta
             enriched_group["vlm_pending"] = False
@@ -2045,22 +2148,29 @@ def _complete_kiosk_summary_with_tds_gemini(
             kiosk_event_summary["total_items_taken_out"] = _count_items_from_kiosk_vlm_result(vlm_result)
             kiosk_event_summary["vlm_result"] = vlm_result
             enriched_group["kiosk_event_summary"] = kiosk_event_summary
-        else:
-            meta_status = str((enriched_group.get("vlm_meta") or {}).get("status") or "").strip()
-            diagnostics_group["status"] = "skipped"
-            diagnostics_group["skip_reason"] = meta_status or "runner_completed_without_tds_gemini"
-            diagnostics_group["result"] = (enriched_group.get("kiosk_event_summary") or {}).get("vlm_result")
-            diagnostics_group["meta"] = enriched_group.get("vlm_meta")
-        detected_total += int((enriched_group.get("kiosk_event_summary") or {}).get("total_items_taken_out") or 0)
-        completed_groups.append(enriched_group)
-        diagnostics_group["group_detected_total_items"] = int(
-            (enriched_group.get("kiosk_event_summary") or {}).get("total_items_taken_out") or 0
+            diagnostics_group["group_detected_total_items"] = kiosk_event_summary["total_items_taken_out"]
+            enriched_groups.append(enriched_group)
+            diagnostics_groups.append(diagnostics_group)
+
+    detected_total = sum(
+        int((group.get("kiosk_event_summary") or {}).get("total_items_taken_out") or 0) for group in enriched_groups
+    )
+    for diagnostics_group in diagnostics_groups:
+        diagnostics_group.setdefault(
+            "group_detected_total_items",
+            next(
+                (
+                    int((group.get("kiosk_event_summary") or {}).get("total_items_taken_out") or 0)
+                    for group in enriched_groups
+                    if str(group.get("group_id")) == str(diagnostics_group.get("group_id"))
+                ),
+                0,
+            ),
         )
-        diagnostics_groups.append(diagnostics_group)
 
     completed_summary = {
         **kiosk_summary,
-        "groups": completed_groups,
+        "groups": enriched_groups,
         "detected_total_items": detected_total,
         "vlm_completed_by": "tds_api",
     }
@@ -2072,7 +2182,7 @@ def _complete_kiosk_summary_with_tds_gemini(
         "detected_total_items": detected_total,
         "match_diagnostics": match_diagnostics,
     }
-    if not completed_groups:
+    if not enriched_groups:
         diagnostics["status"] = "skipped"
         diagnostics["skip_reason"] = str(match_diagnostics.get("gemini_skip_reason") or "no_kiosk_groups")
         diagnostics["message"] = str(
@@ -2387,7 +2497,15 @@ def _finalize_remote_kiosk_script_run(
         )
     runner_payload = dict(script_run.get("runner_payload") or {})
     script_run_id = int(script_run["id"])
-    video_asset_id = int(runner_payload["video_asset_id"])
+    # Kiosk jobs now cover every kiosk video for one session in a single
+    # RunPod call - runner_payload carries "video_asset_ids" (plural) going
+    # forward; "video_asset_id" (singular) is only read as a fallback for a
+    # job already in flight from before this change was deployed.
+    video_asset_ids: list[int] = (
+        [int(v) for v in runner_payload["video_asset_ids"]]
+        if runner_payload.get("video_asset_ids")
+        else [int(runner_payload["video_asset_id"])]
+    )
     processed_video_url = str(remote_result.processed_video_url or runner_payload.get("processed_video_url") or "")
     repositories.assign_script_run_runner_job(
         db,
@@ -2400,7 +2518,11 @@ def _finalize_remote_kiosk_script_run(
             "log_url": remote_result.log_url or runner_payload.get("log_url"),
         },
     )
-    video_asset_row = repositories.get_video_asset(db, video_asset_id)
+    video_asset_rows = {video_asset_id: repositories.get_video_asset(db, video_asset_id) for video_asset_id in video_asset_ids}
+
+    def _mark_all_kiosk_video_assets_issue() -> None:
+        for asset_id in video_asset_ids:
+            repositories.update_video_asset_status(db, asset_id, "issue")
 
     remote_status = "success" if remote_result.status == "success" else "failed"
     repositories.finish_script_run(
@@ -2463,7 +2585,7 @@ def _finalize_remote_kiosk_script_run(
         )
 
     if result.status != "success":
-        repositories.update_video_asset_status(db, video_asset_id, "issue")
+        _mark_all_kiosk_video_assets_issue()
         if session_id is not None:
             repositories.update_session_fields(
                 db,
@@ -2480,9 +2602,10 @@ def _finalize_remote_kiosk_script_run(
             }
         }
     )
-    if not remote_result.processed_video_object_key:
-        repositories.update_video_asset_status(db, video_asset_id, "issue")
-        stderr = f"{result.stderr}\nRemote runner did not return processed video object key.".strip()
+    has_any_processed_video = bool(remote_result.processed_videos) or bool(remote_result.processed_video_object_key)
+    if not has_any_processed_video:
+        _mark_all_kiosk_video_assets_issue()
+        stderr = f"{result.stderr}\nRemote runner did not return any processed video object key.".strip()
         repositories.revise_script_run(
             db,
             result.script_run_id,
@@ -2508,7 +2631,7 @@ def _finalize_remote_kiosk_script_run(
             stderr=stderr,
         )
     if session_id is not None and not remote_result.kiosk_summary:
-        repositories.update_video_asset_status(db, video_asset_id, "issue")
+        _mark_all_kiosk_video_assets_issue()
         stderr = f"{result.stderr}\nRemote runner did not return kiosk summary.".strip()
         repositories.revise_script_run(
             db,
@@ -2543,7 +2666,7 @@ def _finalize_remote_kiosk_script_run(
             model_name=f"{_current_kiosk_model_name(db)}_kiosk_summary",
             runner_payload={
                 "parent_script_run_id": result.script_run_id,
-                "video_asset_id": video_asset_id,
+                "video_asset_ids": video_asset_ids,
                 "session_id": int(session_id) if session_id is not None else None,
                 "source": "tds_api_kiosk_enrichment",
             },
@@ -2600,7 +2723,7 @@ def _finalize_remote_kiosk_script_run(
         }
         persist_gemini_log(gemini_error_payload)
         sync_gemini_script_run_payload(gemini_script_run_id, gemini_error_payload)
-        repositories.update_video_asset_status(db, video_asset_id, "issue")
+        _mark_all_kiosk_video_assets_issue()
         stderr = f"{result.stderr}\nTDS API Gemini kiosk summary failed: {exc}".strip()
         repositories.revise_script_run(
             db,
@@ -2644,7 +2767,7 @@ def _finalize_remote_kiosk_script_run(
         }
         persist_gemini_log(gemini_exception_payload)
         sync_gemini_script_run_payload(gemini_script_run_id, gemini_exception_payload)
-        repositories.update_video_asset_status(db, video_asset_id, "issue")
+        _mark_all_kiosk_video_assets_issue()
         stderr = f"{result.stderr}\nTDS API Gemini kiosk summary failed: {exc}".strip()
         repositories.revise_script_run(
             db,
@@ -2671,21 +2794,19 @@ def _finalize_remote_kiosk_script_run(
             stderr=stderr,
         )
     if session_id is not None and completed_kiosk_summary:
-        # A session can have more than one kiosk video (one per non-overlapping
-        # paid-transaction window - see _prepare_session_kiosk_pipeline), each
-        # analyzed and finalized independently as its own RunPod job. This used
-        # to call finalize_session_result unconditionally on every single
-        # video's own detected_total_items, which both overwrote the previous
-        # video's contribution (finalize_session_result rebuilds result_summary
-        # from scratch, see repositories.py) instead of summing them, AND made
-        # the final detected/not_detected decision prematurely off whichever
-        # video happened to finish last. Mirrors the same fix already applied
-        # to _finalize_remote_entry_script_run above for this exact
-        # section="kiosk" video-asset relationship.
+        # A session's kiosk videos are now all dispatched together as one
+        # RunPod job (see run_kiosk_for_session), so this normally only ever
+        # runs once per session - but a video that becomes ready for analysis
+        # AFTER this batch was already claimed still forms its own separate
+        # job/script_run, so this keeps summing across script_runs (keyed by
+        # script_run_id, since one script_run can now cover several
+        # video_asset_ids) rather than overwriting, same reasoning as the
+        # identical fix already applied to _finalize_remote_entry_script_run
+        # above for this exact section="kiosk" video-asset relationship.
         session_row = repositories.get_session(db, int(session_id))
         existing_summary = dict(session_row.get("result_summary") or {})
         kiosk_runs = dict(existing_summary.get("kiosk_runs") or {})
-        kiosk_runs[str(video_asset_id)] = completed_kiosk_summary
+        kiosk_runs[str(script_run_id)] = completed_kiosk_summary
         cumulative_detected_total = sum(
             int(run.get("detected_total_items") or 0)
             for run in kiosk_runs.values()
@@ -2695,7 +2816,7 @@ def _finalize_remote_kiosk_script_run(
             **existing_summary,
             "kiosk_runs": kiosk_runs,
             "kiosk_detected_total_items": cumulative_detected_total,
-            "last_kiosk_video_asset_id": video_asset_id,
+            "last_kiosk_video_asset_ids": video_asset_ids,
         }
         repositories.update_session_summary(
             db,
@@ -2721,12 +2842,28 @@ def _finalize_remote_kiosk_script_run(
                 tolerance=1,
                 extra_result_summary=merged_summary,
             )
-    _apply_processed_video_upload_result(
-        db,
-        video_asset_row=video_asset_row,
-        object_key=remote_result.processed_video_object_key,
-        video_url=processed_video_url,
-    )
+    if remote_result.processed_videos:
+        for entry in remote_result.processed_videos:
+            entry_video_asset_id = int(entry.get("video_asset_id"))
+            entry_video_asset_row = video_asset_rows.get(entry_video_asset_id)
+            entry_object_key = entry.get("processed_video_object_key")
+            if entry_video_asset_row is None or not entry_object_key:
+                continue
+            _apply_processed_video_upload_result(
+                db,
+                video_asset_row=entry_video_asset_row,
+                object_key=str(entry_object_key),
+                video_url=entry.get("processed_video_url"),
+            )
+    elif video_asset_rows:
+        # Fallback for a job dispatched before this multi-video change - the
+        # response only ever carried one processed video for one video_asset.
+        _apply_processed_video_upload_result(
+            db,
+            video_asset_row=next(iter(video_asset_rows.values())),
+            object_key=remote_result.processed_video_object_key,
+            video_url=processed_video_url,
+        )
     return result
 
 
@@ -13086,15 +13223,22 @@ def run_kiosk_for_session(
     db: Session,
     *,
     session_id: int,
-    video_path: str,
+    video_paths: list[str],
     model_name: str | None = None,
     output_dir: str | None = None,
     gallery_state_path: str | None = None,
 ) -> ScriptExecutionResult:
+    # Dispatches every video passed in as ONE RunPod job (see KioskRunnerRequest
+    # in tds_runner) instead of one job per video - a session can have more
+    # than one kiosk video (one per non-overlapping paid-transaction window,
+    # see _prepare_session_kiosk_pipeline), and batching them avoids paying a
+    # separate RunPod cold-start and a separate Gemini call per video.
+    if not video_paths:
+        raise ValueError("No kiosk video paths were provided to analyze.")
     session = repositories.get_session(db, session_id)
     location_id = int(session["location_id"])
     workdir = build_session_workdir(location_id, session_id)
-    resolved_output_dir = Path(output_dir) if output_dir else default_video_output_dir(location_id, session_id, video_path)
+    resolved_output_dir = Path(output_dir) if output_dir else default_video_output_dir(location_id, session_id, video_paths[0])
     resolved_gallery_state = (
         Path(gallery_state_path)
         if gallery_state_path
@@ -13110,9 +13254,12 @@ def run_kiosk_for_session(
         session_id=session_id,
         gallery_state_path=resolved_gallery_state,
     )
-    video_asset_row = _lookup_video_asset_by_file_path(db, video_path)
-    if video_asset_row is None:
-        raise RuntimeError("Runpod kiosk analysis requires a matching video_asset row for the source video.")
+    video_asset_rows = []
+    for video_path in video_paths:
+        video_asset_row = _lookup_video_asset_by_file_path(db, video_path)
+        if video_asset_row is None:
+            raise RuntimeError(f"Runpod kiosk analysis requires a matching video_asset row for {video_path}.")
+        video_asset_rows.append(video_asset_row)
     if _runpod_dispatch_busy(db):
         return ScriptExecutionResult(
             script_run_id=None,
@@ -13125,30 +13272,51 @@ def run_kiosk_for_session(
             stderr="",
             message="Runpod analysis worker is busy. Kiosk job was not enqueued yet; retry after the current analysis finishes.",
         )
-    repositories.update_video_asset_status(db, int(video_asset_row["id"]), "processing")
-    video_asset_row, source_video_url = _ensure_source_video_ready_for_runner(
-        db,
-        video_asset_row=video_asset_row,
-        location_id=location_id,
-        session_id=session_id,
-        trigger_id=None,
-    )
+    for video_asset_row in video_asset_rows:
+        repositories.update_video_asset_status(db, int(video_asset_row["id"]), "processing")
+
+    videos_payload: list[dict[str, Any]] = []
+    runner_videos: list[dict[str, Any]] = []
+    for video_path, video_asset_row in zip(video_paths, video_asset_rows):
+        video_asset_row, source_video_url = _ensure_source_video_ready_for_runner(
+            db,
+            video_asset_row=video_asset_row,
+            location_id=location_id,
+            session_id=session_id,
+            trigger_id=None,
+        )
+        upload_target = _build_processed_video_upload_target(
+            video_asset_row=video_asset_row,
+            location_id=location_id,
+            session_id=session_id,
+            trigger_id=None,
+            script_name="kiosk",
+            source_video_path=video_path,
+        )
+        video_asset_id = int(video_asset_row["id"])
+        videos_payload.append(
+            {
+                "video_asset_id": video_asset_id,
+                "video_url": source_video_url,
+                "processed_video_object_key": upload_target["object_key"],
+            }
+        )
+        runner_videos.append(
+            {
+                "video_asset_id": video_asset_id,
+                "video_path": video_path,
+                "processed_video_url": upload_target["video_url"],
+            }
+        )
+
     gallery_state_url = _upload_runner_input_file(
         resolved_gallery_state,
         kind="gallery_state",
         location_id=location_id,
         session_id=session_id,
         trigger_id=None,
-        section=str(video_asset_row.get("section") or "kiosk"),
+        section="kiosk",
     )[1]
-    upload_target = _build_processed_video_upload_target(
-        video_asset_row=video_asset_row,
-        location_id=location_id,
-        session_id=session_id,
-        trigger_id=None,
-        script_name="kiosk",
-        source_video_path=video_path,
-    )
     script_run_id = repositories.create_script_run_started(
         db,
         session_id=session_id,
@@ -13162,9 +13330,8 @@ def run_kiosk_for_session(
         kind="kiosk",
         payload={
             "kind": "kiosk",
-            "video_url": source_video_url,
+            "videos": videos_payload,
             "gallery_state_url": gallery_state_url,
-            "processed_video_object_key": upload_target["object_key"],
             "callback_url": _build_runpod_webhook_url("kiosk"),
             "script_run_id": script_run_id,
             "model_name": model_name,
@@ -13175,14 +13342,13 @@ def run_kiosk_for_session(
         script_run_id,
         runner_job_id=enqueue_result.job_id,
         runner_payload={
-            "video_asset_id": int(video_asset_row["id"]),
+            "video_asset_ids": [item["video_asset_id"] for item in runner_videos],
             "location_id": location_id,
             "session_id": session_id,
             "trigger_id": None,
-            "video_path": video_path,
+            "videos": runner_videos,
             "output_dir": str(resolved_output_dir),
             "gallery_state_path": str(resolved_gallery_state),
-            "processed_video_url": upload_target["video_url"],
         },
     )
     return ScriptExecutionResult(
@@ -13198,7 +13364,11 @@ def run_kiosk_for_session(
     )
 
 
-def build_kiosk_analysis_job_from_video_asset(db: Session, video_asset_id: int) -> KioskAnalysisQueued:
+def _resolve_kiosk_video_asset_for_analysis(db: Session, video_asset_id: int) -> tuple[int, KioskVideoAssetInput]:
+    """Validates one kiosk video_asset and resolves its owning session, exactly
+    as build_kiosk_analysis_job_from_video_asset used to for a single video -
+    kept as its own function so build_kiosk_analysis_job_for_videos can call it
+    once per video while batching them into one job for the same session."""
     video_asset = repositories.get_video_asset(db, video_asset_id)
     if str(video_asset.get("section") or "") != "kiosk":
         raise ValueError(f"Video asset {video_asset_id} is not a kiosk video.")
@@ -13266,11 +13436,30 @@ def build_kiosk_analysis_job_from_video_asset(db: Session, video_asset_id: int) 
             f"Video asset {video_asset_id} belongs to session {session_id} with status "
             f"{session.get('status')!r}, expected 'pending'."
         )
+    return session_id, KioskVideoAssetInput(video_asset_id=video_asset_id, video_path=video_path)
+
+
+def build_kiosk_analysis_job_for_videos(db: Session, video_asset_ids: list[int]) -> KioskAnalysisQueued:
+    if not video_asset_ids:
+        raise ValueError("No kiosk video assets were provided to analyze.")
+    videos: list[KioskVideoAssetInput] = []
+    session_id: int | None = None
+    for video_asset_id in video_asset_ids:
+        resolved_session_id, video_input = _resolve_kiosk_video_asset_for_analysis(db, video_asset_id)
+        if session_id is None:
+            session_id = resolved_session_id
+        elif resolved_session_id != session_id:
+            raise ValueError(
+                f"Video asset {video_asset_id} belongs to session {resolved_session_id}, "
+                f"not {session_id} - a batched kiosk job must cover exactly one session."
+            )
+        videos.append(video_input)
+    assert session_id is not None
+    session = repositories.get_session(db, session_id)
     return KioskAnalysisQueued(
-        video_asset_id=video_asset_id,
         session_id=session_id,
         location_id=int(session["location_id"]),
-        video_path=video_path,
+        videos=videos,
         model_name=None,
     )
 
@@ -13281,16 +13470,19 @@ def start_kiosk_analysis_job(job: KioskAnalysisQueued) -> ScriptExecutionResult:
         result = run_kiosk_for_session(
             db,
             session_id=job.session_id,
-            video_path=job.video_path,
+            video_paths=[video.video_path for video in job.videos],
             model_name=job.model_name,
         )
         if result.status == "failed":
-            repositories.update_video_asset_status(db, job.video_asset_id, "issue")
+            for video in job.videos:
+                repositories.update_video_asset_status(db, video.video_asset_id, "issue")
         elif result.status == "pending":
-            repositories.update_video_asset_status(db, job.video_asset_id, "ready")
+            for video in job.videos:
+                repositories.update_video_asset_status(db, video.video_asset_id, "ready")
         return result
     except Exception as exc:
-        repositories.update_video_asset_status(db, job.video_asset_id, "issue")
+        for video in job.videos:
+            repositories.update_video_asset_status(db, video.video_asset_id, "issue")
         script_run_id = repositories.create_script_run_started(
             db,
             session_id=job.session_id,

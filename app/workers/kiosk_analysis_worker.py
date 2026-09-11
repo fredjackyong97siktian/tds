@@ -19,7 +19,8 @@ logger = logging.getLogger("tds.kiosk_analysis_worker")
 class RunningJob:
     future: Future[workflow_service.ScriptExecutionResult]
     location_id: int
-    video_asset_id: int
+    session_id: int
+    video_asset_ids: list[int]
 
 
 class KioskAnalysisWorker:
@@ -50,26 +51,27 @@ class KioskAnalysisWorker:
         cooldown_seconds = max(0, settings.kiosk_analysis_cooldown_seconds)
         with self._lock:
             items = list(self._running.items())
-        for video_asset_id, job in items:
+        for session_id, job in items:
             if not job.future.done():
                 continue
             try:
                 result = job.future.result()
                 logger.info(
-                    "Kiosk analysis dispatch finished for video_asset_id=%s location_id=%s status=%s runner_job_id=%s",
-                    job.video_asset_id,
+                    "Kiosk analysis dispatch finished for session_id=%s video_asset_ids=%s location_id=%s status=%s runner_job_id=%s",
+                    job.session_id,
+                    job.video_asset_ids,
                     job.location_id,
                     result.status,
                     result.runner_job_id,
                 )
             except Exception:
-                logger.exception("Kiosk analysis dispatch crashed for video_asset_id=%s", job.video_asset_id)
-            finished_ids.append(video_asset_id)
+                logger.exception("Kiosk analysis dispatch crashed for session_id=%s video_asset_ids=%s", job.session_id, job.video_asset_ids)
+            finished_ids.append(session_id)
         if not finished_ids:
             return
         with self._lock:
-            for video_asset_id in finished_ids:
-                self._running.pop(video_asset_id, None)
+            for session_id in finished_ids:
+                self._running.pop(session_id, None)
             self._next_dispatch_after = time.time() + cooldown_seconds
 
     def _fill_available_slots(self) -> None:
@@ -111,44 +113,67 @@ class KioskAnalysisWorker:
 
             candidates = repositories.list_pending_kiosk_video_asset_analyses(
                 db,
-                limit=max(settings.kiosk_analysis_max_global_workers * 10, 20),
+                limit=max(settings.kiosk_analysis_max_global_workers * 20, 20),
             )
-            for candidate in candidates:
-                if available_slots <= 0:
-                    break
-                video_asset_id = int(candidate["id"])
-                location_id = int(candidate["location_id"])
-                claimed = repositories.claim_video_asset_for_analysis(db, video_asset_id)
-                if not claimed:
-                    continue
-                try:
-                    job = workflow_service.build_kiosk_analysis_job_from_video_asset(db, video_asset_id)
-                    future = self._executor.submit(workflow_service.start_kiosk_analysis_job, job)
-                except Exception as exc:
-                    logger.exception("Could not build kiosk analysis job for video_asset_id=%s", video_asset_id)
-                    repositories.update_video_asset_status(db, video_asset_id, "issue")
-                    repositories.create_script_run(
-                        db,
-                        session_id=int(candidate["session_id"]) if candidate.get("session_id") is not None else None,
-                        trigger_id=None,
-                        script_name="kiosk",
-                        model_name="worker_build_job",
-                        status="failed",
-                        command="worker_build_job",
-                        stdout_log="",
-                        stderr_log=str(exc),
-                    )
-                    continue
+            if not candidates:
+                return
 
-                with self._lock:
-                    self._running[video_asset_id] = RunningJob(
-                        future=future,
-                        location_id=location_id,
-                        video_asset_id=video_asset_id,
-                    )
-                available_slots -= 1
-                logger.info("Claimed kiosk analysis dispatch video_asset_id=%s location_id=%s", video_asset_id, location_id)
-                break
+            # Every ready kiosk video for the SAME session gets dispatched
+            # together as one RunPod job (one call, one Gemini pass covering
+            # all of them) instead of one job per video - a session can have
+            # more than one kiosk video, one per non-overlapping paid-
+            # transaction window. Candidates are already ordered by
+            # captured_start_time, so the first session_id encountered is the
+            # oldest one waiting; batch only that session's videos this cycle.
+            first_session_id = int(candidates[0]["session_id"])
+            session_candidates = [c for c in candidates if int(c["session_id"]) == first_session_id]
+            location_id = int(session_candidates[0]["location_id"])
+
+            claimed_video_asset_ids: list[int] = []
+            for candidate in session_candidates:
+                video_asset_id = int(candidate["id"])
+                if repositories.claim_video_asset_for_analysis(db, video_asset_id):
+                    claimed_video_asset_ids.append(video_asset_id)
+            if not claimed_video_asset_ids:
+                return
+
+            try:
+                job = workflow_service.build_kiosk_analysis_job_for_videos(db, claimed_video_asset_ids)
+                future = self._executor.submit(workflow_service.start_kiosk_analysis_job, job)
+            except Exception as exc:
+                logger.exception(
+                    "Could not build kiosk analysis job for session_id=%s video_asset_ids=%s",
+                    first_session_id,
+                    claimed_video_asset_ids,
+                )
+                for video_asset_id in claimed_video_asset_ids:
+                    repositories.update_video_asset_status(db, video_asset_id, "issue")
+                repositories.create_script_run(
+                    db,
+                    session_id=first_session_id,
+                    trigger_id=None,
+                    script_name="kiosk",
+                    model_name="worker_build_job",
+                    status="failed",
+                    command="worker_build_job",
+                    stdout_log="",
+                    stderr_log=str(exc),
+                )
+                return
+
+            with self._lock:
+                self._running[first_session_id] = RunningJob(
+                    future=future,
+                    location_id=location_id,
+                    session_id=first_session_id,
+                    video_asset_ids=claimed_video_asset_ids,
+                )
+            logger.info(
+                "Claimed kiosk analysis dispatch session_id=%s video_asset_ids=%s location_id=%s",
+                first_session_id,
+                claimed_video_asset_ids,
+                location_id,
+            )
         finally:
             db.close()
 
