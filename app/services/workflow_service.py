@@ -2671,16 +2671,56 @@ def _finalize_remote_kiosk_script_run(
             stderr=stderr,
         )
     if session_id is not None and completed_kiosk_summary:
-        detected_total_items = int(completed_kiosk_summary.get("detected_total_items") or 0)
-        repositories.finalize_session_result(
+        # A session can have more than one kiosk video (one per non-overlapping
+        # paid-transaction window - see _prepare_session_kiosk_pipeline), each
+        # analyzed and finalized independently as its own RunPod job. This used
+        # to call finalize_session_result unconditionally on every single
+        # video's own detected_total_items, which both overwrote the previous
+        # video's contribution (finalize_session_result rebuilds result_summary
+        # from scratch, see repositories.py) instead of summing them, AND made
+        # the final detected/not_detected decision prematurely off whichever
+        # video happened to finish last. Mirrors the same fix already applied
+        # to _finalize_remote_entry_script_run above for this exact
+        # section="kiosk" video-asset relationship.
+        session_row = repositories.get_session(db, int(session_id))
+        existing_summary = dict(session_row.get("result_summary") or {})
+        kiosk_runs = dict(existing_summary.get("kiosk_runs") or {})
+        kiosk_runs[str(video_asset_id)] = completed_kiosk_summary
+        cumulative_detected_total = sum(
+            int(run.get("detected_total_items") or 0)
+            for run in kiosk_runs.values()
+            if isinstance(run, dict)
+        )
+        merged_summary = {
+            **existing_summary,
+            "kiosk_runs": kiosk_runs,
+            "kiosk_detected_total_items": cumulative_detected_total,
+            "last_kiosk_video_asset_id": video_asset_id,
+        }
+        repositories.update_session_summary(
             db,
             session_id=int(session_id),
-            kiosk_total_items=detected_total_items,
-            tolerance=1,
-            extra_result_summary={
-                "kiosk_summary": completed_kiosk_summary,
-            },
+            status="pending",
+            result_summary=merged_summary,
         )
+        session_videos = repositories.list_session_video_assets(
+            db,
+            session_id=int(session_id),
+            section="kiosk",
+        )
+        has_pending_kiosk = any(
+            str(item.get("video_status") or "").strip().lower()
+            in {"not_retrieved", "retrieving", "ready", "processing"}
+            for item in session_videos
+        )
+        if not has_pending_kiosk:
+            repositories.finalize_session_result(
+                db,
+                session_id=int(session_id),
+                kiosk_total_items=cumulative_detected_total,
+                tolerance=1,
+                extra_result_summary=merged_summary,
+            )
     _apply_processed_video_upload_result(
         db,
         video_asset_row=video_asset_row,
