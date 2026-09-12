@@ -69,6 +69,15 @@ class Settings(BaseSettings):
     grouping_open_entry_max_wait_minutes: int = 30
     grouping_carry_forward_buffer_minutes: int = 30
     grouping_window_grace_minutes: int = 240
+    # A trigger's frame_asset is treated as "complete enough" for grouping
+    # once it has at least this fraction of the expected frame count marked
+    # 'ok' - the retrieval job marks the whole asset 'retrieved' the moment
+    # even one frame succeeds, and retry attempts for a still-short asset are
+    # capped (see MAX_FRAME_RETRIEVAL_ATTEMPTS), so without this threshold a
+    # single trigger permanently stuck at e.g. 5/6 frames blocks its entire
+    # grouping window's batch from ever being built, forever - not just until
+    # retries run out.
+    grouping_frame_completeness_threshold: float = 0.8
     time_period_timezone: str = "Asia/Kuala_Lumpur"
     grouping_poll_seconds: int = 30
     grouping_max_global_workers: int = 1

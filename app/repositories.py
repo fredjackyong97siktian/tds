@@ -2314,11 +2314,18 @@ def has_pending_trigger_frame_retrieval_in_window(
 ) -> bool:
     # A trigger with no frame_asset row yet (retrieval not even queued), one
     # still short of a terminal state ('retrieved', 'processed', or 'issue'), or
-    # one marked 'retrieved' with fewer than min_frame_count successfully-captured
-    # frames (the retrieval job marks the whole asset 'retrieved' the moment even
-    # one frame out of five succeeds) all mean this window's data isn't actually
-    # complete yet - forming a batch now would silently snapshot a partial or
-    # near-empty trigger set, exactly like trigger 454 and 410 slipping through.
+    # one marked 'retrieved' with fewer than grouping_frame_completeness_threshold's
+    # share of min_frame_count successfully-captured frames (the retrieval job
+    # marks the whole asset 'retrieved' the moment even one frame out of five
+    # succeeds) all mean this window's data isn't actually complete yet -
+    # forming a batch now would silently snapshot a partial or near-empty
+    # trigger set, exactly like trigger 454 and 410 slipping through. Below
+    # that completeness threshold, not below the full count - retry attempts
+    # for a still-short asset are capped (see requeue_incomplete_trigger_frame_
+    # assets_in_window), so waiting for 100% here would mean waiting forever
+    # once retries run out and a trigger is permanently stuck a frame or two
+    # short - confirmed live: trigger 2529 stuck at 5/6 blocked its entire
+    # window's batch indefinitely with no automatic recovery.
     # 'processed' is included as terminal because a trigger just inside this
     # window's carry-forward buffer can already have been fully consumed by an
     # earlier, adjacent period's batch (mark_grouping_batch_frame_assets_processed)
@@ -2346,7 +2353,7 @@ def has_pending_trigger_frame_retrieval_in_window(
               and (
                   fa.id is null
                   or fa.status not in ('retrieved', 'processed', 'issue')
-                  or (fa.status = 'retrieved' and coalesce(okc.ok_count, 0) < :min_frame_count)
+                  or (fa.status = 'retrieved' and coalesce(okc.ok_count, 0) < :min_frame_count * :completeness_threshold)
               )
             limit 1
             """
@@ -2356,6 +2363,7 @@ def has_pending_trigger_frame_retrieval_in_window(
             "window_start": window_start,
             "window_end": window_end,
             "min_frame_count": max(1, int(min_frame_count)),
+            "completeness_threshold": max(0.0, min(1.0, float(settings.grouping_frame_completeness_threshold))),
         },
     )
     return result.first() is not None
@@ -2405,7 +2413,7 @@ def requeue_incomplete_trigger_frame_assets_in_window(
               and te.status <> 'whitelisted'
               and fa.status = 'retrieved'
               and fa.retry_count < :max_attempts
-              and coalesce(okc.ok_count, 0) < :min_frame_count
+              and coalesce(okc.ok_count, 0) < :min_frame_count * :completeness_threshold
               and fa.updated_at < date_sub(now(), interval :cooldown_seconds second)
             """
         ),
@@ -2416,6 +2424,7 @@ def requeue_incomplete_trigger_frame_assets_in_window(
             "min_frame_count": max(1, int(min_frame_count)),
             "cooldown_seconds": max(1, int(cooldown_seconds)),
             "max_attempts": MAX_FRAME_RETRIEVAL_ATTEMPTS,
+            "completeness_threshold": max(0.0, min(1.0, float(settings.grouping_frame_completeness_threshold))),
         },
     )
     db.commit()
