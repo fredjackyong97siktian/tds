@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     dahua_output_crf: int = 23
     dahua_output_scale: float = 0.5
     dahua_ffmpeg_threads: int = 2
+    # A single-frame RTSP snapshot grab (_capture_snapshot_frame) should
+    # complete in a couple of seconds on a healthy connection - bounds how
+    # long a hung/unreachable camera connection can block the caller before
+    # it's treated as a failed capture instead of hanging indefinitely.
+    dahua_snapshot_timeout_seconds: int = 20
     spaces_endpoint_url: str | None = None
     spaces_region: str = "sgp1"
     spaces_bucket: str | None = None

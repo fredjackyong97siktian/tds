@@ -4023,7 +4023,26 @@ def _capture_snapshot_frame(
         "2",
         str(snapshot_path),
     ]
-    completed = subprocess.run(command, capture_output=True, text=True)
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=settings.dahua_snapshot_timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        # No timeout here used to mean a hung RTSP connection (camera briefly
+        # unreachable, network blip) blocked forever with nothing to stop it -
+        # confirmed live: this froze an entire theft-confidence batch's
+        # subprocess for 900s until the worker's own stale-process safety net
+        # had to force-kill it, leaving every other group in that batch
+        # unscored. Treated as a normal failed capture (same shape as a
+        # nonzero ffmpeg exit) so one bad frame grab degrades gracefully
+        # instead of hanging the whole worker.
+        return {
+            "status": "failed",
+            "stderr": f"ffmpeg snapshot capture timed out after {settings.dahua_snapshot_timeout_seconds}s",
+        }
     return {
         "status": "ok" if completed.returncode == 0 and snapshot_path.exists() else "failed",
         "stderr": str(completed.stderr or "").strip()[-1000:],
@@ -8787,6 +8806,13 @@ def _run_theft_confidence_for_grouping_batch_locked(
                 continue
         return ids
 
+    # A batch that got interrupted partway through (e.g. its subprocess was
+    # force-killed for hanging) can be picked up again by
+    # list_pending_theft_confidence_batches once any of its groups are still
+    # unscored - without this, re-running it would also redo every
+    # already-scored group's work all over again (re-triggering its kiosk
+    # pipeline, re-running its AI calls) instead of only picking up the rest.
+    already_scored_group_keys = repositories.list_scored_group_keys_for_batch(db, batch_id)
     analyzed_count = 0
     promoted_count_total = 0
     created_session_ids: set[int] = set()
@@ -8795,6 +8821,8 @@ def _run_theft_confidence_for_grouping_batch_locked(
         if not isinstance(group, Mapping):
             continue
         group_key = str(group.get("group_id") or group.get("id") or group_index)
+        if group_key in already_scored_group_keys:
+            continue
         entry_trigger_ids = _trigger_id_list(group.get("entry"))
         exit_trigger_ids = _trigger_id_list(group.get("exit"))
         # Default to True for groups from before this field existed, so older

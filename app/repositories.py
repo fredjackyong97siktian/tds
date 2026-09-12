@@ -3518,10 +3518,15 @@ def list_pending_theft_confidence_batches(db: Session, limit: int = 50) -> list[
             from {batch_table} b
             where b.status = 'success'
               and b.result_payload is not null
-              and not exists (
-                  select 1
-                  from {confidence_table} c
-                  where c.batch_id = b.id
+              and (
+                  select count(*) from {confidence_table} c where c.batch_id = b.id
+              ) < greatest(
+                  1,
+                  coalesce(
+                      json_length(b.result_payload, '$.groups'),
+                      json_length(b.result_payload, '$.Groups'),
+                      0
+                  )
               )
             order by b.finished_at asc, b.id asc
             limit :limit
@@ -3656,6 +3661,18 @@ def upsert_filter_confidence_result(
         },
     )
     db.commit()
+
+
+def list_scored_group_keys_for_batch(db: Session, batch_id: int) -> set[str]:
+    # Used to make a resumed/re-run confidence pass skip groups that already
+    # have a result instead of redoing their (possibly costly - AI calls,
+    # kiosk pipeline kickoff) work all over again.
+    confidence_table = _table("filter_confidence_result")
+    result = db.execute(
+        text(f"select group_key from {confidence_table} where batch_id = :batch_id"),
+        {"batch_id": batch_id},
+    )
+    return {str(row[0]) for row in result.all()}
 
 
 def count_filter_confidence_results(db: Session, *, batch_id: int | None = None) -> int:
