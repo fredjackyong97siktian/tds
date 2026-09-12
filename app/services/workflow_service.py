@@ -2794,6 +2794,39 @@ def _finalize_remote_kiosk_script_run(
             stdout=result.stdout,
             stderr=stderr,
         )
+    # Applied BEFORE the has_pending_kiosk check below, not after - that check
+    # looks at every kiosk video_asset's current status to decide whether this
+    # was the last one still outstanding, and this run's own video(s) are
+    # still sitting at 'processing' (unchanged since dispatch) until this
+    # call updates them. Checking first meant every invocation always saw its
+    # own video as "still pending" and skipped finalize_session_result no
+    # matter what - for a multi-video session, neither run's check ever
+    # caught the true "everything's done" moment, so the session sat at
+    # status='pending' forever even after both kiosk videos genuinely
+    # finished (confirmed live on session 243).
+    if remote_result.processed_videos:
+        for entry in remote_result.processed_videos:
+            entry_video_asset_id = int(entry.get("video_asset_id"))
+            entry_video_asset_row = video_asset_rows.get(entry_video_asset_id)
+            entry_object_key = entry.get("processed_video_object_key")
+            if entry_video_asset_row is None or not entry_object_key:
+                continue
+            _apply_processed_video_upload_result(
+                db,
+                video_asset_row=entry_video_asset_row,
+                object_key=str(entry_object_key),
+                video_url=entry.get("processed_video_url"),
+            )
+    elif video_asset_rows:
+        # Fallback for a job dispatched before this multi-video change - the
+        # response only ever carried one processed video for one video_asset.
+        _apply_processed_video_upload_result(
+            db,
+            video_asset_row=next(iter(video_asset_rows.values())),
+            object_key=remote_result.processed_video_object_key,
+            video_url=processed_video_url,
+        )
+
     if session_id is not None and completed_kiosk_summary:
         # A session's kiosk videos are now all dispatched together as one
         # RunPod job (see run_kiosk_for_session), so this normally only ever
@@ -2843,28 +2876,6 @@ def _finalize_remote_kiosk_script_run(
                 tolerance=1,
                 extra_result_summary=merged_summary,
             )
-    if remote_result.processed_videos:
-        for entry in remote_result.processed_videos:
-            entry_video_asset_id = int(entry.get("video_asset_id"))
-            entry_video_asset_row = video_asset_rows.get(entry_video_asset_id)
-            entry_object_key = entry.get("processed_video_object_key")
-            if entry_video_asset_row is None or not entry_object_key:
-                continue
-            _apply_processed_video_upload_result(
-                db,
-                video_asset_row=entry_video_asset_row,
-                object_key=str(entry_object_key),
-                video_url=entry.get("processed_video_url"),
-            )
-    elif video_asset_rows:
-        # Fallback for a job dispatched before this multi-video change - the
-        # response only ever carried one processed video for one video_asset.
-        _apply_processed_video_upload_result(
-            db,
-            video_asset_row=next(iter(video_asset_rows.values())),
-            object_key=remote_result.processed_video_object_key,
-            video_url=processed_video_url,
-        )
     return result
 
 
