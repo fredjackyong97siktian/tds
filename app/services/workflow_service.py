@@ -6799,14 +6799,30 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
                     f"Triggers: {json.dumps(trigger_notes, default=str)}. "
                     f"Image mapping: {json.dumps(image_mapping, default=str)}."
                 )
-                def _call_chunk_vision() -> tuple[dict[str, Any], dict[str, Any]]:
-                    result, meta = _call_grouping_vision(
-                        db,
-                        prompt=prompt,
-                        image_urls=image_urls,
-                        gemini_model_name=model_name,
-                        gemini_resize_scale=resize_scale,
-                    )
+                def _call_chunk_vision() -> tuple[dict[str, Any], dict[str, Any]] | None:
+                    try:
+                        result, meta = _call_grouping_vision(
+                            db,
+                            prompt=prompt,
+                            image_urls=image_urls,
+                            gemini_model_name=model_name,
+                            gemini_resize_scale=resize_scale,
+                        )
+                    except Exception as exc:
+                        # A truly empty/unparseable response (e.g. _extract_json_object's
+                        # "did not contain a JSON object" on an empty completion) is provider
+                        # flakiness, same in kind as the "everything dumped into unknown" case
+                        # _grouping_chunk_response_is_visual_failure already retries for - but
+                        # it raises instead of returning a result, so without this it never
+                        # reached that retry loop at all and crashed the whole batch over one
+                        # bad chunk response.
+                        logger.warning(
+                            "Grouping direct chunk vision call failed batch_id=%s chunk=%s: %s",
+                            batch_id,
+                            chunk_index,
+                            exc,
+                        )
+                        return None
                     _record_grouping_cost(db, script_run_id, meta)
                     _persist_trigger_unique_customer_counts(db, result, source="direct")
                     _persist_trigger_appearances(db, result, source="direct")
@@ -6824,15 +6840,35 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
                     # correlate with how many vision calls land in a short window.
                     time.sleep(_GROUPING_CHUNK_CALL_INTERVAL_SECONDS)
 
-                gemini_result, gemini_meta = _call_chunk_vision()
+                call_result = _call_chunk_vision()
                 retry_attempts = 0
                 while (
-                    _grouping_chunk_response_is_visual_failure(gemini_result, chunk_trigger_count=len(chunk))
+                    (
+                        call_result is None
+                        or _grouping_chunk_response_is_visual_failure(call_result[0], chunk_trigger_count=len(chunk))
+                    )
                     and retry_attempts < _GROUPING_CHUNK_RETRY_MAX_ATTEMPTS
                 ):
                     retry_attempts += 1
                     time.sleep(_GROUPING_CHUNK_RETRY_INTERVAL_SECONDS)
-                    gemini_result, gemini_meta = _call_chunk_vision()
+                    call_result = _call_chunk_vision()
+                if call_result is None:
+                    # Every attempt failed outright (not just a bad-shaped answer) -
+                    # fall through exactly like a persistent visual failure would:
+                    # nothing resolved, everything in this chunk goes to unknown
+                    # rather than crashing the batch over a provider that never
+                    # managed a real response.
+                    gemini_result = {
+                        "groups": [],
+                        "open_entries": [],
+                        "unknown": [int(trigger_input["trigger_id"]) for trigger_input in chunk],
+                        "notes": [
+                            f"Vision call failed for all {retry_attempts + 1} attempt(s) on this chunk; nothing resolved."
+                        ],
+                    }
+                    gemini_meta = {}
+                else:
+                    gemini_result, gemini_meta = call_result
                 chunk_groups = gemini_result.get("groups") if isinstance(gemini_result.get("groups"), list) else []
                 chunk_open_entries = gemini_result.get("open_entries") if isinstance(gemini_result.get("open_entries"), list) else []
                 chunk_unknown = gemini_result.get("unknown") if isinstance(gemini_result.get("unknown"), list) else []
