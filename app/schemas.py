@@ -430,6 +430,8 @@ class TriggerFrameAssetListItem(BaseModel):
     end_time: datetime
     status: str
     error: str | None = None
+    phone_entry_id: int | None = None
+    credit_card_entry_id: int | None = None
     created_at: datetime
     updated_at: datetime
     frames: list[TriggerFrameItem] = Field(default_factory=list)

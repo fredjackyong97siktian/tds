@@ -1540,31 +1540,34 @@ def list_trigger_frame_assets(
 ) -> list[dict[str, Any]]:
     frame_asset_table = _table("trigger_frame_asset")
     frame_table = _table("trigger_frame")
-    where_clauses = ["status <> 'deleted'"]
+    trigger_table = _table("trigger_event")
+    where_clauses = ["fa.status <> 'deleted'"]
     params: dict[str, Any] = {"limit": limit}
     if location_id is not None:
-        where_clauses.append("location_id = :location_id")
+        where_clauses.append("fa.location_id = :location_id")
         params["location_id"] = location_id
     if start_time is not None:
-        where_clauses.append("start_time >= :start_time")
+        where_clauses.append("fa.start_time >= :start_time")
         params["start_time"] = start_time
     if end_time is not None:
-        where_clauses.append("start_time < :end_time")
+        where_clauses.append("fa.start_time < :end_time")
         params["end_time"] = end_time
     if status:
-        where_clauses.append("status = :status")
+        where_clauses.append("fa.status = :status")
         params["status"] = status
     if trigger_id is not None:
-        where_clauses.append("trigger_id = :trigger_id")
+        where_clauses.append("fa.trigger_id = :trigger_id")
         params["trigger_id"] = trigger_id
     where_sql = " and ".join(where_clauses)
     result = db.execute(
         text(
             f"""
-            select id, trigger_id, location_id, start_time, end_time, status, error, created_at, updated_at
-            from {frame_asset_table}
+            select fa.id, fa.trigger_id, fa.location_id, fa.start_time, fa.end_time, fa.status, fa.error,
+                   fa.created_at, fa.updated_at, te.phone_entry_id, te.credit_card_entry_id
+            from {frame_asset_table} fa
+            left join {trigger_table} te on te.id = fa.trigger_id
             where {where_sql}
-            order by created_at desc, id desc
+            order by fa.created_at desc, fa.id desc
             limit :limit
             """
         ),
