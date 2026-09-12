@@ -27,6 +27,7 @@ from urllib.request import (
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import cv2
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
 from sqlalchemy.orm import Session
@@ -2867,160 +2868,6 @@ def _finalize_remote_kiosk_script_run(
     return result
 
 
-def _finalize_remote_kiosk_match_script_run(
-    db: Session,
-    *,
-    script_run: dict[str, Any],
-    remote_result: RemoteRunnerResult,
-) -> ScriptExecutionResult:
-    if (
-        str(script_run.get("status") or "").strip().lower() != "running"
-        and not _script_run_was_stale_timeout_forced(script_run)
-    ):
-        return ScriptExecutionResult(
-            script_run_id=int(script_run["id"]),
-            runner_job_id=str(script_run.get("runner_job_id") or ""),
-            script_name="kiosk_match",
-            model_name=script_run.get("model_name"),
-            status=str(script_run.get("status") or "success"),
-            command=["runpod_serverless", "kiosk_match"],
-            stdout=str(script_run.get("stdout_log") or ""),
-            stderr=str(script_run.get("stderr_log") or ""),
-            message="Runpod callback already processed for this script run.",
-        )
-    script_run_id = int(script_run["id"])
-    runner_payload = dict(script_run.get("runner_payload") or {})
-    session_id = int(script_run["session_id"]) if script_run.get("session_id") is not None else None
-    location_id = int(runner_payload.get("location_id") or 0) if runner_payload.get("location_id") is not None else None
-
-    remote_status = "success" if remote_result.status == "success" else "failed"
-    repositories.finish_script_run(
-        db,
-        script_run_id,
-        status=remote_status,
-        stdout_log=remote_result.stdout,
-        stderr_log=remote_result.stderr,
-    )
-    _record_remote_runner_cost(db, script_run_id, remote_result)
-    result = ScriptExecutionResult(
-        script_run_id=script_run_id,
-        runner_job_id=str(script_run.get("runner_job_id") or ""),
-        script_name="kiosk_match",
-        model_name=script_run.get("model_name"),
-        status=remote_status,
-        command=["runpod_serverless", "kiosk_match"],
-        stdout=remote_result.stdout,
-        stderr=remote_result.stderr,
-    )
-    if session_id is None or location_id is None:
-        return result
-
-    session_row = repositories.get_session(db, session_id)
-    existing_summary = dict(session_row.get("result_summary") or {})
-    pipeline = dict(existing_summary.get("session_close_pipeline") or {})
-    transaction_identification = dict(remote_result.transaction_match_summary or {})
-    pipeline["transaction_identification"] = transaction_identification
-    existing_summary["session_close_pipeline"] = pipeline
-
-    if result.status != "success":
-        repositories.update_session_fields(
-            db,
-            session_id=session_id,
-            status="issue",
-            result_summary=existing_summary,
-            issue_reason=remote_result.stderr or "Kiosk transaction matching failed in the remote runner.",
-        )
-        return result
-
-    transaction_results = transaction_identification.get("transactions")
-    if not isinstance(transaction_results, list):
-        transaction_results = []
-
-    chosen_candidate_index = transaction_identification.get("chosen_candidate_index")
-    if chosen_candidate_index is None:
-        repositories.update_session_fields(
-            db,
-            session_id=session_id,
-            status="issue",
-            result_summary=existing_summary,
-            issue_reason="No kiosk transaction matched confidently for this session.",
-        )
-        return result
-
-    matched_result = next(
-        (
-            row
-            for row in transaction_results
-            if int(row.get("candidate_index") or 0) == int(chosen_candidate_index)
-        ),
-        None,
-    )
-    if not isinstance(matched_result, dict):
-        repositories.update_session_fields(
-            db,
-            session_id=session_id,
-            status="issue",
-            result_summary=existing_summary,
-            issue_reason="Matched kiosk transaction could not be found in candidate transactions.",
-        )
-        return result
-
-    raw_payload = dict(matched_result.get("raw_payload") or {})
-    raw_payload["transaction_identification"] = matched_result
-    window_start = _coerce_datetime_value(raw_payload.get("window_start"))
-    window_end = _coerce_datetime_value(raw_payload.get("window_end"))
-    if window_start is None or window_end is None:
-        repositories.update_session_fields(
-            db,
-            session_id=session_id,
-            status="issue",
-            result_summary=existing_summary,
-            issue_reason="Matched kiosk transaction is missing window bounds.",
-        )
-        return result
-
-    repositories.delete_session_transactions(db, session_id)
-    selected_transaction_id = repositories.create_transaction(
-        db,
-        session_id,
-        {
-            "receipt_number": str(matched_result.get("receipt_number") or matched_result.get("transaction_id") or ""),
-            "transaction_time": _coerce_datetime_value(matched_result.get("transaction_time")),
-            "total_items": int(matched_result.get("total_items") or 0),
-            "total_amount": matched_result.get("total_amount"),
-            "raw_payload": raw_payload,
-        },
-    )
-    transaction_identification["chosen_session_transaction_id"] = selected_transaction_id
-    pipeline["paid_transactions"] = [matched_result]
-    existing_summary["session_close_pipeline"] = pipeline
-
-    queued = retrieve_kiosk_video_window(
-        db,
-        session_id=session_id,
-        location_id=location_id,
-        start_time=window_start,
-        end_time=window_end,
-    )
-    pipeline["selected_kiosk_windows"] = [
-        {
-            "start_time": window_start.isoformat(),
-            "end_time": window_end.isoformat(),
-        }
-    ]
-    pipeline["queued_kiosk_video_asset_ids"] = [int(queued.video_asset_id)]
-    existing_summary["session_close_pipeline"] = pipeline
-    repositories.update_session_fields(
-        db,
-        session_id=session_id,
-        status="pending",
-        transaction_total_items=int(matched_result.get("total_items") or 0),
-        result_summary=existing_summary,
-        issue_reason=None,
-    )
-    return result
-
-
 def process_runpod_webhook(
     db: Session,
     *,
@@ -3054,7 +2901,7 @@ def process_runpod_webhook(
         if not runner_job_id:
             raise ValueError("Runpod webhook is missing runner job id for status fetch.")
         script_name = str(script_run.get("script_name") or normalized_kind or "").strip().lower()
-        if script_name not in {"entry", "kiosk", "kiosk_match", "grouping"}:
+        if script_name not in {"entry", "kiosk", "grouping"}:
             raise ValueError("Unsupported Runpod webhook kind.")
         effective_body = _fetch_runpod_status_with_retries(
             runner_job_id=runner_job_id,
@@ -3084,8 +2931,6 @@ def process_runpod_webhook(
         result = _finalize_remote_entry_script_run(db, script_run=script_run, remote_result=remote_result)
     elif normalized_kind == "kiosk":
         result = _finalize_remote_kiosk_script_run(db, script_run=script_run, remote_result=remote_result)
-    elif normalized_kind == "kiosk_match":
-        result = _finalize_remote_kiosk_match_script_run(db, script_run=script_run, remote_result=remote_result)
     elif normalized_kind == "grouping":
         result = _finalize_remote_grouping_script_run(db, script_run=script_run, remote_result=remote_result)
     else:
@@ -3177,7 +3022,7 @@ def reconcile_running_remote_analysis_script_runs(db: Session) -> list[dict[str,
     for script_run in repositories.list_running_remote_analysis_script_runs(db):
         job_id = str(script_run.get("runner_job_id") or "").strip()
         script_name = str(script_run.get("script_name") or "").strip().lower()
-        if not job_id or script_name not in {"entry", "kiosk", "kiosk_match", "grouping"}:
+        if not job_id or script_name not in {"entry", "kiosk", "grouping"}:
             continue
         try:
             body = _runpod_request(
@@ -3194,8 +3039,6 @@ def reconcile_running_remote_analysis_script_runs(db: Session) -> list[dict[str,
         remote_status, remote_result = _remote_runner_result_from_runpod_body(body)
         if script_name == "entry":
             result = _finalize_remote_entry_script_run(db, script_run=script_run, remote_result=remote_result)
-        elif script_name == "kiosk_match":
-            result = _finalize_remote_kiosk_match_script_run(db, script_run=script_run, remote_result=remote_result)
         elif script_name == "grouping":
             result = _finalize_remote_grouping_script_run(db, script_run=script_run, remote_result=remote_result)
         else:
@@ -3824,7 +3667,7 @@ def _runpod_endpoint_id(kind: str | None = None) -> str:
     endpoint_id = ""
     if normalized_kind == "entry":
         endpoint_id = str(settings.runpod_entry_endpoint_id or "").strip()
-    elif normalized_kind in {"kiosk", "kiosk_match"}:
+    elif normalized_kind == "kiosk":
         endpoint_id = str(settings.runpod_kiosk_endpoint_id or "").strip()
     elif normalized_kind == "grouping":
         endpoint_id = str(settings.runpod_grouping_endpoint_id or "").strip()
@@ -4176,187 +4019,267 @@ def _capture_snapshot_frame(
     }
 
 
-def _build_kiosk_transaction_match_manifest(
+_KIOSK_TRANSACTION_MATCH_MIN_CONFIDENCE = 0.6
+
+# Frame offsets (seconds relative to paymentAttemptAt) used to probe each
+# candidate transaction's own moment at the kiosk, before committing to a full
+# video retrieval for it - cheap enough (a handful of single-frame ffmpeg
+# grabs) to run for every candidate, paid or not.
+_KIOSK_TRANSACTION_PROBE_FRAME_OFFSETS_SECONDS: tuple[float, ...] = (-4, -3, -2, -1, 0, 1)
+
+_KIOSK_TRANSACTION_MATCH_INSTRUCTIONS = (
+    "You are verifying which kiosk self-checkout transaction(s) belong to a specific confirmed store customer, "
+    "using still images only (not video). Images 1 to {reference_count} show that confirmed customer, captured "
+    "at store entry and exit - this is the specific customer you must check for. "
+    "Below are one or more transaction candidates. Each candidate lists its own receipt number, which physical "
+    "kiosk machine it was made on, its status (paid, pending, or failed), and its own numbered range of kiosk "
+    "camera stills captured within a few seconds of that transaction's payment attempt. Each of those stills has "
+    "two boxes drawn on it marking the two physical kiosk machines in the camera's view, labeled RIGHT and LEFT "
+    "- these labels match the candidate's stated kiosk machine below (e.g. a machine name containing 'Right' "
+    "corresponds to the box labeled RIGHT), not necessarily the literal left/right side of the image. For EACH "
+    "candidate, decide whether the confirmed customer from the reference images is the same physical person "
+    "shown standing at that candidate's own labeled box - compare clothing, build, and hair, and use which "
+    "labeled box they are standing at as a supporting clue when it helps tell candidates apart. More than one "
+    "candidate can belong to the same customer (e.g. they paid at the kiosk twice), so judge every candidate "
+    "independently rather than assuming only one can match. Return strict JSON only with schema: "
+    '{{"candidates":[{{"candidate_index":integer,"belongs_to_customer":true|false,"confidence":number,'
+    '"reasoning":string}}]}}. Include exactly one entry per candidate listed below, using its candidate_index.'
+)
+
+
+def _kiosk_machine_side_label(machine_name: str) -> str | None:
+    normalized = machine_name.strip().lower()
+    if "right" in normalized:
+        return "RIGHT"
+    if "left" in normalized:
+        return "LEFT"
+    return None
+
+
+def _build_kiosk_transaction_candidate_block(
+    *,
+    candidate_index: int,
+    transaction: Mapping[str, Any],
+    image_count: int,
+    image_offset: int,
+) -> str:
+    range_start = image_offset + 1
+    range_end = image_offset + image_count
+    raw_payload = transaction.get("raw_payload")
+    raw_payload = raw_payload if isinstance(raw_payload, Mapping) else {}
+    machine_name = str(
+        raw_payload.get("machineName")
+        or raw_payload.get("machine_name")
+        or raw_payload.get("machinename")
+        or "unknown machine"
+    )
+    side_label = _kiosk_machine_side_label(machine_name)
+    machine_line = (
+        f"Kiosk machine used: {machine_name} (matches the box labeled {side_label} in this candidate's stills)"
+        if side_label
+        else f"Kiosk machine used: {machine_name} (side unknown - rely on appearance matching only)"
+    )
+    receipt_number = transaction.get("receipt_number") or transaction.get("transaction_id") or "unknown"
+    status = transaction.get("status") or "unknown"
+    transaction_time = transaction.get("transaction_time")
+    return (
+        f"=== Candidate {candidate_index} (use images {range_start} to {range_end} ONLY for this candidate) ===\n"
+        f"Receipt number: {receipt_number}\n"
+        f"{machine_line}\n"
+        f"Transaction status: {status}\n"
+        f"Transaction time: {transaction_time}\n"
+        "These stills were captured from the kiosk camera roughly 4 seconds before to 1 second after this "
+        "transaction's payment attempt.\n"
+    )
+
+
+def _parse_kiosk_box(box_str: str) -> tuple[int, int, int, int] | None:
+    try:
+        x1, y1, x2, y2 = (int(float(part.strip())) for part in str(box_str).split(","))
+        return x1, y1, x2, y2
+    except (TypeError, ValueError):
+        return None
+
+
+def _label_kiosk_machines_on_frame(image_path: Path) -> bool:
+    """Draws the two configured kiosk-machine zones directly onto a captured
+    probe still, labeled RIGHT/LEFT to match the machineName substring
+    convention (see _kiosk_machine_side_label) - a VLM follows a visual
+    box+label far more reliably than a text description of camera layout.
+    kiosk_1_box/kiosk_2_box mirror the KIOSK_1_BOX/KIOSK_2_BOX env vars
+    kiosk_runtime.py uses, calibrated against a frame resized to
+    kiosk_box_resize_width wide - scaled here to whatever resolution the raw
+    ffmpeg snapshot actually came in at.
+    """
+    box_right = _parse_kiosk_box(settings.kiosk_1_box)
+    box_left = _parse_kiosk_box(settings.kiosk_2_box)
+    if box_right is None or box_left is None:
+        return False
+    image = cv2.imread(str(image_path))
+    if image is None:
+        return False
+    height, width = image.shape[:2]
+    reference_width = max(1, int(settings.kiosk_box_resize_width))
+    scale = width / reference_width
+    font_scale = max(0.5, 0.9 * scale)
+    thickness = max(1, round(2 * scale))
+    for box, label, color in ((box_right, "RIGHT", (60, 60, 255)), (box_left, "LEFT", (255, 140, 0))):
+        x1, y1, x2, y2 = (int(round(value * scale)) for value in box)
+        cv2.rectangle(image, (x1, y1), (x2, y2), color, thickness)
+        text_origin = (x1 + 6, max(20, y1 - 10))
+        cv2.putText(image, label, text_origin, cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness, cv2.LINE_AA)
+    cv2.imwrite(str(image_path), image)
+    return True
+
+
+def _capture_kiosk_probe_frames(
+    *,
+    location_id: int,
+    session_id: int,
+    transaction: Mapping[str, Any],
+    recorder_channel: str,
+    delayed_seconds: int,
+    snapshot_root: Path,
+) -> list[str]:
+    anchor = _utc_naive_to_local(_coerce_datetime_value(transaction.get("payment_attempt_at")))
+    if anchor is None:
+        anchor = _coerce_datetime_value(transaction.get("transaction_time"))
+    if anchor is None:
+        return []
+    receipt_number = str(transaction.get("receipt_number") or transaction.get("transaction_id") or "candidate")
+    safe_receipt = re.sub(r"[^A-Za-z0-9._-]+", "_", receipt_number) or "candidate"
+    image_urls: list[str] = []
+    for index, offset_seconds in enumerate(_KIOSK_TRANSACTION_PROBE_FRAME_OFFSETS_SECONDS, start=1):
+        sample_time = anchor + timedelta(seconds=offset_seconds)
+        snapshot_path = (
+            snapshot_root / safe_receipt / f"probe_{index:02d}_{sample_time.strftime('%Y%m%d_%H%M%S')}.jpg"
+        )
+        capture_meta = _capture_snapshot_frame(
+            location_id=location_id,
+            session_id=session_id,
+            section="kiosk",
+            recorder_channel=recorder_channel,
+            start_time=sample_time,
+            delayed_seconds=delayed_seconds,
+            snapshot_path=snapshot_path,
+        )
+        if capture_meta["status"] != "ok":
+            continue
+        try:
+            _label_kiosk_machines_on_frame(snapshot_path)
+        except Exception:
+            logger.exception("Could not draw kiosk machine labels on probe frame %s", snapshot_path)
+        _object_key, image_url = _upload_runner_input_file(
+            snapshot_path,
+            kind="kiosk_transaction_probe_image",
+            location_id=location_id,
+            session_id=session_id,
+            trigger_id=None,
+            section="kiosk",
+        )
+        image_urls.append(image_url)
+    return image_urls
+
+
+def _identify_kiosk_transactions_for_session(
     db: Session,
     *,
     session_id: int,
     location_id: int,
-    transaction_summaries: list[dict[str, Any]],
-) -> dict[str, Any]:
-    session_customers = repositories.list_session_customers(db, session_id)
-    session_customer_ids = [
-        int(row["id"])
-        for row in session_customers
-        if row.get("id") is not None
-    ]
-    vector_db = VectorSessionLocal()
+    candidates: list[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Confirms which of a session's candidate transactions actually belong to
+    this session's customer, using probe stills around each candidate's own
+    paymentAttemptAt plus the session's own entry/exit trigger frames as the
+    reference identity - one combined Gemini call regardless of how many
+    candidates there are. Replaces the old embedding/gallery-based kiosk_match
+    RunPod job, which is no longer used.
+    """
     try:
-        history_rows = vector_repositories.list_history_gallery_records(
-            vector_db,
-            location_id=location_id,
-            session_customer_ids=session_customer_ids,
-            limit=500,
-        )
-    finally:
-        vector_db.close()
-
-    cctv = repositories.get_cctv_by_location_section(db, location_id=location_id, section="kiosk")
+        cctv = repositories.get_cctv_by_location_section(db, location_id=location_id, section="kiosk")
+    except Exception as exc:
+        return [], {"status": "failed", "error": f"Could not load kiosk CCTV record: {exc}"}
     recorder_channel = str(cctv.get("recorder_channel") or "").strip()
     if not recorder_channel:
-        raise ValueError("Kiosk CCTV record does not have a recorder_channel.")
+        return [], {"status": "failed", "error": "Kiosk CCTV record does not have a recorder_channel."}
     delayed_seconds = _current_delayed_seconds(db, location_id=location_id, section="kiosk", cctv=cctv)
 
-    snapshot_root = build_session_workdir(location_id, session_id) / "kiosk" / "transaction_match_inputs"
+    snapshot_root = build_session_workdir(location_id, session_id) / "kiosk" / "transaction_identification_inputs"
     snapshot_root.mkdir(parents=True, exist_ok=True)
 
-    transactions_payload: list[dict[str, Any]] = []
-    for transaction in transaction_summaries:
-        receipt_number = str(transaction.get("receipt_number") or transaction.get("transaction_id") or "transaction")
-        window_start = _coerce_datetime_value(transaction.get("window_start"))
-        window_end = _coerce_datetime_value(transaction.get("window_end"))
-        if window_start is None or window_end is None:
+    reference_image_urls = _identity_reference_image_urls_for_session(db, session_id)
+
+    call_image_urls = list(reference_image_urls)
+    offset = len(reference_image_urls)
+    candidate_blocks: list[str] = []
+    indexed_candidates: list[tuple[int, Mapping[str, Any]]] = []
+    for candidate_index, transaction in enumerate(candidates, start=1):
+        image_urls = _capture_kiosk_probe_frames(
+            location_id=location_id,
+            session_id=session_id,
+            transaction=transaction,
+            recorder_channel=recorder_channel,
+            delayed_seconds=delayed_seconds,
+            snapshot_root=snapshot_root,
+        )
+        if not image_urls:
             continue
-        total_seconds = max(1.0, (window_end - window_start).total_seconds())
-        sample_count = 10
-        sample_offsets = [total_seconds * (index / max(1, sample_count - 1)) for index in range(sample_count)]
-        samples_payload: list[dict[str, Any]] = []
-        safe_receipt = re.sub(r"[^A-Za-z0-9._-]+", "_", receipt_number) or "transaction"
-        for index, offset_seconds in enumerate(sample_offsets, start=1):
-            sample_time = window_start + timedelta(seconds=float(offset_seconds))
-            snapshot_path = snapshot_root / safe_receipt / f"sample_{index:02d}_{sample_time.strftime('%Y%m%d_%H%M%S')}.jpg"
-            capture_meta = _capture_snapshot_frame(
-                location_id=location_id,
-                session_id=session_id,
-                section="kiosk",
-                recorder_channel=recorder_channel,
-                start_time=sample_time,
-                delayed_seconds=delayed_seconds,
-                snapshot_path=snapshot_path,
+        candidate_blocks.append(
+            _build_kiosk_transaction_candidate_block(
+                candidate_index=candidate_index,
+                transaction=transaction,
+                image_count=len(image_urls),
+                image_offset=offset,
             )
-            if capture_meta["status"] != "ok":
-                samples_payload.append(
-                    {
-                        "sample_index": index,
-                        "sample_time": sample_time.isoformat(),
-                        "status": "failed",
-                        "stderr": capture_meta["stderr"],
-                    }
-                )
+        )
+        call_image_urls.extend(image_urls)
+        offset += len(image_urls)
+        indexed_candidates.append((candidate_index, transaction))
+
+    if not indexed_candidates:
+        return [], {
+            "status": "failed",
+            "error": "Could not capture any kiosk probe frames for the candidate transaction(s).",
+        }
+
+    prompt = (
+        _KIOSK_TRANSACTION_MATCH_INSTRUCTIONS.format(reference_count=len(reference_image_urls))
+        + "\n\n"
+        + "\n".join(candidate_blocks)
+    )
+    try:
+        result, _meta = _call_kiosk_vision(db, prompt=prompt, image_urls=call_image_urls)
+    except Exception as exc:
+        logger.exception("Kiosk transaction identification call failed session_id=%s", session_id)
+        return [], {"status": "failed", "error": str(exc)}
+
+    results_by_index: dict[int, Mapping[str, Any]] = {}
+    for item in (result.get("candidates") if isinstance(result, Mapping) else None) or []:
+        if isinstance(item, Mapping) and item.get("candidate_index") is not None:
+            try:
+                results_by_index[int(item["candidate_index"])] = item
+            except (TypeError, ValueError):
                 continue
-            object_key, image_url = _upload_runner_input_file(
-                snapshot_path,
-                kind="kiosk_match_image",
-                location_id=location_id,
-                session_id=session_id,
-                trigger_id=None,
-                section="kiosk",
-            )
-            samples_payload.append(
-                {
-                    "sample_index": index,
-                    "sample_time": sample_time.isoformat(),
-                    "status": "ok",
-                    "image_object_key": object_key,
-                    "image_url": image_url,
-                }
-            )
-        transactions_payload.append(
+
+    matched: list[dict[str, Any]] = []
+    diagnostics_candidates: list[dict[str, Any]] = []
+    for candidate_index, transaction in indexed_candidates:
+        item = results_by_index.get(candidate_index) or {}
+        confidence = _coerce_number(item.get("confidence"), 0.0)
+        belongs = bool(item.get("belongs_to_customer")) and confidence >= _KIOSK_TRANSACTION_MATCH_MIN_CONFIDENCE
+        diagnostics_candidates.append(
             {
-                "candidate_index": transaction.get("candidate_index"),
-                "transaction_id": transaction.get("transaction_id"),
+                "candidate_index": candidate_index,
                 "receipt_number": transaction.get("receipt_number"),
-                "transaction_time": transaction.get("transaction_time"),
-                "total_items": transaction.get("total_items"),
-                "total_amount": transaction.get("total_amount"),
-                "window_start": transaction.get("window_start"),
-                "window_end": transaction.get("window_end"),
-                "raw_payload": transaction.get("raw_payload"),
-                "samples": samples_payload,
+                "belongs_to_customer": belongs,
+                "confidence": confidence,
+                "reasoning": item.get("reasoning"),
             }
         )
+        if belongs:
+            matched.append(dict(transaction))
 
-    return {
-        "session_id": session_id,
-        "location_id": location_id,
-        "min_score": 0.74,
-        "min_margin": 0.03,
-        "target_history_rows": [
-            {
-                "history_gallery_id": row.get("id"),
-                "session_customer_id": row.get("session_customer_id"),
-                "embedding_osnet": row.get("embedding_osnet"),
-                "embedding_fashion": row.get("embedding_fashion"),
-            }
-            for row in history_rows
-        ],
-        "transactions": transactions_payload,
-    }
-
-
-def _queue_kiosk_transaction_match_for_session(
-    db: Session,
-    *,
-    session_id: int,
-    location_id: int,
-    session_close_summary: dict[str, Any],
-) -> dict[str, Any]:
-    pipeline = dict(session_close_summary.get("session_close_pipeline") or {})
-    transaction_rows = list(pipeline.get("paid_transactions") or [])
-    manifest_payload = _build_kiosk_transaction_match_manifest(
-        db,
-        session_id=session_id,
-        location_id=location_id,
-        transaction_summaries=transaction_rows,
-    )
-    manifest_path = build_session_workdir(location_id, session_id) / "kiosk" / "transaction_match_manifest.json"
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest_path.write_text(json.dumps(manifest_payload, indent=2, default=str))
-    manifest_object_key, manifest_url = _upload_runner_input_file(
-        manifest_path,
-        kind="kiosk_match_manifest",
-        location_id=location_id,
-        session_id=session_id,
-        trigger_id=None,
-        section="kiosk",
-    )
-    script_run_id = repositories.create_script_run_started(
-        db,
-        session_id=session_id,
-        trigger_id=None,
-        script_name="kiosk_match",
-        model_name="runpod_runner",
-        status="running",
-        command=SCRIPT_RUN_COMMAND_REDACTED,
-    )
-    enqueue_result = _enqueue_runpod_runner(
-        kind="kiosk_match",
-        payload={
-            "kind": "kiosk_match",
-            "manifest_url": manifest_url,
-            "callback_url": _build_runpod_webhook_url("kiosk_match"),
-            "script_run_id": script_run_id,
-        },
-    )
-    runner_payload = {
-        "session_id": session_id,
-        "location_id": location_id,
-        "manifest_object_key": manifest_object_key,
-        "manifest_url": manifest_url,
-    }
-    repositories.assign_script_run_runner_job(
-        db,
-        script_run_id,
-        runner_job_id=enqueue_result.job_id,
-        runner_payload=runner_payload,
-    )
-    return {
-        "method": "runpod_snapshot_embedding_match",
-        "status": "running",
-        "script_run_id": script_run_id,
-        "runner_job_id": enqueue_result.job_id,
-        "manifest_object_key": manifest_object_key,
-        "manifest_url": manifest_url,
-    }
+    return matched, {"status": "success", "candidates": diagnostics_candidates}
 
 
 def _time_value_to_parts(value: Any) -> tuple[int, int, int]:
@@ -9259,6 +9182,7 @@ def _run_theft_confidence_for_grouping_batch_locked(
                         session_id=session_id,
                         location_id=location_id,
                         transactions=transactions,
+                        issue_transactions=issue_transactions,
                         exit_trigger_time=exit_trigger_time,
                     )
                     logger.info(
@@ -9757,6 +9681,7 @@ def score_confidence_for_single_group(
                     session_id=session_id,
                     location_id=location_id,
                     transactions=transactions,
+                    issue_transactions=issue_transactions,
                     exit_trigger_time=exit_trigger_time,
                 )
                 logger.info(
@@ -9921,17 +9846,38 @@ def _prepare_session_kiosk_pipeline(
         )
         selected["session_transaction_id"] = selected_transaction_id
     elif len(transaction_summaries) > 1:
-        identification_summary = _queue_kiosk_transaction_match_for_session(
+        candidates = [dict(item.get("raw_payload") or {}) for item in transaction_summaries]
+        matched_transactions, identification_summary = _identify_kiosk_transactions_for_session(
             db,
             session_id=session_id,
             location_id=location_id,
-            session_close_summary={
-                "session_close_pipeline": {
-                    "paid_transactions": transaction_summaries,
-                }
-            },
+            candidates=candidates,
         )
-        selected_windows = []
+        matched_receipts = {
+            str(transaction.get("receipt_number") or "")
+            for transaction in matched_transactions
+            if transaction.get("receipt_number") is not None
+        }
+        selected_summaries = [
+            item for item in transaction_summaries if str(item.get("receipt_number") or "") in matched_receipts
+        ]
+        selected_windows = [
+            (_coerce_datetime_value(item["window_start"]), _coerce_datetime_value(item["window_end"]))
+            for item in selected_summaries
+        ]
+        for selected in selected_summaries:
+            selected_transaction_id = repositories.create_transaction(
+                db,
+                session_id,
+                {
+                    "receipt_number": str(selected.get("receipt_number") or selected.get("transaction_id") or ""),
+                    "transaction_time": _coerce_datetime_value(selected.get("transaction_time")),
+                    "total_items": int(selected.get("total_items") or 0),
+                    "total_amount": selected.get("total_amount"),
+                    "raw_payload": dict(selected.get("raw_payload") or {}),
+                },
+            )
+            selected["session_transaction_id"] = selected_transaction_id
 
     session_close_summary = {
         "session_close_pipeline": {
@@ -10074,7 +10020,7 @@ def _resolve_runtime_gallery_entry(
     return {}
 
 
-TERMINAL_SESSION_STATUSES = {"detected", "not_detected", "closed", "issue", "whitelisted"}
+TERMINAL_SESSION_STATUSES = {"detected", "not_detected", "closed", "issue", "need_review", "whitelisted"}
 
 
 def _trigger_has_required_entry_identity(trigger: Mapping[str, Any] | None) -> bool:
@@ -10447,7 +10393,7 @@ def _find_open_active_session_for_location(db: Session, location_id: int) -> dic
         status = str(session.get("status") or "").strip().lower()
         if int(session.get("location_id") or 0) != location_id:
             continue
-        if status in {"detected", "not_detected", "closed", "issue", "whitelisted"}:
+        if status in {"detected", "not_detected", "closed", "issue", "need_review", "whitelisted"}:
             continue
         return session
     try:
@@ -10619,6 +10565,7 @@ def _kickoff_kiosk_pipeline_for_session(
     session_id: int,
     location_id: int,
     transactions: list[Mapping[str, Any]],
+    issue_transactions: list[Mapping[str, Any]] | None = None,
     exit_trigger_time: datetime | None = None,
 ) -> dict[str, Any]:
     """Starts the kiosk pipeline for a session confidence just flagged for deep
@@ -10628,6 +10575,12 @@ def _kickoff_kiosk_pipeline_for_session(
     kiosk video_asset is queued here, kiosk_analysis_worker already dispatches
     it to RunPod on its own the moment the video is ready - no changes needed
     there.
+
+    Before committing to any transaction, _identify_kiosk_transactions_for_session
+    confirms which candidate(s) actually belong to this session's customer
+    (paid transactions first; if none exist, the single latest pending/failed
+    transaction is tried instead) - a session is never assumed to belong to
+    whichever transaction merely happened to fall in its time window.
     """
     if _is_kiosk_analysis_disabled(db):
         # Deliberately different from the kiosk_analysis worker pause toggle,
@@ -10636,14 +10589,46 @@ def _kickoff_kiosk_pipeline_for_session(
         # the first place, so re-enabling later does not retroactively sweep
         # up a backlog of sessions from while it was off.
         return {"status": "skipped", "reason": "kiosk_analysis_disabled", "video_asset_ids": []}
-    if not transactions:
+
+    candidates: list[Mapping[str, Any]] = list(transactions) if transactions else []
+    if not candidates:
+        fallback_candidates = list(issue_transactions or [])
+        if fallback_candidates:
+            latest = max(
+                fallback_candidates,
+                key=lambda row: _transaction_event_time(row) or datetime.min,
+            )
+            candidates = [latest]
+
+    if not candidates:
         repositories.update_session_fields(
             db,
             session_id=session_id,
             status="need_review",
-            issue_reason="No paid transaction found between the entry and exit triggers.",
+            issue_reason="No paid, pending, or failed transaction found between the entry and exit triggers.",
         )
-        return {"status": "need_review", "reason": "no_paid_transaction", "video_asset_ids": []}
+        return {"status": "need_review", "reason": "no_transaction_candidates", "video_asset_ids": []}
+
+    matched_transactions, identification_summary = _identify_kiosk_transactions_for_session(
+        db,
+        session_id=session_id,
+        location_id=location_id,
+        candidates=candidates,
+    )
+    if not matched_transactions:
+        repositories.update_session_fields(
+            db,
+            session_id=session_id,
+            status="need_review",
+            issue_reason="Could not confidently match any transaction to this session's customer.",
+            result_summary={"kiosk_transaction_identification": identification_summary},
+        )
+        return {
+            "status": "need_review",
+            "reason": "no_confident_transaction_match",
+            "video_asset_ids": [],
+            "identification": identification_summary,
+        }
 
     # Persisted so get_transaction_total_items (used later by finalize_session_result
     # to compare against Gemini's kiosk item count) has something real to sum -
@@ -10651,7 +10636,7 @@ def _kickoff_kiosk_pipeline_for_session(
     # marked "detected" regardless of what was actually bought.
     repositories.delete_session_transactions(db, session_id)
     windows: list[tuple[datetime, datetime]] = []
-    for transaction in transactions:
+    for transaction in matched_transactions:
         # Use transaction_time specifically, not the generic _transaction_event_time
         # helper (which prefers created_at/createdAt) - created_at on this row is a
         # separate audit timestamp stored in UTC, while transaction_time is the
@@ -10685,7 +10670,7 @@ def _kickoff_kiosk_pipeline_for_session(
             db,
             session_id=session_id,
             status="need_review",
-            issue_reason="Paid transactions were found but none had a usable timestamp.",
+            issue_reason="A transaction was matched but had no usable timestamp.",
         )
         return {"status": "need_review", "reason": "no_usable_transaction_time", "video_asset_ids": []}
 
@@ -10784,29 +10769,21 @@ def _maybe_close_session_and_prepare_kiosk(
         repositories.update_session_fields(
             db,
             session_id=session_id,
-            status="pending",
+            status="need_review",
             end_time=session_end_time,
             exit_trigger_id=exit_trigger_id,
             total_customer=len(session_customers),
             transaction_total_items=total_transaction_items,
             result_summary=session_close_summary,
-            issue_reason=None,
+            issue_reason="Could not confidently match any transaction to this session's customer.",
         )
         return
 
     if not selected_windows:
-        repositories.finalize_session_result(
-            db,
-            session_id=session_id,
-            kiosk_total_items=0,
-            actual_items_brought=0,
-            tolerance=1,
-            extra_result_summary=session_close_summary,
-        )
         repositories.update_session_fields(
             db,
             session_id=session_id,
-            status="closed",
+            status="need_review",
             end_time=session_end_time,
             exit_trigger_id=exit_trigger_id,
             total_customer=len(session_customers),
@@ -13001,26 +12978,18 @@ def ensure_kiosk_video_assets_for_session(db: Session, session_id: int) -> list[
             repositories.update_session_fields(
                 db,
                 session_id=session_id,
-                status="pending",
+                status="need_review",
                 transaction_total_items=total_transaction_items,
                 result_summary=summary,
-                issue_reason=None,
+                issue_reason="Could not confidently match any transaction to this session's customer.",
             )
             return []
         if not recomputed_windows:
             merged_summary = {**summary, **prepared_summary}
-            repositories.finalize_session_result(
-                db,
-                session_id=session_id,
-                kiosk_total_items=0,
-                actual_items_brought=0,
-                tolerance=1,
-                extra_result_summary=merged_summary,
-            )
             repositories.update_session_fields(
                 db,
                 session_id=session_id,
-                status="closed",
+                status="need_review",
                 transaction_total_items=total_transaction_items,
                 result_summary=merged_summary,
                 issue_reason=NO_KIOSK_VIDEO_REASON,

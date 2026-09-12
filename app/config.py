@@ -110,6 +110,22 @@ class Settings(BaseSettings):
     # later than the already-computed end (a stale/earlier exit trigger is
     # ignored rather than shrinking the window). See _build_transaction_window_bounds.
     kiosk_exit_trigger_extend_max_seconds: int = 60
+    # Pixel zones for the two physical kiosk machines within the kiosk
+    # camera's frame ("x1,y1,x2,y2") - mirrors KIOSK_1_BOX/KIOSK_2_BOX in
+    # tds_runner's kiosk_runtime.py (kept in sync manually; tds and
+    # tds_runner are separate services that don't share env vars). Used only
+    # to draw labeled boxes on probe stills for kiosk transaction
+    # identification - kiosk_1_box is the machine whose POS machineName
+    # contains "Right", kiosk_2_box is the one whose machineName contains
+    # "Left" (the physical left/right the camera sees is the opposite of the
+    # machine's own name at this location).
+    kiosk_1_box: str = "0,250,180,540"
+    kiosk_2_box: str = "180,230,430,540"
+    # The frame width kiosk_1_box/kiosk_2_box are calibrated against - boxes
+    # are scaled by (actual_frame_width / this) before being drawn on a probe
+    # still, since ffmpeg snapshots come in at the camera's native resolution,
+    # not this reference width.
+    kiosk_box_resize_width: int = 960
     whitelist_qrentry_table_name: str = "phonenumber"
     whitelist_qrentry_id_column: str = "id"
     whitelist_qrentry_value_column: str = "id"
