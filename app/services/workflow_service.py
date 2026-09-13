@@ -4243,6 +4243,7 @@ def _identify_kiosk_transactions_for_session(
     offset = len(reference_image_urls)
     candidate_blocks: list[str] = []
     indexed_candidates: list[tuple[int, Mapping[str, Any]]] = []
+    candidate_image_urls: dict[int, list[str]] = {}
     for candidate_index, transaction in enumerate(candidates, start=1):
         image_urls = _capture_kiosk_probe_frames(
             location_id=location_id,
@@ -4265,6 +4266,7 @@ def _identify_kiosk_transactions_for_session(
         call_image_urls.extend(image_urls)
         offset += len(image_urls)
         indexed_candidates.append((candidate_index, transaction))
+        candidate_image_urls[candidate_index] = image_urls
 
     if not indexed_candidates:
         return [], {
@@ -4304,12 +4306,21 @@ def _identify_kiosk_transactions_for_session(
                 "belongs_to_customer": belongs,
                 "confidence": confidence,
                 "reasoning": item.get("reasoning"),
+                # The exact probe stills this candidate was judged from, so the
+                # dashboard can show what the model actually saw next to why it
+                # decided what it did - not persisted anywhere else, since these
+                # frames only ever otherwise exist transiently for this one call.
+                "image_urls": candidate_image_urls.get(candidate_index, []),
             }
         )
         if belongs:
             matched.append(dict(transaction))
 
-    return matched, {"status": "success", "candidates": diagnostics_candidates}
+    return matched, {
+        "status": "success",
+        "reference_image_urls": reference_image_urls,
+        "candidates": diagnostics_candidates,
+    }
 
 
 def _time_value_to_parts(value: Any) -> tuple[int, int, int]:
@@ -10705,6 +10716,18 @@ def _kickoff_kiosk_pipeline_for_session(
             "identification": identification_summary,
         }
 
+    # Keyed by receipt_number so each matched transaction's own row can carry
+    # the probe frames + reasoning that confirmed it, not just the failure
+    # case - the dashboard can then show "here's what the model saw and why
+    # it decided this receipt belongs to this customer" per receipt, not only
+    # when identification fails.
+    identification_by_receipt = {
+        str(candidate.get("receipt_number")): candidate
+        for candidate in (identification_summary.get("candidates") or [])
+        if isinstance(candidate, Mapping) and candidate.get("receipt_number") is not None
+    }
+    reference_image_urls = identification_summary.get("reference_image_urls") or []
+
     # Persisted so get_transaction_total_items (used later by finalize_session_result
     # to compare against Gemini's kiosk item count) has something real to sum -
     # without this every session would read 0 items paid for and get falsely
@@ -10720,6 +10743,13 @@ def _kickoff_kiosk_pipeline_for_session(
         if transaction_time is None:
             continue
         total_items = _coerce_int(transaction.get("total_items"))
+        raw_payload = dict(transaction)
+        matched_candidate = identification_by_receipt.get(str(transaction.get("receipt_number")))
+        if matched_candidate is not None:
+            raw_payload["kiosk_transaction_identification"] = {
+                **matched_candidate,
+                "reference_image_urls": reference_image_urls,
+            }
         repositories.create_transaction(
             db,
             session_id,
@@ -10728,7 +10758,7 @@ def _kickoff_kiosk_pipeline_for_session(
                 "transaction_time": transaction_time,
                 "total_items": total_items,
                 "total_amount": transaction.get("total_amount"),
-                "raw_payload": dict(transaction),
+                "raw_payload": raw_payload,
             },
         )
         windows.append(

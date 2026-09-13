@@ -301,6 +301,7 @@ class SessionTransactionDetailResponse(BaseModel):
     price: float | None = None
     subtotal: float | None = None
     raw_payload: dict[str, Any] | None = None
+    kiosk_transaction_identification: dict[str, Any] | None = None
 
 
 class ScriptRunResponse(BaseModel):

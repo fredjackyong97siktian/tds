@@ -5065,6 +5065,11 @@ def list_session_transaction_details(db: Session, session_id: int) -> list[dict[
                     "price": price,
                     "subtotal": subtotal,
                     "raw_payload": dict(detail),
+                    "kiosk_transaction_identification": (
+                        raw_payload.get("kiosk_transaction_identification")
+                        if isinstance(raw_payload, Mapping)
+                        else None
+                    ),
                 }
             )
     return payload
