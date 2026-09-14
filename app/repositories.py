@@ -427,6 +427,21 @@ def get_dashboard_activity_timeseries(db: Session, *, hours: int = 24) -> list[d
     )
     theft_counts = {int(row["bucket_index"]): int(row["count"]) for row in _fetch_all_dicts(theft_result)}
 
+    # All sessions regardless of status (unlike theft_count, which only
+    # counts status='detected') - bucketed the same way, by start_time.
+    session_result = db.execute(
+        text(
+            f"""
+            select timestampdiff(hour, start_time, :anchor) as bucket_index, count(*) as count
+            from {session_table}
+            where start_time >= :start_boundary and start_time < :anchor
+            group by bucket_index
+            """
+        ),
+        params,
+    )
+    session_counts = {int(row["bucket_index"]): int(row["count"]) for row in _fetch_all_dicts(session_result)}
+
     # Sums each grouped entry's own AI-estimated headcount (unique_customer_count,
     # defaulting to 1 when a trigger hasn't been estimated yet) rather than
     # counting session rows - a session only gets created once a group clears
@@ -462,6 +477,7 @@ def get_dashboard_activity_timeseries(db: Session, *, hours: int = 24) -> list[d
                 "trigger_count": trigger_counts.get(bucket_index, 0),
                 "group_count": group_counts.get(bucket_index, 0),
                 "theft_count": theft_counts.get(bucket_index, 0),
+                "session_count": session_counts.get(bucket_index, 0),
                 "customer_count": customer_counts.get(bucket_index, 0),
             }
         )
