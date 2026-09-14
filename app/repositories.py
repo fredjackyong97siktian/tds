@@ -6987,3 +6987,128 @@ def finalize_session_result(
         "actual_items_brought": actual_items,
         "result_summary": result_summary,
     }
+
+
+def _fill_hourly_activity_buckets(rows: list[dict[str, Any]], *, hours: int = 24) -> list[dict[str, Any]]:
+    # Fills every hour in the trailing window with zero counts before
+    # overlaying whatever the query actually found, so a chart always shows a
+    # continuous run of hours instead of gaps wherever nothing happened -
+    # also doubles as the merge point when combining rows from more than one
+    # source table (matching hour keys just add together).
+    now = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
+    buckets: dict[str, dict[str, Any]] = {}
+    for offset in range(hours - 1, -1, -1):
+        bucket_time = now - timedelta(hours=offset)
+        key = bucket_time.strftime("%Y-%m-%d %H:00:00")
+        buckets[key] = {"hour": key, "processed": 0, "failed": 0}
+    for row in rows:
+        key = str(row.get("hour"))
+        bucket = buckets.get(key)
+        if bucket is None:
+            continue
+        bucket["processed"] += int(row.get("processed") or 0)
+        bucket["failed"] += int(row.get("failed") or 0)
+    return list(buckets.values())
+
+
+def _hourly_status_activity(
+    db: Session,
+    *,
+    table_name: str,
+    time_column: str,
+    processed_statuses: tuple[str, ...],
+    failed_statuses: tuple[str, ...],
+    extra_where: str = "",
+) -> list[dict[str, Any]]:
+    table = _table(table_name)
+    # Status values here are always fixed internal constants passed by our own
+    # callers below, never user input, so inlining them (rather than bind
+    # params) is safe - same pattern already used for the fixed script_name
+    # lists in has_active_remote_analysis_script_run.
+    processed_list = ", ".join(f"'{status}'" for status in processed_statuses)
+    failed_list = ", ".join(f"'{status}'" for status in failed_statuses)
+    where_extra = f" and {extra_where}" if extra_where else ""
+    result = db.execute(
+        text(
+            f"""
+            select date_format({time_column}, '%Y-%m-%d %H:00:00') as hour,
+                   sum(case when status in ({processed_list}) then 1 else 0 end) as processed,
+                   sum(case when status in ({failed_list}) then 1 else 0 end) as failed
+            from {table}
+            where {time_column} >= date_sub(utc_timestamp(), interval 24 hour)
+              {where_extra}
+            group by hour
+            """
+        ),
+    )
+    return _fetch_all_dicts(result)
+
+
+def get_retrieval_worker_activity(db: Session) -> list[dict[str, Any]]:
+    frame_rows = _hourly_status_activity(
+        db,
+        table_name="trigger_frame_asset",
+        time_column="updated_at",
+        processed_statuses=("retrieved", "processed"),
+        failed_statuses=("issue",),
+    )
+    video_rows = _hourly_status_activity(
+        db,
+        table_name="video_asset",
+        time_column="updated_at",
+        processed_statuses=("ready", "processed"),
+        failed_statuses=("issue",),
+    )
+    return _fill_hourly_activity_buckets([*frame_rows, *video_rows])
+
+
+def get_grouping_worker_activity(db: Session) -> list[dict[str, Any]]:
+    rows = _hourly_status_activity(
+        db,
+        table_name="filter_grouping_batch",
+        time_column="finished_at",
+        processed_statuses=("success",),
+        failed_statuses=("issue",),
+    )
+    return _fill_hourly_activity_buckets(rows)
+
+
+def get_kiosk_analysis_worker_activity(db: Session) -> list[dict[str, Any]]:
+    rows = _hourly_status_activity(
+        db,
+        table_name="script_run",
+        time_column="finished_at",
+        processed_statuses=("success",),
+        failed_statuses=("failed",),
+        extra_where="script_name = 'kiosk'",
+    )
+    return _fill_hourly_activity_buckets(rows)
+
+
+def get_entrance_analysis_worker_activity(db: Session) -> list[dict[str, Any]]:
+    rows = _hourly_status_activity(
+        db,
+        table_name="script_run",
+        time_column="finished_at",
+        processed_statuses=("success",),
+        failed_statuses=("failed",),
+        extra_where="script_name = 'entry'",
+    )
+    return _fill_hourly_activity_buckets(rows)
+
+
+def get_theft_confidence_worker_activity(db: Session) -> list[dict[str, Any]]:
+    confidence_table = _table("filter_confidence_result")
+    result = db.execute(
+        text(
+            f"""
+            select date_format(created_at, '%Y-%m-%d %H:00:00') as hour,
+                   sum(case when group_key <> '__error__' and coalesce(reason, '') <> 'confidence_error' then 1 else 0 end) as processed,
+                   sum(case when group_key = '__error__' or reason = 'confidence_error' then 1 else 0 end) as failed
+            from {confidence_table}
+            where created_at >= date_sub(utc_timestamp(), interval 24 hour)
+            group by hour
+            """
+        ),
+    )
+    return _fill_hourly_activity_buckets(_fetch_all_dicts(result))

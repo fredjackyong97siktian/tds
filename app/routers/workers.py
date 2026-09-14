@@ -461,3 +461,28 @@ def update_kiosk_analysis_control(payload: WorkerControlRequest, db: Session = D
         "ok": True,
         **state,
     }
+
+
+@router.get("/retrieval-activity")
+def get_retrieval_activity(db: Session = Depends(get_transaction_db)) -> dict:
+    return {"hours": repositories.get_retrieval_worker_activity(db)}
+
+
+@router.get("/grouping-activity")
+def get_grouping_activity(db: Session = Depends(get_transaction_db)) -> dict:
+    return {"hours": repositories.get_grouping_worker_activity(db)}
+
+
+@router.get("/theft-confidence-activity")
+def get_theft_confidence_activity(db: Session = Depends(get_transaction_db)) -> dict:
+    return {"hours": repositories.get_theft_confidence_worker_activity(db)}
+
+
+@router.get("/kiosk-analysis-activity")
+def get_kiosk_analysis_activity(db: Session = Depends(get_transaction_db)) -> dict:
+    return {"hours": repositories.get_kiosk_analysis_worker_activity(db)}
+
+
+@router.get("/analysis-activity")
+def get_analysis_activity(db: Session = Depends(get_transaction_db)) -> dict:
+    return {"hours": repositories.get_entrance_analysis_worker_activity(db)}
