@@ -7569,10 +7569,14 @@ def _retry_grouping_batch_now_locked(db: Session, *, batch_id: int) -> dict[str,
         status = str(batch.get("status") or "").strip().lower()
     if status not in {"success", "failed", "issue", "cancel", "canceled", "cancelled"}:
         raise ValueError(f"Grouping batch {batch_id} is {status or 'unknown'} and cannot be rerun.")
+    # Ignore any OTHER batch that's itself stale rather than genuinely active -
+    # otherwise one orphaned batch (e.g. stuck since before this recovery
+    # logic existed, and nobody's retried it yet) permanently blocks retrying
+    # every other one too, since this check would never see an "all clear".
     active_batches = [
         row
         for row in repositories.list_running_grouping_batches(db)
-        if int(row["id"]) != batch_id
+        if int(row["id"]) != batch_id and not _grouping_batch_is_stale(row)
     ]
     if active_batches or repositories.has_active_remote_analysis_script_run(db, script_names=["grouping"]):
         raise ValueError("Grouping is already dispatching or running.")
