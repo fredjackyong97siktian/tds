@@ -3051,6 +3051,31 @@ def reset_grouping_batch_for_retry(db: Session, batch_id: int) -> dict[str, Any]
     return get_grouping_batch(db, batch_id)
 
 
+def mark_running_grouping_script_runs_as_issue(db: Session, batch_id: int) -> int:
+    # adjacent/direct/repair all stamp runner_payload.batch_id (see
+    # _run_grouping_adjacent_pass, start_grouping_analysis_job, and the repair
+    # pass in workflow_service.py) - a force-killed dispatch subprocess never
+    # runs its own except-handling, so a stage's script_run row can be left
+    # stuck at 'running' forever even after the batch itself moves on. Retrying
+    # a batch should not leave one of its own stages looking like it's still
+    # in progress.
+    script_run_table = _table("script_run")
+    result = db.execute(
+        text(
+            f"""
+            update {script_run_table}
+            set status = 'issue', finished_at = coalesce(finished_at, now())
+            where script_name = 'grouping'
+              and status = 'running'
+              and cast(json_unquote(json_extract(runner_payload, '$.batch_id')) as unsigned) = :batch_id
+            """
+        ),
+        {"batch_id": batch_id},
+    )
+    db.commit()
+    return int(result.rowcount or 0)
+
+
 def delete_filter_confidence_results_for_batch(db: Session, batch_id: int) -> int:
     table_name = _table("filter_confidence_result")
     result = db.execute(
