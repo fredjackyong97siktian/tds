@@ -9,11 +9,13 @@ import re
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as _FutureTimeoutError
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from os.path import basename, splitext
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlparse
@@ -6074,6 +6076,37 @@ def _grouping_model_name_label(db: Session) -> str:
     return _grouping_stage_label(db, "direct")
 
 
+# Plain module-level pool (not a context-managed one-off) so a timed-out
+# call's abandoned thread doesn't block _run_with_hard_deadline from
+# enforcing the *next* call's deadline - Python cannot forcibly cancel a
+# thread blocked in a native socket read, so a timed-out call just leaves
+# one worker occupied until whatever it was stuck on eventually resolves (or
+# the process is restarted). A handful of spare workers means a few
+# concurrent hangs don't starve every future call.
+_VISION_CALL_DEADLINE_EXECUTOR = ThreadPoolExecutor(max_workers=8, thread_name_prefix="vision-call-deadline")
+
+
+def _run_with_hard_deadline(fn: Callable[[], Any], *, timeout_seconds: float, description: str) -> Any:
+    """Runs fn() with a genuine wall-clock deadline, distinct from (and a
+    backstop for) whatever socket-idle timeout fn() uses internally.
+    urlopen(timeout=N) only fires once the connection goes fully silent for N
+    seconds, so a slow/streaming response that keeps trickling bytes can hang
+    far longer than N despite the configured timeout - confirmed live: a
+    grouping_adjacent Gemini call ran for 1h50m against a nominal 180s socket
+    timeout. Raises TimeoutError if fn() doesn't return in time; fn() itself
+    keeps running in the background, but the caller gets control back and can
+    fail the batch/script_run properly instead of hanging indefinitely.
+    """
+    future = _VISION_CALL_DEADLINE_EXECUTOR.submit(fn)
+    try:
+        return future.result(timeout=timeout_seconds)
+    except _FutureTimeoutError as exc:
+        raise TimeoutError(
+            f"{description} exceeded the {timeout_seconds:.0f}s hard deadline "
+            "(likely a stuck network read - still running in the background, abandoned)."
+        ) from exc
+
+
 def _call_grouping_vision(
     db: Session,
     *,
@@ -6093,51 +6126,56 @@ def _call_grouping_vision(
     when a caller doesn't yet have one (matches the old per-caller behavior of
     skipping cost recording in that case).
     """
-    if _grouping_provider_is_deepseek(db):
-        result, meta = _call_deepseek_vision_summary(
-            prompt=prompt,
-            image_urls=image_urls,
-            model_name=settings.deepseek_vision_model,
-            allow_text_only=allow_text_only,
-            image_resize_scale=_grouping_deepseek_resize_scale(),
-            temperature=settings.grouping_temperature,
-        )
-    elif _grouping_provider_is_glm(db):
-        result, meta = _call_glm_vision_summary(
-            prompt=prompt,
-            image_urls=image_urls,
-            model_name=settings.glm_vision_model,
-            allow_text_only=allow_text_only,
-            image_resize_scale=_grouping_glm_resize_scale(),
-            temperature=settings.grouping_temperature,
-        )
-    elif _grouping_provider_is_openai(db):
-        result, meta = _call_openai_vision_summary(
-            prompt=prompt,
-            image_urls=image_urls,
-            model_name=_grouping_openai_model_name(db),
-            allow_text_only=allow_text_only,
-            image_resize_scale=_grouping_openai_resize_scale(),
-            temperature=settings.grouping_temperature,
-        )
-    elif _grouping_provider_is_openrouter(db):
-        result, meta = _call_openrouter_vision_summary(
-            prompt=prompt,
-            image_urls=image_urls,
-            model_name=_grouping_openrouter_model_name(db),
-            allow_text_only=allow_text_only,
-            image_resize_scale=_grouping_openrouter_resize_scale(),
-            temperature=settings.grouping_temperature,
-        )
-    else:
-        result, meta = _call_kiosk_gemini_summary(
+    def _dispatch() -> tuple[dict[str, Any], dict[str, Any] | None]:
+        if _grouping_provider_is_deepseek(db):
+            return _call_deepseek_vision_summary(
+                prompt=prompt,
+                image_urls=image_urls,
+                model_name=settings.deepseek_vision_model,
+                allow_text_only=allow_text_only,
+                image_resize_scale=_grouping_deepseek_resize_scale(),
+                temperature=settings.grouping_temperature,
+            )
+        if _grouping_provider_is_glm(db):
+            return _call_glm_vision_summary(
+                prompt=prompt,
+                image_urls=image_urls,
+                model_name=settings.glm_vision_model,
+                allow_text_only=allow_text_only,
+                image_resize_scale=_grouping_glm_resize_scale(),
+                temperature=settings.grouping_temperature,
+            )
+        if _grouping_provider_is_openai(db):
+            return _call_openai_vision_summary(
+                prompt=prompt,
+                image_urls=image_urls,
+                model_name=_grouping_openai_model_name(db),
+                allow_text_only=allow_text_only,
+                image_resize_scale=_grouping_openai_resize_scale(),
+                temperature=settings.grouping_temperature,
+            )
+        if _grouping_provider_is_openrouter(db):
+            return _call_openrouter_vision_summary(
+                prompt=prompt,
+                image_urls=image_urls,
+                model_name=_grouping_openrouter_model_name(db),
+                allow_text_only=allow_text_only,
+                image_resize_scale=_grouping_openrouter_resize_scale(),
+                temperature=settings.grouping_temperature,
+            )
+        return _call_kiosk_gemini_summary(
             prompt=prompt,
             image_urls=image_urls,
             model_name=_grouping_gemini_model_name(db, gemini_model_name),
             image_resize_scale=gemini_resize_scale,
             temperature=settings.grouping_temperature,
         )
-    return result, meta
+
+    return _run_with_hard_deadline(
+        _dispatch,
+        timeout_seconds=settings.vision_call_hard_deadline_seconds,
+        description="Grouping vision call",
+    )
 
 
 def _record_grouping_cost(db: Session, script_run_id: int, call_meta: Mapping[str, Any] | None) -> dict[str, Any] | None:
@@ -6316,7 +6354,11 @@ def _call_kiosk_vision(
     last_exc: Exception | None = None
     for attempt in range(1, _KIOSK_VISION_TRANSIENT_RETRY_ATTEMPTS + 1):
         try:
-            return _dispatch()
+            return _run_with_hard_deadline(
+                _dispatch,
+                timeout_seconds=settings.vision_call_hard_deadline_seconds,
+                description="Kiosk vision call",
+            )
         except (http.client.HTTPException, URLError, ConnectionError, TimeoutError) as exc:
             last_exc = exc
             if attempt >= _KIOSK_VISION_TRANSIENT_RETRY_ATTEMPTS:
@@ -7523,10 +7565,38 @@ def _retry_grouping_batch_now_locked(db: Session, *, batch_id: int) -> dict[str,
     if active_batches or repositories.has_active_remote_analysis_script_run(db, script_names=["grouping"]):
         raise ValueError("Grouping is already dispatching or running.")
 
+    reset_details = _reset_grouping_batch_for_requeue(
+        db,
+        batch_id=batch_id,
+        batch=batch,
+        issue_reason_for_frame_assets="Rerun queued for grouping batch.",
+    )
+    return {
+        "ok": True,
+        "batch_id": batch_id,
+        "status": "pending",
+        "queued": True,
+        "message": "Grouping batch queued for background rerun.",
+        **reset_details,
+    }
+
+
+def _reset_grouping_batch_for_requeue(
+    db: Session,
+    *,
+    batch_id: int,
+    batch: dict[str, Any],
+    issue_reason_for_frame_assets: str,
+) -> dict[str, Any]:
+    """Shared tail of both the manual stale-retry path and the grouping
+    worker's own force-kill recovery (see force_recover_killed_grouping_batch)
+    - requires the batch to already be in a terminal status (reset_grouping_
+    batch_for_retry only accepts success/failed/issue/cancel*).
+    """
     repositories.mark_grouping_batch_frame_assets_retrieved(
         db,
         batch_id,
-        error="Rerun queued for grouping batch.",
+        error=issue_reason_for_frame_assets,
     )
     reset_issue_count = 0
     batch_location_id = batch.get("location_id")
@@ -7541,15 +7611,55 @@ def _retry_grouping_batch_now_locked(db: Session, *, batch_id: int) -> dict[str,
     repositories.reset_grouping_batch_for_retry(db, batch_id)
     refreshed_count = _refresh_grouping_item_frame_payloads(db, batch=batch)
     return {
-        "ok": True,
-        "batch_id": batch_id,
-        "status": "pending",
-        "queued": True,
-        "message": "Grouping batch queued for background rerun.",
         "refreshed_frame_payload_count": refreshed_count,
         "deleted_confidence_result_count": deleted_confidence_count,
         "reset_issue_frame_asset_count": reset_issue_count,
     }
+
+
+def force_recover_killed_grouping_batch(db: Session, *, batch_id: int) -> dict[str, Any]:
+    """Called by the grouping worker immediately after it force-kills a
+    batch's dispatch subprocess for running past grouping_stale_process_seconds
+    (see grouping_worker.py's _kill_stale_jobs). Unlike retry_grouping_batch_now,
+    this doesn't wait for the batch to also cross the age-based staleness
+    threshold (_GROUPING_BATCH_STALE_MINUTES) - the worker already knows for a
+    fact the process just died uncleanly, so there's nothing to wait for.
+    Requeues the batch straight back to 'pending' so the very next dispatch
+    poll (a few seconds later) picks it up again, instead of it sitting
+    invisible at 'running' until someone notices and clicks Retry.
+    """
+    lock_conn = _try_acquire_theft_confidence_lock(batch_id, wait_seconds=0)
+    if lock_conn is None:
+        logger.warning(
+            "Could not force-recover killed grouping batch_id=%s - theft confidence lock is held for it", batch_id
+        )
+        return {"ok": False, "batch_id": batch_id, "reason": "theft_confidence_lock_held"}
+    try:
+        batch = repositories.get_grouping_batch(db, batch_id)
+        status = str(batch.get("status") or "").strip().lower()
+        if status not in {"pending", "dispatching", "running"}:
+            return {"ok": False, "batch_id": batch_id, "reason": f"batch status is {status!r}, nothing to recover"}
+        issue_reason = (
+            f"Auto-recovered: dispatch process was force-killed after running past "
+            f"{settings.grouping_stale_process_seconds}s with no progress."
+        )
+        repositories.update_grouping_batch(
+            db,
+            batch_id,
+            {"status": "failed", "issue_reason": issue_reason, "finished_at": datetime.now(UTC)},
+        )
+        reset_details = _reset_grouping_batch_for_requeue(
+            db,
+            batch_id=batch_id,
+            batch=batch,
+            issue_reason_for_frame_assets=issue_reason,
+        )
+        logger.warning(
+            "Force-recovered killed grouping batch_id=%s - requeued to pending %s", batch_id, reset_details
+        )
+        return {"ok": True, "batch_id": batch_id, "status": "pending", **reset_details}
+    finally:
+        _release_theft_confidence_lock(lock_conn, batch_id)
 
 
 def _finalize_remote_grouping_script_run(

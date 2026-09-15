@@ -100,6 +100,20 @@ class GroupingWorker:
             job.process.wait()
             with self._lock:
                 self._running.pop(batch_id, None)
+            # A SIGKILL never runs the batch's own except-handling, so without
+            # this it's left stuck at 'running' forever - invisible to
+            # list_pending_grouping_batches (status='pending' only) and only
+            # reachable afterwards via a manual Retry click once it also
+            # crosses the separate 45-minute age-based staleness gate. Requeue
+            # it immediately instead, straight back to 'pending', so the next
+            # poll picks it up on its own.
+            db = TransactionalSessionLocal()
+            try:
+                workflow_service.force_recover_killed_grouping_batch(db, batch_id=batch_id)
+            except Exception:
+                logger.exception("Could not force-recover killed grouping batch_id=%s", batch_id)
+            finally:
+                db.close()
 
     def _fill_available_slots(self) -> None:
         db = TransactionalSessionLocal()

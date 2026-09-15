@@ -186,6 +186,15 @@ class Settings(BaseSettings):
     grouping_temperature: float = 0.0
     kiosk_gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
     kiosk_gemini_timeout_seconds: int = 180
+    # Hard wall-clock ceiling for a single grouping/kiosk vision call, enforced
+    # independently of any provider's own socket-idle timeout (all currently
+    # 180s) - urlopen(timeout=N) only fires once the connection goes fully
+    # silent for N seconds, so a slow/streaming response that keeps trickling
+    # bytes can hang far longer than N despite the configured timeout
+    # (confirmed live: a grouping_adjacent Gemini call ran for 1h50m against a
+    # nominal 180s socket timeout). Set comfortably above every provider's own
+    # timeout so a legitimately-slow-but-completing call isn't cut off early.
+    vision_call_hard_deadline_seconds: int = 240
     gemini_input_cost_per_1m_tokens_usd: float = 0.0
     gemini_output_cost_per_1m_tokens_usd: float = 0.0
     gemini_cached_input_cost_per_1m_tokens_usd: float = 0.0
