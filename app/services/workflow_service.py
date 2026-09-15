@@ -7533,10 +7533,10 @@ def _retry_grouping_batch_now_locked(db: Session, *, batch_id: int) -> dict[str,
     # than exiting cleanly (SIGKILL never runs the batch's own except-
     # handling) - clear those out unconditionally before anything else below
     # can mistake one for a genuinely still-in-progress run.
-    cleared_script_run_count = repositories.mark_running_grouping_script_runs_as_issue(db, batch_id)
+    cleared_script_run_count = repositories.mark_running_grouping_script_runs_as_failed(db, batch_id)
     if cleared_script_run_count:
         logger.warning(
-            "Marked %s stuck 'running' script_run row(s) as 'issue' for grouping batch_id=%s before retrying",
+            "Marked %s stuck 'running' script_run row(s) as 'failed' for grouping batch_id=%s before retrying",
             cleared_script_run_count,
             batch_id,
         )
@@ -7655,7 +7655,7 @@ def force_recover_killed_grouping_batch(db: Session, *, batch_id: int) -> dict[s
             f"Auto-recovered: dispatch process was force-killed after running past "
             f"{settings.grouping_stale_process_seconds}s with no progress."
         )
-        repositories.mark_running_grouping_script_runs_as_issue(db, batch_id)
+        repositories.mark_running_grouping_script_runs_as_failed(db, batch_id)
         repositories.update_grouping_batch(
             db,
             batch_id,
