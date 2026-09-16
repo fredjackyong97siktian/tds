@@ -10793,7 +10793,11 @@ def _kickoff_kiosk_pipeline_for_session(
     confirms which candidate(s) actually belong to this session's customer
     (paid transactions first; if none exist, the single latest pending/failed
     transaction is tried instead) - a session is never assumed to belong to
-    whichever transaction merely happened to fall in its time window.
+    whichever transaction merely happened to fall in its time window. The one
+    exception is exactly one PAID transaction: nothing is genuinely ambiguous
+    there, and the verification call has produced enough confident-but-wrong
+    rejections of the correct match that skipping it is safer than running it
+    (see the len(transactions) == 1 check below).
     """
     if _is_kiosk_analysis_disabled(db):
         # Deliberately different from the kiosk_analysis worker pause toggle,
@@ -10822,12 +10826,27 @@ def _kickoff_kiosk_pipeline_for_session(
         )
         return {"status": "need_review", "reason": "no_transaction_candidates", "video_asset_ids": []}
 
-    matched_transactions, identification_summary = _identify_kiosk_transactions_for_session(
-        db,
-        session_id=session_id,
-        location_id=location_id,
-        candidates=candidates,
-    )
+    if len(transactions) == 1:
+        # With exactly one PAID transaction in the session's window, there's
+        # nothing genuinely ambiguous for the Gemini verification step to
+        # resolve - unlike the 0-paid fallback-to-a-pending/failed-transaction
+        # case just above, where a single candidate could still plausibly
+        # belong to someone else. In practice this verification call has
+        # produced enough confident-but-wrong rejections of the correct
+        # match (rejecting a real customer's own single paid transaction) that
+        # skipping it here is safer than running it.
+        matched_transactions = list(candidates)
+        identification_summary: dict[str, Any] = {
+            "status": "skipped",
+            "reason": "single_paid_transaction",
+        }
+    else:
+        matched_transactions, identification_summary = _identify_kiosk_transactions_for_session(
+            db,
+            session_id=session_id,
+            location_id=location_id,
+            candidates=candidates,
+        )
     if not matched_transactions:
         repositories.update_session_fields(
             db,
