@@ -4565,9 +4565,6 @@ def _first_trigger_frame_payload(frames: list[dict[str, Any]], limit: int | None
     return frames[: max(1, int(limit))]
 
 
-_warned_missed_grouping_windows: set[tuple[int, str, str]] = set()
-
-
 def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
     periods = repositories.list_filter_time_periods(db, selected_only=False)
     if not periods:
@@ -4609,24 +4606,44 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
                 # Two different things collapse into this one branch: the window
                 # hasn't closed yet (normal, happens on almost every cycle), or it
                 # closed so long ago (past grouping_window_grace_minutes - usually
-                # because the worker itself was down/redeploying through the whole
-                # grace period) that it will now NEVER get an automatic batch. The
-                # second case used to be entirely silent - logged once per missed
-                # window so a gap like this is visible instead of only noticed
-                # later from an empty schedule.
+                # because the worker itself was down/redeploying, or dispatch was
+                # silently blocked, through the whole grace period) that it's too
+                # late to automatically process. The second case used to just log
+                # a warning and otherwise vanish - now a real batch row is created
+                # with status='missed' so the gap is visible (and, if genuinely
+                # wanted later, retryable via the normal Retry action) in the
+                # Grouping/Report list instead of only ever showing up in a log
+                # line. get_grouping_batch_by_window (via existing_batch above)
+                # is itself the dedupe - this only runs once per window.
                 if existing_batch is None and period_window_end <= current:
-                    warn_key = (location_id, period_code, period_window_end.isoformat())
-                    if warn_key not in _warned_missed_grouping_windows:
-                        _warned_missed_grouping_windows.add(warn_key)
-                        logger.warning(
-                            "Missed grouping window (past %sm grace, no automatic batch will be created): "
-                            "location_id=%s period_code=%s window_start=%s window_end=%s",
-                            settings.grouping_window_grace_minutes,
-                            location_id,
-                            period_code,
-                            period_window_start,
-                            period_window_end,
-                        )
+                    missed_batch = repositories.create_grouping_batch(
+                        db,
+                        location_id=location_id,
+                        period_code=period_code,
+                        window_start=period_window_start,
+                        window_end=period_window_end,
+                        status="missed",
+                    )
+                    repositories.update_grouping_batch(
+                        db,
+                        int(missed_batch["id"]),
+                        {
+                            "issue_reason": (
+                                f"Missed automatic batch - past the {settings.grouping_window_grace_minutes}m grace period."
+                            ),
+                            "finished_at": datetime.now(UTC),
+                        },
+                    )
+                    logger.warning(
+                        "Created 'missed' grouping batch_id=%s (past %sm grace, never automatically processed): "
+                        "location_id=%s period_code=%s window_start=%s window_end=%s",
+                        missed_batch["id"],
+                        settings.grouping_window_grace_minutes,
+                        location_id,
+                        period_code,
+                        period_window_start,
+                        period_window_end,
+                    )
                 continue
             # A window with a batch already built for it won't get a NEW one
             # this cycle either (see "if existing is not None: continue"
@@ -7600,7 +7617,7 @@ def _retry_grouping_batch_now_locked(db: Session, *, batch_id: int) -> dict[str,
             },
         )
         status = str(batch.get("status") or "").strip().lower()
-    if status not in {"success", "failed", "issue", "cancel", "canceled", "cancelled"}:
+    if status not in {"success", "failed", "issue", "missed", "cancel", "canceled", "cancelled"}:
         raise ValueError(f"Grouping batch {batch_id} is {status or 'unknown'} and cannot be rerun.")
     # Ignore any OTHER batch that's itself stale rather than genuinely active -
     # otherwise one orphaned batch (e.g. stuck since before this recovery
