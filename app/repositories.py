@@ -3042,7 +3042,7 @@ def reset_grouping_batch_for_retry(db: Session, batch_id: int) -> dict[str, Any]
                 finished_at = null,
                 updated_at = now()
             where id = :batch_id
-              and status in ('success', 'failed', 'issue', 'missed', 'cancel', 'canceled', 'cancelled')
+              and status in ('success', 'failed', 'issue', 'missed', 'avoid', 'cancel', 'canceled', 'cancelled')
             """
         ),
         {"batch_id": batch_id},
@@ -3232,7 +3232,7 @@ def list_recent_grouping_batches(db: Session, limit: int = 50, *, offset: int = 
                    manifest_url, manifest_object_key, result_payload, issue_reason, started_at, finished_at, created_at, updated_at,
                    is_used_lock(concat('tds_theft_confidence_batch_', id)) is not null as confidence_running
             from {table_name}
-            where status in ('success', 'failed', 'issue', 'missed')
+            where status in ('success', 'failed', 'issue', 'missed', 'avoid')
             order by coalesce(finished_at, updated_at, created_at) desc, id desc
             limit :limit offset :offset
             """
@@ -3257,7 +3257,7 @@ def count_recent_grouping_batches(db: Session) -> int:
             f"""
             select count(*) as total
             from {table_name}
-            where status in ('success', 'failed', 'issue', 'missed')
+            where status in ('success', 'failed', 'issue', 'missed', 'avoid')
             """
         )
     )

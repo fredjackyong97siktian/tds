@@ -4439,19 +4439,34 @@ def _period_code_for_datetime(db: Session, location_id: int, value: datetime | N
     return None
 
 
-def _selected_grouping_periods_for_location(periods: list[dict[str, Any]], location_id: int) -> list[dict[str, Any]]:
+def _grouping_candidate_periods_for_location(periods: list[dict[str, Any]], location_id: int) -> list[dict[str, Any]]:
     local_periods = [
         period
         for period in periods
         if period.get("location_id") is not None and int(period["location_id"]) == int(location_id)
     ]
-    candidate_periods = local_periods if local_periods else [
-        period for period in periods if period.get("location_id") is None
-    ]
+    return local_periods if local_periods else [period for period in periods if period.get("location_id") is None]
+
+
+def _selected_grouping_periods_for_location(periods: list[dict[str, Any]], location_id: int) -> list[dict[str, Any]]:
     return [
         period
-        for period in candidate_periods
+        for period in _grouping_candidate_periods_for_location(periods, location_id)
         if bool(period.get("selected"))
+    ]
+
+
+def _unselected_grouping_periods_for_location(periods: list[dict[str, Any]], location_id: int) -> list[dict[str, Any]]:
+    # The other half of _selected_grouping_periods_for_location's candidate
+    # set - periods that exist and apply to this location but aren't turned
+    # on. prepare_due_grouping_batches still creates a 'avoid' batch row for
+    # these once their window closes, purely so the Grouping/Report list has
+    # a complete picture of every window (on or off) instead of a gap that
+    # looks identical to a genuinely missed one.
+    return [
+        period
+        for period in _grouping_candidate_periods_for_location(periods, location_id)
+        if not bool(period.get("selected"))
     ]
 
 
@@ -4574,6 +4589,37 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
     prepared: list[dict[str, Any]] = []
     current = _time_period_now()
     for location_id in location_ids:
+        for period in _unselected_grouping_periods_for_location(periods, location_id):
+            period_window_start, period_window_end = _last_completed_period_window(period, now=current)
+            if period_window_end > current:
+                continue
+            period_code = str(period.get("period_code") or "period")
+            existing_batch = repositories.get_grouping_batch_by_window(
+                db,
+                location_id=location_id,
+                period_code=period_code,
+                window_start=period_window_start,
+                window_end=period_window_end,
+            )
+            if existing_batch is not None:
+                continue
+            avoid_batch = repositories.create_grouping_batch(
+                db,
+                location_id=location_id,
+                period_code=period_code,
+                window_start=period_window_start,
+                window_end=period_window_end,
+                status="avoid",
+            )
+            repositories.update_grouping_batch(
+                db,
+                int(avoid_batch["id"]),
+                {
+                    "issue_reason": "Period is not active for this location - not automatically processed.",
+                    "finished_at": datetime.now(UTC),
+                },
+            )
+
         selected_periods = _selected_grouping_periods_for_location(periods, location_id)
         if not selected_periods:
             continue
@@ -7617,7 +7663,7 @@ def _retry_grouping_batch_now_locked(db: Session, *, batch_id: int) -> dict[str,
             },
         )
         status = str(batch.get("status") or "").strip().lower()
-    if status not in {"success", "failed", "issue", "missed", "cancel", "canceled", "cancelled"}:
+    if status not in {"success", "failed", "issue", "missed", "avoid", "cancel", "canceled", "cancelled"}:
         raise ValueError(f"Grouping batch {batch_id} is {status or 'unknown'} and cannot be rerun.")
     # Ignore any OTHER batch that's itself stale rather than genuinely active -
     # otherwise one orphaned batch (e.g. stuck since before this recovery
