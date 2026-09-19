@@ -5972,9 +5972,16 @@ def _run_grouping_adjacent_pass(
                 f"Trigger {entry_id} matched trigger {exit_id} via adjacency check (confidence {confidence:.2f})."
             )
 
-    for entry_group in pending_entry_groups:
+    for index, entry_group in enumerate(pending_entry_groups):
         if entry_group["entry_id"] in consumed:
             continue
+        if index > 0:
+            # Same spacing as the direct stage's chunk-to-chunk calls (see
+            # _GROUPING_VISION_CALL_INTERVAL_SECONDS below) - firing one call
+            # per identity entry back-to-back with zero gap is exactly the
+            # call-density pattern already suspected of correlating with
+            # provider-side throttling/hangs.
+            time.sleep(_GROUPING_VISION_CALL_INTERVAL_SECONDS)
         batch = [entry_group]
         _flush_batch()
 
@@ -6409,7 +6416,7 @@ def _current_kiosk_model_name(db: Session) -> str:
 
 _GROUPING_CHUNK_RETRY_MAX_ATTEMPTS = 3
 _GROUPING_CHUNK_RETRY_INTERVAL_SECONDS = 5.0
-_GROUPING_CHUNK_CALL_INTERVAL_SECONDS = 2.5
+_GROUPING_VISION_CALL_INTERVAL_SECONDS = 2.5
 
 
 def _grouping_chunk_response_is_visual_failure(gemini_result: dict[str, Any], *, chunk_trigger_count: int) -> bool:
@@ -6602,6 +6609,11 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
         grouped_trigger_ids.update(adjacent_group["entry"])
         grouped_trigger_ids.update(adjacent_group["exit"])
     notes.extend(adjacent_notes)
+    if adjacent_script_run_id is not None:
+        # Same reasoning as the spacing within each stage's own calls - give
+        # the provider a moment between adjacent's last call and direct's
+        # first rather than firing them back-to-back.
+        time.sleep(_GROUPING_VISION_CALL_INTERVAL_SECONDS)
     # adjacent_metas is intentionally NOT folded into raw_metas here - adjacent
     # now has its own independent script_run (adjacent_script_run_id) with its
     # own "calls" log, so mixing its calls into direct's "chunks"/cost_details
@@ -6942,7 +6954,7 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
                     # Spread chunk calls out a bit rather than firing them back-to-back -
                     # a suspected soft rate limit/throttle on the provider side seems to
                     # correlate with how many vision calls land in a short window.
-                    time.sleep(_GROUPING_CHUNK_CALL_INTERVAL_SECONDS)
+                    time.sleep(_GROUPING_VISION_CALL_INTERVAL_SECONDS)
 
                 call_result = _call_chunk_vision()
                 retry_attempts = 0
