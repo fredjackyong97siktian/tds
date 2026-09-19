@@ -6171,11 +6171,32 @@ def _call_grouping_vision(
             temperature=settings.grouping_temperature,
         )
 
-    return _run_with_hard_deadline(
-        _dispatch,
-        timeout_seconds=settings.vision_call_hard_deadline_seconds,
-        description="Grouping vision call",
-    )
+    # A dropped/truncated connection (e.g. IncompleteRead) or a one-off hang
+    # tripping the hard deadline is often a transient network blip, not a
+    # real failure of the call itself - retry a couple of times before
+    # giving up, instead of failing the whole grouping stage (and forcing an
+    # expensive full-batch retry) on one bad attempt. Mirrors _call_kiosk_vision.
+    last_exc: Exception | None = None
+    for attempt in range(1, _VISION_CALL_TRANSIENT_RETRY_ATTEMPTS + 1):
+        try:
+            return _run_with_hard_deadline(
+                _dispatch,
+                timeout_seconds=settings.vision_call_hard_deadline_seconds,
+                description="Grouping vision call",
+            )
+        except (http.client.HTTPException, URLError, ConnectionError, TimeoutError) as exc:
+            last_exc = exc
+            if attempt >= _VISION_CALL_TRANSIENT_RETRY_ATTEMPTS:
+                break
+            logger.warning(
+                "Grouping vision call hit a transient network error, retrying attempt=%s/%s error=%s",
+                attempt,
+                _VISION_CALL_TRANSIENT_RETRY_ATTEMPTS,
+                exc,
+            )
+            time.sleep(_VISION_CALL_TRANSIENT_RETRY_DELAY_SECONDS)
+    assert last_exc is not None
+    raise last_exc
 
 
 def _record_grouping_cost(db: Session, script_run_id: int, call_meta: Mapping[str, Any] | None) -> dict[str, Any] | None:
@@ -6283,8 +6304,8 @@ def _kiosk_openrouter_model_name(db: Session) -> str:
     return _OPENROUTER_MODELS.get(provider, next(iter(_OPENROUTER_MODELS.values())))
 
 
-_KIOSK_VISION_TRANSIENT_RETRY_ATTEMPTS = 3
-_KIOSK_VISION_TRANSIENT_RETRY_DELAY_SECONDS = 3.0
+_VISION_CALL_TRANSIENT_RETRY_ATTEMPTS = 3
+_VISION_CALL_TRANSIENT_RETRY_DELAY_SECONDS = 3.0
 
 
 def _call_kiosk_vision(
@@ -6352,7 +6373,7 @@ def _call_kiosk_vision(
     # couple of times before giving up, instead of failing the whole kiosk
     # item-counting summary on one bad read.
     last_exc: Exception | None = None
-    for attempt in range(1, _KIOSK_VISION_TRANSIENT_RETRY_ATTEMPTS + 1):
+    for attempt in range(1, _VISION_CALL_TRANSIENT_RETRY_ATTEMPTS + 1):
         try:
             return _run_with_hard_deadline(
                 _dispatch,
@@ -6361,15 +6382,15 @@ def _call_kiosk_vision(
             )
         except (http.client.HTTPException, URLError, ConnectionError, TimeoutError) as exc:
             last_exc = exc
-            if attempt >= _KIOSK_VISION_TRANSIENT_RETRY_ATTEMPTS:
+            if attempt >= _VISION_CALL_TRANSIENT_RETRY_ATTEMPTS:
                 break
             logger.warning(
                 "Kiosk vision call hit a transient network error, retrying attempt=%s/%s error=%s",
                 attempt,
-                _KIOSK_VISION_TRANSIENT_RETRY_ATTEMPTS,
+                _VISION_CALL_TRANSIENT_RETRY_ATTEMPTS,
                 exc,
             )
-            time.sleep(_KIOSK_VISION_TRANSIENT_RETRY_DELAY_SECONDS)
+            time.sleep(_VISION_CALL_TRANSIENT_RETRY_DELAY_SECONDS)
     assert last_exc is not None
     raise last_exc
 
