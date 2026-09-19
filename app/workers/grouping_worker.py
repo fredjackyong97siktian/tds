@@ -129,8 +129,24 @@ class GroupingWorker:
                     item["status"],
                 )
             if repositories.is_worker_paused(db, "grouping"):
+                logger.warning("Grouping worker is paused - skipping batch preparation and dispatch this poll")
                 return
-            if repositories.has_active_remote_analysis_script_run(db, script_names=["grouping"]):
+            blocking_runs = repositories.list_active_remote_analysis_script_runs(db, script_names=["grouping"])
+            if blocking_runs:
+                # This used to be a silent early return - a single leftover
+                # 'running' script_run row (with a runner_job_id, however that
+                # got set) here blocks EVERY future batch from ever being
+                # created or dispatched, with zero log trace, until something
+                # else clears that row. Confirmed live: this cost hours of
+                # missed grouping windows with nothing in the log to point at.
+                logger.warning(
+                    "Grouping dispatch blocked by %s active remote script_run row(s) still 'running': %s",
+                    len(blocking_runs),
+                    [
+                        {"id": row["id"], "runner_job_id": row["runner_job_id"], "started_at": str(row["started_at"])}
+                        for row in blocking_runs
+                    ],
+                )
                 return
             # Preparing (creating) due batch rows is cheap DB work, independent
             # of whether a dispatch slot is currently free - always run this so

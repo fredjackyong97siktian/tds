@@ -6866,6 +6866,46 @@ def has_active_remote_analysis_script_run(
     return result.first() is not None
 
 
+def list_active_remote_analysis_script_runs(
+    db: Session,
+    *,
+    script_names: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Same match criteria as has_active_remote_analysis_script_run, but
+    returns the actual row(s) instead of a bool - used purely for logging
+    *what* is blocking a dispatch cycle instead of leaving it a silent
+    mystery (see grouping_worker.py's _fill_available_slots)."""
+    script_run_table = _table("script_run")
+    normalized_names = [
+        str(script_name).strip().lower()
+        for script_name in (script_names or [])
+        if str(script_name or "").strip()
+    ]
+    params: dict[str, Any] = {}
+    name_clause = "script_name in ('entry', 'kiosk', 'kiosk_match', 'grouping')"
+    if normalized_names:
+        placeholders: list[str] = []
+        for index, script_name in enumerate(normalized_names):
+            key = f"script_name_{index}"
+            placeholders.append(f":{key}")
+            params[key] = script_name
+        name_clause = f"lower(script_name) in ({', '.join(placeholders)})"
+    result = db.execute(
+        text(
+            f"""
+            select id, script_name, runner_job_id, started_at
+            from {script_run_table}
+            where {name_clause}
+              and status = 'running'
+              and runner_job_id is not null
+            order by started_at asc
+            """
+        ),
+        params,
+    )
+    return _fetch_all_dicts(result)
+
+
 def list_stale_running_remote_analysis_script_runs(db: Session, *, stale_seconds: int) -> list[dict[str, Any]]:
     # has_active_remote_analysis_script_run() treats ANY 'running' row across
     # all four remote script types as a global single-flight lock - if a
