@@ -7998,10 +7998,19 @@ def force_recover_killed_grouping_batch(db: Session, *, batch_id: int) -> dict[s
     poll (a few seconds later) picks it up again, instead of it sitting
     invisible at 'running' until someone notices and clicks Retry.
     """
-    lock_conn = _try_acquire_theft_confidence_lock(batch_id, wait_seconds=0)
+    # A short wait, not 0 - if the lock is orphaned (its holder was just
+    # SIGKILLed, never ran its own release_lock() cleanup), MySQL usually
+    # detects the dead connection and releases it within a few seconds. This
+    # is called every poll now (see grouping_worker.py's
+    # _recover_orphaned_batches), so a still-held lock here just means the
+    # next poll's attempt gets another few seconds' chance instead of never
+    # being retried at all.
+    lock_conn = _try_acquire_theft_confidence_lock(batch_id, wait_seconds=5)
     if lock_conn is None:
         logger.warning(
-            "Could not force-recover killed grouping batch_id=%s - theft confidence lock is held for it", batch_id
+            "Could not force-recover killed grouping batch_id=%s - theft confidence lock is held for it "
+            "(will retry next poll)",
+            batch_id,
         )
         return {"ok": False, "batch_id": batch_id, "reason": "theft_confidence_lock_held"}
     try:

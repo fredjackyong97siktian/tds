@@ -49,42 +49,52 @@ class GroupingWorker:
             self._max_workers,
             self._stale_seconds,
         )
-        self._recover_orphaned_batches_on_startup()
+        self._recover_orphaned_batches()
         while True:
             try:
                 self._reap_finished_jobs()
                 self._kill_stale_jobs()
+                self._recover_orphaned_batches()
                 self._fill_available_slots()
             except Exception:
                 logger.exception("Grouping worker loop failed")
             time.sleep(poll_seconds)
 
-    def _recover_orphaned_batches_on_startup(self) -> None:
-        # self._running always starts empty, so this process cannot possibly
-        # have any of its own jobs genuinely in flight yet - any batch already
-        # sitting at 'dispatching'/'running' at this exact moment was left
-        # behind by a PREVIOUS process instance that died without a chance to
-        # clean up (most commonly: this very container being redeployed while
-        # a batch was mid-dispatch - an external kill, not the graceful
-        # _kill_stale_jobs path below, so that path's own auto-recovery never
-        # got a chance to run). Confirmed live: batch 180 sat at 'running'
-        # with no process behind it for 5+ hours after exactly this happened,
-        # invisible to every other check in this file.
+    def _recover_orphaned_batches(self) -> None:
+        # Any batch sitting at 'dispatching'/'running' that ISN'T in
+        # self._running cannot possibly have a live process behind it in
+        # this instance - either this process just started (self._running
+        # starts empty, so nothing here yet is genuinely in flight), or
+        # _kill_stale_jobs already popped it after killing its process.
+        # Called every poll, not just once at startup or once right after a
+        # kill, because a single recovery attempt can itself fail - most
+        # notably when the killed process was itself mid theft-confidence
+        # analysis for this same batch: a SIGKILL never runs its own
+        # release_lock() cleanup, so force_recover_killed_grouping_batch's
+        # own lock-acquisition guard sees that orphaned lock as "still held"
+        # and refuses to proceed. Confirmed live: batch 180 got stuck exactly
+        # this way, with nothing left to ever retry it since recovery used to
+        # only ever be attempted once. Retrying every poll gives MySQL's own
+        # dead-connection detection time to release the orphaned lock, and
+        # keeps trying until it does.
+        with self._lock:
+            currently_tracked = set(self._running.keys())
         db = TransactionalSessionLocal()
         try:
             orphaned = repositories.list_running_grouping_batches(db)
             for row in orphaned:
                 batch_id = int(row["id"])
+                if batch_id in currently_tracked:
+                    continue
                 logger.warning(
-                    "Recovering orphaned grouping batch_id=%s (status=%s) found already running at worker startup "
-                    "- no process in this instance can own it, so it was abandoned by a previous one",
+                    "Recovering orphaned grouping batch_id=%s (status=%s) - no process in this instance owns it",
                     batch_id,
                     row.get("status"),
                 )
                 try:
                     workflow_service.force_recover_killed_grouping_batch(db, batch_id=batch_id)
                 except Exception:
-                    logger.exception("Could not recover orphaned grouping batch_id=%s at startup", batch_id)
+                    logger.exception("Could not recover orphaned grouping batch_id=%s", batch_id)
         finally:
             db.close()
 
@@ -130,20 +140,13 @@ class GroupingWorker:
             job.process.wait()
             with self._lock:
                 self._running.pop(batch_id, None)
-            # A SIGKILL never runs the batch's own except-handling, so without
-            # this it's left stuck at 'running' forever - invisible to
-            # list_pending_grouping_batches (status='pending' only) and only
-            # reachable afterwards via a manual Retry click once it also
-            # crosses the separate 45-minute age-based staleness gate. Requeue
-            # it immediately instead, straight back to 'pending', so the next
-            # poll picks it up on its own.
-            db = TransactionalSessionLocal()
-            try:
-                workflow_service.force_recover_killed_grouping_batch(db, batch_id=batch_id)
-            except Exception:
-                logger.exception("Could not force-recover killed grouping batch_id=%s", batch_id)
-            finally:
-                db.close()
+            # Recovery itself (resetting the batch back to 'pending') is left
+            # to _recover_orphaned_batches, called right after this in the
+            # same poll - now that the batch is popped from self._running,
+            # that pass picks it up naturally. Doing it here too would
+            # double-process the same batch in one poll (reset it, then
+            # immediately reset it again) whenever the first attempt
+            # succeeds before the second one runs.
 
     def _fill_available_slots(self) -> None:
         db = TransactionalSessionLocal()
