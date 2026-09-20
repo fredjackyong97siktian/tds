@@ -86,10 +86,21 @@ class Settings(BaseSettings):
     time_period_timezone: str = "Asia/Kuala_Lumpur"
     grouping_poll_seconds: int = 30
     grouping_max_global_workers: int = 1
-    grouping_stale_process_seconds: int = 900
+    # Must comfortably exceed _call_vision_with_retry's own worst case
+    # (3 attempts x vision_call_hard_deadline_seconds, plus retry delays -
+    # currently ~1446s at 480s/attempt), or this outer subprocess watchdog
+    # can fire and kill a batch WHILE its inner retry is still legitimately
+    # working within its own allowed budget, immediately requeue it, and
+    # repeat forever - confirmed live: a batch got stuck in exactly this
+    # kill-recover-reclaim-kill loop every ~15 minutes once the hard deadline
+    # was raised without raising this to match, permanently occupying the
+    # only dispatch slot and starving every other due window.
+    grouping_stale_process_seconds: int = 3600
     theft_confidence_poll_seconds: int = 30
     theft_confidence_max_global_workers: int = 1
-    theft_confidence_stale_process_seconds: int = 900
+    # Same reasoning as grouping_stale_process_seconds above - carry-item-
+    # signal calls go through the same _call_vision_with_retry.
+    theft_confidence_stale_process_seconds: int = 3600
     filter_long_stay_seconds: int = 300
     filter_low_purchase_quantity: int = 1
     filter_low_purchase_value: int = 1000
