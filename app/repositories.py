@@ -6432,6 +6432,69 @@ def finish_script_run(
     db.commit()
 
 
+def append_script_run_call(db: Session, script_run_id: int, call_entry: Mapping[str, Any]) -> None:
+    """Incrementally persists one vision-call attempt (full request + response
+    or error) into a script_run's own stdout_log the moment it happens -
+    NOT buffered in memory until the whole batch/stage finishes. Without
+    this, a manually-stopped or crashed run loses every already-completed
+    call's detail even though a real, billed API call did happen - confirmed
+    live: script_run 7844 had real OpenRouter cost recorded but an empty
+    stdout, because the old code only ever wrote stdout_log once at the very
+    end via finish_script_run.
+
+    Read-modify-write on the same row - acceptable here since grouping_
+    max_global_workers=1 means calls for one script_run are made
+    sequentially by a single process, never concurrently.
+    """
+    script_run_table = _table("script_run")
+    row = db.execute(
+        text(f"select stdout_log from {script_run_table} where id = :script_run_id"),
+        {"script_run_id": script_run_id},
+    ).mappings().first()
+    current_stdout = (row or {}).get("stdout_log") or ""
+    try:
+        parsed = json.loads(current_stdout) if current_stdout else {}
+        if not isinstance(parsed, dict):
+            parsed = {}
+    except json.JSONDecodeError:
+        parsed = {}
+    calls = parsed.get("calls")
+    if not isinstance(calls, list):
+        calls = []
+    calls.append(dict(call_entry))
+    parsed["calls"] = calls
+    db.execute(
+        text(f"update {script_run_table} set stdout_log = :stdout_log where id = :script_run_id"),
+        {"stdout_log": json.dumps(parsed, default=str), "script_run_id": script_run_id},
+    )
+    db.commit()
+
+
+def merge_script_run_stdout_fields(db: Session, script_run_id: int, extra_fields: Mapping[str, Any]) -> str:
+    """Adds/overwrites top-level keys in a script_run's stdout_log JSON
+    without touching whatever append_script_run_call already wrote there
+    (in particular the "calls" array) - used by a stage's own final
+    finish_script_run call so its summary (matched_groups, notes, etc.)
+    lands alongside the incrementally-recorded calls instead of replacing
+    them outright. Returns the merged JSON string to pass straight into
+    finish_script_run's stdout_log argument.
+    """
+    script_run_table = _table("script_run")
+    row = db.execute(
+        text(f"select stdout_log from {script_run_table} where id = :script_run_id"),
+        {"script_run_id": script_run_id},
+    ).mappings().first()
+    current_stdout = (row or {}).get("stdout_log") or ""
+    try:
+        parsed = json.loads(current_stdout) if current_stdout else {}
+        if not isinstance(parsed, dict):
+            parsed = {}
+    except json.JSONDecodeError:
+        parsed = {}
+    parsed.update(extra_fields)
+    return json.dumps(parsed, default=str)
+
+
 def update_script_run_cost(
     db: Session,
     script_run_id: int,

@@ -3407,6 +3407,7 @@ def _repair_grouping_with_gemini(
             image_urls=image_urls,
             gemini_model_name=None,
             gemini_resize_scale=None,
+            script_run_id=repair_script_run_id,
         )
         repair_cost = _record_grouping_cost(db, repair_script_run_id, repair_meta)
         _persist_trigger_unique_customer_counts(db, repair_result, source="repair")
@@ -3416,14 +3417,16 @@ def _repair_grouping_with_gemini(
             db,
             repair_script_run_id,
             status="failed",
-            stdout_log=json.dumps(
+            # Merges into the "calls" already incrementally persisted by
+            # _call_vision_with_retry, instead of replacing them.
+            stdout_log=repositories.merge_script_run_stdout_fields(
+                db,
+                repair_script_run_id,
                 {
                     "candidate_trigger_ids": candidate_trigger_ids,
                     "image_count": len(image_urls),
                     "image_mapping": image_notes,
                 },
-                indent=2,
-                default=str,
             ),
             stderr_log=str(exc),
         )
@@ -3533,7 +3536,11 @@ def _repair_grouping_with_gemini(
         db,
         repair_script_run_id,
         status="success",
-        stdout_log=json.dumps(
+        # Merges into the "calls" already incrementally persisted by
+        # _call_vision_with_retry, instead of replacing them.
+        stdout_log=repositories.merge_script_run_stdout_fields(
+            db,
+            repair_script_run_id,
             {
                 "candidate_trigger_ids": candidate_trigger_ids,
                 "image_mapping": image_notes,
@@ -3552,8 +3559,6 @@ def _repair_grouping_with_gemini(
                 "main_call": _compact_gemini_meta_for_log(repair_meta),
                 "verification_calls": [_compact_gemini_meta_for_log(meta) for meta in repair_verification_metas],
             },
-            indent=2,
-            default=str,
         ),
         stderr_log="",
     )
@@ -5607,6 +5612,7 @@ def _verify_gemini_grouping_match(
             image_urls=image_urls,
             gemini_model_name=model_name,
             gemini_resize_scale=resize_scale,
+            script_run_id=script_run_id,
         )
         _record_grouping_cost(db, script_run_id, meta)
     except Exception as exc:
@@ -5704,6 +5710,7 @@ def _verify_gemini_grouping_matches_batch(
             image_urls=image_urls,
             gemini_model_name=model_name,
             gemini_resize_scale=resize_scale,
+            script_run_id=script_run_id,
         )
         _record_grouping_cost(db, script_run_id, meta)
     except Exception:
@@ -5936,6 +5943,7 @@ def _verify_entry_groups_against_candidates_batch(
             image_urls=image_urls,
             gemini_model_name=model_name,
             gemini_resize_scale=resize_scale,
+            script_run_id=script_run_id,
         )
         if meta is not None:
             meta["group_blocks"] = group_blocks
@@ -6176,15 +6184,19 @@ def _run_grouping_adjacent_pass(
         db,
         adjacent_script_run_id,
         status="success",
-        stdout_log=json.dumps(
+        # Merges into the "calls" already incrementally persisted by
+        # _call_vision_with_retry (see append_script_run_call) as each entry
+        # was checked - does NOT overwrite them with [_compact_gemini_meta_
+        # for_log(meta) for meta in metas], which would lose every attempt
+        # except the final successful one per entry.
+        stdout_log=repositories.merge_script_run_stdout_fields(
+            db,
+            adjacent_script_run_id,
             {
                 "identity_entry_count": len(pending_entry_groups),
                 "matched_groups": groups,
                 "remaining_trigger_ids": sorted(int(item["trigger_id"]) for item in remaining),
-                "calls": [_compact_gemini_meta_for_log(meta) for meta in metas],
             },
-            indent=2,
-            default=str,
         ),
         stderr_log="",
     )
@@ -6306,17 +6318,26 @@ def _call_vision_with_retry(
     description: str,
     prompt: str,
     image_urls: list[str],
+    db: Session | None = None,
+    script_run_id: int | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Wraps a provider dispatch call with the hard wall-clock deadline (see
     _run_with_hard_deadline) and a transient-error retry (a dropped/truncated
     connection, or the hard deadline itself tripping, is often a one-off
     network blip rather than a real failure of the call). Records the full
     request and response/error for EVERY attempt - not just a duration/outcome
-    summary - so the actual API traffic is visible in the script_run's own
-    stored log instead of only in server logs, whether the call ultimately
-    succeeds or fails. On success this rides along as "retry_attempts" in the
-    returned meta; on total failure it's the raised exception's own message
-    (as JSON), since there's no meta to attach it to at that point.
+    summary.
+
+    When db+script_run_id are given, each attempt is persisted to that
+    script_run's own stdout_log IMMEDIATELY (see
+    repositories.append_script_run_call), not buffered in memory until the
+    whole batch/stage finishes - a manually-stopped or crashed run still
+    keeps every already-completed call's real request/response, even though
+    it was billed. Confirmed live: script_run 7844 had real OpenRouter cost
+    recorded but an empty stdout, because the old code only ever wrote
+    stdout_log once at the very end. It also still rides along as
+    "retry_attempts" in the returned meta for callers that fold multiple
+    calls' metas into their own final summary.
 
     Only the narrow, genuinely-transient exception set is actually retried
     (dropped connection, our own hard-deadline timeout) - anything else (a
@@ -6330,6 +6351,15 @@ def _call_vision_with_retry(
         "image_count": len(image_urls),
         "image_urls": image_urls,
     }
+
+    def _persist(entry: dict[str, Any]) -> None:
+        if db is None or script_run_id is None:
+            return
+        try:
+            repositories.append_script_run_call(db, script_run_id, entry)
+        except Exception:
+            logger.exception("Could not persist vision call attempt for script_run_id=%s", script_run_id)
+
     attempt_log: list[dict[str, Any]] = []
     last_exc: Exception | None = None
     for attempt in range(1, _VISION_CALL_TRANSIENT_RETRY_ATTEMPTS + 1):
@@ -6343,15 +6373,15 @@ def _call_vision_with_retry(
         except Exception as exc:
             duration = round(time.monotonic() - started, 1)
             is_transient = isinstance(exc, (http.client.HTTPException, URLError, ConnectionError, TimeoutError))
-            attempt_log.append(
-                {
-                    "attempt": attempt,
-                    "duration_seconds": duration,
-                    "outcome": "timeout" if isinstance(exc, TimeoutError) else ("network_error" if is_transient else "error"),
-                    "error": str(exc),
-                    "request": request_detail,
-                }
-            )
+            entry = {
+                "attempt": attempt,
+                "duration_seconds": duration,
+                "outcome": "timeout" if isinstance(exc, TimeoutError) else ("network_error" if is_transient else "error"),
+                "error": str(exc),
+                "request": request_detail,
+            }
+            attempt_log.append(entry)
+            _persist(entry)
             last_exc = exc
             if not is_transient or attempt >= _VISION_CALL_TRANSIENT_RETRY_ATTEMPTS:
                 break
@@ -6364,18 +6394,18 @@ def _call_vision_with_retry(
             )
             time.sleep(_VISION_CALL_TRANSIENT_RETRY_DELAY_SECONDS)
             continue
-        attempt_log.append(
-            {
-                "attempt": attempt,
-                "duration_seconds": round(time.monotonic() - started, 1),
-                "outcome": "success",
-                "request": request_detail,
-                "response": {
-                    "raw_response": (meta or {}).get("raw_response"),
-                    "raw_usage": (meta or {}).get("raw_usage"),
-                },
-            }
-        )
+        entry = {
+            "attempt": attempt,
+            "duration_seconds": round(time.monotonic() - started, 1),
+            "outcome": "success",
+            "request": request_detail,
+            "response": {
+                "raw_response": (meta or {}).get("raw_response"),
+                "raw_usage": (meta or {}).get("raw_usage"),
+            },
+        }
+        attempt_log.append(entry)
+        _persist(entry)
         if meta is not None:
             meta = {**meta, "retry_attempts": attempt_log}
         return result, meta
@@ -6393,6 +6423,7 @@ def _call_grouping_vision(
     gemini_model_name: str | None,
     gemini_resize_scale: float | None,
     allow_text_only: bool = False,
+    script_run_id: int | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Single dispatch point for every grouping-related vision call (chunk
     scan, adjacent, verification, repair, carry-item-signal) - picks whichever
@@ -6449,7 +6480,14 @@ def _call_grouping_vision(
             temperature=settings.grouping_temperature,
         )
 
-    return _call_vision_with_retry(_dispatch, description="Grouping vision call", prompt=prompt, image_urls=image_urls)
+    return _call_vision_with_retry(
+        _dispatch,
+        description="Grouping vision call",
+        prompt=prompt,
+        image_urls=image_urls,
+        db=db,
+        script_run_id=script_run_id,
+    )
 
 
 def _record_grouping_cost(db: Session, script_run_id: int, call_meta: Mapping[str, Any] | None) -> dict[str, Any] | None:
@@ -6569,6 +6607,7 @@ def _call_kiosk_vision(
     gemini_model_name: str | None = None,
     gemini_resize_scale: float | None = None,
     allow_text_only: bool = False,
+    script_run_id: int | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Single dispatch point for kiosk identity+item-counting calls - mirrors
     _call_grouping_vision exactly but reads _current_kiosk_provider, so kiosk
@@ -6621,7 +6660,14 @@ def _call_kiosk_vision(
             temperature=settings.grouping_temperature,
         )
 
-    return _call_vision_with_retry(_dispatch, description="Kiosk vision call", prompt=prompt, image_urls=image_urls)
+    return _call_vision_with_retry(
+        _dispatch,
+        description="Kiosk vision call",
+        prompt=prompt,
+        image_urls=image_urls,
+        db=db,
+        script_run_id=script_run_id,
+    )
 
 
 def _current_kiosk_model_name(db: Session) -> str:
@@ -7145,6 +7191,7 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
                             image_urls=image_urls,
                             gemini_model_name=model_name,
                             gemini_resize_scale=resize_scale,
+                            script_run_id=script_run_id,
                         )
                     except Exception as exc:
                         # A truly empty/unparseable response (e.g. _extract_json_object's
@@ -7534,7 +7581,11 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
             db,
             script_run_id,
             status="failed",
-            stdout_log="",
+            # Preserves whatever _call_vision_with_retry already
+            # incrementally persisted for earlier chunks in this same loop,
+            # instead of hardcoding "" and losing every already-completed
+            # (and billed) call the moment a later chunk fails.
+            stdout_log=repositories.merge_script_run_stdout_fields(db, script_run_id, {}),
             stderr_log=str(exc),
         )
         raise
@@ -7632,7 +7683,12 @@ def start_grouping_analysis_job(job: GroupingAnalysisQueued) -> ScriptExecutionR
             db,
             script_run_id,
             status="success",
-            stdout_log=json.dumps(
+            # Merges into the "calls" already incrementally persisted by
+            # _call_vision_with_retry (each chunk's own attempt(s)) as the
+            # chunk-scan loop ran, instead of replacing them.
+            stdout_log=repositories.merge_script_run_stdout_fields(
+                db,
+                script_run_id,
                 {
                     "grouping_summary": grouping_summary,
                     "gemini_meta": _compact_gemini_meta_for_log(gemini_meta),
@@ -7641,8 +7697,6 @@ def start_grouping_analysis_job(job: GroupingAnalysisQueued) -> ScriptExecutionR
                         "message": "Theft confidence worker will process this successful grouping batch.",
                     },
                 },
-                indent=2,
-                default=str,
             ),
             stderr_log="",
         )
@@ -7670,7 +7724,12 @@ def start_grouping_analysis_job(job: GroupingAnalysisQueued) -> ScriptExecutionR
                 db,
                 script_run_id,
                 status="failed",
-                stdout_log="",
+                # Preserves whatever _call_vision_with_retry already
+                # incrementally persisted into "calls" for this run - this
+                # used to hardcode "" here, wiping out every already-completed
+                # (and billed) call's request/response the moment the batch
+                # failed for any reason, including a manual Stop.
+                stdout_log=repositories.merge_script_run_stdout_fields(db, script_run_id, {}),
                 stderr_log=str(exc),
             )
         repositories.update_grouping_batch(
@@ -8715,6 +8774,7 @@ def _evaluate_carry_item_signal_with_ai(
             gemini_model_name=model_name,
             gemini_resize_scale=None,
             allow_text_only=True,
+            script_run_id=script_run_id,
         )
         cost_detail = _record_grouping_cost(db, script_run_id, meta)
         normalized = {
@@ -8742,7 +8802,9 @@ def _evaluate_carry_item_signal_with_ai(
             db,
             script_run_id,
             status="success",
-            stdout_log=json.dumps(normalized, indent=2, default=str),
+            # Merges into the "calls" already incrementally persisted by
+            # _call_vision_with_retry, instead of replacing them.
+            stdout_log=repositories.merge_script_run_stdout_fields(db, script_run_id, normalized),
             stderr_log="",
         )
         return normalized
@@ -8752,7 +8814,9 @@ def _evaluate_carry_item_signal_with_ai(
             db,
             script_run_id,
             status="failed",
-            stdout_log="",
+            # Preserves whatever _call_vision_with_retry already
+            # incrementally persisted, instead of hardcoding "".
+            stdout_log=repositories.merge_script_run_stdout_fields(db, script_run_id, {}),
             stderr_log=str(exc),
         )
         return {
