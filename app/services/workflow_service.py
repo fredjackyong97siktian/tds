@@ -4676,16 +4676,6 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
     prepared: list[dict[str, Any]] = []
     current = _time_period_now()
     for location_id in location_ids:
-        # Fetched once per location and reused for both the 'avoid'/'missed'
-        # placeholder batches below and the normal due-window flow further
-        # down - list_manual_grouping_ready_trigger_frame_assets already
-        # excludes anything already linked to active/grouped work, so the
-        # same rows are safe to check against every window's range in turn.
-        location_ready_assets = repositories.list_manual_grouping_ready_trigger_frame_assets(
-            db,
-            location_id=location_id,
-            limit=1000,
-        )
         for period in _unselected_grouping_periods_for_location(periods, location_id):
             period_window_start, period_window_end = _last_completed_period_window(period, now=current)
             if period_window_end > current:
@@ -4851,8 +4841,7 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
                 location_id,
                 requeued_count,
             )
-        ready_assets = location_ready_assets
-        for period in selected_periods if ready_assets else []:
+        for period in selected_periods:
             window_start, window_end = _last_completed_period_window(period, now=current)
             if not _is_recently_completed_grouping_window(window_end, current):
                 continue
@@ -4896,9 +4885,25 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
             ):
                 continue
 
+            # Fetched scoped to THIS window (plus its carry-forward buffer)
+            # directly in SQL, not filtered client-side out of a flat,
+            # location-wide "oldest N" list - the latter silently excluded
+            # a genuinely-due window's own triggers once the location's
+            # overall backlog of ready-but-unlinked triggers (e.g. from
+            # older 'missed'/'avoid' windows, before those linked their own
+            # triggers) exceeded the old fetch's cap. Confirmed live: this is
+            # exactly why today's early_evening window never got a batch
+            # despite every one of its own triggers being fully ready and
+            # completely unlinked.
+            window_ready_assets = repositories.list_ready_trigger_frame_assets_in_window(
+                db,
+                location_id=location_id,
+                window_start=carry_forward_cutoff,
+                window_end=window_end,
+            )
             current_window_rows: list[dict[str, Any]] = []
             carried_over_rows: list[dict[str, Any]] = []
-            for row in ready_assets:
+            for row in window_ready_assets:
                 grouping_time = _grouping_time_from_trigger_frame_asset(row)
                 if grouping_time is None:
                     continue

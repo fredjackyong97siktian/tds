@@ -2341,10 +2341,13 @@ def has_pending_trigger_frame_retrieval_in_window(
     # trigger set, exactly like trigger 454 and 410 slipping through. Below
     # that completeness threshold, not below the full count - retry attempts
     # for a still-short asset are capped (see requeue_incomplete_trigger_frame_
-    # assets_in_window), so waiting for 100% here would mean waiting forever
-    # once retries run out and a trigger is permanently stuck a frame or two
-    # short - confirmed live: trigger 2529 stuck at 5/6 blocked its entire
-    # window's batch indefinitely with no automatic recovery.
+    # assets_in_window's own retry_count < max_attempts guard), so a
+    # 'retrieved' row that's ALREADY used up MAX_FRAME_RETRIEVAL_ATTEMPTS is
+    # excluded here too - its current partial frame set is as good as it will
+    # ever get, so it must not keep counting as "still pending" forever.
+    # Confirmed live twice now: trigger 2529 (5/6) and again a later one
+    # (also 5/6) each blocked their entire window's batch indefinitely with
+    # no automatic recovery, because this check had no such cap of its own.
     # 'processed' is included as terminal because a trigger just inside this
     # window's carry-forward buffer can already have been fully consumed by an
     # earlier, adjacent period's batch (mark_grouping_batch_frame_assets_processed)
@@ -2372,7 +2375,11 @@ def has_pending_trigger_frame_retrieval_in_window(
               and (
                   fa.id is null
                   or fa.status not in ('retrieved', 'processed', 'issue')
-                  or (fa.status = 'retrieved' and coalesce(okc.ok_count, 0) < :min_frame_count * :completeness_threshold)
+                  or (
+                      fa.status = 'retrieved'
+                      and coalesce(okc.ok_count, 0) < :min_frame_count * :completeness_threshold
+                      and fa.retry_count < :max_attempts
+                  )
               )
             limit 1
             """
@@ -2383,6 +2390,7 @@ def has_pending_trigger_frame_retrieval_in_window(
             "window_end": window_end,
             "min_frame_count": max(1, int(min_frame_count)),
             "completeness_threshold": max(0.0, min(1.0, float(settings.grouping_frame_completeness_threshold))),
+            "max_attempts": MAX_FRAME_RETRIEVAL_ATTEMPTS,
         },
     )
     return result.first() is not None
