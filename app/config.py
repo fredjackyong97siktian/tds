@@ -85,7 +85,16 @@ class Settings(BaseSettings):
     grouping_frame_completeness_threshold: float = 0.8
     time_period_timezone: str = "Asia/Kuala_Lumpur"
     grouping_poll_seconds: int = 30
-    grouping_max_global_workers: int = 1
+    # With only 1 slot, a single slow/retrying batch (now allowed up to
+    # ~3600s before the stale-process watchdog even considers it stuck)
+    # fully blocks every OTHER due window behind it for that whole time -
+    # confirmed live: batch 192 (early_night) sat ahead of a genuinely-ready
+    # late_night window in list_pending_grouping_batches's window_start-
+    # ordered queue, so late_night couldn't get a turn no matter how long it
+    # waited. 2 slots means one problem batch can no longer starve
+    # everything else; grouping calls are mostly network-wait time, not
+    # CPU-bound, so a second concurrent one is cheap even on a small host.
+    grouping_max_global_workers: int = 2
     # Must comfortably exceed _call_vision_with_retry's own worst case
     # (3 attempts x vision_call_hard_deadline_seconds, plus retry delays -
     # currently ~1446s at 480s/attempt), or this outer subprocess watchdog
