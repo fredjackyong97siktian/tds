@@ -7663,7 +7663,20 @@ def _retry_grouping_batch_now_locked(db: Session, *, batch_id: int) -> dict[str,
             },
         )
         status = str(batch.get("status") or "").strip().lower()
-    if status not in {"success", "failed", "issue", "missed", "avoid", "cancel", "canceled", "cancelled"}:
+    if status in {"missed", "avoid"}:
+        # These are placeholder rows prepare_due_grouping_batches creates purely
+        # for visibility (a window past grace, or one whose period isn't active
+        # for this location) - unlike a real failed/issue batch, no
+        # filter_grouping_item rows were ever populated for it, so retrying
+        # would just hit "No trigger frame images are available" immediately.
+        # Use a manual grouping batch (grouping/self-group, or the date-range
+        # form) instead - that path actually discovers and links the ready
+        # triggers for the window before dispatching.
+        raise ValueError(
+            f"Grouping batch {batch_id} is '{status}' - it was never linked to any triggers, so it can't be "
+            "retried directly. Use a manual grouping batch for that time range instead if you want it processed."
+        )
+    if status not in {"success", "failed", "issue", "cancel", "canceled", "cancelled"}:
         raise ValueError(f"Grouping batch {batch_id} is {status or 'unknown'} and cannot be rerun.")
     # Ignore any OTHER batch that's itself stale rather than genuinely active -
     # otherwise one orphaned batch (e.g. stuck since before this recovery
