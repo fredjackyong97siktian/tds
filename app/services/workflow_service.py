@@ -4658,7 +4658,12 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
                 batch_id=int(avoid_batch["id"]),
                 window_start=period_window_start,
                 window_end=period_window_end,
-                ready_assets=location_ready_assets,
+                ready_assets=repositories.list_ready_trigger_frame_assets_in_window(
+                    db,
+                    location_id=location_id,
+                    window_start=period_window_start,
+                    window_end=period_window_end,
+                ),
             )
             repositories.update_grouping_batch(
                 db,
@@ -4734,7 +4739,12 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
                         batch_id=int(missed_batch["id"]),
                         window_start=period_window_start,
                         window_end=period_window_end,
-                        ready_assets=location_ready_assets,
+                        ready_assets=repositories.list_ready_trigger_frame_assets_in_window(
+                            db,
+                            location_id=location_id,
+                            window_start=period_window_start,
+                            window_end=period_window_end,
+                        ),
                     )
                     repositories.update_grouping_batch(
                         db,
@@ -7738,17 +7748,24 @@ def _retry_grouping_batch_now_locked(db: Session, *, batch_id: int) -> dict[str,
         # window - the same discovery Run By Time Range uses - so an
         # already-existing empty batch like this gets fixed retroactively
         # too, not just ones created after this existed.
-        location_ready_assets = repositories.list_manual_grouping_ready_trigger_frame_assets(
+        # Scoped by window in SQL, NOT a flat location-wide "oldest N" list
+        # filtered client-side afterward - the latter silently drops anything
+        # past its cap once the location's overall ready-but-unlinked backlog
+        # exceeds it, even when this exact window is nowhere near that cap.
+        # Confirmed live: 19 clearly-eligible, fully unlinked triggers inside
+        # this batch's own window were invisible until this was fixed.
+        window_ready_assets = repositories.list_ready_trigger_frame_assets_in_window(
             db,
             location_id=int(batch["location_id"]),
-            limit=1000,
+            window_start=batch["window_start"],
+            window_end=batch["window_end"],
         )
         linked_count = _link_ready_triggers_into_batch(
             db,
             batch_id=batch_id,
             window_start=batch["window_start"],
             window_end=batch["window_end"],
-            ready_assets=location_ready_assets,
+            ready_assets=window_ready_assets,
         )
         if linked_count:
             logger.warning(

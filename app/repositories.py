@@ -2520,6 +2520,91 @@ def list_manual_grouping_ready_trigger_frame_assets(
     return rows
 
 
+def list_ready_trigger_frame_assets_in_window(
+    db: Session,
+    *,
+    location_id: int,
+    window_start: Any,
+    window_end: Any,
+    limit: int = 2000,
+) -> list[dict[str, Any]]:
+    """Same eligibility rule as list_manual_grouping_ready_trigger_frame_assets
+    (retrieved, not whitelisted, not already linked to active/grouped work),
+    but filtered by trigger_time IN SQL instead of fetched as a flat
+    location-wide "oldest N" list and filtered client-side afterward. The
+    latter silently drops anything past the cap once the location's overall
+    backlog of ready-but-unlinked triggers exceeds the limit, even when the
+    specific window being asked about is nowhere near that cap itself -
+    confirmed live: 19 clearly-eligible, completely unlinked triggers inside
+    a batch's own window were invisible to the self-heal retry path because
+    of exactly this.
+    """
+    frame_asset_table = _table("trigger_frame_asset")
+    frame_table = _table("trigger_frame")
+    trigger_table = _table("trigger_event")
+    grouping_item_table = _table("filter_grouping_item")
+    grouping_batch_table = _table("filter_grouping_batch")
+    result = db.execute(
+        text(
+            f"""
+            select te.id as trigger_id,
+                   te.location_id,
+                   te.trigger_time,
+                   te.phone_entry_id,
+                   te.credit_card_entry_id,
+                   te.entry_source_type,
+                   fa.id as frame_asset_id,
+                   fa.start_time as frame_asset_start_time,
+                   fa.end_time as frame_asset_end_time,
+                   fa.status as frame_asset_status,
+                   fa.created_at as frame_asset_created_at
+            from {trigger_table} te
+            join {frame_asset_table} fa on fa.trigger_id = te.id
+            where te.location_id = :location_id
+              and te.whitelist_hit = 0
+              and te.status <> 'whitelisted'
+              and fa.status = 'retrieved'
+              and te.trigger_time >= :window_start
+              and te.trigger_time < :window_end
+              and not exists (
+                  select 1
+                  from {grouping_item_table} gi
+                  join {grouping_batch_table} gb on gb.id = gi.batch_id
+                  where gi.trigger_id = te.id
+                    and (
+                        gb.status in ('pending', 'dispatching', 'running')
+                        or gi.status = 'grouped'
+                    )
+              )
+            order by te.trigger_time asc, te.id asc, fa.id asc
+            limit :limit
+            """
+        ),
+        {"location_id": location_id, "window_start": window_start, "window_end": window_end, "limit": limit},
+    )
+    rows = _fetch_all_dicts(result)
+    frame_asset_ids = [int(row["frame_asset_id"]) for row in rows if row.get("frame_asset_id") is not None]
+    frames_by_asset: dict[int, list[dict[str, Any]]] = {}
+    if frame_asset_ids:
+        frame_result = db.execute(
+            text(
+                f"""
+                select id, frame_asset_id, trigger_id, frame_index, sample_time, image_url, status, created_at
+                from {frame_table}
+                where frame_asset_id in :frame_asset_ids
+                  and status <> 'deleted'
+                order by frame_asset_id asc, frame_index asc, id asc
+                """
+            ).bindparams(bindparam("frame_asset_ids", expanding=True)),
+            {"frame_asset_ids": frame_asset_ids},
+        )
+        for frame in _fetch_all_dicts(frame_result):
+            frames_by_asset.setdefault(int(frame["frame_asset_id"]), []).append(frame)
+    for row in rows:
+        row["trigger_frames"] = frames_by_asset.get(int(row["frame_asset_id"]), [])
+    return rows
+
+
 def list_ungrouped_trigger_ids_in_window(
     db: Session, *, location_id: int, window_start: Any, window_end: Any
 ) -> list[int]:
