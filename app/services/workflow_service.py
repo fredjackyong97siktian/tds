@@ -6304,17 +6304,32 @@ def _call_vision_with_retry(
     dispatch: Callable[[], tuple[dict[str, Any], dict[str, Any] | None]],
     *,
     description: str,
+    prompt: str,
+    image_urls: list[str],
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Wraps a provider dispatch call with the hard wall-clock deadline (see
     _run_with_hard_deadline) and a transient-error retry (a dropped/truncated
     connection, or the hard deadline itself tripping, is often a one-off
-    network blip rather than a real failure of the call) - and records what
-    actually happened on every attempt (duration, outcome, error) so it's
-    visible in the script_run's own stored log, not just server logs. On
-    success this rides along as "retry_attempts" in the returned meta; on
-    total failure it's folded into the raised exception's own message, since
-    there's no meta to attach it to at that point.
+    network blip rather than a real failure of the call). Records the full
+    request and response/error for EVERY attempt - not just a duration/outcome
+    summary - so the actual API traffic is visible in the script_run's own
+    stored log instead of only in server logs, whether the call ultimately
+    succeeds or fails. On success this rides along as "retry_attempts" in the
+    returned meta; on total failure it's the raised exception's own message
+    (as JSON), since there's no meta to attach it to at that point.
+
+    Only the narrow, genuinely-transient exception set is actually retried
+    (dropped connection, our own hard-deadline timeout) - anything else (a
+    real HTTP error, a parsing failure) is logged with full detail and
+    raised immediately rather than burning 2 more attempts on an error that
+    will never resolve itself.
     """
+    request_detail = {
+        "prompt_chars": len(prompt),
+        "prompt_preview": prompt[:2000],
+        "image_count": len(image_urls),
+        "image_urls": image_urls,
+    }
     attempt_log: list[dict[str, Any]] = []
     last_exc: Exception | None = None
     for attempt in range(1, _VISION_CALL_TRANSIENT_RETRY_ATTEMPTS + 1):
@@ -6325,18 +6340,20 @@ def _call_vision_with_retry(
                 timeout_seconds=settings.vision_call_hard_deadline_seconds,
                 description=description,
             )
-        except (http.client.HTTPException, URLError, ConnectionError, TimeoutError) as exc:
+        except Exception as exc:
             duration = round(time.monotonic() - started, 1)
+            is_transient = isinstance(exc, (http.client.HTTPException, URLError, ConnectionError, TimeoutError))
             attempt_log.append(
                 {
                     "attempt": attempt,
                     "duration_seconds": duration,
-                    "outcome": "timeout" if isinstance(exc, TimeoutError) else "network_error",
+                    "outcome": "timeout" if isinstance(exc, TimeoutError) else ("network_error" if is_transient else "error"),
                     "error": str(exc),
+                    "request": request_detail,
                 }
             )
             last_exc = exc
-            if attempt >= _VISION_CALL_TRANSIENT_RETRY_ATTEMPTS:
+            if not is_transient or attempt >= _VISION_CALL_TRANSIENT_RETRY_ATTEMPTS:
                 break
             logger.warning(
                 "%s hit a transient error, retrying attempt=%s/%s error=%s",
@@ -6348,16 +6365,24 @@ def _call_vision_with_retry(
             time.sleep(_VISION_CALL_TRANSIENT_RETRY_DELAY_SECONDS)
             continue
         attempt_log.append(
-            {"attempt": attempt, "duration_seconds": round(time.monotonic() - started, 1), "outcome": "success"}
+            {
+                "attempt": attempt,
+                "duration_seconds": round(time.monotonic() - started, 1),
+                "outcome": "success",
+                "request": request_detail,
+                "response": {
+                    "raw_response": (meta or {}).get("raw_response"),
+                    "raw_usage": (meta or {}).get("raw_usage"),
+                },
+            }
         )
         if meta is not None:
             meta = {**meta, "retry_attempts": attempt_log}
         return result, meta
     assert last_exc is not None
-    attempt_summary = "; ".join(
-        f"attempt {item['attempt']}: {item['outcome']} after {item['duration_seconds']}s" for item in attempt_log
-    )
-    raise RuntimeError(f"{description} failed after {len(attempt_log)} attempt(s) - {attempt_summary}") from last_exc
+    raise RuntimeError(
+        json.dumps({"description": description, "attempts": attempt_log}, default=str, indent=2)
+    ) from last_exc
 
 
 def _call_grouping_vision(
@@ -6424,7 +6449,7 @@ def _call_grouping_vision(
             temperature=settings.grouping_temperature,
         )
 
-    return _call_vision_with_retry(_dispatch, description="Grouping vision call")
+    return _call_vision_with_retry(_dispatch, description="Grouping vision call", prompt=prompt, image_urls=image_urls)
 
 
 def _record_grouping_cost(db: Session, script_run_id: int, call_meta: Mapping[str, Any] | None) -> dict[str, Any] | None:
@@ -6596,7 +6621,7 @@ def _call_kiosk_vision(
             temperature=settings.grouping_temperature,
         )
 
-    return _call_vision_with_retry(_dispatch, description="Kiosk vision call")
+    return _call_vision_with_retry(_dispatch, description="Kiosk vision call", prompt=prompt, image_urls=image_urls)
 
 
 def _current_kiosk_model_name(db: Session) -> str:
