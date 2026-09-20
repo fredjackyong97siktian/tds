@@ -127,6 +127,49 @@ def get_script_run_details(db: Session, script_run_id: int) -> dict[str, Any]:
     return _build_script_run_details(record)
 
 
+def stop_script_run_now(db: Session, script_run_id: int) -> dict[str, Any]:
+    """The dashboard's Stop button - manually forces a stuck 'running'
+    script_run to a terminal state instead of waiting on the 240s hard
+    deadline / 900s worker force-kill / next redeploy's startup sweep to
+    eventually catch it. This is a DB-only override: it does not kill
+    whatever process or RunPod job is actually behind the row, if anything
+    still is - it only stops the system from waiting on/trusting it further.
+    """
+    record = repositories.get_script_run(db, script_run_id)
+    if not record:
+        raise ValueError(f"Script run {script_run_id} was not found.")
+    stopped_count = repositories.force_stop_script_run(db, script_run_id)
+    if stopped_count == 0:
+        raise ValueError(f"Script run {script_run_id} is '{record.get('status')}', not 'running' - nothing to stop.")
+    result: dict[str, Any] = {"ok": True, "script_run_id": script_run_id, "batch_id": None}
+    # grouping's adjacent/direct/repair stages all stamp runner_payload.batch_id
+    # (see _run_grouping_adjacent_pass, start_grouping_analysis_job) - if this
+    # was one of those and its batch is still sitting at running/dispatching
+    # because of it, mark the batch 'issue' too so it's not left showing
+    # "running" with nothing behind it anymore. Deliberately does NOT also
+    # reset it to 'pending' - stopping is not the same as asking for a retry.
+    if str(record.get("script_name") or "") == "grouping":
+        runner_payload = record.get("runner_payload")
+        batch_id = runner_payload.get("batch_id") if isinstance(runner_payload, Mapping) else None
+        if batch_id is not None:
+            try:
+                batch = repositories.get_grouping_batch(db, int(batch_id))
+            except Exception:
+                batch = None
+            if batch and str(batch.get("status") or "").strip().lower() in {"pending", "dispatching", "running"}:
+                repositories.update_grouping_batch(
+                    db,
+                    int(batch_id),
+                    {
+                        "status": "issue",
+                        "issue_reason": "Manually stopped by user via the Script Run Stop button.",
+                        "finished_at": datetime.now(UTC),
+                    },
+                )
+                result["batch_id"] = int(batch_id)
+    return result
+
+
 def get_script_run_details_by_runner_job_id(db: Session, runner_job_id: str) -> dict[str, Any]:
     record = repositories.get_script_run_by_runner_job_id(db, runner_job_id)
     if not record:
@@ -1056,6 +1099,13 @@ def _compact_gemini_meta_for_log(gemini_meta: Mapping[str, Any]) -> dict[str, An
             for chunk in chunks
             if isinstance(chunk, Mapping)
         ]
+    # Per-attempt timing/outcome from _call_vision_with_retry - shows whether
+    # a call succeeded on the first try or only after retrying past a
+    # transient error/hard-deadline timeout, directly in the script_run's own
+    # stored log instead of only ever being visible in server logs.
+    retry_attempts = gemini_meta.get("retry_attempts")
+    if isinstance(retry_attempts, list):
+        compact["retry_attempts"] = retry_attempts
     return compact
 
 
@@ -6250,6 +6300,66 @@ def _run_with_hard_deadline(fn: Callable[[], Any], *, timeout_seconds: float, de
         ) from exc
 
 
+def _call_vision_with_retry(
+    dispatch: Callable[[], tuple[dict[str, Any], dict[str, Any] | None]],
+    *,
+    description: str,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Wraps a provider dispatch call with the hard wall-clock deadline (see
+    _run_with_hard_deadline) and a transient-error retry (a dropped/truncated
+    connection, or the hard deadline itself tripping, is often a one-off
+    network blip rather than a real failure of the call) - and records what
+    actually happened on every attempt (duration, outcome, error) so it's
+    visible in the script_run's own stored log, not just server logs. On
+    success this rides along as "retry_attempts" in the returned meta; on
+    total failure it's folded into the raised exception's own message, since
+    there's no meta to attach it to at that point.
+    """
+    attempt_log: list[dict[str, Any]] = []
+    last_exc: Exception | None = None
+    for attempt in range(1, _VISION_CALL_TRANSIENT_RETRY_ATTEMPTS + 1):
+        started = time.monotonic()
+        try:
+            result, meta = _run_with_hard_deadline(
+                dispatch,
+                timeout_seconds=settings.vision_call_hard_deadline_seconds,
+                description=description,
+            )
+        except (http.client.HTTPException, URLError, ConnectionError, TimeoutError) as exc:
+            duration = round(time.monotonic() - started, 1)
+            attempt_log.append(
+                {
+                    "attempt": attempt,
+                    "duration_seconds": duration,
+                    "outcome": "timeout" if isinstance(exc, TimeoutError) else "network_error",
+                    "error": str(exc),
+                }
+            )
+            last_exc = exc
+            if attempt >= _VISION_CALL_TRANSIENT_RETRY_ATTEMPTS:
+                break
+            logger.warning(
+                "%s hit a transient error, retrying attempt=%s/%s error=%s",
+                description,
+                attempt,
+                _VISION_CALL_TRANSIENT_RETRY_ATTEMPTS,
+                exc,
+            )
+            time.sleep(_VISION_CALL_TRANSIENT_RETRY_DELAY_SECONDS)
+            continue
+        attempt_log.append(
+            {"attempt": attempt, "duration_seconds": round(time.monotonic() - started, 1), "outcome": "success"}
+        )
+        if meta is not None:
+            meta = {**meta, "retry_attempts": attempt_log}
+        return result, meta
+    assert last_exc is not None
+    attempt_summary = "; ".join(
+        f"attempt {item['attempt']}: {item['outcome']} after {item['duration_seconds']}s" for item in attempt_log
+    )
+    raise RuntimeError(f"{description} failed after {len(attempt_log)} attempt(s) - {attempt_summary}") from last_exc
+
+
 def _call_grouping_vision(
     db: Session,
     *,
@@ -6314,32 +6424,7 @@ def _call_grouping_vision(
             temperature=settings.grouping_temperature,
         )
 
-    # A dropped/truncated connection (e.g. IncompleteRead) or a one-off hang
-    # tripping the hard deadline is often a transient network blip, not a
-    # real failure of the call itself - retry a couple of times before
-    # giving up, instead of failing the whole grouping stage (and forcing an
-    # expensive full-batch retry) on one bad attempt. Mirrors _call_kiosk_vision.
-    last_exc: Exception | None = None
-    for attempt in range(1, _VISION_CALL_TRANSIENT_RETRY_ATTEMPTS + 1):
-        try:
-            return _run_with_hard_deadline(
-                _dispatch,
-                timeout_seconds=settings.vision_call_hard_deadline_seconds,
-                description="Grouping vision call",
-            )
-        except (http.client.HTTPException, URLError, ConnectionError, TimeoutError) as exc:
-            last_exc = exc
-            if attempt >= _VISION_CALL_TRANSIENT_RETRY_ATTEMPTS:
-                break
-            logger.warning(
-                "Grouping vision call hit a transient network error, retrying attempt=%s/%s error=%s",
-                attempt,
-                _VISION_CALL_TRANSIENT_RETRY_ATTEMPTS,
-                exc,
-            )
-            time.sleep(_VISION_CALL_TRANSIENT_RETRY_DELAY_SECONDS)
-    assert last_exc is not None
-    raise last_exc
+    return _call_vision_with_retry(_dispatch, description="Grouping vision call")
 
 
 def _record_grouping_cost(db: Session, script_run_id: int, call_meta: Mapping[str, Any] | None) -> dict[str, Any] | None:
@@ -6511,31 +6596,7 @@ def _call_kiosk_vision(
             temperature=settings.grouping_temperature,
         )
 
-    # A dropped/truncated connection mid-response (e.g. IncompleteRead) is a
-    # transient network blip, not a real failure of the call itself - retry a
-    # couple of times before giving up, instead of failing the whole kiosk
-    # item-counting summary on one bad read.
-    last_exc: Exception | None = None
-    for attempt in range(1, _VISION_CALL_TRANSIENT_RETRY_ATTEMPTS + 1):
-        try:
-            return _run_with_hard_deadline(
-                _dispatch,
-                timeout_seconds=settings.vision_call_hard_deadline_seconds,
-                description="Kiosk vision call",
-            )
-        except (http.client.HTTPException, URLError, ConnectionError, TimeoutError) as exc:
-            last_exc = exc
-            if attempt >= _VISION_CALL_TRANSIENT_RETRY_ATTEMPTS:
-                break
-            logger.warning(
-                "Kiosk vision call hit a transient network error, retrying attempt=%s/%s error=%s",
-                attempt,
-                _VISION_CALL_TRANSIENT_RETRY_ATTEMPTS,
-                exc,
-            )
-            time.sleep(_VISION_CALL_TRANSIENT_RETRY_DELAY_SECONDS)
-    assert last_exc is not None
-    raise last_exc
+    return _call_vision_with_retry(_dispatch, description="Kiosk vision call")
 
 
 def _current_kiosk_model_name(db: Session) -> str:

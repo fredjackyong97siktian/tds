@@ -6800,6 +6800,32 @@ def get_script_run(db: Session, script_run_id: int) -> dict[str, Any]:
     return row
 
 
+def force_stop_script_run(db: Session, script_run_id: int) -> int:
+    """Manually forces a 'running' script_run to 'failed' (chk_script_run_status
+    doesn't allow 'issue' on this table - only filter_grouping_batch does).
+    This is a DB-only override for the dashboard's Stop button - it does not
+    kill whatever process/RunPod job is actually behind the row, if anything
+    still is; it just stops the system from waiting on/trusting it further.
+    Returns 1 if a running row was actually stopped, 0 if it wasn't running.
+    """
+    script_run_table = _table("script_run")
+    result = db.execute(
+        text(
+            f"""
+            update {script_run_table}
+            set status = 'failed',
+                stderr_log = concat(coalesce(stderr_log, ''), case when coalesce(stderr_log, '') = '' then '' else '\n' end, 'Manually stopped by user.'),
+                finished_at = now()
+            where id = :script_run_id
+              and status = 'running'
+            """
+        ),
+        {"script_run_id": script_run_id},
+    )
+    db.commit()
+    return int(result.rowcount or 0)
+
+
 def get_script_run_by_runner_job_id(db: Session, runner_job_id: str) -> dict[str, Any]:
     script_run_table = _table("script_run")
     cost_select = _script_run_cost_select(db, script_run_table)

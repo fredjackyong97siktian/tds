@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
@@ -112,6 +113,17 @@ def get_script_run(
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return ScriptRunDetailResponse(**result)
+
+
+@router.post("/script-runs/{script_run_id}/stop")
+def stop_script_run(
+    script_run_id: int,
+    db: Session = Depends(get_transaction_db),
+) -> dict[str, Any]:
+    try:
+        return workflow_service.stop_script_run_now(db, script_run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/script-runs/by-runner-job/{runner_job_id}", response_model=ScriptRunDetailResponse)
