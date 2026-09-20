@@ -6369,6 +6369,7 @@ def _call_vision_with_retry(
     last_exc: Exception | None = None
     for attempt in range(1, _VISION_CALL_TRANSIENT_RETRY_ATTEMPTS + 1):
         started = time.monotonic()
+        started_at = datetime.now(UTC)
         try:
             result, meta = _run_with_hard_deadline(
                 dispatch,
@@ -6380,6 +6381,8 @@ def _call_vision_with_retry(
             is_transient = isinstance(exc, (http.client.HTTPException, URLError, ConnectionError, TimeoutError))
             entry = {
                 "attempt": attempt,
+                "started_at": started_at.isoformat(),
+                "finished_at": datetime.now(UTC).isoformat(),
                 "duration_seconds": duration,
                 "outcome": "timeout" if isinstance(exc, TimeoutError) else ("network_error" if is_transient else "error"),
                 "error": str(exc),
@@ -6401,6 +6404,8 @@ def _call_vision_with_retry(
             continue
         entry = {
             "attempt": attempt,
+            "started_at": started_at.isoformat(),
+            "finished_at": datetime.now(UTC).isoformat(),
             "duration_seconds": round(time.monotonic() - started, 1),
             "outcome": "success",
             "request": request_detail,

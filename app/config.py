@@ -194,7 +194,7 @@ class Settings(BaseSettings):
     # (confirmed live: a grouping_adjacent Gemini call ran for 1h50m against a
     # nominal 180s socket timeout). Set comfortably above every provider's own
     # timeout so a legitimately-slow-but-completing call isn't cut off early.
-    vision_call_hard_deadline_seconds: int = 240
+    vision_call_hard_deadline_seconds: int = 480
     gemini_input_cost_per_1m_tokens_usd: float = 0.0
     gemini_output_cost_per_1m_tokens_usd: float = 0.0
     gemini_cached_input_cost_per_1m_tokens_usd: float = 0.0
