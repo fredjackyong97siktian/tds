@@ -3265,6 +3265,16 @@ def count_recent_grouping_batches(db: Session) -> int:
     return int((row or {}).get("total") or 0)
 
 
+def count_grouping_items(db: Session, batch_id: int) -> int:
+    table_name = _table("filter_grouping_item")
+    result = db.execute(
+        text(f"select count(*) as total from {table_name} where batch_id = :batch_id"),
+        {"batch_id": batch_id},
+    )
+    row = result.mappings().first()
+    return int((row or {}).get("total") or 0)
+
+
 def list_grouping_items(db: Session, batch_id: int) -> list[dict[str, Any]]:
     table_name = _table("filter_grouping_item")
     result = db.execute(
