@@ -7676,8 +7676,9 @@ def _retry_grouping_batch_now_locked(db: Session, *, batch_id: int) -> dict[str,
         # trigger frame images are available" failure indefinitely.
         raise ValueError(
             f"Grouping batch {batch_id} has no linked triggers, so it can't be retried directly - retrying would "
-            "only repeat the same 'No trigger frame images are available' failure. Use a manual grouping batch for "
-            "that time range instead if you want it processed."
+            "only repeat the same 'No trigger frame images are available' failure. Use the 'Run By Time Range' "
+            "panel on the Grouping page instead, with this batch's own window as the start/end time - that path "
+            "actually discovers and links the ready triggers before dispatching."
         )
     # Ignore any OTHER batch that's itself stale rather than genuinely active -
     # otherwise one orphaned batch (e.g. stuck since before this recovery
