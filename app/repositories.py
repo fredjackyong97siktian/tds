@@ -6440,6 +6440,35 @@ def finish_script_run(
     db.commit()
 
 
+def get_latest_successful_grouping_stage_script_run(
+    db: Session, *, batch_id: int, stage_suffix: str
+) -> dict[str, Any] | None:
+    """Finds the most recent 'success' script_run for one grouping stage
+    (script_name='grouping', model_name ending in stage_suffix, e.g.
+    '_adjacent') tied to this exact batch via runner_payload.batch_id - used
+    to check whether that stage's already-paid-for result can be safely
+    reused on retry instead of re-running its real, billed API calls from
+    scratch just to get the same answer again."""
+    script_run_table = _table("script_run")
+    result = db.execute(
+        text(
+            f"""
+            select id, stdout_log
+            from {script_run_table}
+            where script_name = 'grouping'
+              and status = 'success'
+              and model_name like :stage_suffix
+              and cast(json_unquote(json_extract(runner_payload, '$.batch_id')) as unsigned) = :batch_id
+            order by id desc
+            limit 1
+            """
+        ),
+        {"stage_suffix": f"%{stage_suffix}", "batch_id": batch_id},
+    )
+    row = result.mappings().first()
+    return dict(row) if row else None
+
+
 def append_script_run_call(db: Session, script_run_id: int, call_entry: Mapping[str, Any]) -> None:
     """Incrementally persists one vision-call attempt (full request + response
     or error) into a script_run's own stdout_log the moment it happens -

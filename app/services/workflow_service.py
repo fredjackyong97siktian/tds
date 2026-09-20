@@ -6012,6 +6012,54 @@ _GROUPING_ADJACENT_LOOKAHEAD_COUNT = 2
 _GROUPING_ADJACENT_LOOKAHEAD_MINUTES = 30
 
 
+def _find_resumable_adjacent_result(
+    db: Session, *, batch_id: int, trigger_inputs: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int] | None:
+    """A retried batch re-runs _run_gemini_grouping_for_batch completely from
+    scratch by design (no intermediate checkpoint exists elsewhere in that
+    function) - but redoing adjacent's own real, billed Gemini/OpenRouter
+    calls just to arrive at the exact same answer as last time is pure waste
+    when nothing about the batch's trigger set has changed since. Confirmed
+    live: a batch whose adjacent stage had already succeeded got it fully
+    redone anyway after direct failed and the batch was retried.
+
+    Reuses a prior successful adjacent run's result instead, but ONLY if the
+    current trigger set exactly matches what that run was made against -
+    anything different (a trigger added/removed via a later carry-forward or
+    a manual re-link) falls through to a fresh run instead, which is always
+    safe.
+    """
+    prior = repositories.get_latest_successful_grouping_stage_script_run(
+        db, batch_id=batch_id, stage_suffix="_adjacent"
+    )
+    if prior is None:
+        return None
+    try:
+        parsed = json.loads(prior.get("stdout_log") or "")
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    input_trigger_ids = parsed.get("input_trigger_ids")
+    matched_groups = parsed.get("matched_groups")
+    remaining_trigger_ids = parsed.get("remaining_trigger_ids")
+    if (
+        not isinstance(input_trigger_ids, list)
+        or not isinstance(matched_groups, list)
+        or not isinstance(remaining_trigger_ids, list)
+    ):
+        return None
+    current_trigger_ids = sorted(int(item["trigger_id"]) for item in trigger_inputs)
+    try:
+        if sorted(int(value) for value in input_trigger_ids) != current_trigger_ids:
+            return None
+    except (TypeError, ValueError):
+        return None
+    remaining_ids = {int(value) for value in remaining_trigger_ids}
+    remaining = [item for item in trigger_inputs if int(item["trigger_id"]) in remaining_ids]
+    return remaining, matched_groups, int(prior["id"])
+
+
 def _run_grouping_adjacent_pass(
     db: Session,
     *,
@@ -6040,6 +6088,25 @@ def _run_grouping_adjacent_pass(
     every trigger that appeared in at least one adjacent check, whether or not
     it matched.
     """
+    resumed = _find_resumable_adjacent_result(db, batch_id=batch_id, trigger_inputs=trigger_inputs)
+    if resumed is not None:
+        remaining, matched_groups, reused_script_run_id = resumed
+        logger.warning(
+            "Resuming grouping batch_id=%s adjacent stage from prior script_run_id=%s - trigger set "
+            "unchanged since then, skipping its real API call(s) entirely",
+            batch_id,
+            reused_script_run_id,
+        )
+        return (
+            remaining,
+            matched_groups,
+            [f"Adjacent stage resumed from script_run #{reused_script_run_id} (trigger set unchanged)."],
+            [],
+            {},
+            {},
+            reused_script_run_id,
+        )
+
     sorted_inputs = sorted(
         trigger_inputs, key=lambda item: _coerce_datetime_value(item.get("trigger_time")) or datetime.min
     )
@@ -6201,6 +6268,12 @@ def _run_grouping_adjacent_pass(
                 "identity_entry_count": len(pending_entry_groups),
                 "matched_groups": groups,
                 "remaining_trigger_ids": sorted(int(item["trigger_id"]) for item in remaining),
+                # The full input set this run was made against - a later
+                # retry compares its own current trigger set against this to
+                # decide whether it's safe to reuse this result instead of
+                # re-running the real API calls (see
+                # _find_resumable_adjacent_result).
+                "input_trigger_ids": sorted(int(item["trigger_id"]) for item in trigger_inputs),
             },
         ),
         stderr_log="",
