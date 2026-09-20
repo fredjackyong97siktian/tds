@@ -4580,6 +4580,38 @@ def _first_trigger_frame_payload(frames: list[dict[str, Any]], limit: int | None
     return frames[: max(1, int(limit))]
 
 
+def _link_ready_triggers_into_batch(
+    db: Session,
+    *,
+    batch_id: int,
+    window_start: datetime,
+    window_end: datetime,
+    ready_assets: list[dict[str, Any]],
+) -> int:
+    # Same eligibility list prepare_manual_grouping_batches_for_range uses -
+    # list_manual_grouping_ready_trigger_frame_assets already excludes any
+    # trigger already linked to a pending/dispatching/running batch or
+    # already 'grouped', so linking the same rows here to a 'missed'/'avoid'
+    # placeholder can't double up with whatever a later window or a manual
+    # Run-By-Time-Range call also picks up - those triggers stay eligible
+    # until something actually processes them.
+    matched_rows = [
+        row
+        for row in ready_assets
+        if (grouping_time := _grouping_time_from_trigger_frame_asset(row)) is not None
+        and window_start <= grouping_time < window_end
+    ]
+    for row in matched_rows:
+        repositories.upsert_grouping_item(
+            db,
+            batch_id=batch_id,
+            trigger_id=int(row["trigger_id"]),
+            video_asset_id=None,
+            frame_payload={"frames": _first_trigger_frame_payload(_frame_urls_from_trigger_frame_asset(row))},
+        )
+    return len(matched_rows)
+
+
 def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
     periods = repositories.list_filter_time_periods(db, selected_only=False)
     if not periods:
@@ -4589,6 +4621,16 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
     prepared: list[dict[str, Any]] = []
     current = _time_period_now()
     for location_id in location_ids:
+        # Fetched once per location and reused for both the 'avoid'/'missed'
+        # placeholder batches below and the normal due-window flow further
+        # down - list_manual_grouping_ready_trigger_frame_assets already
+        # excludes anything already linked to active/grouped work, so the
+        # same rows are safe to check against every window's range in turn.
+        location_ready_assets = repositories.list_manual_grouping_ready_trigger_frame_assets(
+            db,
+            location_id=location_id,
+            limit=1000,
+        )
         for period in _unselected_grouping_periods_for_location(periods, location_id):
             period_window_start, period_window_end = _last_completed_period_window(period, now=current)
             if period_window_end > current:
@@ -4611,6 +4653,13 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
                 window_end=period_window_end,
                 status="avoid",
             )
+            linked_count = _link_ready_triggers_into_batch(
+                db,
+                batch_id=int(avoid_batch["id"]),
+                window_start=period_window_start,
+                window_end=period_window_end,
+                ready_assets=location_ready_assets,
+            )
             repositories.update_grouping_batch(
                 db,
                 int(avoid_batch["id"]),
@@ -4618,6 +4667,16 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
                     "issue_reason": "Period is not active for this location - not automatically processed.",
                     "finished_at": datetime.now(UTC),
                 },
+            )
+            logger.info(
+                "Created 'avoid' grouping batch_id=%s with %s linked trigger(s): location_id=%s period_code=%s "
+                "window_start=%s window_end=%s",
+                avoid_batch["id"],
+                linked_count,
+                location_id,
+                period_code,
+                period_window_start,
+                period_window_end,
             )
 
         selected_periods = _selected_grouping_periods_for_location(periods, location_id)
@@ -4670,6 +4729,13 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
                         window_end=period_window_end,
                         status="missed",
                     )
+                    linked_count = _link_ready_triggers_into_batch(
+                        db,
+                        batch_id=int(missed_batch["id"]),
+                        window_start=period_window_start,
+                        window_end=period_window_end,
+                        ready_assets=location_ready_assets,
+                    )
                     repositories.update_grouping_batch(
                         db,
                         int(missed_batch["id"]),
@@ -4681,9 +4747,10 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
                         },
                     )
                     logger.warning(
-                        "Created 'missed' grouping batch_id=%s (past %sm grace, never automatically processed): "
-                        "location_id=%s period_code=%s window_start=%s window_end=%s",
+                        "Created 'missed' grouping batch_id=%s with %s linked trigger(s) (past %sm grace, never "
+                        "automatically processed): location_id=%s period_code=%s window_start=%s window_end=%s",
                         missed_batch["id"],
+                        linked_count,
                         settings.grouping_window_grace_minutes,
                         location_id,
                         period_code,
@@ -4719,11 +4786,7 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
                 location_id,
                 requeued_count,
             )
-        ready_assets = repositories.list_manual_grouping_ready_trigger_frame_assets(
-            db,
-            location_id=location_id,
-            limit=1000,
-        )
+        ready_assets = location_ready_assets
         for period in selected_periods if ready_assets else []:
             window_start, window_end = _last_completed_period_window(period, now=current)
             if not _is_recently_completed_grouping_window(window_end, current):
@@ -7667,18 +7730,36 @@ def _retry_grouping_batch_now_locked(db: Session, *, batch_id: int) -> dict[str,
         raise ValueError(f"Grouping batch {batch_id} is {status or 'unknown'} and cannot be rerun.")
     if repositories.count_grouping_items(db, batch_id) == 0:
         # A 'missed'/'avoid' placeholder batch (prepare_due_grouping_batches)
-        # never gets any filter_grouping_item rows in the first place - but a
-        # batch that started that way and was already retried once (before
-        # this check existed) can just as easily be sitting at 'issue' now,
-        # its status label no longer showing where the problem actually came
-        # from. Check the real thing (zero linked triggers) instead of trusting
-        # the status string, so this can't loop through the exact same "No
-        # trigger frame images are available" failure indefinitely.
+        # used to never get any filter_grouping_item rows at all - and a batch
+        # that started that way and was already retried once before that was
+        # fixed can just as easily be sitting at 'issue' now, its status label
+        # no longer showing where the problem came from. Before giving up,
+        # try once to link whatever's currently ready for this batch's own
+        # window - the same discovery Run By Time Range uses - so an
+        # already-existing empty batch like this gets fixed retroactively
+        # too, not just ones created after this existed.
+        location_ready_assets = repositories.list_manual_grouping_ready_trigger_frame_assets(
+            db,
+            location_id=int(batch["location_id"]),
+            limit=1000,
+        )
+        linked_count = _link_ready_triggers_into_batch(
+            db,
+            batch_id=batch_id,
+            window_start=batch["window_start"],
+            window_end=batch["window_end"],
+            ready_assets=location_ready_assets,
+        )
+        if linked_count:
+            logger.warning(
+                "Linked %s previously-missing trigger(s) into grouping batch_id=%s before retrying",
+                linked_count,
+                batch_id,
+            )
+    if repositories.count_grouping_items(db, batch_id) == 0:
         raise ValueError(
-            f"Grouping batch {batch_id} has no linked triggers, so it can't be retried directly - retrying would "
-            "only repeat the same 'No trigger frame images are available' failure. Use the 'Run By Time Range' "
-            "panel on the Grouping page instead, with this batch's own window as the start/end time - that path "
-            "actually discovers and links the ready triggers before dispatching."
+            f"Grouping batch {batch_id} has no linked triggers (none are currently ready either), so it can't be "
+            "retried - retrying would only repeat the same 'No trigger frame images are available' failure."
         )
     # Ignore any OTHER batch that's itself stale rather than genuinely active -
     # otherwise one orphaned batch (e.g. stuck since before this recovery
