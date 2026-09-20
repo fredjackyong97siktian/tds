@@ -4846,6 +4846,12 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
             if not _is_recently_completed_grouping_window(window_end, current):
                 continue
             period_code = str(period.get("period_code") or "period")
+            # Everything past this point only ever runs for a window that has
+            # actually closed and is still within grace - logging every
+            # decision from here on is cheap (a handful of times per period
+            # per day, not every poll) and turns "why didn't this window get
+            # a batch" from a guessing game into something the very next
+            # poll answers directly.
             existing = repositories.get_grouping_batch_by_window(
                 db,
                 location_id=location_id,
@@ -4854,6 +4860,16 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
                 window_end=window_end,
             )
             if existing is not None:
+                logger.info(
+                    "Due-window check location_id=%s period_code=%s window=%s-%s: batch_id=%s already exists "
+                    "(status=%s), skipping",
+                    location_id,
+                    period_code,
+                    window_start,
+                    window_end,
+                    existing.get("id"),
+                    existing.get("status"),
+                )
                 continue
 
             # Only pull in triggers from this exact window, plus a short buffer just
@@ -4883,6 +4899,15 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
                 window_end=window_end,
                 min_frame_count=expected_frame_count,
             ):
+                logger.info(
+                    "Due-window check location_id=%s period_code=%s window=%s-%s: still has pending/incomplete "
+                    "trigger frame retrieval (expected_frame_count=%s), skipping this cycle",
+                    location_id,
+                    period_code,
+                    window_start,
+                    window_end,
+                    expected_frame_count,
+                )
                 continue
 
             # Fetched scoped to THIS window (plus its carry-forward buffer)
@@ -4913,6 +4938,17 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
                     carried_over_rows.append(row)
             trigger_assets = current_window_rows + carried_over_rows
             if not trigger_assets:
+                logger.info(
+                    "Due-window check location_id=%s period_code=%s window=%s-%s (carry_forward_cutoff=%s): "
+                    "query returned %s ready trigger frame asset row(s), but 0 matched this window's time range "
+                    "after filtering - skipping, nothing to build a batch from",
+                    location_id,
+                    period_code,
+                    window_start,
+                    window_end,
+                    carry_forward_cutoff,
+                    len(window_ready_assets),
+                )
                 continue
             batch = repositories.create_grouping_batch(
                 db,
