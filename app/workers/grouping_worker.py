@@ -49,6 +49,7 @@ class GroupingWorker:
             self._max_workers,
             self._stale_seconds,
         )
+        self._recover_orphaned_batches_on_startup()
         while True:
             try:
                 self._reap_finished_jobs()
@@ -57,6 +58,35 @@ class GroupingWorker:
             except Exception:
                 logger.exception("Grouping worker loop failed")
             time.sleep(poll_seconds)
+
+    def _recover_orphaned_batches_on_startup(self) -> None:
+        # self._running always starts empty, so this process cannot possibly
+        # have any of its own jobs genuinely in flight yet - any batch already
+        # sitting at 'dispatching'/'running' at this exact moment was left
+        # behind by a PREVIOUS process instance that died without a chance to
+        # clean up (most commonly: this very container being redeployed while
+        # a batch was mid-dispatch - an external kill, not the graceful
+        # _kill_stale_jobs path below, so that path's own auto-recovery never
+        # got a chance to run). Confirmed live: batch 180 sat at 'running'
+        # with no process behind it for 5+ hours after exactly this happened,
+        # invisible to every other check in this file.
+        db = TransactionalSessionLocal()
+        try:
+            orphaned = repositories.list_running_grouping_batches(db)
+            for row in orphaned:
+                batch_id = int(row["id"])
+                logger.warning(
+                    "Recovering orphaned grouping batch_id=%s (status=%s) found already running at worker startup "
+                    "- no process in this instance can own it, so it was abandoned by a previous one",
+                    batch_id,
+                    row.get("status"),
+                )
+                try:
+                    workflow_service.force_recover_killed_grouping_batch(db, batch_id=batch_id)
+                except Exception:
+                    logger.exception("Could not recover orphaned grouping batch_id=%s at startup", batch_id)
+        finally:
+            db.close()
 
     def _reap_finished_jobs(self) -> None:
         finished_ids: list[int] = []
