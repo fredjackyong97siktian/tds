@@ -3135,7 +3135,7 @@ def reset_grouping_batch_for_retry(db: Session, batch_id: int) -> dict[str, Any]
                 finished_at = null,
                 updated_at = now()
             where id = :batch_id
-              and status in ('success', 'failed', 'issue', 'cancel', 'canceled', 'cancelled')
+              and status in ('success', 'failed', 'issue', 'missed', 'avoid', 'cancel', 'canceled', 'cancelled')
             """
         ),
         {"batch_id": batch_id},
@@ -6469,7 +6469,7 @@ def get_latest_successful_grouping_stage_script_run(
     return dict(row) if row else None
 
 
-def append_script_run_call(db: Session, script_run_id: int, call_entry: Mapping[str, Any]) -> None:
+def append_script_run_call(db: Session, script_run_id: int, call_entry: Mapping[str, Any]) -> int:
     """Incrementally persists one vision-call attempt (full request + response
     or error) into a script_run's own stdout_log the moment it happens -
     NOT buffered in memory until the whole batch/stage finishes. Without
@@ -6482,6 +6482,10 @@ def append_script_run_call(db: Session, script_run_id: int, call_entry: Mapping[
     Read-modify-write on the same row - acceptable here since grouping_
     max_global_workers=1 means calls for one script_run are made
     sequentially by a single process, never concurrently.
+
+    Returns the new entry's index in the "calls" array, so a caller that
+    appended an in-progress placeholder can later overwrite that exact
+    entry (see replace_script_run_call) once the call actually finishes.
     """
     script_run_table = _table("script_run")
     row = db.execute(
@@ -6499,6 +6503,44 @@ def append_script_run_call(db: Session, script_run_id: int, call_entry: Mapping[
     if not isinstance(calls, list):
         calls = []
     calls.append(dict(call_entry))
+    index = len(calls) - 1
+    parsed["calls"] = calls
+    db.execute(
+        text(f"update {script_run_table} set stdout_log = :stdout_log where id = :script_run_id"),
+        {"stdout_log": json.dumps(parsed, default=str), "script_run_id": script_run_id},
+    )
+    db.commit()
+    return index
+
+
+def replace_script_run_call(db: Session, script_run_id: int, index: int, call_entry: Mapping[str, Any]) -> None:
+    """Overwrites one previously-appended "calls" array entry in place, by
+    its index - used to turn the in-progress placeholder append_script_run_
+    call wrote the moment an attempt started into that attempt's real,
+    finished result once the call returns, instead of leaving both an
+    in-progress row and a separate finished row for the same attempt.
+    """
+    script_run_table = _table("script_run")
+    row = db.execute(
+        text(f"select stdout_log from {script_run_table} where id = :script_run_id"),
+        {"script_run_id": script_run_id},
+    ).mappings().first()
+    current_stdout = (row or {}).get("stdout_log") or ""
+    try:
+        parsed = json.loads(current_stdout) if current_stdout else {}
+        if not isinstance(parsed, dict):
+            parsed = {}
+    except json.JSONDecodeError:
+        parsed = {}
+    calls = parsed.get("calls")
+    if not isinstance(calls, list) or not (0 <= index < len(calls)):
+        # Placeholder is missing/out of range (e.g. stdout_log was reset
+        # elsewhere in between) - append instead so the finished result is
+        # at least recorded somewhere rather than silently dropped.
+        calls = calls if isinstance(calls, list) else []
+        calls.append(dict(call_entry))
+    else:
+        calls[index] = dict(call_entry)
     parsed["calls"] = calls
     db.execute(
         text(f"update {script_run_table} set stdout_log = :stdout_log where id = :script_run_id"),

@@ -157,15 +157,30 @@ def stop_script_run_now(db: Session, script_run_id: int) -> dict[str, Any]:
             except Exception:
                 batch = None
             if batch and str(batch.get("status") or "").strip().lower() in {"pending", "dispatching", "running"}:
+                issue_reason = "Manually stopped by user via the Script Run Stop button."
                 repositories.update_grouping_batch(
                     db,
                     int(batch_id),
                     {
                         "status": "issue",
-                        "issue_reason": "Manually stopped by user via the Script Run Stop button.",
+                        "issue_reason": issue_reason,
                         "finished_at": datetime.now(UTC),
                     },
                 )
+                # Without this, any trigger_frame_asset this batch's dispatch had
+                # already flipped to 'processing' (mark_grouping_batch_frame_assets_
+                # processing, at dispatch start) is stranded there forever - Stop
+                # goes straight to a terminal 'issue' status, so the automatic
+                # orphan-recovery path (force_recover_killed_grouping_batch, which
+                # does call this) never sees this batch as dispatching/running and
+                # never runs. A 'processing' row is neither 'retrieved' (so
+                # requeue_incomplete_trigger_frame_assets_in_window can't touch it
+                # either) nor a terminal status has_pending_trigger_frame_retrieval_
+                # in_window accepts - it silently blocks every future window whose
+                # carry-forward buffer overlaps its trigger_time, indefinitely.
+                # Confirmed live: 4 triggers stuck this way after stopping batch 192
+                # blocked the next period's window from ever completing.
+                repositories.mark_grouping_batch_frame_assets_retrieved(db, int(batch_id), error=issue_reason)
                 result["batch_id"] = int(batch_id)
     return result
 
@@ -1099,13 +1114,15 @@ def _compact_gemini_meta_for_log(gemini_meta: Mapping[str, Any]) -> dict[str, An
             for chunk in chunks
             if isinstance(chunk, Mapping)
         ]
-    # Per-attempt timing/outcome from _call_vision_with_retry - shows whether
-    # a call succeeded on the first try or only after retrying past a
-    # transient error/hard-deadline timeout, directly in the script_run's own
-    # stored log instead of only ever being visible in server logs.
-    retry_attempts = gemini_meta.get("retry_attempts")
-    if isinstance(retry_attempts, list):
-        compact["retry_attempts"] = retry_attempts
+    # retry_attempts is deliberately NOT copied through here anymore - it's
+    # the exact same per-attempt list _call_vision_with_retry already
+    # persists live, attempt by attempt, into this script_run's own "calls"
+    # (see append_script_run_call/replace_script_run_call). Copying it again
+    # into this compacted summary (under main_call/verification_calls/chunks)
+    # just duplicated every attempt's full request+response a second time
+    # under a different shape - confirmed live on grouping_repair script_runs
+    # showing both $.calls and $.main_call.retry_attempts with identical
+    # content, doubling what the dashboard's attempt list renders.
     return compact
 
 
@@ -6466,19 +6483,42 @@ def _call_vision_with_retry(
         "image_urls": image_urls,
     }
 
-    def _persist(entry: dict[str, Any]) -> None:
+    def _persist(entry: dict[str, Any]) -> int | None:
         if db is None or script_run_id is None:
-            return
+            return None
         try:
-            repositories.append_script_run_call(db, script_run_id, entry)
+            return repositories.append_script_run_call(db, script_run_id, entry)
         except Exception:
             logger.exception("Could not persist vision call attempt for script_run_id=%s", script_run_id)
+            return None
+
+    def _replace(index: int | None, entry: dict[str, Any]) -> None:
+        if db is None or script_run_id is None or index is None:
+            return
+        try:
+            repositories.replace_script_run_call(db, script_run_id, index, entry)
+        except Exception:
+            logger.exception("Could not update vision call attempt for script_run_id=%s", script_run_id)
 
     attempt_log: list[dict[str, Any]] = []
     last_exc: Exception | None = None
     for attempt in range(1, _VISION_CALL_TRANSIENT_RETRY_ATTEMPTS + 1):
         started = time.monotonic()
         started_at = datetime.now(UTC)
+        # Persisted immediately, before the actual network call - without this,
+        # a script_run's "calls" only ever shows an attempt AFTER it finishes
+        # (or times out), so a currently-in-flight call looks identical to one
+        # that hasn't started yet. This placeholder is overwritten in place
+        # (see _replace) with the real outcome once the call returns.
+        placeholder_index = _persist(
+            {
+                "attempt": attempt,
+                "max_attempts": _VISION_CALL_TRANSIENT_RETRY_ATTEMPTS,
+                "started_at": started_at.isoformat(),
+                "outcome": "in_progress",
+                "request": request_detail,
+            }
+        )
         try:
             result, meta = _run_with_hard_deadline(
                 dispatch,
@@ -6490,6 +6530,7 @@ def _call_vision_with_retry(
             is_transient = isinstance(exc, (http.client.HTTPException, URLError, ConnectionError, TimeoutError))
             entry = {
                 "attempt": attempt,
+                "max_attempts": _VISION_CALL_TRANSIENT_RETRY_ATTEMPTS,
                 "started_at": started_at.isoformat(),
                 "finished_at": datetime.now(UTC).isoformat(),
                 "duration_seconds": duration,
@@ -6498,7 +6539,7 @@ def _call_vision_with_retry(
                 "request": request_detail,
             }
             attempt_log.append(entry)
-            _persist(entry)
+            _replace(placeholder_index, entry)
             last_exc = exc
             if not is_transient or attempt >= _VISION_CALL_TRANSIENT_RETRY_ATTEMPTS:
                 break
@@ -6513,6 +6554,7 @@ def _call_vision_with_retry(
             continue
         entry = {
             "attempt": attempt,
+            "max_attempts": _VISION_CALL_TRANSIENT_RETRY_ATTEMPTS,
             "started_at": started_at.isoformat(),
             "finished_at": datetime.now(UTC).isoformat(),
             "duration_seconds": round(time.monotonic() - started, 1),
@@ -6524,7 +6566,7 @@ def _call_vision_with_retry(
             },
         }
         attempt_log.append(entry)
-        _persist(entry)
+        _replace(placeholder_index, entry)
         if meta is not None:
             meta = {**meta, "retry_attempts": attempt_log}
         return result, meta
@@ -6715,7 +6757,7 @@ def _kiosk_openrouter_model_name(db: Session) -> str:
 
 
 _VISION_CALL_TRANSIENT_RETRY_ATTEMPTS = 3
-_VISION_CALL_TRANSIENT_RETRY_DELAY_SECONDS = 3.0
+_VISION_CALL_TRANSIENT_RETRY_DELAY_SECONDS = 10.0
 
 
 def _call_kiosk_vision(
@@ -8097,8 +8139,22 @@ def _reset_grouping_batch_for_requeue(
             end_time=batch.get("window_end"),
         )
     deleted_confidence_count = repositories.delete_filter_confidence_results_for_batch(db, batch_id)
-    repositories.reset_grouping_batch_for_retry(db, batch_id)
+    reset_batch = repositories.reset_grouping_batch_for_retry(db, batch_id)
     refreshed_count = _refresh_grouping_item_frame_payloads(db, batch=batch)
+    # reset_grouping_batch_for_retry's own UPDATE only matches a fixed list of
+    # statuses - if the batch's actual status isn't in that list (confirmed
+    # live: 'missed'/'avoid' were added to filter_grouping_batch.status well
+    # after that WHERE clause was written, and never backfilled into it), the
+    # UPDATE silently affects 0 rows and the batch is left exactly as it was.
+    # Without this check, the caller still reported "queued for background
+    # rerun" regardless - a batch stuck at 'missed' looked successfully
+    # retried forever while nothing had actually changed.
+    if str((reset_batch or {}).get("status") or "").strip().lower() != "pending":
+        raise ValueError(
+            f"Grouping batch {batch_id} could not be reset to 'pending' from its current status "
+            f"{(batch.get('status'))!r} - reset_grouping_batch_for_retry's allowed-status list may need "
+            "this status added."
+        )
     return {
         "refreshed_frame_payload_count": refreshed_count,
         "deleted_confidence_result_count": deleted_confidence_count,
