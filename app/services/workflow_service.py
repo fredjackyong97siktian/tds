@@ -11658,10 +11658,12 @@ def _kickoff_kiosk_pipeline_for_session(
     issue_transactions: list[Mapping[str, Any]] | None = None,
     exit_trigger_time: datetime | None = None,
 ) -> dict[str, Any]:
-    """Starts the kiosk pipeline for a session confidence just flagged for deep
-    analysis - with entrance analysis disabled, nothing else does this anymore.
-    Reuses the same transaction-window logic the old kiosk retrieval already
-    used (_build_transaction_window_bounds + _merge_time_windows). Once a
+    """Starts (or resumes) the kiosk pipeline for a session - the single
+    shared implementation for every way this can happen: the automatic
+    confidence-analysis kickoff (which calls this directly with transactions
+    it already gathered) and everything else that goes through
+    ensure_kiosk_video_assets_for_session (the Retry button, a manual session
+    end-time update, a manual customer exit, manual session creation). Once a
     kiosk video_asset is queued here, kiosk_analysis_worker already dispatches
     it to RunPod on its own the moment the video is ready - no changes needed
     there.
@@ -11743,6 +11745,44 @@ def _kickoff_kiosk_pipeline_for_session(
     )
 
 
+def _kiosk_video_window_for_group(
+    *,
+    group_key: tuple[Any, Any],
+    rows: list[Mapping[str, Any]],
+    exit_trigger_time: datetime | None,
+) -> tuple[datetime, datetime] | None:
+    """The kiosk video to retrieve for a matched checkout attempt should never
+    depend on whether any row in it happened to be 'paid' - it's the same
+    physical customer standing at the kiosk regardless of how the payment
+    resolved. Window = earliest initiated_at (when they started scanning) to
+    the latest payment_attempt_at among the group's rows, or this session's
+    own exit trigger time when no payment ever resolved (see
+    _kiosk_transaction_group_anchor_range, shared with the probe-frame
+    range used for AI verification) - padded the same way a single
+    transaction's window always has been.
+    """
+    anchor_start, anchor_end = _kiosk_transaction_group_anchor_range(
+        group_key=group_key, rows=rows, exit_trigger_time=exit_trigger_time
+    )
+    if anchor_start is None:
+        return None
+    if anchor_end is None or anchor_end <= anchor_start:
+        anchor_end = anchor_start
+    before_padding_seconds = max(0, int(settings.kiosk_transaction_extra_before_seconds))
+    after_padding_seconds = max(0, int(settings.kiosk_transaction_extra_after_seconds))
+    window_start = anchor_start - timedelta(seconds=before_padding_seconds)
+    window_end = anchor_end + timedelta(seconds=after_padding_seconds)
+    # A later exit trigger than our own computed end means the customer was
+    # still around after payment last resolved - extend toward it, capped so
+    # a bogus/very-late exit trigger can't balloon the retrieval window.
+    if exit_trigger_time is not None and exit_trigger_time > window_end:
+        max_extended_end = window_end + timedelta(
+            seconds=max(0, int(settings.kiosk_exit_trigger_extend_max_seconds))
+        )
+        window_end = min(exit_trigger_time, max_extended_end)
+    return (window_start, window_end)
+
+
 def _serialize_transaction_groups(
     groups: list[tuple[tuple[Any, Any], list[Mapping[str, Any]]]],
 ) -> list[dict[str, Any]]:
@@ -11818,7 +11858,6 @@ def _finalize_kiosk_transaction_match(
     # without this every session would read 0 items paid for and get falsely
     # marked "detected" regardless of what was actually bought.
     repositories.delete_session_transactions(db, session_id)
-    windows: list[tuple[datetime, datetime]] = []
     for transaction in matched_transactions:
         # Use transaction_time specifically, not the generic _transaction_event_time
         # helper (which prefers created_at/createdAt) - created_at on this row is a
@@ -11846,14 +11885,19 @@ def _finalize_kiosk_transaction_match(
                 "raw_payload": raw_payload,
             },
         )
-        windows.append(
-            _build_transaction_window_bounds(
-                initiated_at=_utc_naive_to_local(_coerce_datetime_value(transaction.get("initiated_at"))),
-                payment_attempt_at=_utc_naive_to_local(_coerce_datetime_value(transaction.get("payment_attempt_at"))),
-                fallback_time=transaction_time,
-                exit_trigger_time=exit_trigger_time,
-            )
-        )
+
+    # The video window is computed per checkout-attempt GROUP, not per
+    # individual transaction row - a group's window never depends on whether
+    # any of its rows happened to be 'paid' (see _kiosk_video_window_for_group).
+    # Re-grouping here (rather than threading the caller's own groups through)
+    # means this works identically whether matched_transactions came from the
+    # automatic group-match path or a manual assign_kiosk_transactions_to_session
+    # selection that only ever hands over flat rows.
+    windows: list[tuple[datetime, datetime]] = []
+    for group_key, rows in _group_transactions_by_machine_and_initiated_at(matched_transactions):
+        window = _kiosk_video_window_for_group(group_key=group_key, rows=rows, exit_trigger_time=exit_trigger_time)
+        if window is not None:
+            windows.append(window)
 
     if not windows:
         repositories.update_session_fields(
@@ -14208,6 +14252,18 @@ def retrieve_alert_kiosk_video_window(
 
 
 def ensure_kiosk_video_assets_for_session(db: Session, session_id: int) -> list[int]:
+    """Ensures a session has kiosk video queued, running the exact same
+    group-based transaction matching (_kickoff_kiosk_pipeline_for_session)
+    the automatic confidence-analysis kickoff uses. This is the shared entry
+    point for every OTHER way a session's kiosk pipeline can be (re)started -
+    the Retry button, a manual session end-time update, a manual customer
+    exit, and manual session creation - so all of them now see the same
+    grouped, pending/failed-aware matching instead of the older, paid-only
+    _prepare_session_kiosk_pipeline this used to fall back to. That older
+    function is unrelated legacy from before this one existed and is left in
+    place only for _maybe_close_session_and_prepare_kiosk's own entrance-
+    video-driven auto-close path, which this function does not touch.
+    """
     session = repositories.get_session(db, session_id)
     existing_kiosk_videos = repositories.list_session_video_assets(
         db,
@@ -14217,119 +14273,60 @@ def ensure_kiosk_video_assets_for_session(db: Session, session_id: int) -> list[
     if existing_kiosk_videos:
         return [int(row["video_asset_id"]) for row in existing_kiosk_videos if row.get("video_asset_id") is not None]
 
+    # Old-shape short-circuit, kept for sessions closed before this function
+    # was unified with _kickoff_kiosk_pipeline_for_session: an explicitly
+    # empty selected_kiosk_windows alongside a recorded transaction_identification
+    # means a prior run of the OLD pipeline already determined there was
+    # nothing to queue for this session - nothing new to try here.
     summary = dict(session.get("result_summary") or {})
     pipeline = dict(summary.get("session_close_pipeline") or {})
     selected_windows = pipeline.get("selected_kiosk_windows")
-    merged_windows = selected_windows if isinstance(selected_windows, list) else (pipeline.get("merged_kiosk_windows") or [])
     if isinstance(selected_windows, list) and not selected_windows and pipeline.get("transaction_identification"):
         return []
-    if not isinstance(merged_windows, list) or not merged_windows:
-        session_start_time = session.get("start_time")
-        session_end_time = session.get("end_time")
-        if session_start_time is None or session_end_time is None:
-            repositories.update_session_fields(
-                db,
-                session_id=session_id,
-                status="issue",
-                issue_reason="Kiosk retry failed because session start_time or end_time is missing.",
-            )
-            return []
 
-        exit_trigger_id = session.get("exit_trigger_id")
-        exit_trigger_time: datetime | None = None
-        if exit_trigger_id is not None:
-            try:
-                exit_trigger_time = _coerce_datetime_value(repositories.get_trigger(db, int(exit_trigger_id)).get("trigger_time"))
-            except Exception:
-                logger.exception("Could not load exit trigger time for kiosk window extension trigger_id=%s", exit_trigger_id)
-
-        total_transaction_items, prepared_summary, recomputed_windows = _prepare_session_kiosk_pipeline(
-            db,
-            session_id=session_id,
-            location_id=int(session["location_id"]),
-            session_start_time=session_start_time,
-            session_end_time=session_end_time,
-            exit_trigger_time=exit_trigger_time,
-        )
-        prepared_pipeline = dict(prepared_summary.get("session_close_pipeline") or {})
-        if not recomputed_windows and prepared_pipeline.get("transaction_identification"):
-            summary["session_close_pipeline"] = prepared_pipeline
-            repositories.update_session_fields(
-                db,
-                session_id=session_id,
-                status="need_review",
-                transaction_total_items=total_transaction_items,
-                result_summary=summary,
-                issue_reason="Could not confidently match any transaction to this session's customer.",
-            )
-            return []
-        if not recomputed_windows:
-            merged_summary = {**summary, **prepared_summary}
-            repositories.update_session_fields(
-                db,
-                session_id=session_id,
-                status="need_review",
-                transaction_total_items=total_transaction_items,
-                result_summary=merged_summary,
-                issue_reason=NO_KIOSK_VIDEO_REASON,
-            )
-            return []
-
-        pipeline = dict(prepared_summary.get("session_close_pipeline") or {})
-        summary["session_close_pipeline"] = pipeline
-        repositories.update_session_fields(
-            db,
-            session_id=session_id,
-            status="pending",
-            transaction_total_items=total_transaction_items,
-            result_summary=summary,
-            issue_reason=None,
-        )
-        merged_windows = pipeline.get("selected_kiosk_windows") or pipeline.get("merged_kiosk_windows") or []
-
-    location_id = int(session["location_id"])
-    queued_video_asset_ids: list[int] = []
-    try:
-        for window in merged_windows:
-            if not isinstance(window, dict):
-                continue
-            start_value = window.get("start_time")
-            end_value = window.get("end_time")
-            if not start_value or not end_value:
-                continue
-            start_time = _coerce_datetime_value(start_value)
-            end_time = _coerce_datetime_value(end_value)
-            if start_time is None or end_time is None:
-                continue
-            queued = retrieve_kiosk_video_window(
-                db,
-                session_id=session_id,
-                location_id=location_id,
-                start_time=start_time,
-                end_time=end_time,
-            )
-            queued_video_asset_ids.append(int(queued.video_asset_id))
-    except Exception as exc:
-        pipeline["queued_kiosk_video_asset_ids"] = queued_video_asset_ids
-        summary["session_close_pipeline"] = pipeline
+    session_start_time = session.get("start_time")
+    session_end_time = session.get("end_time")
+    if session_start_time is None or session_end_time is None:
         repositories.update_session_fields(
             db,
             session_id=session_id,
             status="issue",
-            result_summary=summary,
-            issue_reason=f"Kiosk retry failed while creating video asset: {exc}",
+            issue_reason="Kiosk retry failed because session start_time or end_time is missing.",
         )
-        return queued_video_asset_ids
+        return []
 
-    if queued_video_asset_ids:
-        pipeline["queued_kiosk_video_asset_ids"] = queued_video_asset_ids
-        summary["session_close_pipeline"] = pipeline
-        repositories.update_session_fields(
-            db,
-            session_id=session_id,
-            result_summary=summary,
-        )
-    return queued_video_asset_ids
+    location_id = int(session["location_id"])
+    exit_trigger_id = session.get("exit_trigger_id")
+    exit_trigger_time: datetime | None = None
+    if exit_trigger_id is not None:
+        try:
+            exit_trigger_time = _coerce_datetime_value(repositories.get_trigger(db, int(exit_trigger_id)).get("trigger_time"))
+        except Exception:
+            logger.exception("Could not load exit trigger time for kiosk window extension trigger_id=%s", exit_trigger_id)
+
+    # Same paid + pending/failed candidate gathering every other caller of
+    # _kickoff_kiosk_pipeline_for_session uses.
+    transactions = repositories.list_paid_transactions_for_session_window(
+        db, location_id=location_id, start_time=session_start_time, end_time=session_end_time
+    )
+    issue_transactions = repositories.list_non_paid_transactions_for_session_window(
+        db, location_id=location_id, start_time=session_start_time, end_time=session_end_time
+    )
+    result = _kickoff_kiosk_pipeline_for_session(
+        db,
+        session_id=session_id,
+        location_id=location_id,
+        transactions=transactions,
+        issue_transactions=issue_transactions,
+        exit_trigger_time=exit_trigger_time,
+    )
+    video_asset_ids = [int(value) for value in (result.get("video_asset_ids") or [])]
+    # need_review/skipped statuses are already set by _kickoff_kiosk_pipeline_for_session
+    # itself - only the success case needs this function to move the session
+    # off whatever status it was retried from.
+    if result.get("status") == "queued":
+        repositories.update_session_fields(db, session_id=session_id, status="pending", issue_reason=None)
+    return video_asset_ids
 
 
 def run_entry_for_trigger(
