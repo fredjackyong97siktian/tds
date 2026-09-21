@@ -6400,7 +6400,7 @@ _GROUPING_ADJACENT_LOOKAHEAD_MINUTES = 30
 
 
 def _find_resumable_adjacent_result(
-    db: Session, *, batch_id: int, trigger_inputs: list[dict[str, Any]]
+    db: Session, *, batch_id: int, trigger_inputs: list[dict[str, Any]], allow_resume: bool = True
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int] | None:
     """A retried batch re-runs _run_gemini_grouping_for_batch completely from
     scratch by design (no intermediate checkpoint exists elsewhere in that
@@ -6415,7 +6415,17 @@ def _find_resumable_adjacent_result(
     anything different (a trigger added/removed via a later carry-forward or
     a manual re-link) falls through to a fresh run instead, which is always
     safe.
+
+    allow_resume=False forces a fresh adjacent run unconditionally - used for
+    a deliberate, human-initiated Retry (see _retry_grouping_batch_now_locked)
+    as opposed to the worker's own automatic recovery of a force-killed batch
+    (force_recover_killed_grouping_batch), which should still transparently
+    resume. Confirmed live: someone clicking Retry on a batch expects a real,
+    fresh rerun, not a silent reuse of adjacent's old result - this checkpoint
+    was only ever meant to cover the automatic case.
     """
+    if not allow_resume:
+        return None
     prior = repositories.get_latest_successful_grouping_stage_script_run(
         db, batch_id=batch_id, stage_suffix="_adjacent"
     )
@@ -6455,6 +6465,7 @@ def _run_grouping_adjacent_pass(
     trigger_inputs: list[dict[str, Any]],
     model_name: str,
     resize_scale: float | None,
+    allow_resume: bool = True,
 ) -> tuple[
     list[dict[str, Any]],
     list[dict[str, Any]],
@@ -6475,7 +6486,9 @@ def _run_grouping_adjacent_pass(
     every trigger that appeared in at least one adjacent check, whether or not
     it matched.
     """
-    resumed = _find_resumable_adjacent_result(db, batch_id=batch_id, trigger_inputs=trigger_inputs)
+    resumed = _find_resumable_adjacent_result(
+        db, batch_id=batch_id, trigger_inputs=trigger_inputs, allow_resume=allow_resume
+    )
     if resumed is not None:
         remaining, matched_groups, reused_script_run_id = resumed
         logger.warning(
@@ -7248,6 +7261,15 @@ def _mark_open_entry_or_unknown(
 
 def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[str, Any], dict[str, Any], int]:
     batch = repositories.get_grouping_batch(db, batch_id)
+    # A deliberate manual Retry (see _retry_grouping_batch_now_locked) stashes
+    # this flag in result_payload right before requeueing, specifically to
+    # force a fresh adjacent run instead of silently reusing a prior success -
+    # read it up front, before anything below overwrites result_payload with
+    # this run's own real output.
+    batch_result_payload = batch.get("result_payload")
+    allow_adjacent_resume = not (
+        isinstance(batch_result_payload, Mapping) and batch_result_payload.get("resume_allowed") is False
+    )
     # A trigger's stored frame_payload snapshot can predate retrieval finishing -
     # refresh it from live data first so "this trigger has no frames" reflects
     # retrieval's actual current outcome, not a stale snapshot taken too early.
@@ -7366,6 +7388,7 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
         trigger_inputs=trigger_inputs,
         model_name=model_name,
         resize_scale=resize_scale,
+        allow_resume=allow_adjacent_resume,
     )
     normalized_groups.extend(adjacent_groups)
     for adjacent_group in adjacent_groups:
@@ -8435,6 +8458,7 @@ def _retry_grouping_batch_now_locked(db: Session, *, batch_id: int) -> dict[str,
         batch_id=batch_id,
         batch=batch,
         issue_reason_for_frame_assets="Rerun queued for grouping batch.",
+        allow_adjacent_resume=False,
     )
     return {
         "ok": True,
@@ -8452,11 +8476,21 @@ def _reset_grouping_batch_for_requeue(
     batch_id: int,
     batch: dict[str, Any],
     issue_reason_for_frame_assets: str,
+    allow_adjacent_resume: bool = True,
 ) -> dict[str, Any]:
     """Shared tail of both the manual stale-retry path and the grouping
     worker's own force-kill recovery (see force_recover_killed_grouping_batch)
     - requires the batch to already be in a terminal status (reset_grouping_
     batch_for_retry only accepts success/failed/issue/cancel*).
+
+    allow_adjacent_resume=False (only ever passed by the manual Retry path,
+    _retry_grouping_batch_now_locked) stashes a marker in the freshly-reset
+    batch's own result_payload so _run_gemini_grouping_for_batch knows to
+    force a fresh adjacent run instead of transparently resuming a prior
+    success (see _find_resumable_adjacent_result) - a deliberate human Retry
+    should always mean a real rerun, not a silent reuse of old work. The
+    worker's own automatic force-kill recovery leaves this True, since that
+    case is exactly what the checkpoint was built for.
     """
     repositories.mark_grouping_batch_frame_assets_retrieved(
         db,
@@ -8474,6 +8508,8 @@ def _reset_grouping_batch_for_requeue(
         )
     deleted_confidence_count = repositories.delete_filter_confidence_results_for_batch(db, batch_id)
     reset_batch = repositories.reset_grouping_batch_for_retry(db, batch_id)
+    if not allow_adjacent_resume:
+        reset_batch = repositories.update_grouping_batch(db, batch_id, {"result_payload": {"resume_allowed": False}})
     refreshed_count = _refresh_grouping_item_frame_payloads(db, batch=batch)
     # reset_grouping_batch_for_retry's own UPDATE only matches a fixed list of
     # statuses - if the batch's actual status isn't in that list (confirmed
