@@ -6650,6 +6650,23 @@ def _run_grouping_adjacent_pass(
             time.sleep(_GROUPING_VISION_CALL_INTERVAL_SECONDS)
         batch = [entry_group]
         _flush_batch()
+        # Persisted immediately after each entry, not just once at the end -
+        # $.calls already shows every attempt as it happens, but a stage with
+        # many identity entries has no way to tell "4 of 12 entries done" from
+        # that alone, since a retried entry adds several attempts for the
+        # SAME entry. This is a clean, retry-independent progress counter.
+        try:
+            repositories.merge_script_run_stdout_fields(
+                db,
+                adjacent_script_run_id,
+                {"entries_processed": index + 1, "identity_entry_count": len(pending_entry_groups)},
+            )
+        except Exception:
+            logger.exception(
+                "Could not persist adjacent stage progress batch_id=%s script_run_id=%s",
+                batch_id,
+                adjacent_script_run_id,
+            )
 
     remaining = [item for item in trigger_inputs if int(item["trigger_id"]) not in consumed]
     repositories.finish_script_run(

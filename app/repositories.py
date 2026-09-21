@@ -5076,6 +5076,21 @@ def get_dashboard_session_stats(db: Session, *, month: str) -> dict[str, Any]:
 
 
 def get_transaction_total_items(db: Session, session_id: int) -> int:
+    # "Total Items Recorded" is compared against the kiosk vision's own
+    # detected item count to decide whether a session looks like theft - it
+    # must mean items the customer actually PAID for, not merely scanned.
+    # session_transaction has no dedicated status column (a transaction's
+    # paid/pending/failed status only ever lives inside raw_payload, set by
+    # _finalize_kiosk_transaction_match) - since that function now links
+    # every transaction in a matched checkout group regardless of status
+    # (not just paid ones, so a pending/failed group can still be identified
+    # and its kiosk video retrieved), summing every linked row's total_items
+    # unconditionally would count a failed/pending attempt's scanned items as
+    # if they were bought. Confirmed live: a session with zero paid
+    # transactions still showed "Total Items Recorded: 6" from its one
+    # pending transaction's scan - which would have made a real theft (scan
+    # 6, pay for 0) look "reconciled" the moment kiosk vision detected 6
+    # items, exactly backwards.
     transaction_table = _table("session_transaction")
     result = db.execute(
         text(
@@ -5083,9 +5098,10 @@ def get_transaction_total_items(db: Session, session_id: int) -> int:
             select coalesce(sum(total_items), 0) as transaction_total_items
             from {transaction_table}
             where session_id = :session_id
+              and json_unquote(json_extract(raw_payload, '$.status')) = :paid_status
             """
         ),
-        {"session_id": session_id},
+        {"session_id": session_id, "paid_status": settings.paid_transaction_status_value},
     )
     row = _fetch_one_dict(result)
     return int(row["transaction_total_items"] or 0)
