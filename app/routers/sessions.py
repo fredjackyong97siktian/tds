@@ -9,6 +9,7 @@ from ..db import VectorSessionLocal, get_transaction_db
 from .. import repositories, vector_repositories
 from ..services import workflow_service
 from ..schemas import (
+    SessionAssignTransactionsRequest,
     SessionCreate,
     SessionManualCreateRequest,
     SessionCustomerResponse,
@@ -246,6 +247,31 @@ def list_session_transactions(session_id: int, db: Session = Depends(get_transac
 def list_session_transaction_details(session_id: int, db: Session = Depends(get_transaction_db)) -> list[SessionTransactionDetailResponse]:
     rows = repositories.list_session_transaction_details(db, session_id)
     return [SessionTransactionDetailResponse(**row) for row in rows]
+
+
+@router.get("/{session_id}/kiosk-transaction-candidates")
+def list_kiosk_transaction_candidates(session_id: int, db: Session = Depends(get_transaction_db)) -> dict:
+    try:
+        return workflow_service.list_kiosk_transaction_candidates_for_session(db, session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/{session_id}/assign-transactions")
+def assign_kiosk_transactions(
+    session_id: int,
+    payload: SessionAssignTransactionsRequest,
+    db: Session = Depends(get_transaction_db),
+) -> dict:
+    try:
+        return workflow_service.assign_kiosk_transactions_to_session(
+            db, session_id=session_id, receipt_numbers=payload.receipt_numbers
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Manual kiosk transaction assignment failed for session_id=%s", session_id)
+        raise HTTPException(status_code=500, detail=f"Manual transaction assignment failed: {exc}") from exc
 
 
 @router.post("/{session_id}/customers")

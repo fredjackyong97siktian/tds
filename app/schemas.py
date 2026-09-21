@@ -183,6 +183,10 @@ class SessionStatusUpdateRequest(BaseModel):
     )
 
 
+class SessionAssignTransactionsRequest(BaseModel):
+    receipt_numbers: list[str] = Field(min_length=1)
+
+
 class SessionResponse(BaseModel):
     id: int
     entry_trigger_id: int

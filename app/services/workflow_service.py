@@ -4131,6 +4131,16 @@ _KIOSK_TRANSACTION_MATCH_MIN_CONFIDENCE = 0.6
 # grabs) to run for every candidate, paid or not.
 _KIOSK_TRANSACTION_PROBE_FRAME_OFFSETS_SECONDS: tuple[float, ...] = (-4, -3, -2, -1, 0, 1)
 
+# A transaction GROUP (see _group_transactions_by_machine_and_initiated_at)
+# doesn't have one single instant to probe the way a single transaction row
+# does - its window can span from when the customer started scanning to
+# whenever payment last resolved (or, for a group that never got a payment
+# response, the session's own exit trigger). 10 evenly-spaced stills across
+# that whole span gives the model a real look at the customer's presence
+# there instead of gambling on one narrow instant that might land on an
+# empty kiosk if the anchor is even slightly off.
+_KIOSK_TRANSACTION_GROUP_PROBE_FRAME_COUNT = 10
+
 _KIOSK_TRANSACTION_MATCH_INSTRUCTIONS = (
     "You are verifying which kiosk self-checkout transaction(s) belong to a specific confirmed store customer, "
     "using still images only (not video). Images 1 to {reference_count} show that confirmed customer, captured "
@@ -4150,6 +4160,29 @@ _KIOSK_TRANSACTION_MATCH_INSTRUCTIONS = (
     '"reasoning":string}}]}}. Include exactly one entry per candidate listed below, using its candidate_index.'
 )
 
+_KIOSK_TRANSACTION_GROUP_MATCH_INSTRUCTIONS = (
+    "You are verifying which kiosk self-checkout attempt(s) belong to a specific confirmed store customer, "
+    "using still images only (not video). Images 1 to {reference_count} show that confirmed customer, captured "
+    "at store entry and exit - this is the specific customer you must check for. "
+    "Below are one or more candidate checkout attempts. Each candidate can involve multiple transaction rows "
+    "(e.g. a failed payment attempt followed by a retried pending or paid one) - all rows in one candidate are "
+    "the SAME physical checkout attempt, not separate people. Each candidate lists which physical kiosk machine "
+    "it was made on, its transaction row(s) with their own statuses, and its own numbered range of kiosk camera "
+    "stills, evenly spaced across the whole time this checkout attempt could have been in progress (from when "
+    "the customer started scanning to whenever payment last resolved, or to when this session's customer left "
+    "if payment never resolved). Each of those stills has two boxes drawn on it marking the two physical kiosk "
+    "machines in the camera's view, labeled RIGHT and LEFT - these labels match the candidate's stated kiosk "
+    "machine below (e.g. a machine name containing 'Right' corresponds to the box labeled RIGHT), not "
+    "necessarily the literal left/right side of the image. For EACH candidate, decide whether the confirmed "
+    "customer from the reference images is the same physical person shown standing at that candidate's own "
+    "labeled box across its stills - compare clothing, build, and hair, and use which labeled box they are "
+    "standing at as a supporting clue when it helps tell candidates apart. More than one candidate can belong "
+    "to the same customer (e.g. they paid at the kiosk twice), so judge every candidate independently rather "
+    "than assuming only one can match. Return strict JSON only with schema: "
+    '{{"candidates":[{{"candidate_index":integer,"belongs_to_customer":true|false,"confidence":number,'
+    '"reasoning":string}}]}}. Include exactly one entry per candidate listed below, using its candidate_index.'
+)
+
 
 def _kiosk_machine_side_label(machine_name: str) -> str | None:
     normalized = machine_name.strip().lower()
@@ -4158,6 +4191,51 @@ def _kiosk_machine_side_label(machine_name: str) -> str | None:
     if "left" in normalized:
         return "LEFT"
     return None
+
+
+def _kiosk_transaction_machine_name(transaction: Mapping[str, Any]) -> str | None:
+    raw_payload = transaction.get("raw_payload")
+    raw_payload = raw_payload if isinstance(raw_payload, Mapping) else {}
+    machine_name = (
+        raw_payload.get("machineName") or raw_payload.get("machine_name") or raw_payload.get("machinename")
+    )
+    return str(machine_name).strip() or None if machine_name else None
+
+
+def _transaction_group_key(row: Mapping[str, Any]) -> tuple[str | None, datetime | None]:
+    return (_kiosk_transaction_machine_name(row), _coerce_datetime_value(row.get("initiated_at")))
+
+
+def _group_transactions_by_machine_and_initiated_at(
+    rows: list[Mapping[str, Any]],
+) -> list[tuple[tuple[Any, Any], list[Mapping[str, Any]]]]:
+    """Groups candidate transactions into distinct checkout attempts. The POS
+    writes a new row per PAYMENT ATTEMPT, not per customer visit - a failed
+    attempt followed by a retried pending or eventually-paid one share the
+    same kiosk machine and the same initiated_at (when the customer started
+    scanning, set once per visit, before any payment attempt). Confirmed
+    live on session 445: a 'failed' and a 'pending' row shared machineName
+    and initiated_at exactly - they were the same checkout, not two
+    candidates to disambiguate between.
+
+    A row missing either field can't be safely grouped with anything else,
+    so it gets its own singleton group keyed by its own receipt/transaction
+    id rather than silently colliding with other ungroupable rows under the
+    same (None, None) key.
+    """
+    groups: dict[Any, list[Mapping[str, Any]]] = {}
+    order: list[Any] = []
+    for row in rows:
+        machine_name, initiated_at = _transaction_group_key(row)
+        if machine_name is None or initiated_at is None:
+            key: Any = ("_unidentified", str(row.get("receipt_number") or row.get("transaction_id") or id(row)))
+        else:
+            key = (machine_name, initiated_at)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(row)
+    return [(key, groups[key]) for key in order]
 
 
 def _build_kiosk_transaction_candidate_block(
@@ -4169,14 +4247,7 @@ def _build_kiosk_transaction_candidate_block(
 ) -> str:
     range_start = image_offset + 1
     range_end = image_offset + image_count
-    raw_payload = transaction.get("raw_payload")
-    raw_payload = raw_payload if isinstance(raw_payload, Mapping) else {}
-    machine_name = str(
-        raw_payload.get("machineName")
-        or raw_payload.get("machine_name")
-        or raw_payload.get("machinename")
-        or "unknown machine"
-    )
+    machine_name = _kiosk_transaction_machine_name(transaction) or "unknown machine"
     side_label = _kiosk_machine_side_label(machine_name)
     machine_line = (
         f"Kiosk machine used: {machine_name} (matches the box labeled {side_label} in this candidate's stills)"
@@ -4194,6 +4265,38 @@ def _build_kiosk_transaction_candidate_block(
         f"Transaction time: {transaction_time}\n"
         "These stills were captured from the kiosk camera roughly 4 seconds before to 1 second after this "
         "transaction's payment attempt.\n"
+    )
+
+
+def _build_kiosk_transaction_group_candidate_block(
+    *,
+    candidate_index: int,
+    machine_name: str | None,
+    rows: list[Mapping[str, Any]],
+    anchor_start: datetime,
+    anchor_end: datetime,
+    image_count: int,
+    image_offset: int,
+) -> str:
+    range_start = image_offset + 1
+    range_end = image_offset + image_count
+    display_machine_name = machine_name or "unknown machine"
+    side_label = _kiosk_machine_side_label(display_machine_name)
+    machine_line = (
+        f"Kiosk machine used: {display_machine_name} (matches the box labeled {side_label} in this candidate's stills)"
+        if side_label
+        else f"Kiosk machine used: {display_machine_name} (side unknown - rely on appearance matching only)"
+    )
+    rows_line = "; ".join(
+        f"receipt {row.get('receipt_number') or row.get('transaction_id') or 'unknown'} (status: {row.get('status') or 'unknown'})"
+        for row in rows
+    )
+    return (
+        f"=== Candidate {candidate_index} (use images {range_start} to {range_end} ONLY for this candidate) ===\n"
+        f"Transaction row(s) in this one checkout attempt: {rows_line}\n"
+        f"{machine_line}\n"
+        f"This checkout attempt spans from {anchor_start.isoformat()} to {anchor_end.isoformat()}.\n"
+        "These stills are evenly spaced across that whole span.\n"
     )
 
 
@@ -4247,6 +4350,18 @@ def _capture_kiosk_probe_frames(
 ) -> list[str]:
     anchor = _utc_naive_to_local(_coerce_datetime_value(transaction.get("payment_attempt_at")))
     if anchor is None:
+        # A still-pending transaction never got a payment gateway response, so
+        # payment_attempt_at is null - initiated_at (when the customer started
+        # scanning items, also UTC from the POS DB) is a much closer stand-in
+        # for "customer is physically at the kiosk now" than transaction_time,
+        # which for a pending record isn't guaranteed to reflect real customer
+        # presence at all. Confirmed live on session 445: initiated_at fell
+        # squarely inside the session's own window while transaction_time was
+        # ~1.5 minutes after the session's exit trigger - probe frames only
+        # span a 5s window around the anchor, so that gap alone was enough to
+        # capture nothing.
+        anchor = _utc_naive_to_local(_coerce_datetime_value(transaction.get("initiated_at")))
+    if anchor is None:
         anchor = _coerce_datetime_value(transaction.get("transaction_time"))
     if anchor is None:
         return []
@@ -4257,6 +4372,64 @@ def _capture_kiosk_probe_frames(
         sample_time = anchor + timedelta(seconds=offset_seconds)
         snapshot_path = (
             snapshot_root / safe_receipt / f"probe_{index:02d}_{sample_time.strftime('%Y%m%d_%H%M%S')}.jpg"
+        )
+        capture_meta = _capture_snapshot_frame(
+            location_id=location_id,
+            session_id=session_id,
+            section="kiosk",
+            recorder_channel=recorder_channel,
+            start_time=sample_time,
+            delayed_seconds=delayed_seconds,
+            snapshot_path=snapshot_path,
+        )
+        if capture_meta["status"] != "ok":
+            continue
+        try:
+            _label_kiosk_machines_on_frame(snapshot_path)
+        except Exception:
+            logger.exception("Could not draw kiosk machine labels on probe frame %s", snapshot_path)
+        _object_key, image_url = _upload_runner_input_file(
+            snapshot_path,
+            kind="kiosk_transaction_probe_image",
+            location_id=location_id,
+            session_id=session_id,
+            trigger_id=None,
+            section="kiosk",
+        )
+        image_urls.append(image_url)
+    return image_urls
+
+
+def _capture_kiosk_probe_frames_for_range(
+    *,
+    location_id: int,
+    session_id: int,
+    group_label: str,
+    recorder_channel: str,
+    delayed_seconds: int,
+    snapshot_root: Path,
+    start_time: datetime,
+    end_time: datetime,
+    frame_count: int = _KIOSK_TRANSACTION_GROUP_PROBE_FRAME_COUNT,
+) -> list[str]:
+    """Same capture mechanics as _capture_kiosk_probe_frames, but for a
+    transaction GROUP that spans a real time range rather than one instant -
+    frame_count stills spaced evenly across [start_time, end_time] instead of
+    a handful of offsets around one anchor."""
+    if end_time <= start_time:
+        # Degenerate range (e.g. a group with no payment_attempt_at and no
+        # exit_trigger_time to fall back on) - still needs SOME span so the
+        # frames aren't all identical.
+        end_time = start_time + timedelta(seconds=30)
+    span_seconds = (end_time - start_time).total_seconds()
+    safe_label = re.sub(r"[^A-Za-z0-9._-]+", "_", group_label) or "group"
+    image_urls: list[str] = []
+    frame_count = max(1, int(frame_count))
+    for index in range(frame_count):
+        fraction = index / (frame_count - 1) if frame_count > 1 else 0.0
+        sample_time = start_time + timedelta(seconds=span_seconds * fraction)
+        snapshot_path = (
+            snapshot_root / safe_label / f"probe_{index + 1:02d}_{sample_time.strftime('%Y%m%d_%H%M%S')}.jpg"
         )
         capture_meta = _capture_snapshot_frame(
             location_id=location_id,
@@ -4389,6 +4562,167 @@ def _identify_kiosk_transactions_for_session(
         )
         if belongs:
             matched.append(dict(transaction))
+
+    return matched, {
+        "status": "success",
+        "reference_image_urls": reference_image_urls,
+        "candidates": diagnostics_candidates,
+    }
+
+
+def _kiosk_transaction_group_anchor_range(
+    *,
+    group_key: tuple[Any, Any],
+    rows: list[Mapping[str, Any]],
+    exit_trigger_time: datetime | None,
+) -> tuple[datetime | None, datetime | None]:
+    """Start = initiated_at (when the customer started scanning - the same
+    for every row in the group by construction). End = the latest
+    payment_attempt_at among the group's rows if any resolved, else the
+    session's own exit trigger time - a group that never got a payment
+    response (pure pending, no attempt at all) has no better signal for
+    "when did this customer stop being at the kiosk" than when they left the
+    store. Both are UTC from the POS DB / already-local trigger_time
+    respectively, so only the POS-derived one gets _utc_naive_to_local.
+    """
+    _machine_name, initiated_at = group_key
+    anchor_start = _utc_naive_to_local(initiated_at) if isinstance(initiated_at, datetime) else None
+    if anchor_start is None:
+        # Ungroupable row (see _group_transactions_by_machine_and_initiated_at) -
+        # fall back to the same anchor chain a lone transaction already uses.
+        fallback_row = rows[0]
+        anchor_start = _utc_naive_to_local(_coerce_datetime_value(fallback_row.get("payment_attempt_at")))
+        if anchor_start is None:
+            anchor_start = _utc_naive_to_local(_coerce_datetime_value(fallback_row.get("initiated_at")))
+        if anchor_start is None:
+            anchor_start = _coerce_datetime_value(fallback_row.get("transaction_time"))
+    payment_attempt_times = [
+        value
+        for row in rows
+        if (value := _coerce_datetime_value(row.get("payment_attempt_at"))) is not None
+    ]
+    anchor_end = _utc_naive_to_local(max(payment_attempt_times)) if payment_attempt_times else exit_trigger_time
+    return anchor_start, anchor_end
+
+
+def _identify_kiosk_transaction_groups_for_session(
+    db: Session,
+    *,
+    session_id: int,
+    location_id: int,
+    groups: list[tuple[tuple[Any, Any], list[Mapping[str, Any]]]],
+    exit_trigger_time: datetime | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Group-level counterpart to _identify_kiosk_transactions_for_session -
+    used whenever a session's window has more than one distinct transaction
+    GROUP (see _group_transactions_by_machine_and_initiated_at), so there's
+    genuine ambiguity about which checkout attempt(s) belong to this
+    session's customer. One combined Gemini call covers every group, each
+    represented by frames spread across its own whole time span rather than
+    a handful of instants around one anchor."""
+    try:
+        cctv = repositories.get_cctv_by_location_section(db, location_id=location_id, section="kiosk")
+    except Exception as exc:
+        return [], {"status": "failed", "error": f"Could not load kiosk CCTV record: {exc}"}
+    recorder_channel = str(cctv.get("recorder_channel") or "").strip()
+    if not recorder_channel:
+        return [], {"status": "failed", "error": "Kiosk CCTV record does not have a recorder_channel."}
+    delayed_seconds = _current_delayed_seconds(db, location_id=location_id, section="kiosk", cctv=cctv)
+
+    snapshot_root = build_session_workdir(location_id, session_id) / "kiosk" / "transaction_group_identification_inputs"
+    snapshot_root.mkdir(parents=True, exist_ok=True)
+
+    reference_image_urls = _identity_reference_image_urls_for_session(db, session_id)
+
+    call_image_urls = list(reference_image_urls)
+    offset = len(reference_image_urls)
+    candidate_blocks: list[str] = []
+    indexed_groups: list[tuple[int, tuple[Any, Any], list[Mapping[str, Any]]]] = []
+    group_image_urls: dict[int, list[str]] = {}
+
+    for candidate_index, (group_key, rows) in enumerate(groups, start=1):
+        anchor_start, anchor_end = _kiosk_transaction_group_anchor_range(
+            group_key=group_key, rows=rows, exit_trigger_time=exit_trigger_time
+        )
+        if anchor_start is None:
+            continue
+        if anchor_end is None or anchor_end <= anchor_start:
+            anchor_end = anchor_start + timedelta(seconds=30)
+        machine_name = group_key[0]
+        group_label = f"{machine_name or 'unknown'}_{anchor_start.strftime('%Y%m%d%H%M%S')}"
+        image_urls = _capture_kiosk_probe_frames_for_range(
+            location_id=location_id,
+            session_id=session_id,
+            group_label=group_label,
+            recorder_channel=recorder_channel,
+            delayed_seconds=delayed_seconds,
+            snapshot_root=snapshot_root,
+            start_time=anchor_start,
+            end_time=anchor_end,
+        )
+        if not image_urls:
+            continue
+        candidate_blocks.append(
+            _build_kiosk_transaction_group_candidate_block(
+                candidate_index=candidate_index,
+                machine_name=machine_name,
+                rows=rows,
+                anchor_start=anchor_start,
+                anchor_end=anchor_end,
+                image_count=len(image_urls),
+                image_offset=offset,
+            )
+        )
+        call_image_urls.extend(image_urls)
+        offset += len(image_urls)
+        indexed_groups.append((candidate_index, group_key, rows))
+        group_image_urls[candidate_index] = image_urls
+
+    if not indexed_groups:
+        return [], {
+            "status": "failed",
+            "error": "Could not capture any kiosk probe frames for the candidate transaction group(s).",
+        }
+
+    prompt = (
+        _KIOSK_TRANSACTION_GROUP_MATCH_INSTRUCTIONS.format(reference_count=len(reference_image_urls))
+        + "\n\n"
+        + "\n".join(candidate_blocks)
+    )
+    try:
+        result, _meta = _call_kiosk_vision(db, prompt=prompt, image_urls=call_image_urls)
+    except Exception as exc:
+        logger.exception("Kiosk transaction group identification call failed session_id=%s", session_id)
+        return [], {"status": "failed", "error": str(exc)}
+
+    results_by_index: dict[int, Mapping[str, Any]] = {}
+    for item in (result.get("candidates") if isinstance(result, Mapping) else None) or []:
+        if isinstance(item, Mapping) and item.get("candidate_index") is not None:
+            try:
+                results_by_index[int(item["candidate_index"])] = item
+            except (TypeError, ValueError):
+                continue
+
+    matched: list[dict[str, Any]] = []
+    diagnostics_candidates: list[dict[str, Any]] = []
+    for candidate_index, group_key, rows in indexed_groups:
+        item = results_by_index.get(candidate_index) or {}
+        confidence = _coerce_number(item.get("confidence"), 0.0)
+        belongs = bool(item.get("belongs_to_customer")) and confidence >= _KIOSK_TRANSACTION_MATCH_MIN_CONFIDENCE
+        receipt_numbers = [row.get("receipt_number") or row.get("transaction_id") for row in rows]
+        diagnostics_candidates.append(
+            {
+                "candidate_index": candidate_index,
+                "machine_name": group_key[0],
+                "receipt_numbers": receipt_numbers,
+                "belongs_to_customer": belongs,
+                "confidence": confidence,
+                "reasoning": item.get("reasoning"),
+                "image_urls": group_image_urls.get(candidate_index, []),
+            }
+        )
+        if belongs:
+            matched.extend(dict(row) for row in rows)
 
     return matched, {
         "status": "success",
@@ -11332,15 +11666,21 @@ def _kickoff_kiosk_pipeline_for_session(
     it to RunPod on its own the moment the video is ready - no changes needed
     there.
 
-    Before committing to any transaction, _identify_kiosk_transactions_for_session
-    confirms which candidate(s) actually belong to this session's customer
-    (paid transactions first; if none exist, the single latest pending/failed
-    transaction is tried instead) - a session is never assumed to belong to
-    whichever transaction merely happened to fall in its time window. The one
-    exception is exactly one PAID transaction: nothing is genuinely ambiguous
-    there, and the verification call has produced enough confident-but-wrong
-    rejections of the correct match that skipping it is safer than running it
-    (see the len(transactions) == 1 check below).
+    Candidates (paid + pending/failed) are first grouped into transaction
+    GROUPS (see _group_transactions_by_machine_and_initiated_at) - the POS
+    writes a new row per payment ATTEMPT, not per customer visit, so a failed
+    attempt followed by a retried pending/paid one are the same checkout, not
+    two things to disambiguate between. If the whole window collapses to one
+    group, it's assigned directly with no AI verification (nothing is
+    genuinely ambiguous, and that verification call has a track record of
+    confidently rejecting even an unambiguous correct match). With more than
+    one group, _identify_kiosk_transaction_groups_for_session verifies which
+    group(s) actually belong to this session's customer. If none can be
+    confidently determined, the session is marked need_review with every
+    candidate group recorded in result_summary, so it can be resolved via
+    assign_kiosk_transactions_to_session (the dashboard's manual "tick which
+    transaction is this session's" action) instead of only ever waiting on a
+    fallible AI call.
     """
     if _is_kiosk_analysis_disabled(db):
         # Deliberately different from the kiosk_analysis worker pause toggle,
@@ -11350,17 +11690,8 @@ def _kickoff_kiosk_pipeline_for_session(
         # up a backlog of sessions from while it was off.
         return {"status": "skipped", "reason": "kiosk_analysis_disabled", "video_asset_ids": []}
 
-    candidates: list[Mapping[str, Any]] = list(transactions) if transactions else []
-    if not candidates:
-        fallback_candidates = list(issue_transactions or [])
-        if fallback_candidates:
-            latest = max(
-                fallback_candidates,
-                key=lambda row: _transaction_event_time(row) or datetime.min,
-            )
-            candidates = [latest]
-
-    if not candidates:
+    all_candidates: list[Mapping[str, Any]] = list(transactions or []) + list(issue_transactions or [])
+    if not all_candidates:
         repositories.update_session_fields(
             db,
             session_id=session_id,
@@ -11369,26 +11700,20 @@ def _kickoff_kiosk_pipeline_for_session(
         )
         return {"status": "need_review", "reason": "no_transaction_candidates", "video_asset_ids": []}
 
-    if len(transactions) == 1:
-        # With exactly one PAID transaction in the session's window, there's
-        # nothing genuinely ambiguous for the Gemini verification step to
-        # resolve - unlike the 0-paid fallback-to-a-pending/failed-transaction
-        # case just above, where a single candidate could still plausibly
-        # belong to someone else. In practice this verification call has
-        # produced enough confident-but-wrong rejections of the correct
-        # match (rejecting a real customer's own single paid transaction) that
-        # skipping it here is safer than running it.
-        matched_transactions = list(candidates)
-        identification_summary: dict[str, Any] = {
-            "status": "skipped",
-            "reason": "single_paid_transaction",
-        }
+    groups = _group_transactions_by_machine_and_initiated_at(all_candidates)
+
+    if len(groups) == 1:
+        # The whole window is one checkout attempt (however many payment-retry
+        # rows it left behind) - nothing for verification to disambiguate.
+        matched_transactions = list(groups[0][1])
+        identification_summary: dict[str, Any] = {"status": "skipped", "reason": "single_transaction_group"}
     else:
-        matched_transactions, identification_summary = _identify_kiosk_transactions_for_session(
+        matched_transactions, identification_summary = _identify_kiosk_transaction_groups_for_session(
             db,
             session_id=session_id,
             location_id=location_id,
-            candidates=candidates,
+            groups=groups,
+            exit_trigger_time=exit_trigger_time,
         )
     if not matched_transactions:
         repositories.update_session_fields(
@@ -11396,7 +11721,10 @@ def _kickoff_kiosk_pipeline_for_session(
             session_id=session_id,
             status="need_review",
             issue_reason="Could not confidently match any transaction to this session's customer.",
-            result_summary={"kiosk_transaction_identification": identification_summary},
+            result_summary={
+                "kiosk_transaction_identification": identification_summary,
+                "kiosk_transaction_candidate_groups": _serialize_transaction_groups(groups),
+            },
         )
         return {
             "status": "need_review",
@@ -11405,16 +11733,84 @@ def _kickoff_kiosk_pipeline_for_session(
             "identification": identification_summary,
         }
 
+    return _finalize_kiosk_transaction_match(
+        db,
+        session_id=session_id,
+        location_id=location_id,
+        matched_transactions=matched_transactions,
+        identification_summary=identification_summary,
+        exit_trigger_time=exit_trigger_time,
+    )
+
+
+def _serialize_transaction_groups(
+    groups: list[tuple[tuple[Any, Any], list[Mapping[str, Any]]]],
+) -> list[dict[str, Any]]:
+    """JSON-safe view of candidate transaction groups, persisted on a
+    need_review session so the dashboard can list them for manual selection
+    (see assign_kiosk_transactions_to_session) without re-querying the POS
+    tables just to show what was already found."""
+    serialized: list[dict[str, Any]] = []
+    for (machine_name, initiated_at), rows in groups:
+        serialized.append(
+            {
+                "machine_name": machine_name,
+                "initiated_at": initiated_at.isoformat() if isinstance(initiated_at, datetime) else initiated_at,
+                "transactions": [
+                    {
+                        "receipt_number": row.get("receipt_number") or row.get("transaction_id"),
+                        "status": row.get("status"),
+                        "transaction_time": _isoformat_or_none(row.get("transaction_time")),
+                        "initiated_at": _isoformat_or_none(row.get("initiated_at")),
+                        "payment_attempt_at": _isoformat_or_none(row.get("payment_attempt_at")),
+                        "total_amount": row.get("total_amount"),
+                        "total_items": row.get("total_items"),
+                    }
+                    for row in rows
+                ],
+            }
+        )
+    return serialized
+
+
+def _isoformat_or_none(value: Any) -> str | None:
+    coerced = _coerce_datetime_value(value)
+    return coerced.isoformat() if coerced is not None else (str(value) if value is not None else None)
+
+
+def _finalize_kiosk_transaction_match(
+    db: Session,
+    *,
+    session_id: int,
+    location_id: int,
+    matched_transactions: list[Mapping[str, Any]],
+    identification_summary: dict[str, Any],
+    exit_trigger_time: datetime | None,
+) -> dict[str, Any]:
+    """Shared tail of the kiosk transaction-matching pipeline: persists every
+    matched transaction row, builds and merges their capture windows, and
+    queues kiosk video retrieval for each. Used both by the automatic path
+    (_kickoff_kiosk_pipeline_for_session) and the manual one
+    (assign_kiosk_transactions_to_session), so a human's selection is
+    finalized in exactly the same way an AI-confirmed match would be."""
     # Keyed by receipt_number so each matched transaction's own row can carry
     # the probe frames + reasoning that confirmed it, not just the failure
     # case - the dashboard can then show "here's what the model saw and why
     # it decided this receipt belongs to this customer" per receipt, not only
-    # when identification fails.
-    identification_by_receipt = {
-        str(candidate.get("receipt_number")): candidate
-        for candidate in (identification_summary.get("candidates") or [])
-        if isinstance(candidate, Mapping) and candidate.get("receipt_number") is not None
-    }
+    # when identification fails. A group-level candidate (see
+    # _identify_kiosk_transaction_groups_for_session) carries "receipt_numbers"
+    # (plural - one candidate can cover several rows) instead of a single
+    # "receipt_number", so every receipt in that list is pointed at the same
+    # candidate entry.
+    identification_by_receipt: dict[str, Mapping[str, Any]] = {}
+    for candidate in identification_summary.get("candidates") or []:
+        if not isinstance(candidate, Mapping):
+            continue
+        if candidate.get("receipt_number") is not None:
+            identification_by_receipt[str(candidate.get("receipt_number"))] = candidate
+        for receipt_number in candidate.get("receipt_numbers") or []:
+            if receipt_number is not None:
+                identification_by_receipt[str(receipt_number)] = candidate
     reference_image_urls = identification_summary.get("reference_image_urls") or []
 
     # Persisted so get_transaction_total_items (used later by finalize_session_result
@@ -11489,6 +11885,95 @@ def _kickoff_kiosk_pipeline_for_session(
             continue
         video_asset_ids.append(int(queued.video_asset_id))
     return {"status": "queued", "video_windows": merged_windows, "video_asset_ids": video_asset_ids}
+
+
+def _gather_kiosk_transaction_candidate_groups_for_session(
+    db: Session, session_id: int
+) -> tuple[dict[str, Any], int, datetime | None, list[tuple[tuple[Any, Any], list[dict[str, Any]]]]]:
+    """Recomputes the same paid+pending/failed candidate pool and grouping
+    _kickoff_kiosk_pipeline_for_session uses, straight from the session's own
+    entry/exit trigger times - used both to list candidates for the manual
+    "tick which transaction" UI and to resolve a manual selection back to its
+    full transaction row(s)."""
+    session = repositories.get_session(db, session_id)
+    location_id = int(session["location_id"])
+    entry_trigger_id = session.get("entry_trigger_id")
+    exit_trigger_id = session.get("exit_trigger_id")
+    entry_time = (
+        _coerce_datetime_value(repositories.get_trigger(db, int(entry_trigger_id)).get("trigger_time"))
+        if entry_trigger_id is not None
+        else None
+    )
+    exit_time = (
+        _coerce_datetime_value(repositories.get_trigger(db, int(exit_trigger_id)).get("trigger_time"))
+        if exit_trigger_id is not None
+        else None
+    )
+    exit_time = exit_time or _coerce_datetime_value(session.get("end_time"))
+    if entry_time is None or exit_time is None:
+        return session, location_id, exit_time, []
+    start_time, end_time = (entry_time, exit_time) if entry_time <= exit_time else (exit_time, entry_time)
+    transactions = repositories.list_paid_transactions_for_session_window(
+        db, location_id=location_id, start_time=start_time, end_time=end_time
+    )
+    issue_transactions = repositories.list_non_paid_transactions_for_session_window(
+        db, location_id=location_id, start_time=start_time, end_time=end_time
+    )
+    groups = _group_transactions_by_machine_and_initiated_at(list(transactions) + list(issue_transactions))
+    return session, location_id, exit_time, groups
+
+
+def list_kiosk_transaction_candidates_for_session(db: Session, session_id: int) -> dict[str, Any]:
+    """Backs the dashboard's "select the related transaction" picker on a
+    need_review session - the same candidate groups the automatic pipeline
+    saw (or would see right now, if called before the pipeline ever ran)."""
+    _session, _location_id, _exit_time, groups = _gather_kiosk_transaction_candidate_groups_for_session(
+        db, session_id
+    )
+    return {"session_id": session_id, "groups": _serialize_transaction_groups(groups)}
+
+
+def assign_kiosk_transactions_to_session(
+    db: Session, *, session_id: int, receipt_numbers: list[str]
+) -> dict[str, Any]:
+    """Manual override for a session stuck at need_review because no
+    transaction group could be confidently identified automatically - the
+    dashboard lets the user tick which transaction(s) actually belong to this
+    session, and this finalizes them exactly like an AI-confirmed match
+    would (see _finalize_kiosk_transaction_match), skipping identification
+    entirely since a human already made the call."""
+    if not receipt_numbers:
+        raise ValueError("At least one receipt_number must be selected.")
+    _session, location_id, exit_trigger_time, groups = _gather_kiosk_transaction_candidate_groups_for_session(
+        db, session_id
+    )
+    receipt_set = {str(value) for value in receipt_numbers}
+    matched_transactions = [
+        row
+        for _key, rows in groups
+        for row in rows
+        if str(row.get("receipt_number") or row.get("transaction_id") or "") in receipt_set
+    ]
+    if not matched_transactions:
+        raise ValueError(
+            f"None of the selected receipt number(s) {sorted(receipt_set)} match a transaction in this "
+            "session's entry-to-exit window."
+        )
+    result = _finalize_kiosk_transaction_match(
+        db,
+        session_id=session_id,
+        location_id=location_id,
+        matched_transactions=matched_transactions,
+        identification_summary={"status": "manual", "reason": "user_selected", "receipt_numbers": sorted(receipt_set)},
+        exit_trigger_time=exit_trigger_time,
+    )
+    repositories.update_session_fields(
+        db,
+        session_id=session_id,
+        status="pending" if result.get("status") == "queued" else "need_review",
+        issue_reason=None if result.get("status") == "queued" else "A transaction was matched but had no usable timestamp.",
+    )
+    return result
 
 
 def _maybe_close_session_and_prepare_kiosk(
