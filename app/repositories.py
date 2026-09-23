@@ -6565,6 +6565,43 @@ def replace_script_run_call(db: Session, script_run_id: int, index: int, call_en
     db.commit()
 
 
+def annotate_latest_script_run_call(db: Session, script_run_id: int, extra_fields: Mapping[str, Any]) -> None:
+    """Merges extra fields into the LAST entry of a script_run's "calls"
+    array - used by grouping_adjacent to attach which trigger_ids were the
+    entry/candidates for that one call and which one (if any) it matched,
+    directly onto that call's own attempt entry, right after the call
+    returns. Relies on grouping_adjacent making exactly one call per
+    identity entry, sequentially (never concurrently, same assumption
+    append_script_run_call already documents) - safe as long as that holds.
+    A no-op if "calls" is empty (nothing to annotate).
+    """
+    script_run_table = _table("script_run")
+    row = db.execute(
+        text(f"select stdout_log from {script_run_table} where id = :script_run_id"),
+        {"script_run_id": script_run_id},
+    ).mappings().first()
+    current_stdout = (row or {}).get("stdout_log") or ""
+    try:
+        parsed = json.loads(current_stdout) if current_stdout else {}
+        if not isinstance(parsed, dict):
+            parsed = {}
+    except json.JSONDecodeError:
+        parsed = {}
+    calls = parsed.get("calls")
+    if not isinstance(calls, list) or not calls:
+        return
+    last_entry = calls[-1]
+    if not isinstance(last_entry, dict):
+        return
+    calls[-1] = {**last_entry, **dict(extra_fields)}
+    parsed["calls"] = calls
+    db.execute(
+        text(f"update {script_run_table} set stdout_log = :stdout_log where id = :script_run_id"),
+        {"stdout_log": json.dumps(parsed, default=str), "script_run_id": script_run_id},
+    )
+    db.commit()
+
+
 def merge_script_run_stdout_fields(db: Session, script_run_id: int, extra_fields: Mapping[str, Any]) -> str:
     """Adds/overwrites top-level keys in a script_run's stdout_log JSON
     without touching whatever append_script_run_call already wrote there

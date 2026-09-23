@@ -6600,42 +6600,78 @@ def _run_grouping_adjacent_pass(
             group_number = index + 1
             entry_id = item["entry_id"]
             candidates = item["candidates"]
+            candidate_trigger_ids = [int(candidate["trigger_id"]) for candidate in candidates]
             result = results_by_group.get(group_number)
-            if not result:
-                continue
-            matched_candidate = result.get("matched_candidate")
-            confidence = _coerce_number(result.get("confidence"), 0.0)
-            if matched_candidate is None or confidence < 0.5 or not (1 <= int(matched_candidate) <= len(candidates)):
-                continue
-            exit_trigger = candidates[int(matched_candidate) - 1]
-            exit_id = int(exit_trigger["trigger_id"])
-            if entry_id in consumed or exit_id in consumed:
+            matched_trigger_id: int | None = None
+            match_confidence: float | None = None
+            match_reason: str | None = None
+            if result:
+                matched_candidate = result.get("matched_candidate")
+                confidence = _coerce_number(result.get("confidence"), 0.0)
+                if (
+                    matched_candidate is not None
+                    and confidence >= 0.5
+                    and 1 <= int(matched_candidate) <= len(candidates)
+                ):
+                    exit_trigger = candidates[int(matched_candidate) - 1]
+                    exit_id = int(exit_trigger["trigger_id"])
+                    if entry_id not in consumed and exit_id not in consumed:
+                        matched_trigger_id = exit_id
+                        match_confidence = confidence
+                        match_reason = str(result.get("reason") or "Matched by adjacency check.")
+            # Attached directly onto this entry's own call attempt (see
+            # annotate_latest_script_run_call) so the Script Run page can show
+            # every candidate this call actually considered and which one (if
+            # any) it matched, without anyone having to dig through the raw
+            # prompt text or response JSON to reconstruct it.
+            try:
+                repositories.annotate_latest_script_run_call(
+                    db,
+                    adjacent_script_run_id,
+                    {
+                        "entry_trigger_id": entry_id,
+                        "candidate_trigger_ids": candidate_trigger_ids,
+                        "matched_trigger_id": matched_trigger_id,
+                        "match_confidence": match_confidence,
+                        "match_reason": match_reason,
+                    },
+                )
+            except Exception:
+                logger.exception(
+                    "Could not annotate adjacent call with candidate/match info batch_id=%s "
+                    "script_run_id=%s entry_id=%s",
+                    batch_id,
+                    adjacent_script_run_id,
+                    entry_id,
+                )
+            if matched_trigger_id is None:
                 continue
             consumed.add(entry_id)
-            consumed.add(exit_id)
+            consumed.add(matched_trigger_id)
             groups.append(
                 {
                     "group_id": next_group_id,
                     "entry": [entry_id],
-                    "exit": [exit_id],
-                    "score": confidence,
-                    "reason": str(result.get("reason") or "Matched by adjacency check."),
+                    "exit": [matched_trigger_id],
+                    "score": match_confidence,
+                    "reason": match_reason,
                     "source": "grouping_adjacent",
                     "verified": True,
                     "verification": {
                         "error": None,
-                        "confidence": confidence,
+                        "confidence": match_confidence,
                     },
                     "total_customer": 1,
                     "entry_has_identity": True,
-                    "entry_carry": result.get("entry_carry"),
-                    "exit_carry": result.get("exit_carry"),
-                    "carry_change_summary": str(result.get("carry_change_summary") or ""),
+                    "entry_carry": result.get("entry_carry") if result else None,
+                    "exit_carry": result.get("exit_carry") if result else None,
+                    "carry_change_summary": str((result or {}).get("carry_change_summary") or ""),
                 }
             )
             next_group_id += 1
             notes.append(
-                f"Trigger {entry_id} matched trigger {exit_id} via adjacency check (confidence {confidence:.2f})."
+                f"Trigger {entry_id} matched trigger {matched_trigger_id} via adjacency check "
+                f"(confidence {match_confidence:.2f})."
             )
 
     for index, entry_group in enumerate(pending_entry_groups):
