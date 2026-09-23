@@ -286,7 +286,12 @@ class Settings(BaseSettings):
     openrouter_api_key: str | None = None
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_timeout_seconds: int = 180
-    openrouter_image_scale: float = 0.5
+    # Raised from 0.5 - user reported repeated wrong garment/appearance
+    # descriptions from OpenRouter's mimo model on grouping images; testing
+    # whether preserving more detail (at the cost of more bandwidth/tokens
+    # per image) improves description accuracy before concluding it's the
+    # model itself rather than image resolution.
+    openrouter_image_scale: float = 0.75
 
     model_config = SettingsConfigDict(
         env_prefix="THEFT_API_",
