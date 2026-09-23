@@ -6606,6 +6606,13 @@ def _run_grouping_adjacent_pass(
             match_confidence: float | None = None
             match_reason: str | None = None
             if result:
+                # The model gives a reason either way - the prompt schema
+                # explicitly asks for one even when matched_candidate is null
+                # ("if matched_candidate is null, still [explain why]") - so
+                # this is captured unconditionally, not only on a confirmed
+                # match, otherwise a genuine no-match decision silently lost
+                # the model's own explanation for it.
+                match_reason = str(result.get("reason") or "") or None
                 matched_candidate = result.get("matched_candidate")
                 confidence = _coerce_number(result.get("confidence"), 0.0)
                 if (
@@ -6618,7 +6625,7 @@ def _run_grouping_adjacent_pass(
                     if entry_id not in consumed and exit_id not in consumed:
                         matched_trigger_id = exit_id
                         match_confidence = confidence
-                        match_reason = str(result.get("reason") or "Matched by adjacency check.")
+                        match_reason = match_reason or "Matched by adjacency check."
             # Attached directly onto this entry's own call attempt (see
             # annotate_latest_script_run_call) so the Script Run page can show
             # every candidate this call actually considered and which one (if
