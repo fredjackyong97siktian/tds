@@ -6292,10 +6292,14 @@ def _verify_entry_groups_against_candidates_batch(
         "For each group: first describe the entry customer's own appearance from their entry images alone - "
         "clothing, build, hair, and carried items - in 15 words or fewer; this is that entry trigger's "
         "customer_description. Then, for each of that group's candidates, describe that candidate trigger's own "
-        "customer the same way (15 words or fewer, its own customer_description), and check whether the SAME "
-        "physical person you just described for the entry is present in that candidate's images. Give a "
-        "similarity score from 0 (definitely a different person) to 1 (definitely the same physical person) for "
-        "every candidate, based only on clothing, build, hair, and carried items visibly present - always give "
+        "customer the same way (15 words or fewer, its own customer_description). "
+        "Multi-person rule: a candidate's images may show MORE THAN ONE person - never assume there is only one. "
+        "If more than one person is visible in a candidate's images, check the entry customer against EACH person "
+        "shown, individually, not just whichever one looks most prominent or central. It counts as a match if ANY "
+        "ONE of the people in that candidate's images is the same physical person as the entry customer, even if "
+        "that person is not the one you would otherwise describe as the main subject of those images. "
+        "Give a similarity score from 0 (definitely a different person) to 1 (definitely the same physical person) "
+        "for every candidate, based only on clothing, build, hair, and carried items visibly present - always give "
         "this score, even when you conclude it is not a match. At most one candidate per group can be correct - "
         "candidates are different, unrelated triggers, not multiple views of the same event. If no candidate's "
         "similarity score is high enough to be confident, or you are not confident, say so for that group (return "
@@ -6307,13 +6311,6 @@ def _verify_entry_groups_against_candidates_batch(
         "most 2 of that trigger's images as best_for_verification=1 - whichever show the person's face/clothing "
         "most clearly with the least blur or occlusion. Every image with has_person=0 must be best_for_verification=0, "
         "and every other image for that trigger not among your top 2 clearest must also be best_for_verification=0. "
-        "Also, for every trigger listed above (both entries and candidates), count how many distinct, separate "
-        "people appear together in that trigger's own images - usually 1, but count higher when a group of "
-        "customers clearly entered or exited together in the same trigger. Give your confidence in that count. "
-        "Also classify that trigger's customer_group_type as one of solo, couple, family, or friends, based on how "
-        "many people appear together and visible cues like relative age and interaction - use solo for a single "
-        "person. Also give age_brackets: one entry per distinct person you counted, each one of child, adult, or "
-        "senior, based only on visible appearance. "
         "Carry observation rule: for every group, whether or not it matched, describe what the entry customer visibly "
         "carries in the entry image set, and - only if matched_candidate is not null - what they visibly carry in that "
         "matched candidate's images. Count bags, plastic bags, woven/reusable bags, backpacks, boxes, cartons, bottles, "
@@ -6334,15 +6331,13 @@ def _verify_entry_groups_against_candidates_batch(
         '"exit_carry":{"bag_count":integer,"item_count":integer,"items":[{"type":string,"color":string,"size":string,"count":integer,"confidence":number}],"summary":string},'
         '"carry_change_summary":string}],'
         '"image_presence":[{"image_number":integer,"has_person":0 or 1,"best_for_verification":0 or 1}],'
-        '"trigger_customer_counts":[{"trigger_id":integer,"unique_customer_count":integer,"confidence":number,'
-        '"customer_group_type":"solo"|"couple"|"family"|"friends","age_brackets":[string]}],'
         '"trigger_appearances":[{"trigger_id":integer,"direction":"entry"|"exit"|"unclear","description":string}]}. '
         "Include exactly one result per group listed above, using its group_number, one image_presence entry "
-        "per image number, one trigger_customer_counts entry, and one trigger_appearances entry per trigger_id "
-        "listed above (entries and candidates both). matched_candidate is the candidate_number of the match "
-        "within that group, or null if none match. confidence is the similarity score (0 to 1) for whichever "
-        "candidate you judged closest, or your similarity score against the single candidate if only one was "
-        "given - always populate it, never omit it just because matched_candidate is null."
+        "per image number, and one trigger_appearances entry per trigger_id listed above (entries and candidates "
+        "both). matched_candidate is the candidate_number of the match within that group, or null if none match. "
+        "confidence is the similarity score (0 to 1) for whichever candidate you judged closest, or your "
+        "similarity score against the single candidate if only one was given - always populate it, never omit it "
+        "just because matched_candidate is null."
     )
     try:
         result, meta = _call_grouping_vision(
@@ -6359,7 +6354,13 @@ def _verify_entry_groups_against_candidates_batch(
     except Exception:
         return {}, {}, {}, None
 
-    _persist_trigger_unique_customer_counts(db, result, source="adjacent")
+    # unique_customer_count/customer_group_type/age_brackets were dropped
+    # from this call's own schema - they never fed any real detection
+    # decision (only ever shown on the session detail page), and competing
+    # with them for the model's attention in the same call was diluting the
+    # instructions that actually matter here (identity matching, carry-item
+    # observation, best-for-verification frame selection). Direct's own
+    # chunk scan still persists them for whichever triggers it processes.
     # Adjacent never contributed to this before - direct and repair both
     # already reuse whichever earlier stage's trigger_appearances a trigger
     # has (repair's "known appearance" rule explicitly says so), but until
