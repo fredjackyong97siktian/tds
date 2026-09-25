@@ -249,6 +249,12 @@ class Settings(BaseSettings):
     # repair instead. Restart-only (not live-toggleable), since this is meant
     # for a short A/B test, not routine operation.
     grouping_direct_enabled: bool = True
+    # Off by default for now - the structured-attribute pre-filter can wrongly
+    # eliminate a real candidate on a multi-person trigger (a single set of
+    # attributes only ever describes one of the people present), and that
+    # gap isn't fully closed yet. The stage's code stays in place; this just
+    # keeps it from actually running until that's resolved.
+    grouping_text_enabled: bool = False
     # Temporary diagnostic switch - when False, confidence analysis still runs
     # and writes its normal filter_confidence_result (score, factors,
     # need_deep_analysis) for every group, but stops short of creating an

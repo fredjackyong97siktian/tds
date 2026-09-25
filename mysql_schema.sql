@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS sesamedb.tds_trigger_event (
     appearance_direction VARCHAR(10) DEFAULT NULL COMMENT 'Grouping model''s own entry/exit/unclear read for this trigger, independent of identity.',
     appearance_source VARCHAR(20) DEFAULT NULL COMMENT 'Which grouping stage produced appearance_description/appearance_direction: adjacent, direct, or repair.',
     appearance_updated_at DATETIME DEFAULT NULL,
+    appearance_attributes JSON DEFAULT NULL COMMENT 'Structured appearance breakdown (top_color, top_type, bottom_color, bottom_type, footwear_color, footwear_type, distinguishing_features) - deliberately excludes gender. Used by grouping_text as a cheap pre-filter before spending an API call on a candidate.',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     KEY idx_trigger_event_location_time (location_id, trigger_time),

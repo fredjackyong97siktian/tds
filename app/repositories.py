@@ -1781,30 +1781,57 @@ def set_trigger_appearance(
     description: str,
     direction: str | None,
     source: str,
+    attributes: Mapping[str, Any] | None = None,
 ) -> None:
     # Persisted per-trigger (not per-batch) so it survives past this batch's
     # own lifecycle - a later chunk, a later repair pass, or even a
     # completely different batch can look this trigger up by id and reuse
     # the same description instead of re-deriving it from scratch.
+    # attributes is the structured breakdown (top_color, top_type, etc.) used
+    # by grouping_text as a cheap pre-filter - only overwritten when actually
+    # given, so a caller that doesn't collect attributes (direct, repair)
+    # never wipes out whatever adjacent already recorded for this trigger.
     trigger_table = _table("trigger_event")
-    db.execute(
-        text(
-            f"""
-            update {trigger_table}
-            set appearance_description = :description,
-                appearance_direction = :direction,
-                appearance_source = :source,
-                appearance_updated_at = now()
-            where id = :trigger_id
-            """
-        ),
-        {
-            "trigger_id": trigger_id,
-            "description": description,
-            "direction": direction,
-            "source": source,
-        },
-    )
+    if attributes is not None:
+        db.execute(
+            text(
+                f"""
+                update {trigger_table}
+                set appearance_description = :description,
+                    appearance_direction = :direction,
+                    appearance_source = :source,
+                    appearance_attributes = :attributes,
+                    appearance_updated_at = now()
+                where id = :trigger_id
+                """
+            ),
+            {
+                "trigger_id": trigger_id,
+                "description": description,
+                "direction": direction,
+                "source": source,
+                "attributes": _json_dumps(dict(attributes)),
+            },
+        )
+    else:
+        db.execute(
+            text(
+                f"""
+                update {trigger_table}
+                set appearance_description = :description,
+                    appearance_direction = :direction,
+                    appearance_source = :source,
+                    appearance_updated_at = now()
+                where id = :trigger_id
+                """
+            ),
+            {
+                "trigger_id": trigger_id,
+                "description": description,
+                "direction": direction,
+                "source": source,
+            },
+        )
     db.commit()
 
 
@@ -1815,7 +1842,8 @@ def get_trigger_appearances(db: Session, trigger_ids: list[int]) -> dict[int, di
     result = db.execute(
         text(
             f"""
-            select id, appearance_description, appearance_direction, appearance_source, appearance_updated_at
+            select id, appearance_description, appearance_direction, appearance_source, appearance_updated_at,
+                   appearance_attributes
             from {trigger_table}
             where id in :trigger_ids
               and appearance_description is not null
@@ -1823,7 +1851,14 @@ def get_trigger_appearances(db: Session, trigger_ids: list[int]) -> dict[int, di
         ).bindparams(bindparam("trigger_ids", expanding=True)),
         {"trigger_ids": trigger_ids},
     )
-    return {int(row["id"]): dict(row) for row in _fetch_all_dicts(result)}
+    rows = _fetch_all_dicts(result)
+    for row in rows:
+        if isinstance(row.get("appearance_attributes"), str):
+            try:
+                row["appearance_attributes"] = json.loads(row["appearance_attributes"])
+            except json.JSONDecodeError:
+                row["appearance_attributes"] = None
+    return {int(row["id"]): dict(row) for row in rows}
 
 
 def get_trigger_frame_asset(db: Session, frame_asset_id: int) -> dict[str, Any]:

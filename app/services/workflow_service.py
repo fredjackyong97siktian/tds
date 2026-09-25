@@ -6174,6 +6174,36 @@ def _persist_trigger_unique_customer_counts(db: Session, result: Mapping[str, An
 _VALID_APPEARANCE_DIRECTIONS = {"entry", "exit", "unclear"}
 
 
+_APPEARANCE_ATTRIBUTE_STRING_KEYS = (
+    "top_color",
+    "top_type",
+    "bottom_color",
+    "bottom_type",
+    "footwear_color",
+    "footwear_type",
+)
+
+
+def _normalize_appearance_attributes(raw: Any) -> dict[str, Any] | None:
+    # Deliberately excludes gender - noticed to be wrong often enough that
+    # using it as a hard pre-filter risks wrongly rejecting a real match.
+    # Values are lowercased/trimmed so grouping_text's pre-filter can compare
+    # them with a plain string equality check instead of fuzzy matching.
+    if not isinstance(raw, Mapping):
+        return None
+    attributes: dict[str, Any] = {}
+    for key in _APPEARANCE_ATTRIBUTE_STRING_KEYS:
+        value = str(raw.get(key) or "").strip().lower()
+        if value and value not in {"unknown", "n/a", "none", "unclear"}:
+            attributes[key] = value
+    features = raw.get("distinguishing_features")
+    if isinstance(features, list):
+        normalized_features = [str(item).strip().lower() for item in features if str(item or "").strip()]
+        if normalized_features:
+            attributes["distinguishing_features"] = normalized_features
+    return attributes or None
+
+
 def _persist_trigger_appearances(db: Session, result: Mapping[str, Any], *, source: str) -> None:
     # Mirrors _persist_trigger_unique_customer_counts above - each stage asks
     # for a "trigger_appearances" array (same shape) and persists every entry
@@ -6194,9 +6224,15 @@ def _persist_trigger_appearances(db: Session, result: Mapping[str, Any], *, sour
         direction = str(entry.get("direction") or "").strip().lower()
         if direction not in _VALID_APPEARANCE_DIRECTIONS:
             direction = None
+        attributes = _normalize_appearance_attributes(entry.get("attributes"))
         try:
             repositories.set_trigger_appearance(
-                db, trigger_id, description=description[:255], direction=direction, source=source
+                db,
+                trigger_id,
+                description=description[:255],
+                direction=direction,
+                source=source,
+                attributes=attributes,
             )
         except Exception:
             logger.exception("Could not persist appearance for trigger_id=%s source=%s", trigger_id, source)
@@ -6323,6 +6359,12 @@ def _verify_entry_groups_against_candidates_batch(
         "vague filler like 'a person'. This is the same customer_description used for the similarity check above - "
         "report it here too so it is saved for later reuse. Also state whether that trigger is this group's entry "
         "or one of its candidates (direction: 'entry' or 'exit'). "
+        "Structured attributes rule: for that same trigger, ALSO break its appearance down into separate fields - "
+        "top_color, top_type (e.g. t-shirt, tank top, blouse, jacket), bottom_color, bottom_type (e.g. shorts, "
+        "jeans, skirt, pants), footwear_color, footwear_type (e.g. sneakers, sandals, slides, boots), and "
+        "distinguishing_features (a short list of visible items like glasses, cap, backpack, beard - not clothing "
+        "already covered above). Use a single lowercase word or short phrase per field, and omit a field entirely "
+        "if it is not clearly visible rather than guessing. Do NOT include gender or age in these attributes. "
         "Keep reason and each description under 15 words, and summary/carry_change_summary under 20 words each - "
         "short, specific, no filler. "
         "Return strict JSON only with schema: "
@@ -6331,7 +6373,9 @@ def _verify_entry_groups_against_candidates_batch(
         '"exit_carry":{"bag_count":integer,"item_count":integer,"items":[{"type":string,"color":string,"size":string,"count":integer,"confidence":number}],"summary":string},'
         '"carry_change_summary":string}],'
         '"image_presence":[{"image_number":integer,"has_person":0 or 1,"best_for_verification":0 or 1}],'
-        '"trigger_appearances":[{"trigger_id":integer,"direction":"entry"|"exit"|"unclear","description":string}]}. '
+        '"trigger_appearances":[{"trigger_id":integer,"direction":"entry"|"exit"|"unclear","description":string,'
+        '"attributes":{"top_color":string,"top_type":string,"bottom_color":string,"bottom_type":string,'
+        '"footwear_color":string,"footwear_type":string,"distinguishing_features":[string]}}]}. '
         "Include exactly one result per group listed above, using its group_number, one image_presence entry "
         "per image number, and one trigger_appearances entry per trigger_id listed above (entries and candidates "
         "both). matched_candidate is the candidate_number of the match within that group, or null if none match. "
@@ -6772,6 +6816,31 @@ def _run_grouping_adjacent_pass(
 _GROUPING_TEXT_WINDOW_MINUTES = 15
 
 
+_APPEARANCE_ATTRIBUTE_MISMATCH_THRESHOLD = 2
+
+
+def _count_clear_attribute_mismatches(
+    entry_attributes: Mapping[str, Any] | None, candidate_attributes: Mapping[str, Any] | None
+) -> int:
+    """Counts how many structured appearance attributes are present on BOTH
+    sides and clearly disagree (exact string inequality - values are already
+    lowercased/trimmed at persist time). A single mismatched attribute is
+    NOT treated as disqualifying on its own - any one attribute can be
+    misjudged, the same reason gender was ruled out as a hard filter - so
+    this count only ever feeds a require-MULTIPLE-mismatches filter (see
+    _APPEARANCE_ATTRIBUTE_MISMATCH_THRESHOLD), never a single-field reject.
+    """
+    if not entry_attributes or not candidate_attributes:
+        return 0
+    mismatches = 0
+    for key in _APPEARANCE_ATTRIBUTE_STRING_KEYS:
+        entry_value = entry_attributes.get(key)
+        candidate_value = candidate_attributes.get(key)
+        if entry_value and candidate_value and entry_value != candidate_value:
+            mismatches += 1
+    return mismatches
+
+
 def _run_grouping_text_pass(
     db: Session,
     *,
@@ -6847,6 +6916,30 @@ def _run_grouping_text_pass(
         ]
         if not candidates:
             continue
+
+        # Cheap, free pre-filter before spending any API call: a candidate
+        # whose structured attributes clearly disagree with the entry's on
+        # MULTIPLE fields at once is implausible enough to skip outright.
+        # Requires multiple simultaneous mismatches, not just one, guarding
+        # against a single misjudged attribute wrongly eliminating a real
+        # candidate - the same risk that already ruled out gender for this.
+        entry_attributes = (appearance_by_trigger.get(entry_id) or {}).get("appearance_attributes")
+        plausible_candidates = [
+            candidate
+            for candidate in candidates
+            if _count_clear_attribute_mismatches(
+                entry_attributes,
+                (appearance_by_trigger.get(int(candidate["trigger_id"])) or {}).get("appearance_attributes"),
+            )
+            < _APPEARANCE_ATTRIBUTE_MISMATCH_THRESHOLD
+        ]
+        if not plausible_candidates:
+            notes.append(
+                f"grouping_text: entry {entry_id} had {len(candidates)} candidate(s) in its window, all "
+                "eliminated by structured attribute mismatch before any API call was made."
+            )
+            continue
+        candidates = plausible_candidates
 
         if text_script_run_id is None:
             text_script_run_id = _create_gemini_script_run(
@@ -7724,31 +7817,36 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
     # cheaply propose candidates for whatever adjacent couldn't resolve using
     # the text appearance descriptions adjacent already wrote, then confirm
     # any proposal with a real focused image verification call - see
-    # _run_grouping_text_pass docstring.
-    (
-        trigger_inputs,
-        text_groups,
-        text_notes,
-        text_metas,
-        text_script_run_id,
-    ) = _run_grouping_text_pass(
-        db,
-        batch_id=batch_id,
-        location_id=batch.get("location_id"),
-        trigger_inputs=trigger_inputs,
-        model_name=model_name,
-        resize_scale=resize_scale,
-    )
-    normalized_groups.extend(text_groups)
-    for text_group in text_groups:
-        grouped_trigger_ids.update(text_group["entry"])
-        grouped_trigger_ids.update(text_group["exit"])
-    notes.extend(text_notes)
-    if text_script_run_id is not None:
-        time.sleep(_GROUPING_VISION_CALL_INTERVAL_SECONDS)
-    # text_metas intentionally NOT folded into raw_metas either, same
-    # reasoning as adjacent_metas above - grouping_text has its own
-    # independent script_run.
+    # _run_grouping_text_pass docstring. Off by default (grouping_text_enabled)
+    # until the structured-attribute pre-filter's multi-person gap is closed -
+    # see that setting's own comment in config.py.
+    if settings.grouping_text_enabled:
+        (
+            trigger_inputs,
+            text_groups,
+            text_notes,
+            text_metas,
+            text_script_run_id,
+        ) = _run_grouping_text_pass(
+            db,
+            batch_id=batch_id,
+            location_id=batch.get("location_id"),
+            trigger_inputs=trigger_inputs,
+            model_name=model_name,
+            resize_scale=resize_scale,
+        )
+        normalized_groups.extend(text_groups)
+        for text_group in text_groups:
+            grouped_trigger_ids.update(text_group["entry"])
+            grouped_trigger_ids.update(text_group["exit"])
+        notes.extend(text_notes)
+        if text_script_run_id is not None:
+            time.sleep(_GROUPING_VISION_CALL_INTERVAL_SECONDS)
+        # text_metas intentionally NOT folded into raw_metas either, same
+        # reasoning as adjacent_metas above - grouping_text has its own
+        # independent script_run.
+    else:
+        text_script_run_id = None
 
     # A trigger with a person in NONE of its checked frames has nothing usable
     # at all - pull it out entirely as an issue, off-limits to both
