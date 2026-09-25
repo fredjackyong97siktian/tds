@@ -6289,11 +6289,17 @@ def _verify_entry_groups_against_candidates_batch(
         "own small set of nearby candidate exit triggers. Groups are unrelated to each other - never compare a "
         "group's entry or candidates against another group's images. "
         f"Groups: {json.dumps(group_blocks)}. "
-        "For each group, decide whether ANY ONE of that group's candidates shows the exact same physical person as "
-        "that group's own entry image set, based only on clothing, build, hair, and carried items visibly present. "
-        "At most one candidate per group can be correct - candidates are different, unrelated triggers, not "
-        "multiple views of the same event. If none of a group's candidates show the same person, or you are not "
-        "confident, say so for that group rather than guessing. "
+        "For each group: first describe the entry customer's own appearance from their entry images alone - "
+        "clothing, build, hair, and carried items - in 15 words or fewer; this is that entry trigger's "
+        "customer_description. Then, for each of that group's candidates, describe that candidate trigger's own "
+        "customer the same way (15 words or fewer, its own customer_description), and check whether the SAME "
+        "physical person you just described for the entry is present in that candidate's images. Give a "
+        "similarity score from 0 (definitely a different person) to 1 (definitely the same physical person) for "
+        "every candidate, based only on clothing, build, hair, and carried items visibly present - always give "
+        "this score, even when you conclude it is not a match. At most one candidate per group can be correct - "
+        "candidates are different, unrelated triggers, not multiple views of the same event. If no candidate's "
+        "similarity score is high enough to be confident, or you are not confident, say so for that group (return "
+        "matched_candidate as null) rather than guessing. "
         "Separately, for every numbered image across all groups (1 to "
         f"{len(image_urls)}), also note whether a person is visibly present in that specific image at all - not "
         "just an empty scene, doorway, vehicle, or object. "
@@ -6314,7 +6320,14 @@ def _verify_entry_groups_against_candidates_batch(
         "and loose items only when visibly held, worn, or moving with the person. Record color, type, approximate size, "
         "count, and confidence. Use 0 count when the customer appears empty-handed. If matched_candidate is null, still "
         "return entry_carry from the entry images, and leave exit_carry empty. "
-        "Keep reason under 15 words and summary/carry_change_summary under 20 words each - short, specific, no filler. "
+        "Appearance field rule: for every trigger listed above (both entries and candidates), also give a SHORT, "
+        "reusable description of its own customer's appearance - clothing top, clothing bottom, footwear, and any "
+        "carried item, in one phrase under 15 words, using only concrete, distinguishing visual details, never "
+        "vague filler like 'a person'. This is the same customer_description used for the similarity check above - "
+        "report it here too so it is saved for later reuse. Also state whether that trigger is this group's entry "
+        "or one of its candidates (direction: 'entry' or 'exit'). "
+        "Keep reason and each description under 15 words, and summary/carry_change_summary under 20 words each - "
+        "short, specific, no filler. "
         "Return strict JSON only with schema: "
         '{"results":[{"group_number":integer,"matched_candidate":integer or null,"confidence":number,"reason":string,'
         '"entry_carry":{"bag_count":integer,"item_count":integer,"items":[{"type":string,"color":string,"size":string,"count":integer,"confidence":number}],"summary":string},'
@@ -6322,11 +6335,14 @@ def _verify_entry_groups_against_candidates_batch(
         '"carry_change_summary":string}],'
         '"image_presence":[{"image_number":integer,"has_person":0 or 1,"best_for_verification":0 or 1}],'
         '"trigger_customer_counts":[{"trigger_id":integer,"unique_customer_count":integer,"confidence":number,'
-        '"customer_group_type":"solo"|"couple"|"family"|"friends","age_brackets":[string]}]}. '
+        '"customer_group_type":"solo"|"couple"|"family"|"friends","age_brackets":[string]}],'
+        '"trigger_appearances":[{"trigger_id":integer,"direction":"entry"|"exit"|"unclear","description":string}]}. '
         "Include exactly one result per group listed above, using its group_number, one image_presence entry "
-        "per image number, and one trigger_customer_counts entry per trigger_id listed above (entries and "
-        "candidates both). matched_candidate is the candidate_number of the match within that group, or null if "
-        "none match."
+        "per image number, one trigger_customer_counts entry, and one trigger_appearances entry per trigger_id "
+        "listed above (entries and candidates both). matched_candidate is the candidate_number of the match "
+        "within that group, or null if none match. confidence is the similarity score (0 to 1) for whichever "
+        "candidate you judged closest, or your similarity score against the single candidate if only one was "
+        "given - always populate it, never omit it just because matched_candidate is null."
     )
     try:
         result, meta = _call_grouping_vision(
@@ -6344,6 +6360,13 @@ def _verify_entry_groups_against_candidates_batch(
         return {}, {}, {}, None
 
     _persist_trigger_unique_customer_counts(db, result, source="adjacent")
+    # Adjacent never contributed to this before - direct and repair both
+    # already reuse whichever earlier stage's trigger_appearances a trigger
+    # has (repair's "known appearance" rule explicitly says so), but until
+    # now only direct's own chunk scan ever wrote one. Adjacent resolves the
+    # easy, high-confidence cases first and in large volume, so this is
+    # genuinely new, high-quality appearance data for later stages to reuse.
+    _persist_trigger_appearances(db, result, source="adjacent")
 
     # Fail-open per trigger: only mark a trigger person-absent if the model
     # actually said so for every one of its images we sent - a missing/partial
@@ -6606,25 +6629,24 @@ def _run_grouping_adjacent_pass(
             match_confidence: float | None = None
             match_reason: str | None = None
             if result:
-                # The model gives a reason either way - the prompt schema
-                # explicitly asks for one even when matched_candidate is null
-                # ("if matched_candidate is null, still [explain why]") - so
-                # this is captured unconditionally, not only on a confirmed
-                # match, otherwise a genuine no-match decision silently lost
-                # the model's own explanation for it.
+                # The model gives a reason AND a similarity score either way -
+                # the prompt schema explicitly asks for both even when
+                # matched_candidate is null - so both are captured
+                # unconditionally, not only on a confirmed match, otherwise a
+                # genuine no-match decision silently lost the model's own
+                # explanation and similarity score for it.
                 match_reason = str(result.get("reason") or "") or None
+                match_confidence = _coerce_number(result.get("confidence"), 0.0)
                 matched_candidate = result.get("matched_candidate")
-                confidence = _coerce_number(result.get("confidence"), 0.0)
                 if (
                     matched_candidate is not None
-                    and confidence >= 0.5
+                    and match_confidence >= 0.5
                     and 1 <= int(matched_candidate) <= len(candidates)
                 ):
                     exit_trigger = candidates[int(matched_candidate) - 1]
                     exit_id = int(exit_trigger["trigger_id"])
                     if entry_id not in consumed and exit_id not in consumed:
                         matched_trigger_id = exit_id
-                        match_confidence = confidence
                         match_reason = match_reason or "Matched by adjacency check."
             # Attached directly onto this entry's own call attempt (see
             # annotate_latest_script_run_call) so the Script Run page can show
@@ -8891,6 +8913,40 @@ def _stripe_get(path: str, params: Mapping[str, Any] | None = None) -> dict[str,
         raise RuntimeError(f"Stripe request failed: {exc}") from exc
 
 
+def _stripe_post(path: str, body: Mapping[str, Any], *, idempotency_key: str | None = None) -> dict[str, Any]:
+    """POST to the Stripe API - form-encoded body, same as _stripe_get's auth
+    pattern. idempotency_key should be a stable value tied to the specific
+    theft_action row being charged (e.g. f"theft_action_{theft_action_id}"),
+    so a network retry after an ambiguous response can never create a
+    second, duplicate charge - Stripe deduplicates on this key server-side
+    for 24h regardless of how many times the same request is sent.
+    """
+    secret_key = str(settings.stripe_secret_key or os.environ.get("STRIPE_SECRET_KEY") or "").strip()
+    if not secret_key:
+        raise RuntimeError("Stripe API key is not configured. Set THEFT_API_STRIPE_SECRET_KEY.")
+    base_url = str(settings.stripe_api_base_url or "https://api.stripe.com/v1").rstrip("/")
+    headers = {
+        "Authorization": f"Bearer {secret_key}",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    if idempotency_key:
+        headers["Idempotency-Key"] = idempotency_key
+    request = Request(
+        f"{base_url}/{path.lstrip('/')}",
+        data=urlencode(body, doseq=True).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=settings.stripe_charge_timeout_seconds) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Stripe request failed with HTTP {exc.code}: {error_body}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"Stripe request failed: {exc}") from exc
+
+
 def _card_country_from_stripe_payload(payload: Mapping[str, Any]) -> str | None:
     return (
         _nested_get(payload, "card", "country")
@@ -8972,6 +9028,304 @@ def _resolve_stripe_card_country(identity: Mapping[str, Any] | None) -> dict[str
 
 def resolve_stripe_card_country_for_identity(identity: Mapping[str, Any] | None) -> dict[str, Any]:
     return _resolve_stripe_card_country(identity)
+
+
+# ---------------------------------------------------------------------------
+# Theft Action (Beta) - a human explicitly reviews a 'detected' session and
+# chooses to either charge the customer's card via Stripe or send them a
+# WhatsApp message about the unpaid items. Deliberately NEVER automatic:
+# every function below requires the caller (the dashboard, after its own
+# confirm dialog) to already have a concrete amount/message decided - there
+# is no code path here that decides on its own to charge or message anyone.
+# ---------------------------------------------------------------------------
+
+
+def _whatsapp_send_text_message(*, to_phone_number: str, message_text: str) -> dict[str, Any]:
+    """Sends a freeform text message via the WhatsApp Cloud API (Meta),
+    direct integration - no BSP, no pre-approved template. Freeform is valid
+    here because the customer already messages the store's WhatsApp number
+    first as part of the QR entry flow, opening a genuine 24h customer-
+    service window this reply falls inside of.
+    """
+    access_token = str(settings.whatsapp_access_token or os.environ.get("WHATSAPP_ACCESS_TOKEN") or "").strip()
+    phone_number_id = str(settings.whatsapp_phone_number_id or os.environ.get("WHATSAPP_PHONE_NUMBER_ID") or "").strip()
+    if not access_token or not phone_number_id:
+        raise RuntimeError(
+            "WhatsApp Cloud API is not configured. Set THEFT_API_WHATSAPP_ACCESS_TOKEN and "
+            "THEFT_API_WHATSAPP_PHONE_NUMBER_ID."
+        )
+    base_url = str(settings.whatsapp_api_base_url or "https://graph.facebook.com/v20.0").rstrip("/")
+    body = {
+        "messaging_product": "whatsapp",
+        "to": to_phone_number,
+        "type": "text",
+        "text": {"body": message_text},
+    }
+    request = Request(
+        f"{base_url}/{phone_number_id}/messages",
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=settings.whatsapp_timeout_seconds) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"WhatsApp request failed with HTTP {exc.code}: {error_body}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"WhatsApp request failed: {exc}") from exc
+
+
+def _get_session_entry_identity(db: Session, session_id: int) -> tuple[str | None, Any | None]:
+    """Returns (identity_type, entry_id) for a session's own entry trigger -
+    ("credit_card", credit_card_entry_id), ("phone", phone_entry_id), or
+    (None, None) if the entry trigger has neither (no identity captured)."""
+    session = repositories.get_session(db, session_id)
+    entry_trigger_id = session.get("entry_trigger_id")
+    if entry_trigger_id is None:
+        return None, None
+    trigger = repositories.get_trigger(db, int(entry_trigger_id))
+    if trigger.get("credit_card_entry_id") is not None:
+        return "credit_card", trigger.get("credit_card_entry_id")
+    if trigger.get("phone_entry_id") is not None:
+        return "phone", trigger.get("phone_entry_id")
+    return None, None
+
+
+def get_theft_action_worksheet(db: Session, session_id: int) -> dict[str, Any]:
+    """What the dashboard's Theft Action panel needs to render: this
+    session's identity type/masked detail, its existing theft_action
+    history (for the "already charged" idempotency check to show in the
+    UI), and the paid-transaction total as a starting reference for the
+    human-editable line-item worksheet - never used to charge anything on
+    its own."""
+    identity_type, entry_id = _get_session_entry_identity(db, session_id)
+    identity_detail: dict[str, Any] = {"identity_type": identity_type, "entry_id": entry_id}
+    if identity_type == "credit_card" and entry_id is not None:
+        card_identity = repositories.get_credit_card_entry_identity(db, entry_id)
+        identity_detail["last4"] = (card_identity or {}).get("last4")
+        identity_detail["fingerprint"] = (card_identity or {}).get("fingerprint")
+        identity_detail["has_stripe_payment_method"] = bool(
+            (card_identity or {}).get("payment_method_id") and (card_identity or {}).get("customer_stripe_id")
+        )
+    elif identity_type == "phone" and entry_id is not None:
+        phone_identity = repositories.get_phone_entry_identity(db, entry_id)
+        identity_detail["phone_number"] = (phone_identity or {}).get("phone_number")
+    return {
+        "session_id": session_id,
+        "identity": identity_detail,
+        "actions": repositories.list_theft_actions_for_session(db, session_id),
+        "already_charged": repositories.has_successful_theft_action(
+            db, session_id=session_id, action_type="stripe_charge"
+        ),
+        "already_messaged": repositories.has_successful_theft_action(
+            db, session_id=session_id, action_type="whatsapp_message"
+        ),
+        "paid_total_amount": repositories.get_transaction_total_amount(db, session_id),
+    }
+
+
+def _line_items_total(line_items: list[Mapping[str, Any]]) -> float:
+    total = 0.0
+    for item in line_items:
+        try:
+            price = float(item.get("price") or 0)
+            quantity = float(item.get("quantity") or 1)
+        except (TypeError, ValueError):
+            continue
+        total += price * quantity
+    return round(total, 2)
+
+
+def trigger_theft_action_charge(
+    db: Session,
+    *,
+    session_id: int,
+    line_items: list[Mapping[str, Any]],
+    triggered_by: str | None = None,
+) -> dict[str, Any]:
+    """Charges the session's credit-card entry via Stripe for a human-
+    confirmed amount (the dashboard's own confirm dialog is the only gate -
+    this function does not ask again and does not decide the amount itself).
+    Refuses outright if this session already has a successful charge -
+    the idempotency guard against a double-charge from a second click,
+    a page refresh, or two staff members acting at once.
+    """
+    if repositories.has_successful_theft_action(db, session_id=session_id, action_type="stripe_charge"):
+        raise ValueError(f"Session {session_id} has already been successfully charged for this theft.")
+    identity_type, entry_id = _get_session_entry_identity(db, session_id)
+    if identity_type != "credit_card" or entry_id is None:
+        raise ValueError(f"Session {session_id}'s entry was not a credit-card entry - cannot charge via Stripe.")
+    card_identity = repositories.get_credit_card_entry_identity(db, entry_id)
+    if not card_identity:
+        raise ValueError(f"Could not resolve the credit-card identity for session {session_id}.")
+    payment_method_id = _extract_stripe_id(card_identity.get("payment_method_id"), "pm")
+    customer_stripe_id = str(card_identity.get("customer_stripe_id") or "").strip() or None
+    if not payment_method_id or not customer_stripe_id:
+        raise ValueError(
+            f"Session {session_id}'s credit-card entry has no usable Stripe payment_method_id/customer id on file."
+        )
+    amount = _line_items_total(line_items)
+    if amount <= 0:
+        raise ValueError("Theft action amount must be greater than zero - add at least one line item.")
+
+    theft_action = repositories.create_theft_action(
+        db,
+        {
+            "session_id": session_id,
+            "action_type": "stripe_charge",
+            "status": "pending",
+            "identity_type": identity_type,
+            "identity_entry_id": str(entry_id),
+            "amount": amount,
+            "currency": "MYR",
+            "line_items": list(line_items),
+            "triggered_by": triggered_by,
+        },
+    )
+    theft_action_id = int(theft_action["id"])
+    try:
+        stripe_response = _stripe_post(
+            "payment_intents",
+            {
+                "amount": int(round(amount * 100)),
+                "currency": "myr",
+                "customer": customer_stripe_id,
+                "payment_method": payment_method_id,
+                "off_session": "true",
+                "confirm": "true",
+                "description": f"Theft recovery charge for session {session_id}",
+            },
+            idempotency_key=f"tds_theft_action_{theft_action_id}",
+        )
+    except Exception as exc:
+        return repositories.update_theft_action(
+            db,
+            theft_action_id,
+            {"status": "failed", "error_message": str(exc)},
+        )
+
+    stripe_status = str(stripe_response.get("status") or "")
+    if stripe_status != "succeeded":
+        return repositories.update_theft_action(
+            db,
+            theft_action_id,
+            {
+                "status": "failed",
+                "provider_reference": stripe_response.get("id"),
+                "provider_response": stripe_response,
+                "error_message": f"Stripe PaymentIntent ended in status={stripe_status!r}, not 'succeeded'.",
+            },
+        )
+
+    # Recorded as a real session_transaction so it shows up in Transaction
+    # Details alongside every other receipt, keeping this session's
+    # accounting trail complete instead of the recovered amount only ever
+    # existing inside this theft_action's own audit row.
+    session_transaction_id = repositories.create_transaction(
+        db,
+        session_id,
+        {
+            "receipt_number": f"theft_recovery_{theft_action_id}",
+            "transaction_time": datetime.now(UTC),
+            "total_items": sum(int(item.get("quantity") or 1) for item in line_items),
+            "total_amount": amount,
+            "raw_payload": {
+                "status": "paid",
+                "source": "theft_action_stripe_charge",
+                "theft_action_id": theft_action_id,
+                "line_items": list(line_items),
+                "stripe_payment_intent_id": stripe_response.get("id"),
+            },
+        },
+    )
+    return repositories.update_theft_action(
+        db,
+        theft_action_id,
+        {
+            "status": "success",
+            "provider_reference": stripe_response.get("id"),
+            "provider_response": stripe_response,
+            "session_transaction_id": session_transaction_id,
+        },
+    )
+
+
+def trigger_theft_action_whatsapp(
+    db: Session,
+    *,
+    session_id: int,
+    message_text: str,
+    triggered_by: str | None = None,
+) -> dict[str, Any]:
+    """Sends a human-confirmed WhatsApp message about a session's unpaid
+    items. Works for a phone-entry session directly, or as a fallback for a
+    credit-card-entry session whose Stripe charge failed and has a phone
+    number linked via entrylink - in either case the caller already knows
+    which phone number to use (see get_theft_action_worksheet /
+    resolve_theft_action_fallback_phone) before calling this.
+    """
+    if repositories.has_successful_theft_action(db, session_id=session_id, action_type="whatsapp_message"):
+        raise ValueError(f"Session {session_id} has already had a theft-action WhatsApp message sent.")
+    identity_type, entry_id = _get_session_entry_identity(db, session_id)
+    phone_number: str | None = None
+    if identity_type == "phone" and entry_id is not None:
+        phone_identity = repositories.get_phone_entry_identity(db, entry_id)
+        phone_number = (phone_identity or {}).get("phone_number")
+    elif identity_type == "credit_card" and entry_id is not None:
+        phone_number = repositories.get_theft_action_fallback_phone_number(db, fingerprint_entry_id=entry_id)
+    if not phone_number:
+        raise ValueError(f"No phone number is available for session {session_id} to send a WhatsApp message to.")
+    if not message_text.strip():
+        raise ValueError("Message text is required.")
+
+    theft_action = repositories.create_theft_action(
+        db,
+        {
+            "session_id": session_id,
+            "action_type": "whatsapp_message",
+            "status": "pending",
+            "identity_type": identity_type,
+            "identity_entry_id": str(entry_id) if entry_id is not None else None,
+            "message_text": message_text,
+            "triggered_by": triggered_by,
+        },
+    )
+    theft_action_id = int(theft_action["id"])
+    try:
+        whatsapp_response = _whatsapp_send_text_message(to_phone_number=phone_number, message_text=message_text)
+    except Exception as exc:
+        return repositories.update_theft_action(
+            db,
+            theft_action_id,
+            {"status": "failed", "error_message": str(exc)},
+        )
+    messages = whatsapp_response.get("messages")
+    message_id = messages[0].get("id") if isinstance(messages, list) and messages and isinstance(messages[0], Mapping) else None
+    return repositories.update_theft_action(
+        db,
+        theft_action_id,
+        {
+            "status": "success",
+            "provider_reference": message_id,
+            "provider_response": whatsapp_response,
+        },
+    )
+
+
+def resolve_theft_action_fallback_phone(db: Session, session_id: int) -> str | None:
+    """Used by the dashboard to decide whether to offer a "Send WhatsApp
+    instead" option after a Stripe charge attempt failed - None means there
+    genuinely is no recourse (per the decision: "if no [entrylink], nothing
+    can do, just give the outcome of the Stripe [call]")."""
+    identity_type, entry_id = _get_session_entry_identity(db, session_id)
+    if identity_type != "credit_card" or entry_id is None:
+        return None
+    return repositories.get_theft_action_fallback_phone_number(db, fingerprint_entry_id=entry_id)
 
 
 def _evaluate_country_code_check(

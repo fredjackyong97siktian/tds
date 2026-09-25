@@ -174,6 +174,22 @@ class Settings(BaseSettings):
     stripe_secret_key: str | None = None
     stripe_api_base_url: str = "https://api.stripe.com/v1"
     stripe_lookup_timeout_seconds: int = 12
+    stripe_charge_timeout_seconds: int = 30
+    # entrylink connects a credit-card entry (fingerprintId) to a phone entry
+    # (phonenumberId) for the same customer - used as the Theft Action's
+    # fallback contact path when a Stripe charge fails and no other recourse
+    # exists (see resolve_theft_action_fallback_phone).
+    entrylink_table_name: str = "entrylink"
+    entrylink_fingerprint_id_column: str = "fingerprintId"
+    entrylink_phonenumber_id_column: str = "phonenumberId"
+    # WhatsApp Cloud API (Meta), direct integration - no BSP. Freeform text is
+    # sent (not a pre-approved template) because the customer already
+    # messages the store's WhatsApp number first as part of the QR entry
+    # flow, opening a genuine 24h customer-service window.
+    whatsapp_access_token: str | None = None
+    whatsapp_phone_number_id: str | None = None
+    whatsapp_api_base_url: str = "https://graph.facebook.com/v20.0"
+    whatsapp_timeout_seconds: int = 20
     theft_transaction_table_name: str = "transaction"
     theft_transaction_status_column: str = "status"
     theft_transaction_status_value: str = "theft"

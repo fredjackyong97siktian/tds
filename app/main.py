@@ -13,6 +13,7 @@ from .routers.runpod import router as runpod_router
 from .routers.sessions import router as sessions_router
 from .routers.settings import router as settings_router
 from .routers.theft import router as theft_router
+from .routers.theft_actions import router as theft_actions_router
 from .routers.triggers import router as triggers_router
 from .routers.vector import router as vector_router
 from .routers.videos import router as videos_router
@@ -41,6 +42,7 @@ app.include_router(triggers_router)
 app.include_router(sessions_router)
 app.include_router(settings_router)
 app.include_router(theft_router)
+app.include_router(theft_actions_router)
 app.include_router(videos_router)
 app.include_router(vector_router)
 app.include_router(workers_router)

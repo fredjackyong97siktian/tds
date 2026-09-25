@@ -225,6 +225,40 @@ def get_credit_card_entry_identity(db: Session, credit_card_entry_id: Any) -> di
     }
 
 
+def get_theft_action_fallback_phone_number(db: Session, *, fingerprint_entry_id: Any) -> str | None:
+    """entrylink connects a credit-card entry (fingerprintId) to a phone
+    entry (phonenumberId) for the same customer - used by the Theft Action
+    flow when a Stripe charge fails and there's no other recourse but to try
+    WhatsApp instead, IF this customer happens to have a linked phone number
+    on file at all. Returns None (not an error) when no link exists - the
+    caller should then report the Stripe failure with no further recourse,
+    exactly as decided: "if no [link], nothing can do, just give the outcome
+    of the Stripe [call]".
+    """
+    entrylink_table = settings.entrylink_table_name
+    fingerprint_column = settings.entrylink_fingerprint_id_column
+    phonenumber_column = settings.entrylink_phonenumber_id_column
+    try:
+        row = db.execute(
+            text(
+                f"""
+                select {phonenumber_column} as phonenumber_id
+                from {entrylink_table}
+                where cast({fingerprint_column} as char) = :fingerprint_entry_id
+                limit 1
+                """
+            ),
+            {"fingerprint_entry_id": str(fingerprint_entry_id)},
+        ).mappings().first()
+    except SQLAlchemyError:
+        row = None
+    if not row or row.get("phonenumber_id") is None:
+        return None
+    return _resolve_entry_source_value(
+        db, source=_whitelist_source_config("qrentry"), entry_id=row["phonenumber_id"]
+    )
+
+
 def _resolve_trigger_entry_identity(
     db: Session,
     *,
@@ -5107,6 +5141,27 @@ def get_transaction_total_items(db: Session, session_id: int) -> int:
     return int(row["transaction_total_items"] or 0)
 
 
+def get_transaction_total_amount(db: Session, session_id: int) -> float:
+    # Same paid-only filter as get_transaction_total_items, but summing the
+    # dollar amount instead of item count - used as the Theft Action
+    # worksheet's starting reference (a trustworthy, already-recorded POS
+    # figure) rather than counting on kiosk vision's own item pricing.
+    transaction_table = _table("session_transaction")
+    result = db.execute(
+        text(
+            f"""
+            select coalesce(sum(total_amount), 0) as transaction_total_amount
+            from {transaction_table}
+            where session_id = :session_id
+              and json_unquote(json_extract(raw_payload, '$.status')) = :paid_status
+            """
+        ),
+        {"session_id": session_id, "paid_status": settings.paid_transaction_status_value},
+    )
+    row = _fetch_one_dict(result)
+    return float(row["transaction_total_amount"] or 0)
+
+
 def delete_session_transactions(db: Session, session_id: int) -> None:
     transaction_table = _table("session_transaction")
     db.execute(
@@ -6313,6 +6368,119 @@ def list_session_video_assets(
             except json.JSONDecodeError:
                 pass
     return rows
+
+
+def _deserialize_theft_action_json_fields(row: dict[str, Any]) -> dict[str, Any]:
+    for json_field in ("line_items", "provider_response"):
+        if isinstance(row.get(json_field), str):
+            try:
+                row[json_field] = json.loads(row[json_field])
+            except json.JSONDecodeError:
+                pass
+    return row
+
+
+def create_theft_action(db: Session, payload: Mapping[str, Any]) -> dict[str, Any]:
+    table_name = _table("theft_action")
+    result = db.execute(
+        text(
+            f"""
+            insert into {table_name} (
+                session_id, action_type, status, identity_type, identity_entry_id,
+                amount, currency, line_items, message_text, triggered_by
+            ) values (
+                :session_id, :action_type, :status, :identity_type, :identity_entry_id,
+                :amount, :currency, :line_items, :message_text, :triggered_by
+            )
+            """
+        ),
+        {
+            "session_id": payload["session_id"],
+            "action_type": payload["action_type"],
+            "status": payload.get("status") or "pending",
+            "identity_type": payload.get("identity_type"),
+            "identity_entry_id": payload.get("identity_entry_id"),
+            "amount": payload.get("amount"),
+            "currency": payload.get("currency") or "MYR",
+            "line_items": _json_dumps(payload.get("line_items")) if payload.get("line_items") is not None else None,
+            "message_text": payload.get("message_text"),
+            "triggered_by": payload.get("triggered_by"),
+        },
+    )
+    db.commit()
+    theft_action_id = int(getattr(result, "lastrowid", 0) or 0)
+    if not theft_action_id:
+        row = db.execute(text("select last_insert_id()")).first()
+        theft_action_id = int(row[0]) if row else 0
+    return get_theft_action(db, theft_action_id)
+
+
+def update_theft_action(db: Session, theft_action_id: int, payload: Mapping[str, Any]) -> dict[str, Any]:
+    table_name = _table("theft_action")
+    db.execute(
+        text(
+            f"""
+            update {table_name}
+            set status = coalesce(:status, status),
+                provider_reference = coalesce(:provider_reference, provider_reference),
+                provider_response = coalesce(:provider_response, provider_response),
+                error_message = coalesce(:error_message, error_message),
+                session_transaction_id = coalesce(:session_transaction_id, session_transaction_id)
+            where id = :theft_action_id
+            """
+        ),
+        {
+            "theft_action_id": theft_action_id,
+            "status": payload.get("status"),
+            "provider_reference": payload.get("provider_reference"),
+            "provider_response": (
+                _json_dumps(payload.get("provider_response")) if payload.get("provider_response") is not None else None
+            ),
+            "error_message": payload.get("error_message"),
+            "session_transaction_id": payload.get("session_transaction_id"),
+        },
+    )
+    db.commit()
+    return get_theft_action(db, theft_action_id)
+
+
+def get_theft_action(db: Session, theft_action_id: int) -> dict[str, Any]:
+    table_name = _table("theft_action")
+    row = db.execute(
+        text(f"select * from {table_name} where id = :theft_action_id"),
+        {"theft_action_id": theft_action_id},
+    ).mappings().first()
+    if not row:
+        raise ValueError(f"Theft action {theft_action_id} was not found.")
+    return _deserialize_theft_action_json_fields(dict(row))
+
+
+def list_theft_actions_for_session(db: Session, session_id: int) -> list[dict[str, Any]]:
+    table_name = _table("theft_action")
+    result = db.execute(
+        text(f"select * from {table_name} where session_id = :session_id order by created_at desc, id desc"),
+        {"session_id": session_id},
+    )
+    return [_deserialize_theft_action_json_fields(row) for row in _fetch_all_dicts(result)]
+
+
+def has_successful_theft_action(db: Session, *, session_id: int, action_type: str) -> bool:
+    # The idempotency guard - never allow a second charge to actually go
+    # through for the same session once one has already succeeded. A
+    # 'failed' attempt does NOT block a retry (or trying the other action
+    # type as a fallback), only a 'success' does.
+    table_name = _table("theft_action")
+    row = db.execute(
+        text(
+            f"""
+            select 1 from {table_name}
+            where session_id = :session_id and action_type = :action_type and status = 'success'
+            limit 1
+            """
+        ),
+        {"session_id": session_id, "action_type": action_type},
+    ).first()
+    return row is not None
 
 
 def create_transaction(db: Session, session_id: int, payload: Mapping[str, Any]) -> int:
