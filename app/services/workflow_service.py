@@ -6420,6 +6420,11 @@ def _verify_entry_groups_against_candidates_batch(
 
 _GROUPING_ADJACENT_LOOKAHEAD_COUNT = 2
 _GROUPING_ADJACENT_LOOKAHEAD_MINUTES = 30
+# Raised from 0.5 to match direct/repair's own independent verification bar
+# (_VERIFICATION_MATCH_CONFIDENCE_THRESHOLD) - adjacent's one-shot decision
+# was accepting a match at a lower bar than the separate verification step
+# direct/repair each run on top of their own proposals.
+_GROUPING_ADJACENT_MATCH_CONFIDENCE_THRESHOLD = 0.8
 
 
 def _find_resumable_adjacent_result(
@@ -6640,7 +6645,7 @@ def _run_grouping_adjacent_pass(
                 matched_candidate = result.get("matched_candidate")
                 if (
                     matched_candidate is not None
-                    and match_confidence >= 0.5
+                    and match_confidence >= _GROUPING_ADJACENT_MATCH_CONFIDENCE_THRESHOLD
                     and 1 <= int(matched_candidate) <= len(candidates)
                 ):
                     exit_trigger = candidates[int(matched_candidate) - 1]
@@ -6761,6 +6766,232 @@ def _run_grouping_adjacent_pass(
         stderr_log="",
     )
     return remaining, groups, notes, metas, frame_presence_by_trigger, best_frames_by_trigger, adjacent_script_run_id
+
+
+_GROUPING_TEXT_WINDOW_MINUTES = 15
+
+
+def _run_grouping_text_pass(
+    db: Session,
+    *,
+    batch_id: int,
+    location_id: Any,
+    trigger_inputs: list[dict[str, Any]],
+    model_name: str,
+    resize_scale: float | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str], list[dict[str, Any]], int | None]:
+    """Stage 2, between adjacent and direct: for each identity-bearing
+    trigger adjacent couldn't resolve, cheaply propose a candidate exit
+    using the text appearance descriptions adjacent already wrote (see
+    _persist_trigger_appearances) - no images, no vision call needed for
+    this step - then confirm any proposal with a real, focused image
+    verification call (_verify_gemini_grouping_match, the same single-pair
+    check direct/repair already use) before accepting it. Text similarity is
+    only ever a candidate filter, never a final decision on its own.
+
+    Only ever proposes identity-trigger-as-entry pairings, same
+    authoritative identity rule as adjacent and direct - a non-identity
+    trigger is always the candidate exit side, never the reverse.
+
+    Batched one call per identity trigger, not one call for the whole
+    remaining pool: each identity trigger gets its own window starting at
+    its own trigger_time (_GROUPING_TEXT_WINDOW_MINUTES long), and only
+    candidates inside that window with a trigger_id greater than the
+    identity trigger's own (the same chronological-impossibility guard
+    grouping_repair already uses for its own pairings) are considered. A
+    window with no other trigger in it - or where the entry itself has no
+    description yet - is skipped entirely, nothing to compare against.
+    """
+    sorted_inputs = sorted(
+        trigger_inputs, key=lambda item: _coerce_datetime_value(item.get("trigger_time")) or datetime.min
+    )
+    by_id = {int(item["trigger_id"]): item for item in sorted_inputs}
+    identity_trigger_ids = [
+        int(item["trigger_id"])
+        for item in sorted_inputs
+        if item.get("phone_entry_id") is not None or item.get("credit_card_entry_id") is not None
+    ]
+    if not identity_trigger_ids:
+        return trigger_inputs, [], [], [], None
+
+    appearance_by_trigger = repositories.get_trigger_appearances(
+        db, [int(item["trigger_id"]) for item in sorted_inputs]
+    )
+
+    window = timedelta(minutes=_GROUPING_TEXT_WINDOW_MINUTES)
+    consumed: set[int] = set()
+    groups: list[dict[str, Any]] = []
+    notes: list[str] = []
+    metas: list[dict[str, Any]] = []
+    next_group_id = 1
+    text_script_run_id: int | None = None
+
+    for entry_id in identity_trigger_ids:
+        if entry_id in consumed:
+            continue
+        entry_trigger = by_id[entry_id]
+        entry_time = _coerce_datetime_value(entry_trigger.get("trigger_time"))
+        entry_description = (appearance_by_trigger.get(entry_id) or {}).get("appearance_description")
+        if entry_time is None or not entry_description:
+            continue
+        candidates = [
+            item
+            for item in sorted_inputs
+            if int(item["trigger_id"]) > entry_id
+            and int(item["trigger_id"]) not in consumed
+            and item.get("phone_entry_id") is None
+            and item.get("credit_card_entry_id") is None
+            and (appearance_by_trigger.get(int(item["trigger_id"])) or {}).get("appearance_description")
+            and entry_time <= (_coerce_datetime_value(item.get("trigger_time")) or entry_time) < entry_time + window
+        ]
+        if not candidates:
+            continue
+
+        if text_script_run_id is None:
+            text_script_run_id = _create_gemini_script_run(
+                db,
+                session_id=None,
+                trigger_id=None,
+                script_name="grouping",
+                model_name=_grouping_stage_label(db, "text"),
+                runner_payload={
+                    "batch_id": batch_id,
+                    "location_id": location_id,
+                    "identity_entry_count": len(identity_trigger_ids),
+                },
+            )
+        else:
+            time.sleep(_GROUPING_VISION_CALL_INTERVAL_SECONDS)
+
+        candidate_blocks = [
+            {
+                "candidate_number": index + 1,
+                "trigger_id": int(candidate["trigger_id"]),
+                "description": (appearance_by_trigger.get(int(candidate["trigger_id"])) or {}).get(
+                    "appearance_description"
+                ),
+            }
+            for index, candidate in enumerate(candidates)
+        ]
+        prompt = (
+            "You are comparing short text descriptions of retail customers to find a possible match - no images, "
+            "text only. "
+            f"Entry customer's description: {json.dumps(entry_description)}. "
+            f"Candidate customers: {json.dumps(candidate_blocks)}. "
+            "Decide whether ANY ONE candidate's description plausibly describes the exact same physical person as "
+            "the entry description - same clothing, build, hair, and carried items as far as the text says. This "
+            "is only a first pass to narrow down who is worth a real image check next, so include a candidate "
+            "whenever the description is plausibly consistent, even if not certain - a real image comparison will "
+            "confirm or reject it afterward. At most one candidate can be the actual match. If no candidate's "
+            "description is even plausibly consistent, return matched_candidate as null. "
+            "Return strict JSON only with schema: "
+            '{"matched_candidate":integer or null,"confidence":number,"reason":string}. Keep reason under 15 words. '
+            "confidence is how similar the descriptions are (0 to 1) - always populate it, even when "
+            "matched_candidate is null."
+        )
+        try:
+            text_result, text_meta = _call_grouping_vision(
+                db,
+                prompt=prompt,
+                image_urls=[],
+                gemini_model_name=model_name,
+                gemini_resize_scale=resize_scale,
+                allow_text_only=True,
+                script_run_id=text_script_run_id,
+            )
+        except Exception:
+            logger.exception("grouping_text call failed batch_id=%s entry_id=%s", batch_id, entry_id)
+            continue
+        if text_meta is not None:
+            metas.append(text_meta)
+
+        matched_candidate = text_result.get("matched_candidate")
+        if matched_candidate is None or not (1 <= int(matched_candidate) <= len(candidates)):
+            continue
+        candidate_trigger = candidates[int(matched_candidate) - 1]
+        exit_id = int(candidate_trigger["trigger_id"])
+        if exit_id in consumed:
+            continue
+
+        # Text similarity alone is never enough to accept a match - it's
+        # purely a candidate filter (see docstring). Confirm with a real,
+        # focused image verification call before accepting anything.
+        verification, verification_meta = _verify_gemini_grouping_match(
+            db,
+            text_script_run_id,
+            entry_trigger=entry_trigger,
+            exit_triggers=[candidate_trigger],
+            model_name=model_name,
+            resize_scale=resize_scale,
+        )
+        if verification_meta is not None:
+            metas.append(verification_meta)
+        verification_confidence = verification.get("confidence")
+        # Deliberately fails CLOSED on a missing/failed verification call,
+        # unlike direct/repair's own "fail open" convention for the same
+        # situation - there, the original proposal already came from a real
+        # image-based first look, so a broken follow-up verification is a
+        # tooling hiccup on top of existing visual evidence. Here, the
+        # proposal came from text alone with no images involved at all, so
+        # this verification call is the ONLY visual check in the entire
+        # chain - if it's missing or fails, there is no visual evidence for
+        # this match whatsoever, not just a second opinion gone missing.
+        if verification_confidence is None or verification_confidence < _VERIFICATION_MATCH_CONFIDENCE_THRESHOLD:
+            notes.append(
+                f"grouping_text: entry {entry_id} textually resembled candidate {exit_id}, but image "
+                f"verification did not confirm it (confidence {verification_confidence})."
+            )
+            continue
+
+        consumed.add(entry_id)
+        consumed.add(exit_id)
+        groups.append(
+            {
+                "group_id": next_group_id,
+                "entry": [entry_id],
+                "exit": [exit_id],
+                "score": verification_confidence,
+                "reason": str(
+                    text_result.get("reason") or "Matched via text pre-grouping, confirmed by verification."
+                ),
+                "source": "grouping_text",
+                "verified": True,
+                "verification": verification,
+                "total_customer": 1,
+                "entry_has_identity": True,
+                "entry_carry": None,
+                "exit_carry": None,
+                "carry_change_summary": "",
+            }
+        )
+        next_group_id += 1
+        notes.append(
+            f"Trigger {entry_id} matched trigger {exit_id} via text pre-grouping + verification "
+            f"(confidence {verification_confidence:.2f})."
+        )
+
+    if text_script_run_id is not None:
+        remaining_ids = {
+            int(item["trigger_id"]) for item in trigger_inputs if int(item["trigger_id"]) not in consumed
+        }
+        repositories.finish_script_run(
+            db,
+            text_script_run_id,
+            status="success",
+            stdout_log=repositories.merge_script_run_stdout_fields(
+                db,
+                text_script_run_id,
+                {
+                    "identity_entry_count": len(identity_trigger_ids),
+                    "matched_groups": groups,
+                    "remaining_trigger_ids": sorted(remaining_ids),
+                },
+            ),
+            stderr_log="",
+        )
+
+    remaining = [item for item in trigger_inputs if int(item["trigger_id"]) not in consumed]
+    return remaining, groups, notes, metas, text_script_run_id
 
 
 _GROUPING_PROVIDER_APP_SETTING_KEY = "grouping_provider"
@@ -7488,6 +7719,36 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
     # would just duplicate them under the wrong stage's diagnostics, making
     # direct's raw responses look identical to adjacent's.
 
+    # Stage 2 (Text Pre-Grouping): before the full, expensive chunk scan,
+    # cheaply propose candidates for whatever adjacent couldn't resolve using
+    # the text appearance descriptions adjacent already wrote, then confirm
+    # any proposal with a real focused image verification call - see
+    # _run_grouping_text_pass docstring.
+    (
+        trigger_inputs,
+        text_groups,
+        text_notes,
+        text_metas,
+        text_script_run_id,
+    ) = _run_grouping_text_pass(
+        db,
+        batch_id=batch_id,
+        location_id=batch.get("location_id"),
+        trigger_inputs=trigger_inputs,
+        model_name=model_name,
+        resize_scale=resize_scale,
+    )
+    normalized_groups.extend(text_groups)
+    for text_group in text_groups:
+        grouped_trigger_ids.update(text_group["entry"])
+        grouped_trigger_ids.update(text_group["exit"])
+    notes.extend(text_notes)
+    if text_script_run_id is not None:
+        time.sleep(_GROUPING_VISION_CALL_INTERVAL_SECONDS)
+    # text_metas intentionally NOT folded into raw_metas either, same
+    # reasoning as adjacent_metas above - grouping_text has its own
+    # independent script_run.
+
     # A trigger with a person in NONE of its checked frames has nothing usable
     # at all - pull it out entirely as an issue, off-limits to both
     # grouping_direct and grouping_repair, distinct from "unknown" (which means
@@ -7567,6 +7828,7 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
             "batch_id": batch_id,
             "location_id": batch.get("location_id"),
             "adjacent_script_run_id": adjacent_script_run_id,
+            "text_script_run_id": text_script_run_id,
         },
     )
     repositories.update_grouping_batch(db, batch_id, {"script_run_id": script_run_id})
