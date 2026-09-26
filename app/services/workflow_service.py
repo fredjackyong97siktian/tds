@@ -7281,14 +7281,36 @@ def _call_vision_with_retry(
             )
         except Exception as exc:
             duration = round(time.monotonic() - started, 1)
-            is_transient = isinstance(exc, (http.client.HTTPException, URLError, ConnectionError, TimeoutError))
+            # ValueError is what _extract_json_object raises for an empty or
+            # unparseable model response - previously NOT retried, so a single
+            # empty response (a plausible one-off provider hiccup - truncated
+            # output, a content-filter false trigger, a rate-limit-related
+            # empty return) failed the whole call outright after just one
+            # attempt. Confirmed live on grouping_adjacent: "Model response
+            # did not contain a JSON object. Got: '(empty response)'" with no
+            # retry attempted. Same class of bug as the earlier uncaught
+            # RuntimeError-from-HTTPError fix - broadened here because
+            # everything raised inside dispatch is either a network issue or
+            # a provider response issue, never a deliberate validation gate.
+            is_transient = isinstance(
+                exc, (http.client.HTTPException, URLError, ConnectionError, TimeoutError, ValueError)
+            )
+            outcome = (
+                "timeout"
+                if isinstance(exc, TimeoutError)
+                else "malformed_response"
+                if isinstance(exc, ValueError)
+                else "network_error"
+                if is_transient
+                else "error"
+            )
             entry = {
                 "attempt": attempt,
                 "max_attempts": _VISION_CALL_TRANSIENT_RETRY_ATTEMPTS,
                 "started_at": started_at.isoformat(),
                 "finished_at": datetime.now(UTC).isoformat(),
                 "duration_seconds": duration,
-                "outcome": "timeout" if isinstance(exc, TimeoutError) else ("network_error" if is_transient else "error"),
+                "outcome": outcome,
                 "error": str(exc),
                 "request": request_detail,
             }
