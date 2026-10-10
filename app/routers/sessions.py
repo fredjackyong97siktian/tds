@@ -208,14 +208,16 @@ def _attach_source_video_urls(rows: list[dict]) -> list[dict]:
 
 
 @router.get("", response_model=list[SessionListItem])
-def list_sessions(limit: int = 50, offset: int = 0, db: Session = Depends(get_transaction_db)) -> list[SessionListItem]:
-    rows = _attach_source_video_urls(repositories.list_sessions(db, limit=limit, offset=offset))
+def list_sessions(
+    limit: int = 50, offset: int = 0, status: str | None = None, db: Session = Depends(get_transaction_db)
+) -> list[SessionListItem]:
+    rows = _attach_source_video_urls(repositories.list_sessions(db, limit=limit, offset=offset, status=status))
     return [SessionListItem(**row) for row in rows]
 
 
 @router.get("/count")
-def count_sessions(db: Session = Depends(get_transaction_db)) -> dict[str, int]:
-    return {"total": repositories.count_sessions(db)}
+def count_sessions(status: str | None = None, db: Session = Depends(get_transaction_db)) -> dict[str, int]:
+    return {"total": repositories.count_sessions(db, status=status)}
 
 
 @router.get("/dashboard-stats")

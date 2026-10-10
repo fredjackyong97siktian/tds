@@ -437,6 +437,7 @@ class TriggerFrameAssetListItem(BaseModel):
     error: str | None = None
     phone_entry_id: int | None = None
     credit_card_entry_id: int | None = None
+    trigger_source: str | None = None
     created_at: datetime
     updated_at: datetime
     frames: list[TriggerFrameItem] = Field(default_factory=list)

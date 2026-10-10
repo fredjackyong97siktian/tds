@@ -1613,7 +1613,7 @@ def list_trigger_frame_assets(
         text(
             f"""
             select fa.id, fa.trigger_id, fa.location_id, fa.start_time, fa.end_time, fa.status, fa.error,
-                   fa.created_at, fa.updated_at, te.phone_entry_id, te.credit_card_entry_id
+                   fa.created_at, fa.updated_at, te.phone_entry_id, te.credit_card_entry_id, te.trigger_source
             from {frame_asset_table} fa
             left join {trigger_table} te on te.id = fa.trigger_id
             where {where_sql}
@@ -5043,7 +5043,7 @@ def retry_session_issue(db: Session, session_id: int) -> dict[str, Any]:
 
 
 def list_sessions(
-    db: Session, limit: int = 50, *, offset: int = 0, session_id: int | None = None
+    db: Session, limit: int = 50, *, offset: int = 0, session_id: int | None = None, status: str | None = None
 ) -> list[dict[str, Any]]:
     session_table = _table("session")
     trigger_table = _table("trigger_event")
@@ -5052,7 +5052,12 @@ def list_sessions(
     location_name_column = settings.location_name_column
     has_grouping_id = _column_exists(db, session_table, "grouping_id")
     grouping_id_select = ", s.grouping_id" if has_grouping_id else ""
-    where_sql = "where s.id = :session_id" if session_id is not None else ""
+    where_clauses = []
+    if session_id is not None:
+        where_clauses.append("s.id = :session_id")
+    if status is not None:
+        where_clauses.append("s.status = :status")
+    where_sql = f"where {' and '.join(where_clauses)}" if where_clauses else ""
     result = db.execute(
         text(
             f"""
@@ -5073,7 +5078,7 @@ def list_sessions(
             limit :limit offset :offset
             """
         ),
-        {"limit": limit, "offset": offset, "session_id": session_id},
+        {"limit": limit, "offset": offset, "session_id": session_id, "status": status},
     )
     rows = _fetch_all_dicts(result)
     for row in rows:
@@ -5092,9 +5097,13 @@ def list_sessions(
     return rows
 
 
-def count_sessions(db: Session) -> int:
+def count_sessions(db: Session, *, status: str | None = None) -> int:
     session_table = _table("session")
-    result = db.execute(text(f"select count(*) as total from {session_table}"))
+    where_sql = "where status = :status" if status is not None else ""
+    result = db.execute(
+        text(f"select count(*) as total from {session_table} {where_sql}"),
+        {"status": status},
+    )
     row = _fetch_one_dict(result)
     return int(row.get("total") or 0)
 
