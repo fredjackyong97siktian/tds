@@ -4986,6 +4986,89 @@ def _first_trigger_frame_payload(frames: list[dict[str, Any]], limit: int | None
     return frames[: max(1, int(limit))]
 
 
+_MOTION_SENSOR_TRIGGER_SOURCE = "motion_sensor"
+
+_MOTION_PERSON_PRESENCE_PROMPT = (
+    "These images are sampled frames from a single store security trigger. Determine "
+    "whether any image shows a real human being physically present (not just an empty "
+    "scene, a cart, a pet, a shadow, or a lighting change). "
+    'Respond with a JSON object only: {"person_present": true|false, "confidence": <0-1 number>}.'
+)
+
+
+def _check_motion_sensor_person_presence(db: Session, row: Mapping[str, Any]) -> bool:
+    """For a single motion_sensor-sourced trigger whose frames are ready, asks
+    the vision model whether a person is actually visible - motion sensors can
+    false-trigger on carts/pets/shadows/lighting changes, unlike
+    front_door_sensor where the door physically opening is already a strong
+    signal, so only motion_sensor triggers go through this gate at all.
+    Returns True (use this trigger in grouping) when a person is confirmed OR
+    the check itself fails for any reason - a flaky API call must never cost a
+    real customer, so this fails open. Returns False only on an explicit "no
+    person" reading, which gets cached on trigger_event so it's never
+    re-checked by a later batch-build pass or retry.
+    """
+    trigger_id = int(row["trigger_id"])
+    frame_urls = [
+        frame["image_url"]
+        for frame in _first_trigger_frame_payload(_frame_urls_from_trigger_frame_asset(row))
+        if frame.get("image_url")
+    ]
+    if not frame_urls:
+        return True
+
+    try:
+        result, _call_meta = _call_grouping_vision(
+            db,
+            prompt=_MOTION_PERSON_PRESENCE_PROMPT,
+            image_urls=frame_urls,
+            gemini_model_name=str(settings.grouping_gemini_model or "gemini-3.5-flash-lite").strip(),
+            gemini_resize_scale=_grouping_gemini_resize_scale(),
+        )
+    except Exception:
+        logger.warning(
+            "Motion-sensor person-presence check failed for trigger_id=%s - using it in grouping anyway "
+            "(fail open)",
+            trigger_id,
+            exc_info=True,
+        )
+        return True
+
+    present = bool(result.get("person_present", True))
+    confidence = _coerce_number(result.get("confidence"))
+    repositories.set_trigger_motion_person_present(db, trigger_id, present=present, confidence=confidence)
+    if not present:
+        logger.info(
+            "Motion-sensor trigger_id=%s has no confirmed person present (confidence=%s) - excluding from "
+            "grouping",
+            trigger_id,
+            confidence,
+        )
+    return present
+
+
+def _filter_motion_sensor_ready_assets(db: Session, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drops motion_sensor-sourced triggers with no confirmed person in their
+    frames before they're ever linked into a grouping batch - every other
+    trigger_source (front_door_sensor, aqara, etc.) passes through untouched.
+    Applied at every call site that lists ready trigger frame assets for
+    grouping, so adjacent/text/direct/repair never see an excluded trigger.
+    """
+    kept: list[dict[str, Any]] = []
+    for row in rows:
+        if row.get("trigger_source") != _MOTION_SENSOR_TRIGGER_SOURCE:
+            kept.append(row)
+            continue
+        cached = row.get("motion_person_present")
+        if cached is not None:
+            if bool(cached):
+                kept.append(row)
+            continue
+        if _check_motion_sensor_person_presence(db, row):
+            kept.append(row)
+    return kept
+
+
 def _link_ready_triggers_into_batch(
     db: Session,
     *,
@@ -5054,11 +5137,14 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
                 batch_id=int(avoid_batch["id"]),
                 window_start=period_window_start,
                 window_end=period_window_end,
-                ready_assets=repositories.list_ready_trigger_frame_assets_in_window(
+                ready_assets=_filter_motion_sensor_ready_assets(
                     db,
-                    location_id=location_id,
-                    window_start=period_window_start,
-                    window_end=period_window_end,
+                    repositories.list_ready_trigger_frame_assets_in_window(
+                        db,
+                        location_id=location_id,
+                        window_start=period_window_start,
+                        window_end=period_window_end,
+                    ),
                 ),
             )
             repositories.update_grouping_batch(
@@ -5135,11 +5221,14 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
                         batch_id=int(missed_batch["id"]),
                         window_start=period_window_start,
                         window_end=period_window_end,
-                        ready_assets=repositories.list_ready_trigger_frame_assets_in_window(
+                        ready_assets=_filter_motion_sensor_ready_assets(
                             db,
-                            location_id=location_id,
-                            window_start=period_window_start,
-                            window_end=period_window_end,
+                            repositories.list_ready_trigger_frame_assets_in_window(
+                                db,
+                                location_id=location_id,
+                                window_start=period_window_start,
+                                window_end=period_window_end,
+                            ),
                         ),
                     )
                     repositories.update_grouping_batch(
@@ -5271,11 +5360,14 @@ def prepare_due_grouping_batches(db: Session) -> list[dict[str, Any]]:
             # exactly why today's early_evening window never got a batch
             # despite every one of its own triggers being fully ready and
             # completely unlinked.
-            window_ready_assets = repositories.list_ready_trigger_frame_assets_in_window(
+            window_ready_assets = _filter_motion_sensor_ready_assets(
                 db,
-                location_id=location_id,
-                window_start=carry_forward_cutoff,
-                window_end=window_end,
+                repositories.list_ready_trigger_frame_assets_in_window(
+                    db,
+                    location_id=location_id,
+                    window_start=carry_forward_cutoff,
+                    window_end=window_end,
+                ),
             )
             current_window_rows: list[dict[str, Any]] = []
             carried_over_rows: list[dict[str, Any]] = []
@@ -5336,10 +5428,13 @@ def prepare_manual_grouping_batches(db: Session) -> list[dict[str, Any]]:
     prepared: list[dict[str, Any]] = []
     for location in locations:
         location_id = int(location["id"])
-        ready_assets = repositories.list_manual_grouping_ready_trigger_frame_assets(
+        ready_assets = _filter_motion_sensor_ready_assets(
             db,
-            location_id=location_id,
-            limit=200,
+            repositories.list_manual_grouping_ready_trigger_frame_assets(
+                db,
+                location_id=location_id,
+                limit=200,
+            ),
         )
         if not ready_assets:
             continue
@@ -5407,10 +5502,13 @@ def prepare_manual_grouping_batches_for_range(
     prepared: list[dict[str, Any]] = []
     for location in locations:
         current_location_id = int(location["id"])
-        ready_assets = repositories.list_manual_grouping_ready_trigger_frame_assets(
+        ready_assets = _filter_motion_sensor_ready_assets(
             db,
-            location_id=current_location_id,
-            limit=1000,
+            repositories.list_manual_grouping_ready_trigger_frame_assets(
+                db,
+                location_id=current_location_id,
+                limit=1000,
+            ),
         )
         trigger_assets = [
             row
@@ -8882,11 +8980,14 @@ def _retry_grouping_batch_now_locked(db: Session, *, batch_id: int) -> dict[str,
         # exceeds it, even when this exact window is nowhere near that cap.
         # Confirmed live: 19 clearly-eligible, fully unlinked triggers inside
         # this batch's own window were invisible until this was fixed.
-        window_ready_assets = repositories.list_ready_trigger_frame_assets_in_window(
+        window_ready_assets = _filter_motion_sensor_ready_assets(
             db,
-            location_id=int(batch["location_id"]),
-            window_start=batch["window_start"],
-            window_end=batch["window_end"],
+            repositories.list_ready_trigger_frame_assets_in_window(
+                db,
+                location_id=int(batch["location_id"]),
+                window_start=batch["window_start"],
+                window_end=batch["window_end"],
+            ),
         )
         linked_count = _link_ready_triggers_into_batch(
             db,

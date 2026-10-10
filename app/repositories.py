@@ -1835,6 +1835,34 @@ def set_trigger_appearance(
     db.commit()
 
 
+def set_trigger_motion_person_present(
+    db: Session,
+    trigger_id: int,
+    *,
+    present: bool,
+    confidence: float | None,
+) -> None:
+    # Cached per-trigger so a later batch-build pass (or a retry) doesn't
+    # re-spend an API call re-checking a motion_sensor trigger that was
+    # already confirmed/ruled out - list_ready_trigger_frame_assets_in_window
+    # and list_manual_grouping_ready_trigger_frame_assets select this column
+    # back out to skip triggers already checked.
+    trigger_table = _table("trigger_event")
+    db.execute(
+        text(
+            f"""
+            update {trigger_table}
+            set motion_person_present = :present,
+                motion_person_present_confidence = :confidence,
+                motion_person_checked_at = now()
+            where id = :trigger_id
+            """
+        ),
+        {"trigger_id": trigger_id, "present": present, "confidence": confidence},
+    )
+    db.commit()
+
+
 def get_trigger_appearances(db: Session, trigger_ids: list[int]) -> dict[int, dict[str, Any]]:
     if not trigger_ids:
         return {}
@@ -2547,6 +2575,8 @@ def list_manual_grouping_ready_trigger_frame_assets(
                    te.phone_entry_id,
                    te.credit_card_entry_id,
                    te.entry_source_type,
+                   te.trigger_source,
+                   te.motion_person_present,
                    fa.id as frame_asset_id,
                    fa.start_time as frame_asset_start_time,
                    fa.end_time as frame_asset_end_time,
@@ -2630,6 +2660,8 @@ def list_ready_trigger_frame_assets_in_window(
                    te.phone_entry_id,
                    te.credit_card_entry_id,
                    te.entry_source_type,
+                   te.trigger_source,
+                   te.motion_person_present,
                    fa.id as frame_asset_id,
                    fa.start_time as frame_asset_start_time,
                    fa.end_time as frame_asset_end_time,
