@@ -10694,12 +10694,16 @@ def _run_theft_confidence_for_grouping_batch_locked(
         raise ValueError(f"Grouping batch {batch_id} does not have a result payload.")
     grouping_summary = dict(grouping_summary)
     grouping_summary_before_repair = json.dumps(grouping_summary, sort_keys=True, default=str)
-    repaired_grouping_summary = _repair_grouping_with_gemini(
-        db,
-        parent_script_run_id=int(batch["script_run_id"]) if batch.get("script_run_id") is not None else None,
-        batch_id=batch_id,
-        location_id=int(batch.get("location_id") or 0) or None,
-        grouping_summary=grouping_summary,
+    repaired_grouping_summary = (
+        _repair_grouping_with_gemini(
+            db,
+            parent_script_run_id=int(batch["script_run_id"]) if batch.get("script_run_id") is not None else None,
+            batch_id=batch_id,
+            location_id=int(batch.get("location_id") or 0) or None,
+            grouping_summary=grouping_summary,
+        )
+        if settings.grouping_repair_enabled
+        else grouping_summary
     )
     grouping_summary_after_repair = json.dumps(repaired_grouping_summary, sort_keys=True, default=str)
     if grouping_summary_after_repair != grouping_summary_before_repair:

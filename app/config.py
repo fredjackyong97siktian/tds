@@ -255,6 +255,11 @@ class Settings(BaseSettings):
     # gap isn't fully closed yet. The stage's code stays in place; this just
     # keeps it from actually running until that's resolved.
     grouping_text_enabled: bool = False
+    # Off by default - a week's worth of real cost-per-successful-group data
+    # showed repair costing far more per group than adjacent/direct for very
+    # few actual matches. The stage's code stays in place; this just keeps it
+    # from running until it's reworked to be worth its cost.
+    grouping_repair_enabled: bool = False
     # Temporary diagnostic switch - when False, confidence analysis still runs
     # and writes its normal filter_confidence_result (score, factors,
     # need_deep_analysis) for every group, but stops short of creating an
