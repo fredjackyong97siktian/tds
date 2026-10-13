@@ -4839,6 +4839,24 @@ def _utc_naive_to_local(value: datetime | None) -> datetime | None:
     return aware_utc.astimezone(_time_period_zoneinfo()).replace(tzinfo=None)
 
 
+def _local_naive_to_utc(value: datetime | None) -> datetime | None:
+    # Inverse of _utc_naive_to_local above - converts a naive datetime
+    # implicitly meaning Malaysia local time (e.g. start_time/end_time,
+    # derived from trigger_event.trigger_time) into naive UTC, for comparing
+    # against a column actually stored in UTC (e.g. tds_thief_alert.createdAt).
+    # Missing this is the exact same class of bug _utc_naive_to_local exists
+    # to prevent, just in the opposite direction - confirmed live:
+    # multiple_minus_button_alert never fired because
+    # list_minus_button_alerts_for_window compared a UTC createdAt directly
+    # against a local start_time/end_time window with no conversion, an
+    # 8-hour mismatch that pushed every real alert outside the window it was
+    # actually computed to cover.
+    if value is None:
+        return None
+    aware_local = value.replace(tzinfo=_time_period_zoneinfo()) if value.tzinfo is None else value.astimezone(_time_period_zoneinfo())
+    return aware_local.astimezone(UTC).replace(tzinfo=None)
+
+
 def _to_time_period_local_naive(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=None, microsecond=0)
@@ -11113,8 +11131,11 @@ def _run_theft_confidence_for_grouping_batch_locked(
         minus_alerts = repositories.list_minus_button_alerts_for_window(
             db,
             location_id=location_id,
-            start_time=start_time,
-            end_time=end_time,
+            # tds_thief_alert.createdAt is stored in UTC, while start_time/
+            # end_time (from trigger_event.trigger_time) are naive local -
+            # see _local_naive_to_utc.
+            start_time=_local_naive_to_utc(start_time),
+            end_time=_local_naive_to_utc(end_time),
         )
         total_quantity = sum(_coerce_int(row.get("total_items")) for row in transactions)
         total_value = 0.0
@@ -11631,8 +11652,11 @@ def score_confidence_for_single_group(
     minus_alerts = repositories.list_minus_button_alerts_for_window(
         db,
         location_id=location_id,
-        start_time=start_time,
-        end_time=end_time,
+        # tds_thief_alert.createdAt is stored in UTC, while start_time/
+        # end_time (from trigger_event.trigger_time) are naive local - see
+        # _local_naive_to_utc.
+        start_time=_local_naive_to_utc(start_time),
+        end_time=_local_naive_to_utc(end_time),
     )
     total_quantity = sum(_coerce_int(row.get("total_items")) for row in transactions)
     total_value = 0.0
