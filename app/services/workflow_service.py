@@ -57,6 +57,7 @@ from ..storage import (
     session_logs_root,
     session_root,
     tmp_media_root,
+    tmp_trigger_root,
     trigger_gallery_state_path,
     trigger_processed_root,
     trigger_tmp_video_path,
@@ -1618,6 +1619,18 @@ def _record_glm_cost(db: Session, script_run_id: int, glm_meta: Mapping[str, Any
 
 _OPENAI_GROUPING_MODELS = ("gpt-4.1-nano", "gpt-4o-mini", "gpt-5-nano")
 
+# OpenAI's reasoning-family models (o1/o3/o4/gpt-5*) reject any custom
+# temperature - "does not support 0.0 with this model, only the default (1)
+# value is supported" - confirmed live against gpt-5-nano. Checked by prefix
+# rather than listing gpt-5-nano alone, since every model in this family
+# shares the same restriction.
+_OPENAI_REASONING_MODEL_PREFIXES = ("o1", "o3", "o4", "gpt-5")
+
+
+def _openai_model_supports_custom_temperature(model_name: str) -> bool:
+    normalized = model_name.strip().lower()
+    return not normalized.startswith(_OPENAI_REASONING_MODEL_PREFIXES)
+
 
 def _call_openai_vision_summary(
     *,
@@ -1657,7 +1670,7 @@ def _call_openai_vision_summary(
         "messages": [{"role": "user", "content": content}],
         "response_format": {"type": "json_object"},
     }
-    if temperature is not None:
+    if temperature is not None and _openai_model_supports_custom_temperature(selected_model):
         request_body["temperature"] = temperature
     url = f"{str(settings.openai_base_url).rstrip('/')}/chat/completions"
     request = Request(
@@ -4060,6 +4073,37 @@ def _seconds_to_nearest_transaction(db: Session, session_id: int, anchor_time: d
     return min(abs((value - anchor_time).total_seconds()) for value in transaction_times)
 
 
+_RETRIEVAL_FFMPEG_LOCK_NAME = "tds_retrieval_ffmpeg"
+
+
+def _acquire_retrieval_ffmpeg_lock(*, wait_seconds: int) -> Connection | None:
+    # VideoRetrievalWorker enforces "exactly one ffmpeg process at a time" for
+    # its own queued jobs (see video_retrieval_worker.py), but an ad-hoc
+    # direct capture - kiosk transaction probe frames, carry-evidence
+    # re-check probes - calls ffmpeg immediately, entirely outside that
+    # queue. This MySQL named lock is what actually keeps the two from
+    # hitting the NVR at the same time. Same raw-Connection pattern as
+    # _try_acquire_theft_confidence_lock below - GET_LOCK/RELEASE_LOCK must
+    # run on the exact same physical connection, which an ORM Session's own
+    # transaction lifecycle doesn't guarantee.
+    conn = transactional_engine.connect()
+    acquired_row = conn.execute(
+        text("select get_lock(:lock_name, :wait_seconds) as acquired"),
+        {"lock_name": _RETRIEVAL_FFMPEG_LOCK_NAME, "wait_seconds": wait_seconds},
+    ).mappings().first()
+    if int((acquired_row or {}).get("acquired") or 0) != 1:
+        conn.close()
+        return None
+    return conn
+
+
+def _release_retrieval_ffmpeg_lock(conn: Connection) -> None:
+    try:
+        conn.execute(text("select release_lock(:lock_name)"), {"lock_name": _RETRIEVAL_FFMPEG_LOCK_NAME})
+    finally:
+        conn.close()
+
+
 def _capture_snapshot_frame(
     *,
     location_id: int,
@@ -4102,6 +4146,15 @@ def _capture_snapshot_frame(
         "2",
         str(snapshot_path),
     ]
+    lock_conn = _acquire_retrieval_ffmpeg_lock(wait_seconds=settings.retrieval_ffmpeg_lock_wait_seconds)
+    if lock_conn is None:
+        return {
+            "status": "failed",
+            "stderr": (
+                f"Could not get exclusive ffmpeg/NVR access within "
+                f"{settings.retrieval_ffmpeg_lock_wait_seconds}s (retrieval worker busy)."
+            ),
+        }
     try:
         completed = subprocess.run(
             command,
@@ -4122,6 +4175,8 @@ def _capture_snapshot_frame(
             "status": "failed",
             "stderr": f"ffmpeg snapshot capture timed out after {settings.dahua_snapshot_timeout_seconds}s",
         }
+    finally:
+        _release_retrieval_ffmpeg_lock(lock_conn)
     return {
         "status": "ok" if completed.returncode == 0 and snapshot_path.exists() else "failed",
         "stderr": str(completed.stderr or "").strip()[-1000:],
@@ -10142,6 +10197,209 @@ def _group_carry_evidence(group: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+_CARRY_CHECK_EXIT_PROBE_FRAME_COUNT = 12
+_CARRY_CHECK_EXIT_PROBE_INTERVAL_SECONDS = 0.5
+_CARRY_CHECK_KIOSK_PROBE_FRAME_COUNT = 6
+_CARRY_CHECK_KIOSK_PROBE_INTERVAL_SECONDS = 1.0
+
+
+def _capture_carry_check_probe_frames(
+    db: Session,
+    *,
+    location_id: int,
+    section: str,
+    anchor_time: datetime,
+    frame_count: int,
+    interval_seconds: float,
+    label: str,
+    snapshot_root: Path,
+    trigger_id: int | None = None,
+) -> list[str]:
+    """Ad-hoc frame capture used only by carry_item_signal's insufficient-
+    evidence re-check (see _reexamine_carry_item_signal_with_probe_frames) -
+    same capture mechanics as _capture_kiosk_probe_frames, generalized to any
+    camera section/anchor/frame-count/interval and usable before a session
+    exists: carry_item_signal runs during confidence scoring, before
+    need_deep_analysis has decided whether to create one, and
+    _capture_snapshot_frame's session_id param is accepted but never actually
+    used inside it.
+    """
+    try:
+        cctv = repositories.get_cctv_by_location_section(db, location_id=location_id, section=section)
+    except Exception:
+        logger.exception(
+            "Could not load %s CCTV record for carry-check probe location_id=%s", section, location_id
+        )
+        return []
+    recorder_channel = str(cctv.get("recorder_channel") or "").strip()
+    if not recorder_channel:
+        return []
+    delayed_seconds = _current_delayed_seconds(db, location_id=location_id, section=section, cctv=cctv)
+    safe_label = re.sub(r"[^A-Za-z0-9._-]+", "_", label) or "probe"
+    image_urls: list[str] = []
+    for index in range(max(1, int(frame_count))):
+        sample_time = anchor_time + timedelta(seconds=index * interval_seconds)
+        snapshot_path = (
+            snapshot_root / safe_label / f"probe_{index + 1:02d}_{sample_time.strftime('%Y%m%d_%H%M%S_%f')}.jpg"
+        )
+        capture_meta = _capture_snapshot_frame(
+            location_id=location_id,
+            session_id=0,
+            section=section,
+            recorder_channel=recorder_channel,
+            start_time=sample_time,
+            delayed_seconds=delayed_seconds,
+            snapshot_path=snapshot_path,
+        )
+        if capture_meta["status"] != "ok":
+            continue
+        if section == "kiosk":
+            try:
+                _label_kiosk_machines_on_frame(snapshot_path)
+            except Exception:
+                logger.exception("Could not draw kiosk machine labels on carry-check probe frame %s", snapshot_path)
+        _object_key, image_url = _upload_runner_input_file(
+            snapshot_path,
+            kind="carry_check_probe_image",
+            location_id=location_id,
+            session_id=None,
+            trigger_id=trigger_id,
+            section=section,
+        )
+        image_urls.append(image_url)
+    return image_urls
+
+
+def _reexamine_carry_item_signal_with_probe_frames(
+    db: Session,
+    *,
+    location_id: int,
+    group: Mapping[str, Any],
+    transactions: list[dict[str, Any]],
+    script_run_id: int,
+) -> dict[str, Any] | None:
+    """carry_item_signal's first pass is text-only, reading only the carry
+    description grouping already wrote - when it says insufficient_evidence,
+    this captures real images from three vantage points that first pass never
+    saw (a denser re-sample of the exit door camera, plus the kiosk camera at
+    the start and end of checkout) and re-asks with those images directly,
+    instead of leaving the group permanently flagged as ambiguous. Returns
+    None if no probe frames could be captured at all (e.g. no exit trigger or
+    no transaction timestamps to anchor on), in which case the original
+    insufficient_evidence result stands as final.
+    """
+    exit_trigger_ids = [int(value) for value in (_read_group_value(group, "exit") or []) if value is not None]
+    exit_trigger_id = exit_trigger_ids[0] if exit_trigger_ids else None
+    exit_trigger_time: datetime | None = None
+    if exit_trigger_id is not None:
+        try:
+            exit_trigger_time = _coerce_datetime_value(repositories.get_trigger(db, exit_trigger_id).get("trigger_time"))
+        except Exception:
+            logger.exception("Could not load exit trigger_time for carry-check probe trigger_id=%s", exit_trigger_id)
+
+    initiated_times = [value for row in transactions if (value := _coerce_datetime_value(row.get("initiated_at"))) is not None]
+    first_initiated_at = min(initiated_times) if initiated_times else None
+    payment_times = [value for row in transactions if (value := _coerce_datetime_value(row.get("payment_attempt_at"))) is not None]
+    last_payment_at = max(payment_times) if payment_times else None
+
+    snapshot_root = tmp_trigger_root(location_id, exit_trigger_id or 0) / "carry_check"
+    probe_plan = (
+        ("entrance", exit_trigger_time, _CARRY_CHECK_EXIT_PROBE_FRAME_COUNT, _CARRY_CHECK_EXIT_PROBE_INTERVAL_SECONDS, "exit"),
+        ("kiosk", first_initiated_at, _CARRY_CHECK_KIOSK_PROBE_FRAME_COUNT, _CARRY_CHECK_KIOSK_PROBE_INTERVAL_SECONDS, "kiosk_start"),
+        ("kiosk", last_payment_at, _CARRY_CHECK_KIOSK_PROBE_FRAME_COUNT, _CARRY_CHECK_KIOSK_PROBE_INTERVAL_SECONDS, "kiosk_end"),
+    )
+    probe_descriptions = {
+        "exit": "exit door camera, a denser re-sample of the same exit moment",
+        "kiosk_start": "kiosk camera, starting when the customer began scanning items (first transaction's initiated_at)",
+        "kiosk_end": "kiosk camera, starting when payment last resolved (last transaction's payment_attempt_at)",
+    }
+
+    image_blocks: list[str] = []
+    all_image_urls: list[str] = []
+    offset = 0
+    for section, anchor_time, frame_count, interval_seconds, label in probe_plan:
+        if anchor_time is None:
+            continue
+        urls = _capture_carry_check_probe_frames(
+            db,
+            location_id=location_id,
+            section=section,
+            anchor_time=anchor_time,
+            frame_count=frame_count,
+            interval_seconds=interval_seconds,
+            label=label,
+            snapshot_root=snapshot_root,
+            trigger_id=exit_trigger_id,
+        )
+        if not urls:
+            continue
+        range_start = offset + 1
+        range_end = offset + len(urls)
+        image_blocks.append(
+            f"Images {range_start}-{range_end}: {probe_descriptions[label]}, "
+            f"{len(urls)} frames at {interval_seconds}s intervals."
+        )
+        all_image_urls.extend(urls)
+        offset += len(urls)
+
+    if not all_image_urls:
+        return None
+
+    prompt = (
+        "You are re-examining a retail theft confidence case where a first text-only pass could not tell whether "
+        "the customer's exit carrying state is suspicious. You now have real camera stills from these vantage "
+        "points the first pass never saw:\n"
+        + "\n".join(image_blocks)
+        + "\n\n"
+        "Decide whether the exit carrying state is suspicious by comparing what the exit door camera images show "
+        "the customer carrying against the paid receipt item details - use the kiosk stills only as supporting "
+        "context (e.g. to see them bagging items at checkout) when that helps. "
+        "Flag only when the exit bag/plastic bag/container/items are not reasonably explained by the paid "
+        "transaction. If even these real images don't show the carrying state clearly enough to judge, set "
+        "insufficient_evidence=true and reason='insufficient_visual_carry_evidence_after_reexamination' - this is "
+        "now the final answer; do not guess further after this. "
+        "Yellow bag rule: if a yellow bag, yellow plastic bag, or any yellow-colored carried container is visible "
+        "anywhere in the images, set hit=true - this overrides the usual receipt-reasonableness check. "
+        "Bag-enlarged-in-hand rule: if a bag held folded, scrunched, or bunched up in hand in the earlier images "
+        "appears visibly larger, fuller, or more rigid/loaded in the later images, this is a strong concealment "
+        "sign - set bag_enlarged_at_exit=true and hit=true, even if the receipt could otherwise seem to explain "
+        "some items. "
+        "Use item names, quantity, likely physical size, and total value from the transaction details below. Be "
+        "conservative when evidence is unclear. Return strict JSON only with schema: "
+        '{"hit":true|false,"insufficient_evidence":true|false,"score":number,"reason":string,"entry_bag_count":integer,'
+        '"exit_bag_count":integer,"reasonable_with_receipt":true|false,"bag_enlarged_at_exit":true|false,'
+        '"evidence_summary":string,"suspicious_objects":[string]}. '
+        f"Transaction details: {json.dumps(_transaction_summary(transactions), default=str)}."
+    )
+    try:
+        result, meta = _call_grouping_vision(
+            db,
+            prompt=prompt,
+            image_urls=all_image_urls,
+            gemini_model_name=_current_grouping_model_name(db, settings.grouping_gemini_model or "gemini-3.5-flash-lite"),
+            gemini_resize_scale=_grouping_gemini_resize_scale(),
+            script_run_id=script_run_id,
+        )
+    except Exception:
+        logger.exception("Carry-check probe re-ask call failed")
+        return None
+    _record_grouping_cost(db, script_run_id, meta)
+    return {
+        "hit": _as_boolish(result.get("hit")),
+        "insufficient_evidence": _as_boolish(result.get("insufficient_evidence")),
+        "score": _coerce_number(result.get("score"), 0.0),
+        "reason": str(result.get("reason") or "carry_ai_reexamined"),
+        "entry_bag_count": _coerce_int(result.get("entry_bag_count"), 0),
+        "exit_bag_count": _coerce_int(result.get("exit_bag_count"), 0),
+        "reasonable_with_receipt": _as_boolish(result.get("reasonable_with_receipt")),
+        "bag_enlarged_at_exit": _as_boolish(result.get("bag_enlarged_at_exit")),
+        "evidence_summary": result.get("evidence_summary"),
+        "suspicious_objects": result.get("suspicious_objects") if isinstance(result.get("suspicious_objects"), list) else [],
+        "probe_image_urls": all_image_urls,
+        "probe_image_count": len(all_image_urls),
+    }
+
+
 def _evaluate_carry_item_signal_with_ai(
     db: Session,
     *,
@@ -10195,11 +10453,6 @@ def _evaluate_carry_item_signal_with_ai(
         "Exit carrying a normal plastic bag with several paid items that fit inside = usually reasonable. "
         "Yellow bag rule: if a yellow bag, yellow plastic bag, or any yellow-colored carried container is visible "
         "anywhere in the carry evidence, set hit=true - this overrides the usual receipt-reasonableness check. "
-        "Concealment-capable entry bag rule: if the customer enters already carrying a bag that could be used to "
-        "conceal small items - a backpack, drawstring bag, shopping tote, or similar closed/semi-closed bag - "
-        "even if that bag looks empty or unremarkable at entry, set entry_bag_conceal_risk=true and hit=true. "
-        "The customer had the opportunity to slip small items into that bag during the visit, so its mere presence "
-        "at entry is itself a risk factor, independent of what the receipt shows. "
         "Bag-enlarged-in-hand rule: some customers enter holding a plastic bag or woven bag folded, scrunched, or "
         "bunched up in their hand rather than open and hanging - watch for this. If that same bag appears visibly "
         "larger, fuller, or more rigid/loaded by exit compared to how it looked folded in hand at entry, this is a "
@@ -10210,7 +10463,7 @@ def _evaluate_carry_item_signal_with_ai(
         "Return strict JSON only with schema: "
         '{"hit":true|false,"insufficient_evidence":true|false,"score":number,"reason":string,"entry_bag_count":integer,'
         '"exit_bag_count":integer,"reasonable_with_receipt":true|false,'
-        '"entry_bag_conceal_risk":true|false,"bag_enlarged_at_exit":true|false,'
+        '"bag_enlarged_at_exit":true|false,'
         '"evidence_summary":string,"suspicious_objects":[string]}. '
         f"Input: {json.dumps(runner_payload, default=str)}"
     )
@@ -10234,7 +10487,6 @@ def _evaluate_carry_item_signal_with_ai(
             "entry_bag_count": _coerce_int(result.get("entry_bag_count"), 0),
             "exit_bag_count": _coerce_int(result.get("exit_bag_count"), 0),
             "reasonable_with_receipt": _as_boolish(result.get("reasonable_with_receipt")),
-            "entry_bag_conceal_risk": _as_boolish(result.get("entry_bag_conceal_risk")),
             "bag_enlarged_at_exit": _as_boolish(result.get("bag_enlarged_at_exit")),
             "evidence_summary": result.get("evidence_summary"),
             "suspicious_objects": result.get("suspicious_objects") if isinstance(result.get("suspicious_objects"), list) else [],
@@ -10246,6 +10498,33 @@ def _evaluate_carry_item_signal_with_ai(
             "total_quantity": total_quantity,
             "total_value": total_value,
         }
+        if normalized["insufficient_evidence"]:
+            # The first pass is text-only - before accepting "can't tell" as
+            # final, try again with real images from three vantage points it
+            # never saw (see _reexamine_carry_item_signal_with_probe_frames).
+            # Reuses this same script_run_id, so both calls show up together.
+            try:
+                reexamined = _reexamine_carry_item_signal_with_probe_frames(
+                    db,
+                    location_id=location_id,
+                    group=group,
+                    transactions=transactions,
+                    script_run_id=script_run_id,
+                )
+            except Exception:
+                logger.exception(
+                    "Carry-check probe re-examination failed batch_id=%s group_key=%s", batch_id, group_key
+                )
+                reexamined = None
+            if reexamined is not None:
+                normalized["first_pass"] = {
+                    "hit": normalized["hit"],
+                    "insufficient_evidence": normalized["insufficient_evidence"],
+                    "score": normalized["score"],
+                    "reason": normalized["reason"],
+                }
+                normalized.update(reexamined)
+                normalized["reexamined_with_probe_frames"] = True
         repositories.finish_script_run(
             db,
             script_run_id,
@@ -15050,35 +15329,50 @@ def start_trigger_frame_asset_retrieval_job(job: TriggerFrameAssetRetrievalQueue
 
 
 def start_video_retrieval_job(job: VideoRetrievalQueued) -> None:
-    if job.status == "not_retrieved" and job.section == "entrance" and job.retrieval_mode != "full_video":
-        _run_trigger_frame_retrieval_job(
+    # Holds the same lock _capture_snapshot_frame uses for the whole job, not
+    # just around each individual ffmpeg call inside it - this job was
+    # already exclusive within VideoRetrievalWorker's own single-slot queue,
+    # so there's no extra serialization cost, and it guarantees an ad-hoc
+    # direct capture (kiosk probe, carry-evidence re-check) can never overlap
+    # with it either. If the lock can't be acquired in time, this raises and
+    # the job is picked back up by the worker's own stale-job reset.
+    lock_conn = _acquire_retrieval_ffmpeg_lock(wait_seconds=settings.retrieval_ffmpeg_lock_wait_seconds)
+    if lock_conn is None:
+        raise RuntimeError(
+            f"Could not get exclusive ffmpeg/NVR access within {settings.retrieval_ffmpeg_lock_wait_seconds}s."
+        )
+    try:
+        if job.status == "not_retrieved" and job.section == "entrance" and job.retrieval_mode != "full_video":
+            _run_trigger_frame_retrieval_job(
+                video_asset_id=job.video_asset_id,
+                trigger_id=job.trigger_id,
+                location_id=job.location_id,
+                section=job.section,
+                start_time=job.requested_start_time,
+                end_time=job.requested_end_time,
+                rtsp_url=job.rtsp_url,
+                output_path=job.output_path,
+            )
+            return
+        _run_video_retrieval_job(
             video_asset_id=job.video_asset_id,
+            session_id=job.session_id,
             trigger_id=job.trigger_id,
             location_id=job.location_id,
             section=job.section,
             start_time=job.requested_start_time,
             end_time=job.requested_end_time,
-            rtsp_url=job.rtsp_url,
+            delayed_seconds=job.delayed_seconds,
+            adjusted_start_time=job.adjusted_start_time,
+            adjusted_end_time=job.adjusted_end_time,
             output_path=job.output_path,
+            rtsp_url=job.rtsp_url,
+            dahua_host=job.dahua_host,
+            dahua_username=job.dahua_username,
+            rtsp_port=job.rtsp_port,
         )
-        return
-    _run_video_retrieval_job(
-        video_asset_id=job.video_asset_id,
-        session_id=job.session_id,
-        trigger_id=job.trigger_id,
-        location_id=job.location_id,
-        section=job.section,
-        start_time=job.requested_start_time,
-        end_time=job.requested_end_time,
-        delayed_seconds=job.delayed_seconds,
-        adjusted_start_time=job.adjusted_start_time,
-        adjusted_end_time=job.adjusted_end_time,
-        output_path=job.output_path,
-        rtsp_url=job.rtsp_url,
-        dahua_host=job.dahua_host,
-        dahua_username=job.dahua_username,
-        rtsp_port=job.rtsp_port,
-    )
+    finally:
+        _release_retrieval_ffmpeg_lock(lock_conn)
 
 
 def start_entrance_analysis_job(job: EntranceAnalysisQueued) -> ScriptExecutionResult:
