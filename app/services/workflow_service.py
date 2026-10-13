@@ -1786,7 +1786,12 @@ def _record_openai_cost(db: Session, script_run_id: int, openai_meta: Mapping[st
 # means adding a line here (plus the matching entries in _GROUPING_PROVIDERS
 # and the dashboard's PROVIDER_LABELS), not a new integration.
 _OPENROUTER_MODELS: dict[str, str] = {
+    # mimo-v2.5 is being retired by Xiaomi on 2026-10-21 (auto-routed to
+    # v2.6-flash at v2.6 rates starting 2026-10-14 regardless) - kept here
+    # so anything still pointed at it keeps working until then, but
+    # openrouter-mimo-v2.6-flash is the one to actually select going forward.
     "openrouter-mimo-v2.5": "xiaomi/mimo-v2.5",
+    "openrouter-mimo-v2.6-flash": "xiaomi/mimo-v2.6-flash",
     "openrouter-qwen3.8-flash": "qwen/qwen3.8-flash",
 }
 
