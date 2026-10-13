@@ -18,6 +18,8 @@ def list_frame_assets(
     end_time: datetime | None = None,
     status: str | None = None,
     trigger_id: int | None = None,
+    trigger_id_min: int | None = None,
+    trigger_id_max: int | None = None,
     db: Session = Depends(get_transaction_db),
 ) -> list[TriggerFrameAssetListItem]:
     rows = repositories.list_trigger_frame_assets(
@@ -28,6 +30,8 @@ def list_frame_assets(
         end_time=end_time,
         status=status,
         trigger_id=trigger_id,
+        trigger_id_min=trigger_id_min,
+        trigger_id_max=trigger_id_max,
     )
     return [TriggerFrameAssetListItem(**row) for row in rows]
 

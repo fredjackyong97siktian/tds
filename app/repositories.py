@@ -1587,6 +1587,8 @@ def list_trigger_frame_assets(
     end_time: Any | None = None,
     status: str | None = None,
     trigger_id: int | None = None,
+    trigger_id_min: int | None = None,
+    trigger_id_max: int | None = None,
 ) -> list[dict[str, Any]]:
     frame_asset_table = _table("trigger_frame_asset")
     frame_table = _table("trigger_frame")
@@ -1608,6 +1610,12 @@ def list_trigger_frame_assets(
     if trigger_id is not None:
         where_clauses.append("fa.trigger_id = :trigger_id")
         params["trigger_id"] = trigger_id
+    if trigger_id_min is not None:
+        where_clauses.append("fa.trigger_id >= :trigger_id_min")
+        params["trigger_id_min"] = trigger_id_min
+    if trigger_id_max is not None:
+        where_clauses.append("fa.trigger_id <= :trigger_id_max")
+        params["trigger_id_max"] = trigger_id_max
     where_sql = " and ".join(where_clauses)
     result = db.execute(
         text(
