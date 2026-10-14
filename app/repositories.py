@@ -3931,27 +3931,35 @@ def list_scored_group_keys_for_batch(db: Session, batch_id: int) -> set[str]:
     return {str(row[0]) for row in result.all()}
 
 
+def _confidence_customer_source(identity_type: str) -> dict[str, str]:
+    # Trigger credentials reference entry records, not whitelist identity rows.
+    if identity_type == "phone":
+        return {"table_name": "qrentry", "id_column": "id", "value_column": "id", "display_column": "participantId"}
+    if identity_type == "card":
+        return {"table_name": "entrylogs", "id_column": "id", "value_column": "id", "display_column": "fingerprint"}
+    raise ValueError("Unsupported customer identity type.")
+
+
 def _confidence_customer_clause(identity_type: str) -> str:
     if identity_type not in {"phone", "card"}:
         raise ValueError("Unsupported customer identity type.")
-    source = _whitelist_source_config("qrentry" if identity_type == "phone" else "entrylogs")
+    source = _confidence_customer_source(identity_type)
     entry_column = "phone_entry_id" if identity_type == "phone" else "credit_card_entry_id"
     return f"""
         exists (
             select 1
             from {_table('trigger_event')} customer_trigger
             join {source['table_name']} customer_source
-              on cast(customer_trigger.{entry_column} as char) = cast(customer_source.{source['id_column']} as char)
-              or cast(customer_trigger.{entry_column} as char) = cast(customer_source.{source['value_column']} as char)
-            where cast(customer_source.{source['display_column']} as char) = :customer_value
+              on customer_trigger.{entry_column} = customer_source.{source['id_column']}
+            where cast(customer_source.{source['display_column']} as binary) = cast(:customer_value as binary)
               and (
-                  json_contains(c.factor_payload, cast(customer_trigger.id as json), '$.entry_trigger_ids')
+                  json_contains(c.factor_payload, cast(customer_trigger.id as char), '$.entry_trigger_ids')
                   or (
                       json_extract(c.factor_payload, '$.entry_trigger_ids') is null
                       and exists (
                           select 1 from {_table('filter_grouping_item')} customer_item
                           where customer_item.batch_id = c.batch_id
-                            and customer_item.group_key = c.group_key
+                            and cast(customer_item.group_key as binary) = cast(c.group_key as binary)
                             and customer_item.trigger_id = customer_trigger.id
                             and customer_item.role = 'entry'
                             and customer_item.status <> 'deleted'
@@ -4200,7 +4208,37 @@ def get_filter_confidence_result_detail(db: Session, confidence_result_id: int) 
     # for a matching id, which silently 404'd for anything older than the
     # most recent 500 across every location and batch combined.
     rows = list_filter_confidence_results(db, limit=1, confidence_result_id=confidence_result_id)
-    return rows[0] if rows else None
+    if not rows:
+        return None
+    row = rows[0]
+    payload = row.get("factor_payload") or {}
+    entry_ids = payload.get("entry_trigger_ids") or []
+    identities: dict[tuple[str, str], dict[str, str]] = {}
+    if entry_ids:
+        triggers = db.execute(
+            text(f"select phone_entry_id, credit_card_entry_id from {_table('trigger_event')} where id in :entry_ids")
+            .bindparams(bindparam("entry_ids", expanding=True)),
+            {"entry_ids": entry_ids},
+        ).mappings().all()
+        for trigger in triggers:
+            if trigger.get("phone_entry_id") is not None:
+                phone = _resolve_entry_source_row(
+                    db, source=_confidence_customer_source("phone"), entry_id=trigger["phone_entry_id"]
+                )
+                value = phone.get("participantId") if phone else None
+                if value is not None and str(value).strip():
+                    value = str(value).strip()
+                    identities[("phone", value)] = {"type": "phone", "label": "Phone Number", "value": value}
+            if trigger.get("credit_card_entry_id") is not None:
+                card = _resolve_entry_source_row(
+                    db, source=_confidence_customer_source("card"), entry_id=trigger["credit_card_entry_id"]
+                )
+                value = card.get("fingerprint") if card else None
+                if value is not None and str(value).strip():
+                    value = str(value).strip()
+                    identities[("card", value)] = {"type": "card", "label": "Fingerprint", "value": value}
+    row["customer_identities"] = list(identities.values())
+    return row
 
 
 def get_filter_confidence_result(db: Session, confidence_result_id: int) -> dict[str, Any] | None:
