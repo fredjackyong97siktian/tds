@@ -12900,10 +12900,9 @@ def _kickoff_kiosk_pipeline_for_session(
     confidence-analysis kickoff (which calls this directly with transactions
     it already gathered) and everything else that goes through
     ensure_kiosk_video_assets_for_session (the Retry button, a manual session
-    end-time update, a manual customer exit, manual session creation). Once a
-    kiosk video_asset is queued here, kiosk_analysis_worker already dispatches
-    it to RunPod on its own the moment the video is ready - no changes needed
-    there.
+    end-time update, a manual customer exit, manual session creation).
+    Kiosk assets can still be prepared here, but automatic analysis dispatch
+    has been retired along with the kiosk analysis worker.
 
     Candidates (paid + pending/failed) are first grouped into transaction
     GROUPS (see _group_transactions_by_machine_and_initiated_at) - the POS
@@ -12922,11 +12921,7 @@ def _kickoff_kiosk_pipeline_for_session(
     fallible AI call.
     """
     if _is_kiosk_analysis_disabled(db):
-        # Deliberately different from the kiosk_analysis worker pause toggle,
-        # which only holds already-queued video_assets until resumed. This
-        # setting means "ignore" - nothing is ever queued for this session in
-        # the first place, so re-enabling later does not retroactively sweep
-        # up a backlog of sessions from while it was off.
+        # Nothing is queued while disabled; re-enabling does not backfill it.
         return {"status": "skipped", "reason": "kiosk_analysis_disabled", "video_asset_ids": []}
 
     all_candidates: list[Mapping[str, Any]] = list(transactions or []) + list(issue_transactions or [])

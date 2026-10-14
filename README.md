@@ -116,6 +116,16 @@ From inside `tds/`:
 docker compose up -d --build
 ```
 
+The automatic kiosk analysis worker has been removed. When upgrading an
+existing deployment, stop and remove its old container once:
+
+```bash
+docker rm -f theft-detection-kiosk-analysis-worker
+```
+
+Other workers and existing kiosk videos/results are retained. Kiosk assets
+may still be retrieved, but they are no longer analyzed by a background worker.
+
 ## 5. Open the API
 
 Default:

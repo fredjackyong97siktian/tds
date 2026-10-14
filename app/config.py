@@ -134,9 +134,6 @@ class Settings(BaseSettings):
     analysis_poll_seconds: int = 10
     analysis_max_global_workers: int = 1
     analysis_cooldown_seconds: int = 10
-    kiosk_analysis_poll_seconds: int = 10
-    kiosk_analysis_max_global_workers: int = 1
-    kiosk_analysis_cooldown_seconds: int = 10
     entrance_trigger_extra_before_seconds: int = 10
     entrance_trigger_extra_after_seconds: int = 40
     # Padding applied on top of the initiatedAt/paymentAttemptAt (or Formatted

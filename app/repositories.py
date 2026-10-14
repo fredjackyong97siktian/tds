@@ -4510,11 +4510,8 @@ def reset_orphaned_processing_kiosk_video_assets(db: Session) -> list[int]:
     # dispatch thread dies without reaching its own except-block cleanup (for
     # example, a second exception - a DB hiccup - raised while handling the
     # first one, before it could flip the row to 'issue'). Once that happens,
-    # kiosk_analysis_worker's "is anything already running" gate sees this row
-    # forever and refuses to dispatch anything else queued, even though
-    # nothing is actually running behind it. Detect that: 'processing' with no
-    # backing 'running' kiosk script_run left to explain it, and clear it so
-    # the queue can move again.
+    # a later manual retry can see this row as still running. Detect
+    # 'processing' with no backing 'running' kiosk script_run and clear it.
     video_asset_table = _table("video_asset")
     session_video_asset_table = _table("session_video_asset")
     script_run_table = _table("script_run")
@@ -7803,18 +7800,6 @@ def get_grouping_worker_activity(db: Session) -> list[dict[str, Any]]:
         time_column="finished_at",
         processed_statuses=("success",),
         failed_statuses=("issue",),
-    )
-    return _fill_hourly_activity_buckets(rows)
-
-
-def get_kiosk_analysis_worker_activity(db: Session) -> list[dict[str, Any]]:
-    rows = _hourly_status_activity(
-        db,
-        table_name="script_run",
-        time_column="finished_at",
-        processed_statuses=("success",),
-        failed_statuses=("failed",),
-        extra_where="script_name = 'kiosk'",
     )
     return _fill_hourly_activity_buckets(rows)
 
