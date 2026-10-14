@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -195,22 +195,34 @@ def list_confidence_results(
     limit: int = 100,
     offset: int = 0,
     batch_id: int | None = None,
+    identity_type: Literal["phone", "card"] | None = None,
+    customer_value: str | None = None,
     db: Session = Depends(get_transaction_db),
 ) -> list[dict[str, Any]]:
+    if (identity_type is None) != (customer_value is None) or (customer_value is not None and not customer_value.strip()):
+        raise HTTPException(status_code=400, detail="Provide both an identity type and a customer value.")
     return repositories.list_filter_confidence_results(
         db,
         limit=max(1, min(limit, 500)),
         offset=max(0, offset),
         batch_id=batch_id,
+        customer_identity=(identity_type, customer_value.strip()) if identity_type and customer_value else None,
     )
 
 
 @router.get("/confidence-results/count")
 def count_confidence_results(
     batch_id: int | None = None,
+    identity_type: Literal["phone", "card"] | None = None,
+    customer_value: str | None = None,
     db: Session = Depends(get_transaction_db),
 ) -> dict[str, int]:
-    return {"total": repositories.count_filter_confidence_results(db, batch_id=batch_id)}
+    if (identity_type is None) != (customer_value is None) or (customer_value is not None and not customer_value.strip()):
+        raise HTTPException(status_code=400, detail="Provide both an identity type and a customer value.")
+    return {"total": repositories.count_filter_confidence_results(
+        db, batch_id=batch_id,
+        customer_identity=(identity_type, customer_value.strip()) if identity_type and customer_value else None,
+    )}
 
 
 @router.get("/confidence-results/{confidence_result_id}")

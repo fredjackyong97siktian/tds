@@ -3931,19 +3931,55 @@ def list_scored_group_keys_for_batch(db: Session, batch_id: int) -> set[str]:
     return {str(row[0]) for row in result.all()}
 
 
-def count_filter_confidence_results(db: Session, *, batch_id: int | None = None) -> int:
+def _confidence_customer_clause(identity_type: str) -> str:
+    if identity_type not in {"phone", "card"}:
+        raise ValueError("Unsupported customer identity type.")
+    source = _whitelist_source_config("qrentry" if identity_type == "phone" else "entrylogs")
+    entry_column = "phone_entry_id" if identity_type == "phone" else "credit_card_entry_id"
+    return f"""
+        exists (
+            select 1
+            from {_table('trigger_event')} customer_trigger
+            join {source['table_name']} customer_source
+              on cast(customer_trigger.{entry_column} as char) = cast(customer_source.{source['id_column']} as char)
+              or cast(customer_trigger.{entry_column} as char) = cast(customer_source.{source['value_column']} as char)
+            where cast(customer_source.{source['display_column']} as char) = :customer_value
+              and (
+                  json_contains(c.factor_payload, cast(customer_trigger.id as json), '$.entry_trigger_ids')
+                  or (
+                      json_extract(c.factor_payload, '$.entry_trigger_ids') is null
+                      and exists (
+                          select 1 from {_table('filter_grouping_item')} customer_item
+                          where customer_item.batch_id = c.batch_id
+                            and customer_item.group_key = c.group_key
+                            and customer_item.trigger_id = customer_trigger.id
+                            and customer_item.role = 'entry'
+                            and customer_item.status <> 'deleted'
+                      )
+                  )
+              )
+        )
+    """
+
+
+def count_filter_confidence_results(
+    db: Session, *, batch_id: int | None = None, customer_identity: tuple[str, str] | None = None
+) -> int:
     confidence_table = _table("filter_confidence_result")
     where_clauses: list[str] = []
     params: dict[str, Any] = {}
     if batch_id is not None:
-        where_clauses.append("batch_id = :batch_id")
+        where_clauses.append("c.batch_id = :batch_id")
         params["batch_id"] = batch_id
+    if customer_identity is not None:
+        where_clauses.append(_confidence_customer_clause(customer_identity[0]))
+        params["customer_value"] = customer_identity[1]
     where_sql = f"where {' and '.join(where_clauses)}" if where_clauses else ""
     result = db.execute(
         text(
             f"""
             select count(*) as total
-            from {confidence_table}
+            from {confidence_table} c
             {where_sql}
             """
         ),
@@ -3960,6 +3996,7 @@ def list_filter_confidence_results(
     offset: int = 0,
     batch_id: int | None = None,
     confidence_result_id: int | None = None,
+    customer_identity: tuple[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     confidence_table = _table("filter_confidence_result")
     batch_table = _table("filter_grouping_batch")
@@ -3975,6 +4012,9 @@ def list_filter_confidence_results(
     if confidence_result_id is not None:
         where_clauses.append("c.id = :confidence_result_id")
         params["confidence_result_id"] = confidence_result_id
+    if customer_identity is not None:
+        where_clauses.append(_confidence_customer_clause(customer_identity[0]))
+        params["customer_value"] = customer_identity[1]
     where_sql = f"where {' and '.join(where_clauses)}" if where_clauses else ""
     result = db.execute(
         text(
