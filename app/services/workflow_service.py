@@ -5101,15 +5101,40 @@ def _check_motion_sensor_person_presence(db: Session, row: Mapping[str, Any]) ->
     if not frame_urls:
         return True
 
+    provider = _current_jev_stage_provider(db, "presence")
+    default_model = str(settings.grouping_gemini_model or "gemini-3.5-flash-lite").strip()
+    model = "openrouter-jev-1.14" if provider == "jev" else _current_grouping_model_name(db, default_model)
+    run_id = repositories.create_script_run_started(
+        db, session_id=None, trigger_id=trigger_id, script_name="grouping",
+        model_name=f"{model}_person_presence", command=SCRIPT_RUN_COMMAND_REDACTED,
+        runner_payload={"stage": "person_presence", "trigger_id": trigger_id,
+                        "location_id": row.get("location_id"), "image_urls": frame_urls},
+    )
     try:
-        result, _call_meta = _call_grouping_vision(
-            db,
-            prompt=_MOTION_PERSON_PRESENCE_PROMPT,
-            image_urls=frame_urls,
-            gemini_model_name=str(settings.grouping_gemini_model or "gemini-3.5-flash-lite").strip(),
-            gemini_resize_scale=_grouping_gemini_resize_scale(),
+        if provider == "jev":
+            result = jev_pipeline.check_person_presence(db, run_id, frame_urls)
+        else:
+            result, call_meta = _call_grouping_vision(
+                db,
+                prompt=_MOTION_PERSON_PRESENCE_PROMPT,
+                image_urls=frame_urls,
+                gemini_model_name=default_model,
+                gemini_resize_scale=_grouping_gemini_resize_scale(),
+                script_run_id=run_id,
+            )
+            _record_grouping_cost(db, run_id, call_meta)
+        if not isinstance(result.get("person_present"), bool):
+            raise ValueError("Presence response must contain a boolean person_present.")
+        repositories.finish_script_run(
+            db, run_id, status="success",
+            stdout_log=repositories.merge_script_run_stdout_fields(db, run_id, result), stderr_log="",
         )
-    except Exception:
+    except Exception as exc:
+        repositories.finish_script_run(
+            db, run_id, status="failed",
+            stdout_log=repositories.merge_script_run_stdout_fields(db, run_id, {"error": str(exc), "fail_open": True}),
+            stderr_log=str(exc),
+        )
         logger.warning(
             "Motion-sensor person-presence check failed for trigger_id=%s - using it in grouping anyway "
             "(fail open)",
@@ -5120,6 +5145,8 @@ def _check_motion_sensor_person_presence(db: Session, row: Mapping[str, Any]) ->
 
     present = bool(result.get("person_present", True))
     confidence = _coerce_number(result.get("confidence"))
+    if result.get("uncertain"):
+        return True
     repositories.set_trigger_motion_person_present(db, trigger_id, present=present, confidence=confidence)
     if not present:
         logger.info(
@@ -7356,10 +7383,11 @@ def _grouping_openrouter_model_name(db: Session) -> str:
 
 
 def _current_jev_stage_provider(db: Session, stage: str) -> str:
-    if stage not in {"adjacent", "carry"}:
+    if stage not in {"adjacent", "carry", "presence"}:
         raise ValueError("Unknown Jev stage.")
-    value = str(repositories.get_app_setting(db, f"{stage}_provider") or "jev").strip().lower()
-    return value if value in {"jev", "inherit"} else "jev"
+    default = "inherit" if stage == "presence" else "jev"
+    value = str(repositories.get_app_setting(db, f"{stage}_provider") or default).strip().lower()
+    return value if value in {"jev", "inherit"} else default
 
 
 def _grouping_stage_label(db: Session, stage: str, *, adjacent_provider: str | None = None) -> str:

@@ -93,3 +93,19 @@ response validation; missing cost remains unknown. No new price table is used.
 
 Test known matches/non-matches, duplicate exits, similar clothing, changed
 bags and unclear receipt attribution before judging production accuracy.
+
+## Motion-Sensor Presence
+
+Pipeline Settings includes a separate Sensor Customer Presence selector:
+Jev 1.14 or Use Grouping Model. The default remains Use Grouping Model;
+selecting Jev here does not change direct grouping, adjacent matching,
+carry analysis, or kiosk analysis.
+
+Each uncached motion-sensor presence check creates a Script Run before the
+API call. To remain compatible with existing MySQL script-name constraints,
+it uses script_name `grouping`, a model label ending in `_person_presence`,
+and runner_payload.stage `person_presence`. Trigger ID, per-attempt responses,
+errors, and reported/estimated provider costs use the existing monitoring path.
+An API failure is recorded as failed and keeps the trigger eligible. Jev
+unclear/low-confidence decisions also keep it eligible without caching an
+absence. Existing cached presence decisions are not automatically rechecked.

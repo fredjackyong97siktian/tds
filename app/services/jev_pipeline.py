@@ -207,6 +207,29 @@ def logged_call(db: Any, script_run_id: int, body: dict[str, Any], urls: list[st
     return response, meta
 
 
+def check_person_presence(db: Any, script_run_id: int, urls: list[str]) -> dict[str, Any]:
+    sequences, urls = encode_sequences([{"trigger_id": 0, "frames": [
+        {"frame_index": index + 1, "image_url": url} for index, url in enumerate(urls)
+    ]}])
+    criteria = {
+        "present": "At least one frame clearly shows a real human physically present.",
+        "absent": "The frames clearly show no real human; only an empty scene, objects, pets, shadows, or lighting changes.",
+        "unclear": "Visibility, blur, or occlusion prevents a reliable determination.",
+    }
+    body = {"model": jev.MODEL, "state": {"trigger": sequences[0]}, "questions": {
+        "person_presence": {"type": "choice", "instructions":
+            "Inspect all ordered trigger frames. Is a real human physically present in any frame? "
+            "Do not count posters, reflections of posters, carts, pets, or shadows as a person.",
+            "criteria": criteria},
+    }}
+    response, _ = logged_call(db, script_run_id, body, urls, description="Jev sensor person presence")
+    decision = read_choice(response, "person_presence", set(criteria))
+    uncertain = decision["choice"] == "unclear" or decision["confidence"] < MIN_CHOICE_CONFIDENCE
+    return {"person_present": uncertain or decision["choice"] != "absent",
+            "confidence": decision["confidence"], "uncertain": uncertain,
+            "jev_decision": decision, "source": "openrouter_jev_person_presence"}
+
+
 def verify_adjacent(db: Any, script_run_id: int, entry_groups: list[dict[str, Any]]):
     if len(entry_groups) != 1:
         raise ValueError("Each Jev adjacent call must contain exactly one independent entry group.")
