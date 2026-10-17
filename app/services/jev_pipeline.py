@@ -207,6 +207,62 @@ def logged_call(db: Any, script_run_id: int, body: dict[str, Any], urls: list[st
     return response, meta
 
 
+def verify_direct_matches(db: Any, script_run_id: int, candidates: list[dict[str, Any]]) -> tuple[dict[int, dict[str, Any]], dict[str, Any]]:
+    from . import workflow_service as workflow
+
+    triggers: dict[int, dict[str, Any]] = {}
+    pairs: dict[str, tuple[int, int, int]] = {}
+    questions = {}
+    for candidate in candidates:
+        number = int(candidate["match_number"])
+        entry = candidate["entry"]
+        exits = candidate["exit_triggers"]
+        if not exits:
+            raise ValueError("Direct verification needs at least one exit per match.")
+        for trigger in [entry, *exits]:
+            trigger_id = int(trigger["trigger_id"])
+            triggers[trigger_id] = {**trigger, "frames": workflow._select_verification_frames(trigger)}
+        for index, exit_trigger in enumerate(exits):
+            entry_id, exit_id = int(entry["trigger_id"]), int(exit_trigger["trigger_id"])
+            if entry_id == exit_id:
+                raise ValueError("An entry cannot verify against itself as an exit.")
+            entry_time = datetime.fromisoformat(str(entry["trigger_time"]))
+            if datetime.fromisoformat(str(exit_trigger["trigger_time"])) <= entry_time:
+                raise ValueError("Verification exits must follow their entry.")
+            key = f"match_{number}_exit_{index}"
+            if key in pairs:
+                raise ValueError("Duplicate direct verification match number.")
+            pairs[key] = (number, entry_id, exit_id)
+            questions[key] = {
+                "type": "noul",
+                "instructions": f"Do `triggers.t{entry_id}` and `triggers.t{exit_id}` show the SAME physical customer "
+                "entering and subsequently exiting this store? Judge only these two ordered frame sequences, "
+                "never another match's images. Identify the actor interacting with the door or passing through "
+                "the doorway, not an unrelated background passerby. Compare visible clothing, patterns, "
+                "pants, shoes, hair and build. Carried purchases may change. Do not assume a proposed match "
+                "is correct and do not invent hidden details. Unclear identity or direction is uncertain, "
+                "not a confirmed match.",
+                "criteria": {"true": "Visible identity and direction support the same customer entering then exiting.",
+                             "false": "Different customer or inconsistent entry/exit direction."},
+            }
+    sequences, urls = encode_sequences(list(triggers.values()))
+    body = {"model": jev.MODEL, "state": {"triggers": {f"t{item['trigger_id']}": item for item in sequences}},
+            "questions": questions}
+    response, meta = logged_call(db, script_run_id, body, urls, description="Jev direct-match verification")
+    results: dict[int, dict[str, Any]] = {}
+    for key, (number, entry_id, exit_id) in pairs.items():
+        answer = (response.get("answers") or {}).get(key) or {}
+        if answer.get("type") != "noul":
+            raise ValueError(f"Jev returned no valid verification for {key}.")
+        probability = jev._probability(answer.get("noul"))
+        result = results.setdefault(number, {"confidence": 1.0, "error": None,
+                                             "source": "openrouter_jev_direct_verification", "exit_checks": []})
+        result["confidence"] = min(result["confidence"], probability)
+        result["exit_checks"].append({"entry_trigger_id": entry_id, "exit_trigger_id": exit_id,
+                                     "same_customer_probability": probability})
+    return results, meta
+
+
 def check_person_presence(db: Any, script_run_id: int, urls: list[str]) -> dict[str, Any]:
     sequences, urls = encode_sequences([{"trigger_id": 0, "frames": [
         {"frame_index": index + 1, "image_url": url} for index, url in enumerate(urls)

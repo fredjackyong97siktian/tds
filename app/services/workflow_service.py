@@ -6230,6 +6230,40 @@ def _verify_gemini_grouping_match(
     }, meta
 
 
+def _verify_jev_direct_grouping_matches_batch(
+    db: Session, parent_script_run_id: int, *, match_candidates: list[dict[str, Any]],
+    batch_id: int | None = None, location_id: int | None = None,
+) -> tuple[dict[int, dict[str, Any]], dict[str, Any] | None]:
+    if not match_candidates:
+        return {}, None
+    run_id = repositories.create_script_run_started(
+        db, session_id=None, trigger_id=None, script_name="grouping",
+        model_name="openrouter-jev-1.14_grouping_verification", command=SCRIPT_RUN_COMMAND_REDACTED,
+        runner_payload={"stage": "direct_verification", "parent_script_run_id": parent_script_run_id,
+                        "batch_id": batch_id, "location_id": location_id,
+                        "matches": [{"match_number": item["match_number"],
+                                     "entry_trigger_id": item["entry"]["trigger_id"],
+                                     "exit_trigger_ids": [trigger["trigger_id"] for trigger in item["exit_triggers"]]}
+                                    for item in match_candidates]},
+    )
+    try:
+        results, meta = jev_pipeline.verify_direct_matches(db, run_id, match_candidates)
+    except Exception as exc:
+        repositories.finish_script_run(
+            db, run_id, status="failed", stderr_log=str(exc),
+            stdout_log=repositories.merge_script_run_stdout_fields(db, run_id, {"error": str(exc)}),
+        )
+        return {int(item["match_number"]): {"confidence": None, "error": str(exc),
+                "script_run_id": run_id} for item in match_candidates}, None
+    for result in results.values():
+        result["script_run_id"] = run_id
+    repositories.finish_script_run(
+        db, run_id, status="success", stderr_log="",
+        stdout_log=repositories.merge_script_run_stdout_fields(db, run_id, {"results": results}),
+    )
+    return results, meta
+
+
 def _verify_gemini_grouping_matches_batch(
     db: Session,
     script_run_id: int,
@@ -8540,12 +8574,12 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
                 ]
                 batch_verifications: dict[int, dict[str, Any]] = {}
                 if match_candidates:
-                    batch_verifications, batch_verification_meta = _verify_gemini_grouping_matches_batch(
+                    batch_verifications, batch_verification_meta = _verify_jev_direct_grouping_matches_batch(
                         db,
                         script_run_id,
                         match_candidates=match_candidates,
-                        model_name=model_name,
-                        resize_scale=resize_scale,
+                        batch_id=batch_id,
+                        location_id=int(batch["location_id"]),
                     )
                     if batch_verification_meta is not None:
                         verification_metas.append(batch_verification_meta)
@@ -8620,13 +8654,11 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
                             "error": "Verification call failed or returned no result for this match.",
                         }
 
-                    # A missing/failed verification call (confidence is None) fails open -
-                    # that's a tooling problem, not evidence the match is wrong. A real
-                    # score below the threshold is rejected outright.
+                    # Do not accept an unverified direct proposal when Jev is unavailable.
                     verification_confidence = verification["confidence"]
                     if (
-                        verification_confidence is not None
-                        and verification_confidence < _VERIFICATION_MATCH_CONFIDENCE_THRESHOLD
+                        verification_confidence is None
+                        or verification_confidence < _VERIFICATION_MATCH_CONFIDENCE_THRESHOLD
                     ):
                         normalized_unknown.update(exit_ids)
                         _mark_open_entry_or_unknown(
@@ -8635,9 +8667,10 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
                             normalized_open_entries=normalized_open_entries,
                             normalized_unknown=normalized_unknown,
                         )
+                        verification_label = "unavailable" if verification_confidence is None else f"{verification_confidence:.2f}"
                         notes.append(
                             f"Verification rejected match between entry {entry_trigger_id} and exit(s) {sorted(exit_ids)}: "
-                            f"confidence-of-a-match was only {verification_confidence:.2f}, below the "
+                            f"match probability was {verification_label}; requires the "
                             f"{_VERIFICATION_MATCH_CONFIDENCE_THRESHOLD:.2f} bar."
                         )
                         continue

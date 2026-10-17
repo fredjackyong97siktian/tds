@@ -109,3 +109,19 @@ errors, and reported/estimated provider costs use the existing monitoring path.
 An API failure is recorded as failed and keeps the trigger eligible. Jev
 unclear/low-confidence decisions also keep it eligible without caching an
 absence. Existing cached presence decisions are not automatically rechecked.
+
+## Direct Match Verification
+
+The direct scan still uses the main grouping model. Its proposed entry/exit
+matches are independently verified with Jev 1.14. Each exit gets a separate
+same-customer Noul question, batched in one request. Questions reference only
+their own entry/exit sequences. Every exit must reach the existing 0.8 match
+probability threshold; a missing, failed, or lower-probability verification
+leaves the entry open/unknown and the exits unknown. This threshold remains
+provisional, not a calibrated accuracy guarantee.
+
+Verification has its own Script Run under `grouping`, with model label
+`openrouter-jev-1.14_grouping_verification` and the parent direct Script Run ID
+in its payload. Actual OpenRouter costs and per-attempt responses are recorded
+there, not charged again to the parent. Text-pass verification remains on its
+existing model. No changes to carry, kiosk, or direct scan model selection.
