@@ -85,9 +85,14 @@ class JevPipelineTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             pipeline.adjacent_result(adjacent_answer(), 1)
 
-    def test_none_and_low_confidence_do_not_force_matches(self):
+    def test_adjacent_uses_selected_option_regardless_of_confidence(self):
         self.assertEqual(pipeline.adjacent_result(adjacent_answer("none"), 2)["matched_candidates"], [])
-        self.assertEqual(pipeline.adjacent_result(adjacent_answer(confidence=0.2), 2)["matched_candidates"], [])
+        for option, expected in [("candidate_1", [1]), ("candidate_2", [2]), ("both", [1, 2]), ("none", [])]:
+            with self.subTest(option=option):
+                result = pipeline.adjacent_result(adjacent_answer(option, confidence=0.0), 2)
+                self.assertEqual(result["matched_candidates"], expected)
+                self.assertIsNone(result["minimum_confidence"])
+                self.assertEqual(result["confidence"], 0.0)
 
     def test_single_candidate_and_unknown_choice_validation(self):
         answer = {"answers": {"matched_exits": choice("candidate_1", ["candidate_1", "none"])}}
@@ -98,7 +103,7 @@ class JevPipelineTests(unittest.TestCase):
 
     def test_both_exits_are_persisted_and_cannot_be_reused_by_next_entry(self):
         inputs = [trigger(1, identity=True), trigger(2, 0.5, identity=True), trigger(3, 1), trigger(4, 2)]
-        result = pipeline.adjacent_result(adjacent_answer(), 2)
+        result = pipeline.adjacent_result(adjacent_answer(confidence=0.0), 2)
         with patch.object(workflow, "_find_resumable_adjacent_result", return_value=None), patch.object(workflow, "_current_jev_stage_provider", return_value="jev"), patch.object(workflow, "_create_gemini_script_run", return_value=7), patch.object(workflow, "_verify_entry_groups_against_candidates_batch", return_value=({1: result}, {}, {}, None)), patch.object(workflow.repositories, "get_app_setting", return_value=None), patch.object(workflow.repositories, "annotate_latest_script_run_call") as annotate, patch.object(workflow.repositories, "merge_script_run_stdout_fields", return_value="{}"), patch.object(workflow.repositories, "finish_script_run"), patch.object(workflow.time, "sleep"):
             remaining, groups, *_ = workflow._run_grouping_adjacent_pass(Mock(), batch_id=10, location_id=2, trigger_inputs=inputs, model_name="mimo", resize_scale=None)
         self.assertEqual(len(groups), 1)

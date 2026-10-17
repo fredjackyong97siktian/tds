@@ -49,6 +49,8 @@ class SensorPresenceTests(unittest.TestCase):
                 patch.object(workflow, "_record_grouping_cost") as cost:
             self.assertFalse(workflow._check_motion_sensor_person_presence(self.db, self.row))
         self.assertEqual(call.call_args.kwargs["script_run_id"], 42)
+        self.assertIn("in front of the store door", call.call_args.kwargs["prompt"])
+        self.assertIn("need not open the door", call.call_args.kwargs["prompt"])
         cost.assert_called_once_with(self.db, 42, meta)
         created = self.mocks["create_script_run_started"].call_args.kwargs
         self.assertEqual(created["trigger_id"], 17)
@@ -84,6 +86,11 @@ class SensorPresenceTests(unittest.TestCase):
                     result = pipeline.check_person_presence(self.db, 42, ["https://example.test/frame.jpg"])
                 self.assertEqual(result["person_present"], expected)
                 body = call.call_args.args[2]
+                question = body["questions"]["person_presence"]
+                self.assertIn("the door of the store", question["instructions"])
+                self.assertIn("in front of the store door", question["criteria"]["present"])
+                self.assertIn("background", question["criteria"]["absent"])
+                self.assertIn("cannot be identified", question["criteria"]["unclear"])
                 self.assertIn("data:image/jpeg;base64,AA==", json.dumps(body))
                 self.assertEqual(call.call_args.args[1], 42)
 

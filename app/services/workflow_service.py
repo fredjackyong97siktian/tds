@@ -5074,15 +5074,17 @@ _MOTION_SENSOR_TRIGGER_SOURCE = "motion_sensor"
 
 _MOTION_PERSON_PRESENCE_PROMPT = (
     "These images are sampled frames from a single store security trigger. Determine "
-    "whether any image shows a real human being physically present (not just an empty "
-    "scene, a cart, a pet, a shadow, or a lighting change). "
+    "whether any image shows a real human physically present in front of the store door, "
+    "in the immediate doorway/entrance area. A person need not open the door or enter the store. "
+    "Do not count people visible only farther away on the sidewalk, road, or in the background. "
+    "Do not count posters, screen images, carts, pets, shadows, or lighting changes as a real human. "
     'Respond with a JSON object only: {"person_present": true|false, "confidence": <0-1 number>}.'
 )
 
 
 def _check_motion_sensor_person_presence(db: Session, row: Mapping[str, Any]) -> bool:
     """For a single motion_sensor-sourced trigger whose frames are ready, asks
-    the vision model whether a person is actually visible - motion sensors can
+    the vision model whether a person is physically in front of the store door - motion sensors can
     false-trigger on carts/pets/shadows/lighting changes, unlike
     front_door_sensor where the door physically opening is already a strong
     signal, so only motion_sensor triggers go through this gate at all.
@@ -6944,12 +6946,12 @@ def _run_grouping_adjacent_pass(
                 selected = result.get("matched_candidates")
                 if not isinstance(selected, list):
                     selected = [result["matched_candidate"]] if result.get("matched_candidate") is not None else []
-                threshold = (jev_pipeline.MIN_CHOICE_CONFIDENCE if adjacent_provider == "jev"
-                             else _GROUPING_ADJACENT_MATCH_CONFIDENCE_THRESHOLD)
+                confidence_accepted = (adjacent_provider == "jev"
+                                       or match_confidence >= _GROUPING_ADJACENT_MATCH_CONFIDENCE_THRESHOLD)
                 valid = (selected and all(isinstance(value, int) and not isinstance(value, bool)
                                          and 1 <= value <= len(candidates) for value in selected)
                          and len(set(selected)) == len(selected))
-                if valid and match_confidence >= threshold and entry_id not in consumed:
+                if valid and confidence_accepted and entry_id not in consumed:
                     exit_ids = [int(candidates[value - 1]["trigger_id"]) for value in selected]
                     # Never silently turn "both" into a different single-exit
                     # answer if another entry already owns one of those exits.

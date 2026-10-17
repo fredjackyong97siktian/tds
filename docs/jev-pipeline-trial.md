@@ -33,10 +33,11 @@ consumed, reject the whole proposed match rather than silently changing it.
 The normal grouping persistence and confidence pipeline consume the complete
 exit array. A retry checkpoint cannot be reused across a provider switch.
 
-Jev's trial minimum Choice confidence is 0.5, separate from the legacy
-MiMo similarity cutoff. It is a provisional screening threshold, not a
-calibrated accuracy claim. Raw selected option, confidence and full option
-probabilities are kept in the group and Script Run for evaluation.
+Jev adjacent matching uses its selected option directly, with no confidence
+cutoff. Raw selected option, confidence and full option probabilities remain
+in the group and Script Run for evaluation. Trigger validation and no-reuse
+rules still apply. Carry and presence retain their separate 0.5 screening
+threshold; direct verification retains its 0.8 match-probability threshold.
 
 Jev does not fabricate carry descriptions, appearance prose or best-frame
 flags. Existing fail-open behavior keeps available frames for remaining direct

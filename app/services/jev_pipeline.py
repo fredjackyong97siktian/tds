@@ -95,15 +95,14 @@ def adjacent_result(response: Mapping[str, Any], candidate_count: int) -> dict[s
     answer = read_choice(response, "matched_exits", options)
     selected = answer["choice"]
     matches = []
-    if answer["confidence"] >= MIN_CHOICE_CONFIDENCE:
-        if selected == "both":
-            matches = [1, 2]
-        elif selected != "none":
-            matches = [int(selected.split("_")[1])]
+    if selected == "both":
+        matches = [1, 2]
+    elif selected != "none":
+        matches = [int(selected.split("_")[1])]
     return {
         "matched_candidates": matches,
         "matched_candidate": matches[0] if len(matches) == 1 else None,
-        "confidence": answer["confidence"], "minimum_confidence": MIN_CHOICE_CONFIDENCE,
+        "confidence": answer["confidence"], "minimum_confidence": None,
         "reason": f"Jev selected {selected}; choice confidence {answer['confidence']:.2f}.",
         "jev_decision": answer, "source": "openrouter_jev_adjacent",
         "entry_carry": None, "exit_carry": None,
@@ -268,14 +267,17 @@ def check_person_presence(db: Any, script_run_id: int, urls: list[str]) -> dict[
         {"frame_index": index + 1, "image_url": url} for index, url in enumerate(urls)
     ]}])
     criteria = {
-        "present": "At least one frame clearly shows a real human physically present.",
-        "absent": "The frames clearly show no real human; only an empty scene, objects, pets, shadows, or lighting changes.",
-        "unclear": "Visibility, blur, or occlusion prevents a reliable determination.",
+        "present": "At least one frame clearly shows a real human physically present in front of the store door, in the immediate doorway/entrance area.",
+        "absent": "No real human is physically in front of the store door. Any visible people are only farther away on the sidewalk, road, or in the background; objects, pets, shadows, and lighting changes do not count.",
+        "unclear": "The store door area cannot be identified reliably, or visibility, blur, or occlusion prevents determining whether a real human is there.",
     }
     body = {"model": jev.MODEL, "state": {"trigger": sequences[0]}, "questions": {
         "person_presence": {"type": "choice", "instructions":
-            "Inspect all ordered trigger frames. Is a real human physically present in any frame? "
-            "Do not count posters, reflections of posters, carts, pets, or shadows as a person.",
+            "Inspect all ordered trigger frames. Is there any real human physically present in front of "
+            "the door of the store, in the immediate doorway/entrance area, in any frame? "
+            "A person need not open the door or enter the store. Do not count people visible only farther "
+            "away on the sidewalk, road, or in the background. Do not count posters, screen images, "
+            "reflections of posters, carts, pets, shadows, or lighting changes as a real human.",
             "criteria": criteria},
     }}
     response, _ = logged_call(db, script_run_id, body, urls, description="Jev sensor person presence")
