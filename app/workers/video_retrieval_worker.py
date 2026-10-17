@@ -11,6 +11,7 @@ from ..config import settings
 from ..db import TransactionalSessionLocal
 from .. import repositories
 from ..services import workflow_service
+from ..services import confidence_media
 
 
 logger = logging.getLogger("tds.video_retrieval_worker")
@@ -115,6 +116,7 @@ class VideoRetrievalWorker:
     def _fill_available_slots(self) -> None:
         db = TransactionalSessionLocal()
         try:
+            confidence_media.finish_pending(db)
             if repositories.is_worker_paused(db, "retrieval"):
                 return
             # Always run this, regardless of slot availability - it's exactly

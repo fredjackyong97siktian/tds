@@ -5843,6 +5843,8 @@ def add_manual_group_to_grouping_batch(
     grouping_summary["groups"] = [*(grouping_summary.get("groups") or []), group]
     grouping_summary["open_entries"] = [trigger_id for trigger_id in open_entries if trigger_id not in requested_ids]
     grouping_summary["unknown"] = [trigger_id for trigger_id in unknown if trigger_id not in requested_ids]
+    for category in ("issues", "frame_retrieval_issue_trigger_ids"):
+        grouping_summary[category] = [trigger_id for trigger_id in _group_trigger_id_list(grouping_summary.get(category)) if trigger_id not in requested_ids]
     updated_batch = repositories.update_grouping_batch(db, batch_id, {"result_payload": grouping_summary})
 
     # If this batch has never been confidence-analyzed at all yet, leave the
@@ -10691,137 +10693,32 @@ def _ensure_session_for_confidence_group(
 
 
 def force_deep_analysis_for_confidence_result(db: Session, confidence_result_id: int) -> dict[str, Any]:
+    from . import confidence_media
+
     row = repositories.get_filter_confidence_result(db, confidence_result_id)
     if row is None:
         raise ValueError(f"Confidence result {confidence_result_id} was not found.")
-    batch_id = int(row["batch_id"])
-    location_id = int(row["location_id"])
-    factor_payload = row.get("factor_payload") if isinstance(row.get("factor_payload"), Mapping) else {}
-
-    def _ids_from_payload(key: str) -> list[int]:
-        values = factor_payload.get(key)
-        if not isinstance(values, list):
-            return []
-        ids: list[int] = []
-        for value in values:
-            try:
-                ids.append(int(value))
-            except (TypeError, ValueError):
-                continue
-        return ids
-
-    entry_trigger_ids = _ids_from_payload("entry_trigger_ids")
-    exit_trigger_ids = _ids_from_payload("exit_trigger_ids")
-    if not entry_trigger_ids:
-        raise ValueError("This confidence result has no entry trigger recorded to run deep analysis on.")
-    entry_has_identity = bool(factor_payload.get("entry_has_identity", True))
-
-    trigger_rows: dict[int, dict[str, Any]] = {}
-    for trigger_id in sorted(set(entry_trigger_ids + exit_trigger_ids)):
-        try:
-            trigger_rows[trigger_id] = repositories.get_trigger(db, trigger_id)
-        except Exception:
-            logger.exception("Could not load trigger while forcing deep analysis trigger_id=%s", trigger_id)
-
-    session = _ensure_session_for_confidence_group(
-        db,
-        location_id=location_id,
-        entry_trigger_ids=entry_trigger_ids,
-        exit_trigger_ids=exit_trigger_ids,
-        entry_has_identity=entry_has_identity,
-    )
-    if session is None:
-        raise ValueError("Could not create a session for this group - its entry trigger does not belong to this location.")
-    session_id = int(session["id"])
-    repositories.update_session_grouping_link(db, session_id=session_id, grouping_id=batch_id)
-
-    queued_video_asset_ids: set[int] = set()
-    for trigger_id in entry_trigger_ids:
-        trigger = trigger_rows.get(trigger_id)
-        if trigger is None:
-            continue
-        video_asset_id = _queue_l1_video_for_trigger(
-            db,
-            session_id=session_id,
-            location_id=location_id,
-            trigger=trigger,
-            video_section="entrance",
-            link_section="entry",
-        )
-        if video_asset_id is not None:
-            queued_video_asset_ids.add(video_asset_id)
-    for trigger_id in exit_trigger_ids:
-        trigger = trigger_rows.get(trigger_id)
-        if trigger is None:
-            continue
-        video_asset_id = _queue_l1_video_for_trigger(
-            db,
-            session_id=session_id,
-            location_id=location_id,
-            trigger=trigger,
-            video_section="entrance",
-            link_section="exit",
-        )
-        if video_asset_id is not None:
-            queued_video_asset_ids.add(video_asset_id)
-
-    promoted_count = repositories.promote_trigger_video_assets_to_full_retrieval(
-        db, sorted(set(entry_trigger_ids + exit_trigger_ids))
-    )
-
-    # In the automatic pipeline, kiosk retrieval only gets queued once entrance
-    # video analysis detects the exit (_maybe_close_session_and_prepare_kiosk),
-    # which can take a while. Here the exit trigger (and so the session's
-    # end_time) is already known synchronously from the grouping result, so
-    # there's no need to wait on that async cascade - queue kiosk directly now,
-    # same as the manual session-create flow in routers/sessions.py does.
-    if exit_trigger_ids:
-        session = repositories.get_session(db, session_id)
-        if session.get("end_time") is not None:
-            queued_video_asset_ids.update(ensure_kiosk_video_assets_for_session(db, session_id))
-
-    updated_reason = str(row.get("reason") or "").strip()
-    updated_reason = f"{updated_reason}; manual_deep_analysis_override" if updated_reason else "manual_deep_analysis_override"
-
-    updated_factor_payload = dict(factor_payload)
-    triggered_factors = list(updated_factor_payload.get("triggered_factors") or [])
-    if "triggered_by_admin" not in triggered_factors:
-        triggered_factors.append("triggered_by_admin")
-    updated_factor_payload["triggered_factors"] = triggered_factors
-    factor_details = dict(updated_factor_payload.get("factor_details") or {})
-    factor_details["triggered_by_admin"] = {
-        "hit": True,
-        "enabled": True,
-        "message": "Manually sent to L1 analysis by an admin, not flagged by any automatic factor.",
-    }
-    updated_factor_payload["factor_details"] = factor_details
-
+    payload = dict(row.get("factor_payload") or {})
+    if not payload.get("entry_trigger_ids") or not payload.get("exit_trigger_ids"):
+        raise ValueError("A complete entry/exit group is required before L1 analysis.")
+    factors = list(payload.get("triggered_factors") or [])
+    if "triggered_by_admin" not in factors:
+        factors.append("triggered_by_admin")
+    payload["triggered_factors"] = factors
+    details = dict(payload.get("factor_details") or {})
+    details["triggered_by_admin"] = {"hit": True, "enabled": True, "message": "Manually sent to L1 analysis by an admin."}
+    payload["factor_details"] = details
+    # Re-open completed evidence so an existing safe session can become L1 eligible.
+    if payload.get("media_retrieval", {}).get("status") == "complete":
+        payload["media_retrieval"]["status"] = "pending"
     repositories.upsert_filter_confidence_result(
-        db,
-        batch_id=batch_id,
-        group_key=str(row.get("group_key") or ""),
-        location_id=location_id,
-        score=float(row.get("score") or 0),
-        need_deep_analysis=True,
-        reason=updated_reason,
-        factor_payload=updated_factor_payload,
-    )
-    logger.info(
-        "Manually forced deep analysis confidence_result_id=%s batch_id=%s session_id=%s queued_video_assets=%s promoted_count=%s",
-        confidence_result_id,
-        batch_id,
-        session_id,
-        sorted(queued_video_asset_ids),
-        promoted_count,
-    )
-    return {
-        "ok": True,
-        "confidence_result_id": confidence_result_id,
-        "batch_id": batch_id,
-        "session_id": session_id,
-        "queued_video_asset_ids": sorted(queued_video_asset_ids),
-        "promoted_count": promoted_count,
-    }
+        db, batch_id=row["batch_id"], group_key=row["group_key"], location_id=row["location_id"],
+        score=float(row.get("score") or 0), need_deep_analysis=True,
+        reason=f"{row.get('reason') or ''}; manual_deep_analysis_override".strip("; "), factor_payload=payload)
+    queued = confidence_media.queue_for_group(db, batch_id=row["batch_id"], group_key=row["group_key"])
+    return {"ok": True, "confidence_result_id": confidence_result_id, "batch_id": row["batch_id"],
+            "session_id": payload.get("media_retrieval", {}).get("session_id"),
+            "queued_video_asset_ids": queued, "promoted_count": 0}
 
 
 def _queue_l1_video_for_trigger(
@@ -11460,117 +11357,18 @@ def _run_theft_confidence_for_grouping_batch_locked(
             },
         )
         analyzed_count += 1
-        if need_deep_analysis:
-            # This whole block used to run with no error handling - if
-            # anything in it threw (session creation, kiosk kickoff, video
-            # queueing), the exception propagated straight out of this
-            # function and aborted every REMAINING group in this batch's
-            # loop, even though this group's own confidence result was
-            # already safely committed above. Since a batch is never
-            # revisited once it has any confidence result at all, that
-            # silently left every later group in the batch permanently
-            # unscored with no visible error anywhere. Catching here instead
-            # means a session/kiosk failure only costs this one group's
-            # side effects, not the rest of the batch.
-            try:
-                session = _ensure_session_for_confidence_group(
-                    db,
-                    location_id=location_id,
-                    entry_trigger_ids=entry_trigger_ids,
-                    exit_trigger_ids=exit_trigger_ids,
-                    entry_has_identity=entry_has_identity,
-                )
-                if session:
-                    session_id = int(session["id"])
-                    session = repositories.update_session_grouping_link(
-                        db,
-                        session_id=session_id,
-                        grouping_id=batch_id,
-                    )
-                    created_session_ids.add(session_id)
-                    exit_trigger_time: datetime | None = None
-                    for exit_trigger_id in exit_trigger_ids:
-                        try:
-                            candidate_time = _coerce_datetime_value(
-                                repositories.get_trigger(db, int(exit_trigger_id)).get("trigger_time")
-                            )
-                        except Exception:
-                            logger.exception(
-                                "Could not load exit trigger time for kiosk window extension trigger_id=%s", exit_trigger_id
-                            )
-                            continue
-                        if candidate_time is not None and (exit_trigger_time is None or candidate_time > exit_trigger_time):
-                            exit_trigger_time = candidate_time
-                    kiosk_kickoff = _kickoff_kiosk_pipeline_for_session(
-                        db,
-                        session_id=session_id,
-                        location_id=location_id,
-                        transactions=transactions,
-                        issue_transactions=issue_transactions,
-                        exit_trigger_time=exit_trigger_time,
-                    )
-                    logger.info(
-                        "Kiosk pipeline kickoff group_key=%s session_id=%s status=%s video_asset_ids=%s",
-                        group_key,
-                        session_id,
-                        kiosk_kickoff.get("status"),
-                        kiosk_kickoff.get("video_asset_ids"),
-                    )
-                    for trigger_id in entry_trigger_ids:
-                        trigger = next((row for row in trigger_rows if int(row.get("id") or 0) == trigger_id), None)
-                        if trigger is None:
-                            continue
-                        video_asset_id = _queue_l1_video_for_trigger(
-                            db,
-                            session_id=session_id,
-                            location_id=location_id,
-                            trigger=trigger,
-                            video_section="entrance",
-                            link_section="entry",
-                        )
-                        if video_asset_id is not None:
-                            queued_video_asset_ids.add(video_asset_id)
-                    for trigger_id in exit_trigger_ids:
-                        trigger = next((row for row in trigger_rows if int(row.get("id") or 0) == trigger_id), None)
-                        if trigger is None:
-                            continue
-                        video_asset_id = _queue_l1_video_for_trigger(
-                            db,
-                            session_id=session_id,
-                            location_id=location_id,
-                            trigger=trigger,
-                            video_section="entrance",
-                            link_section="exit",
-                        )
-                        if video_asset_id is not None:
-                            queued_video_asset_ids.add(video_asset_id)
-                promoted_count = repositories.promote_trigger_video_assets_to_full_retrieval(db, trigger_ids)
-                promoted_count_total += promoted_count
-                logger.info(
-                    "Layer 0 confidence promoted group_key=%s batch_id=%s trigger_ids=%s session_id=%s queued_video_assets=%s promoted_count=%s score=%.2f",
-                    group_key,
-                    batch_id,
-                    trigger_ids,
-                    session.get("id") if session else None,
-                    sorted(queued_video_asset_ids),
-                    promoted_count,
-                    score,
-                )
-            except Exception:
-                logger.exception(
-                    "Deep-analysis session/kiosk pipeline failed for group_key=%s batch_id=%s trigger_ids=%s - "
-                    "confidence result was already saved, only session/promotion side effects were skipped",
-                    group_key,
-                    batch_id,
-                    trigger_ids,
-                )
+        try:
+            from . import confidence_media
+            queued_video_asset_ids.update(confidence_media.queue_for_group(db, batch_id=batch_id, group_key=group_key))
+        except Exception:
+            logger.exception("Could not queue confidence evidence batch_id=%s group_key=%s", batch_id, group_key)
     return {
         "ok": True,
         "batch_id": batch_id,
         "analyzed_count": analyzed_count,
         "promoted_count": promoted_count_total,
-        "session_count": len(created_session_ids),
-        "session_ids": sorted(created_session_ids),
+        "session_count": 0,
+        "session_ids": [],
         "queued_video_asset_ids": sorted(queued_video_asset_ids),
     }
 
@@ -11968,104 +11766,11 @@ def score_confidence_for_single_group(
         },
     )
     promoted_count_total = 0
-    if need_deep_analysis:
-        # See the matching comment in _run_theft_confidence_for_grouping_batch_locked -
-        # this used to run with no error handling, so a session/kiosk
-        # failure here would raise all the way out and abort this call
-        # entirely, even though the confidence result above was already
-        # committed.
-        try:
-            session = _ensure_session_for_confidence_group(
-                db,
-                location_id=location_id,
-                entry_trigger_ids=entry_trigger_ids,
-                exit_trigger_ids=exit_trigger_ids,
-                entry_has_identity=entry_has_identity,
-            )
-            if session:
-                session_id = int(session["id"])
-                session = repositories.update_session_grouping_link(
-                    db,
-                    session_id=session_id,
-                    grouping_id=batch_id,
-                )
-                created_session_ids.add(session_id)
-                exit_trigger_time: datetime | None = None
-                for exit_trigger_id in exit_trigger_ids:
-                    try:
-                        candidate_time = _coerce_datetime_value(
-                            repositories.get_trigger(db, int(exit_trigger_id)).get("trigger_time")
-                        )
-                    except Exception:
-                        logger.exception(
-                            "Could not load exit trigger time for kiosk window extension trigger_id=%s", exit_trigger_id
-                        )
-                        continue
-                    if candidate_time is not None and (exit_trigger_time is None or candidate_time > exit_trigger_time):
-                        exit_trigger_time = candidate_time
-                kiosk_kickoff = _kickoff_kiosk_pipeline_for_session(
-                    db,
-                    session_id=session_id,
-                    location_id=location_id,
-                    transactions=transactions,
-                    issue_transactions=issue_transactions,
-                    exit_trigger_time=exit_trigger_time,
-                )
-                logger.info(
-                    "Kiosk pipeline kickoff group_key=%s session_id=%s status=%s video_asset_ids=%s",
-                    group_key,
-                    session_id,
-                    kiosk_kickoff.get("status"),
-                    kiosk_kickoff.get("video_asset_ids"),
-                )
-                for trigger_id in entry_trigger_ids:
-                    trigger = next((row for row in trigger_rows if int(row.get("id") or 0) == trigger_id), None)
-                    if trigger is None:
-                        continue
-                    video_asset_id = _queue_l1_video_for_trigger(
-                        db,
-                        session_id=session_id,
-                        location_id=location_id,
-                        trigger=trigger,
-                        video_section="entrance",
-                        link_section="entry",
-                    )
-                    if video_asset_id is not None:
-                        queued_video_asset_ids.add(video_asset_id)
-                for trigger_id in exit_trigger_ids:
-                    trigger = next((row for row in trigger_rows if int(row.get("id") or 0) == trigger_id), None)
-                    if trigger is None:
-                        continue
-                    video_asset_id = _queue_l1_video_for_trigger(
-                        db,
-                        session_id=session_id,
-                        location_id=location_id,
-                        trigger=trigger,
-                        video_section="entrance",
-                        link_section="exit",
-                    )
-                    if video_asset_id is not None:
-                        queued_video_asset_ids.add(video_asset_id)
-            promoted_count = repositories.promote_trigger_video_assets_to_full_retrieval(db, trigger_ids)
-            promoted_count_total += promoted_count
-            logger.info(
-                "Layer 0 confidence promoted group_key=%s batch_id=%s trigger_ids=%s session_id=%s queued_video_assets=%s promoted_count=%s score=%.2f",
-                group_key,
-                batch_id,
-                trigger_ids,
-                session.get("id") if session else None,
-                sorted(queued_video_asset_ids),
-                promoted_count,
-                score,
-            )
-        except Exception:
-            logger.exception(
-                "Deep-analysis session/kiosk pipeline failed for group_key=%s batch_id=%s trigger_ids=%s - "
-                "confidence result was already saved, only session/promotion side effects were skipped",
-                group_key,
-                batch_id,
-                trigger_ids,
-            )
+    try:
+        from . import confidence_media
+        queued_video_asset_ids.update(confidence_media.queue_for_group(db, batch_id=batch_id, group_key=group_key))
+    except Exception:
+        logger.exception("Could not queue confidence evidence batch_id=%s group_key=%s", batch_id, group_key)
     return {"analyzed_count": 1, "promoted_count": promoted_count_total}
 
 
@@ -15083,6 +14788,9 @@ def _run_video_retrieval_job(
 ) -> None:
     db = TransactionalSessionLocal()
     command: list[str] = []
+    existing_asset = repositories.get_video_asset(db, video_asset_id)
+    metadata: dict[str, Any] = dict(existing_asset.get("metadata") or {})
+    metadata["local_file_path"] = output_path
     script_run_id = repositories.create_script_run_started(
         db,
         session_id=session_id,
@@ -15100,7 +14808,6 @@ def _run_video_retrieval_job(
         status = "success" if completed.returncode == 0 else "failed"
         source_upload_url = f"/api/v1/videos/assets/{video_asset_id}/content"
         source_file_path = output_path
-        metadata: dict[str, Any] | None = None
         if status == "success":
             try:
                 video_asset_row = repositories.get_video_asset(db, video_asset_id)
@@ -15118,11 +14825,12 @@ def _run_video_retrieval_job(
                 )
                 source_upload_url = str(upload_result.get("public_url") or upload_target["video_url"])
                 source_file_path = f"spaces://{upload_target['object_key']}"
+                metadata["source_object_key"] = upload_target["object_key"]
             except Exception as upload_exc:
-                metadata = {
+                metadata.update({
                     "warning": "spaces_upload_failed_after_retrieval",
                     "spaces_upload_error": str(upload_exc),
-                }
+                })
                 logger.warning(
                     "Spaces upload failed after successful retrieval for video_asset_id=%s; keeping local file ready. error=%s",
                     video_asset_id,
@@ -15170,7 +14878,7 @@ def _run_video_retrieval_job(
                 "analyzed_at": None,
                 "retention_until": end_time + timedelta(days=3),
                 "status": "issue",
-                "metadata": None,
+                "metadata": metadata,
             },
         )
         repositories.finish_script_run(

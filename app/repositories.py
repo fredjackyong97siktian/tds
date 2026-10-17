@@ -3889,6 +3889,9 @@ def upsert_filter_confidence_result(
     factor_payload: Mapping[str, Any],
 ) -> None:
     table_name = _table("filter_confidence_result")
+    saved_payload = dict(factor_payload)
+    if saved_payload.get("entry_trigger_ids") and saved_payload.get("exit_trigger_ids"):
+        saved_payload.setdefault("media_retrieval", {"status": "preparing", "links": []})
     db.execute(
         text(
             f"""
@@ -3913,7 +3916,7 @@ def upsert_filter_confidence_result(
             "score": score,
             "need_deep_analysis": 1 if need_deep_analysis else 0,
             "reason": reason,
-            "factor_payload": _json_dumps(dict(factor_payload)),
+            "factor_payload": _json_dumps(saved_payload),
         },
     )
     db.commit()
@@ -4385,6 +4388,7 @@ def list_pending_video_asset_analyses(db: Session, limit: int = 50) -> list[dict
             left join {session_table} s on s.id = sva.session_id
             where va.section = 'entrance'
               and va.status = 'ready'
+              and coalesce(json_extract(va.metadata, '$.analysis_eligible'), true) = true
               and not exists (
                   select 1
                   from {video_asset_table} prev
@@ -4399,6 +4403,7 @@ def list_pending_video_asset_analyses(db: Session, limit: int = 50) -> list[dict
                         )
                     )
                     and prev.status in ('not_retrieved', 'retrieving', 'ready', 'processing', 'issue')
+                    and coalesce(json_extract(prev.metadata, '$.analysis_eligible'), true) = true
               )
             group by va.id, va.trigger_id, va.section, va.file_path, va.video_url,
                      va.captured_start_time, va.captured_end_time, va.retrieved_at,
@@ -6325,6 +6330,7 @@ def find_video_asset_by_window(
     location_id: int,
     start_time: Any,
     end_time: Any,
+    full_video_only: bool = False,
 ) -> dict[str, Any] | None:
     video_asset_table = _table("video_asset")
     trigger_table = _table("trigger_event")
@@ -6349,6 +6355,7 @@ def find_video_asset_by_window(
                     cast(json_unquote(json_extract(va.metadata, '$.location_id')) as unsigned)
                   ) = :location_id
               and va.status <> 'deleted'
+              and (:full_video_only = 0 or coalesce(json_unquote(json_extract(va.metadata, '$.retrieval_mode')), '') <> 'trigger_frames')
             order by va.id asc
             limit 1
             """
@@ -6358,6 +6365,7 @@ def find_video_asset_by_window(
             "start_time": start_time,
             "end_time": end_time,
             "location_id": location_id,
+            "full_video_only": full_video_only,
         },
     )
     row = result.mappings().first()

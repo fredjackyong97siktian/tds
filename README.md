@@ -110,6 +110,9 @@ THEFT_API_VIDEO_STORAGE_DIR=/app/session
 
 ## 4. Build and run with Docker Compose
 
+The daily 04:00 Malaysia media cleaner and confidence-before-session video
+retrieval are described in [Media Retention And Confidence Retrieval](docs/media-retention-and-confidence-retrieval.md).
+
 From inside `tds/`:
 
 ```bash
