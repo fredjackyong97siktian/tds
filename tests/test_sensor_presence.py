@@ -7,6 +7,20 @@ from app.services import workflow_service as workflow
 
 
 class SensorPresenceTests(unittest.TestCase):
+    def test_presence_filter_uses_existing_rows_and_combines_with_provider(self):
+        filters, params = workflow.repositories._script_run_list_filters(
+            script_name="person_presence", script_type="jev", model_name=None)
+        self.assertEqual(params["script_name"], "grouping")
+        self.assertEqual(params["presence_suffix"], "_person_presence")
+        self.assertIn("right(model_name, length(:presence_suffix)) = :presence_suffix", filters)
+        self.assertIn("model_name like 'openrouter-jev-%'", filters)
+
+    def test_other_script_filters_are_unchanged(self):
+        filters, params = workflow.repositories._script_run_list_filters(
+            script_name="carry_confidence", script_type=None, model_name=None)
+        self.assertEqual(params, {"script_name": "carry_confidence"})
+        self.assertEqual(filters, ["script_name = :script_name"])
+
     def setUp(self):
         self.db = Mock()
         self.row = {"trigger_id": 17, "location_id": 2}

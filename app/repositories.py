@@ -3710,7 +3710,13 @@ def _script_run_list_filters(
 ) -> tuple[list[str], dict[str, Any]]:
     filters: list[str] = []
     params: dict[str, Any] = {}
-    if script_name:
+    if script_name == "person_presence":
+        # Presence checks reuse the allowed grouping script name in older databases.
+        filters.append("script_name = :script_name")
+        params["script_name"] = "grouping"
+        filters.append("right(model_name, length(:presence_suffix)) = :presence_suffix")
+        params["presence_suffix"] = "_person_presence"
+    elif script_name:
         filters.append("script_name = :script_name")
         params["script_name"] = script_name
     if model_name:
