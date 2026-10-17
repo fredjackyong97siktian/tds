@@ -3477,6 +3477,39 @@ def count_grouping_items(db: Session, batch_id: int) -> int:
     return int((row or {}).get("total") or 0)
 
 
+def list_grouping_estimate_triggers(db: Session, batch_id: int) -> list[dict[str, Any]]:
+    result = db.execute(text(f"""
+        select te.id as trigger_id, te.trigger_time, te.phone_entry_id,
+               te.credit_card_entry_id, gi.frame_payload
+        from {_table('filter_grouping_item')} gi
+        join {_table('trigger_event')} te on te.id = gi.trigger_id
+        where gi.batch_id = :batch_id
+        order by te.trigger_time, te.id
+    """), {"batch_id": batch_id})
+    return _fetch_all_dicts(result)
+
+
+def list_grouping_timing_samples(db: Session, model_name: str) -> list[dict[str, Any]]:
+    # Project only counts and elapsed time, never the large request/image logs.
+    result = db.execute(text(f"""
+        select timestampdiff(microsecond, started_at, finished_at) / 1000000 as seconds,
+               json_unquote(json_extract(
+                   if(json_valid(runner_payload), runner_payload, '{{}}'),
+                   '$.identity_entry_count'
+               )) as entry_count,
+               json_unquote(coalesce(
+                   json_extract(if(json_valid(stdout_log), stdout_log, '{{}}'), '$.grouping_summary.diagnostics.chunk_count'),
+                   json_extract(if(json_valid(stdout_log), stdout_log, '{{}}'), '$.gemini_meta.chunk_count'),
+                   json_extract(if(json_valid(stdout_log), stdout_log, '{{}}'), '$.chunk_count')
+               )) as chunk_count
+        from {_table('script_run')}
+        where script_name = 'grouping' and model_name = :model_name
+          and status = 'success' and finished_at > started_at
+        order by id desc limit 20
+    """), {"model_name": model_name})
+    return _fetch_all_dicts(result)
+
+
 def list_grouping_items(db: Session, batch_id: int) -> list[dict[str, Any]]:
     table_name = _table("filter_grouping_item")
     result = db.execute(
@@ -3686,6 +3719,8 @@ def _script_run_list_filters(
     normalized_type = str(script_type or "").strip().lower()
     if normalized_type == "gemini":
         filters.append("model_name like 'gemini_%'")
+    elif normalized_type == "jev":
+        filters.append("model_name like 'openrouter-jev-%'")
     elif normalized_type == "runpod":
         filters.append("(model_name = 'runpod_runner' or runner_job_id is not null)")
     return filters, params
@@ -6804,7 +6839,7 @@ def get_latest_successful_grouping_stage_script_run(
     result = db.execute(
         text(
             f"""
-            select id, stdout_log
+            select id, model_name, stdout_log
             from {script_run_table}
             where script_name = 'grouping'
               and status = 'success'
@@ -7003,7 +7038,7 @@ def add_script_run_cost(
     cost_currency: str = "USD",
     cost_source: str | None,
 ) -> None:
-    if cost_amount is None or cost_amount <= 0:
+    if cost_amount is None or cost_amount < 0:
         return
     script_run_table = _table("script_run")
     if not _script_run_has_cost_columns(db, script_run_table):

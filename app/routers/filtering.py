@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from .. import repositories
 from ..db import get_transaction_db
 from ..services import workflow_service
+from ..services.grouping_estimate import preview_grouping
 
 
 router = APIRouter(prefix="/api/v1/filtering", tags=["filtering"])
@@ -47,6 +48,14 @@ class GroupingRangePayload(BaseModel):
     location_id: int | None = None
     start_time: str
     end_time: str
+
+
+class GroupingPreviewPayload(BaseModel):
+    mode: Literal["now", "range", "retry"] = "now"
+    batch_id: int | None = None
+    location_id: int | None = None
+    start_time: str | None = None
+    end_time: str | None = None
 
 
 class SelfGroupingGroupPayload(BaseModel):
@@ -268,6 +277,14 @@ def prepare_grouping_batches(db: Session = Depends(get_transaction_db)) -> dict[
         "prepared_count": len(batches),
         "batches": batches,
     }
+
+
+@router.post("/grouping-batches/preview")
+def grouping_preview(payload: GroupingPreviewPayload, db: Session = Depends(get_transaction_db)) -> dict[str, Any]:
+    try:
+        return preview_grouping(db, **payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/grouping-batches/run-now")

@@ -3,6 +3,7 @@ import base64
 import http.client
 import json
 import logging
+import math
 import mimetypes
 import os
 import re
@@ -47,6 +48,7 @@ from ..spaces import (
     upload_private_file,
 )
 from .. import vector_repositories
+from . import jev_pipeline
 from ..storage import (
     alert_tmp_video_path,
     build_spaces_object_key,
@@ -1892,7 +1894,13 @@ def _call_openrouter_vision_summary(
 def _openrouter_usage_cost(openrouter_meta: Mapping[str, Any]) -> tuple[float | None, dict[str, Any]]:
     usage = openrouter_meta.get("usage") if isinstance(openrouter_meta.get("usage"), Mapping) else {}
     model_name = str(openrouter_meta.get("model") or "")
-    amount = _positive_float(usage.get("actual_cost_usd"))
+    reported_cost = usage.get("actual_cost_usd")
+    try:
+        amount = float(reported_cost) if reported_cost is not None and not isinstance(reported_cost, bool) else None
+    except (TypeError, ValueError):
+        amount = None
+    if amount is not None and (not math.isfinite(amount) or amount < 0):
+        amount = None
     detail = {
         "model": model_name,
         "input_tokens": int(_positive_float(usage.get("input_tokens")) or 0.0),
@@ -1901,8 +1909,6 @@ def _openrouter_usage_cost(openrouter_meta: Mapping[str, Any]) -> tuple[float | 
         "estimated_cost_usd": amount,
         "cost_is_actual_not_estimated": True,
     }
-    if not amount or amount <= 0:
-        return None, detail
     return amount, detail
 
 
@@ -6423,6 +6429,7 @@ def _verify_entry_groups_against_candidates_batch(
     entry_groups: list[dict[str, Any]],
     model_name: str,
     resize_scale: float | None,
+    adjacent_provider: str | None = None,
 ) -> tuple[dict[int, dict[str, Any]], dict[int, list[bool]], dict[int, list[bool]], dict[str, Any] | None]:
     """Check several independent confirmed entries, each against its own small
     set of nearby candidate exits, in ONE combined call - rather than one call
@@ -6439,6 +6446,9 @@ def _verify_entry_groups_against_candidates_batch(
     separate re-check reuse a cheap 1-2 frame subset instead of resending every
     frame.
     """
+    if (adjacent_provider or _current_jev_stage_provider(db, "adjacent")) == "jev":
+        return jev_pipeline.verify_adjacent(db, script_run_id, entry_groups)
+
     image_urls: list[str] = []
     image_numbers_by_trigger: dict[int, list[int]] = {}
     group_blocks: list[dict[str, Any]] = []
@@ -6682,6 +6692,8 @@ def _find_resumable_adjacent_result(
     )
     if prior is None:
         return None
+    if prior.get("model_name") != _grouping_stage_label(db, "adjacent"):
+        return None
     try:
         parsed = json.loads(prior.get("stdout_log") or "")
     except json.JSONDecodeError:
@@ -6706,6 +6718,31 @@ def _find_resumable_adjacent_result(
     remaining_ids = {int(value) for value in remaining_trigger_ids}
     remaining = [item for item in trigger_inputs if int(item["trigger_id"]) in remaining_ids]
     return remaining, matched_groups, int(prior["id"])
+
+
+def _plan_grouping_adjacent_checks(trigger_inputs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    sorted_inputs = sorted(
+        trigger_inputs, key=lambda item: _coerce_datetime_value(item.get("trigger_time")) or datetime.min
+    )
+    checks = []
+    for entry in sorted_inputs:
+        if entry.get("phone_entry_id") is None and entry.get("credit_card_entry_id") is None:
+            continue
+        entry_time = _coerce_datetime_value(entry.get("trigger_time"))
+        if entry_time is None or not entry.get("frames"):
+            continue
+        candidates = [
+            item for item in sorted_inputs
+            if item["trigger_id"] != entry["trigger_id"]
+            and item.get("frames")
+            and item.get("phone_entry_id") is None
+            and item.get("credit_card_entry_id") is None
+            and (candidate_time := _coerce_datetime_value(item.get("trigger_time"))) is not None
+            and entry_time < candidate_time <= entry_time + timedelta(minutes=_GROUPING_ADJACENT_LOOKAHEAD_MINUTES)
+        ][:_GROUPING_ADJACENT_LOOKAHEAD_COUNT]
+        if candidates:
+            checks.append({"entry_id": int(entry["trigger_id"]), "entry": entry, "candidates": candidates})
+    return checks
 
 
 def _run_grouping_adjacent_pass(
@@ -6758,10 +6795,6 @@ def _run_grouping_adjacent_pass(
             reused_script_run_id,
         )
 
-    sorted_inputs = sorted(
-        trigger_inputs, key=lambda item: _coerce_datetime_value(item.get("trigger_time")) or datetime.min
-    )
-    by_id = {int(item["trigger_id"]): item for item in sorted_inputs}
     consumed: set[int] = set()
     groups: list[dict[str, Any]] = []
     notes: list[str] = []
@@ -6769,13 +6802,6 @@ def _run_grouping_adjacent_pass(
     frame_presence_by_trigger: dict[int, list[bool]] = {}
     best_frames_by_trigger: dict[int, list[bool]] = {}
     next_group_id = 1
-    lookahead_window = timedelta(minutes=_GROUPING_ADJACENT_LOOKAHEAD_MINUTES)
-
-    identity_entry_ids = [
-        int(item["trigger_id"])
-        for item in sorted_inputs
-        if item.get("phone_entry_id") is not None or item.get("credit_card_entry_id") is not None
-    ]
 
     # Build every entry's candidate set up front. Each one gets its own,
     # separate verification call below - packing several unrelated (entry,
@@ -6783,29 +6809,7 @@ def _run_grouping_adjacent_pass(
     # accuracy (the model conflates people across groups when comparing more
     # than one pairing at once), so this deliberately costs one call per
     # entry rather than batching for fewer, larger calls.
-    pending_entry_groups: list[dict[str, Any]] = []
-    for entry_id in identity_entry_ids:
-        entry_trigger = by_id[entry_id]
-        entry_time = _coerce_datetime_value(entry_trigger.get("trigger_time"))
-        if entry_time is None or not entry_trigger.get("frames"):
-            continue
-        candidates = [
-            item
-            for item in sorted_inputs
-            if int(item["trigger_id"]) != entry_id
-            and item.get("frames")
-            # A trigger with its own phone/credit card id is someone else's
-            # CONFIRMED entry, not this entry's exit - skip over it rather than
-            # offering it as a candidate, and keep looking further ahead within
-            # the same lookahead window for a genuine (non-identity) candidate.
-            and item.get("phone_entry_id") is None
-            and item.get("credit_card_entry_id") is None
-            and (_coerce_datetime_value(item.get("trigger_time")) or entry_time) > entry_time
-            and (_coerce_datetime_value(item.get("trigger_time")) or entry_time) - entry_time <= lookahead_window
-        ][:_GROUPING_ADJACENT_LOOKAHEAD_COUNT]
-        if not candidates:
-            continue
-        pending_entry_groups.append({"entry_id": entry_id, "entry": entry_trigger, "candidates": candidates})
+    pending_entry_groups = _plan_grouping_adjacent_checks(trigger_inputs)
 
     if not pending_entry_groups:
         return trigger_inputs, groups, notes, metas, frame_presence_by_trigger, best_frames_by_trigger, None
@@ -6813,12 +6817,13 @@ def _run_grouping_adjacent_pass(
     # Give this stage its own script_run instead of folding its calls into the
     # grouping_direct run's cost/activity - it needs to be independently
     # visible and auditable, not silently merged into another stage's row.
+    adjacent_provider = _current_jev_stage_provider(db, "adjacent")
     adjacent_script_run_id = _create_gemini_script_run(
         db,
         session_id=None,
         trigger_id=None,
         script_name="grouping",
-        model_name=_grouping_stage_label(db, "adjacent"),
+        model_name=_grouping_stage_label(db, "adjacent", adjacent_provider=adjacent_provider),
         runner_payload={
             "batch_id": batch_id,
             "location_id": location_id,
@@ -6836,13 +6841,22 @@ def _run_grouping_adjacent_pass(
             {"group_number": index + 1, "entry": item["entry"], "candidates": item["candidates"]}
             for index, item in enumerate(batch)
         ]
-        results_by_group, batch_presence, batch_best_frames, meta = _verify_entry_groups_against_candidates_batch(
-            db,
-            adjacent_script_run_id,
-            entry_groups=numbered_groups,
-            model_name=model_name,
-            resize_scale=resize_scale,
-        )
+        try:
+            results_by_group, batch_presence, batch_best_frames, meta = _verify_entry_groups_against_candidates_batch(
+                db,
+                adjacent_script_run_id,
+                entry_groups=numbered_groups,
+                model_name=model_name,
+                resize_scale=resize_scale,
+                adjacent_provider=adjacent_provider,
+            )
+        except Exception as exc:
+            repositories.finish_script_run(
+                db, adjacent_script_run_id, status="failed",
+                stdout_log=repositories.merge_script_run_stdout_fields(db, adjacent_script_run_id, {}),
+                stderr_log=str(exc),
+            )
+            raise
         if meta is not None:
             metas.append(meta)
         frame_presence_by_trigger.update(batch_presence)
@@ -6854,6 +6868,7 @@ def _run_grouping_adjacent_pass(
             candidate_trigger_ids = [int(candidate["trigger_id"]) for candidate in candidates]
             result = results_by_group.get(group_number)
             matched_trigger_id: int | None = None
+            matched_trigger_ids: list[int] = []
             match_confidence: float | None = None
             match_reason: str | None = None
             if result:
@@ -6865,16 +6880,21 @@ def _run_grouping_adjacent_pass(
                 # explanation and similarity score for it.
                 match_reason = str(result.get("reason") or "") or None
                 match_confidence = _coerce_number(result.get("confidence"), 0.0)
-                matched_candidate = result.get("matched_candidate")
-                if (
-                    matched_candidate is not None
-                    and match_confidence >= _GROUPING_ADJACENT_MATCH_CONFIDENCE_THRESHOLD
-                    and 1 <= int(matched_candidate) <= len(candidates)
-                ):
-                    exit_trigger = candidates[int(matched_candidate) - 1]
-                    exit_id = int(exit_trigger["trigger_id"])
-                    if entry_id not in consumed and exit_id not in consumed:
-                        matched_trigger_id = exit_id
+                selected = result.get("matched_candidates")
+                if not isinstance(selected, list):
+                    selected = [result["matched_candidate"]] if result.get("matched_candidate") is not None else []
+                threshold = (jev_pipeline.MIN_CHOICE_CONFIDENCE if adjacent_provider == "jev"
+                             else _GROUPING_ADJACENT_MATCH_CONFIDENCE_THRESHOLD)
+                valid = (selected and all(isinstance(value, int) and not isinstance(value, bool)
+                                         and 1 <= value <= len(candidates) for value in selected)
+                         and len(set(selected)) == len(selected))
+                if valid and match_confidence >= threshold and entry_id not in consumed:
+                    exit_ids = [int(candidates[value - 1]["trigger_id"]) for value in selected]
+                    # Never silently turn "both" into a different single-exit
+                    # answer if another entry already owns one of those exits.
+                    if not any(value in consumed for value in exit_ids):
+                        matched_trigger_ids = exit_ids
+                        matched_trigger_id = exit_ids[0]
                         match_reason = match_reason or "Matched by adjacency check."
             # Attached directly onto this entry's own call attempt (see
             # annotate_latest_script_run_call) so the Script Run page can show
@@ -6889,6 +6909,7 @@ def _run_grouping_adjacent_pass(
                         "entry_trigger_id": entry_id,
                         "candidate_trigger_ids": candidate_trigger_ids,
                         "matched_trigger_id": matched_trigger_id,
+                        "matched_trigger_ids": matched_trigger_ids,
                         "match_confidence": match_confidence,
                         "match_reason": match_reason,
                     },
@@ -6904,15 +6925,16 @@ def _run_grouping_adjacent_pass(
             if matched_trigger_id is None:
                 continue
             consumed.add(entry_id)
-            consumed.add(matched_trigger_id)
+            consumed.update(matched_trigger_ids)
             groups.append(
                 {
                     "group_id": next_group_id,
                     "entry": [entry_id],
-                    "exit": [matched_trigger_id],
+                    "exit": matched_trigger_ids,
                     "score": match_confidence,
                     "reason": match_reason,
-                    "source": "grouping_adjacent",
+                    "source": "jev_grouping_adjacent" if adjacent_provider == "jev" else "grouping_adjacent",
+                    "jev_decision": result.get("jev_decision") if result else None,
                     "verified": True,
                     "verification": {
                         "error": None,
@@ -6927,7 +6949,7 @@ def _run_grouping_adjacent_pass(
             )
             next_group_id += 1
             notes.append(
-                f"Trigger {entry_id} matched trigger {matched_trigger_id} via adjacency check "
+                f"Trigger {entry_id} matched trigger(s) {matched_trigger_ids} via adjacency check "
                 f"(confidence {match_confidence:.2f})."
             )
 
@@ -7333,7 +7355,16 @@ def _grouping_openrouter_model_name(db: Session) -> str:
     return _OPENROUTER_MODELS.get(provider, next(iter(_OPENROUTER_MODELS.values())))
 
 
-def _grouping_stage_label(db: Session, stage: str) -> str:
+def _current_jev_stage_provider(db: Session, stage: str) -> str:
+    if stage not in {"adjacent", "carry"}:
+        raise ValueError("Unknown Jev stage.")
+    value = str(repositories.get_app_setting(db, f"{stage}_provider") or "jev").strip().lower()
+    return value if value in {"jev", "inherit"} else "jev"
+
+
+def _grouping_stage_label(db: Session, stage: str, *, adjacent_provider: str | None = None) -> str:
+    if stage == "adjacent" and (adjacent_provider or _current_jev_stage_provider(db, "adjacent")) == "jev":
+        return "openrouter-jev-1.14_grouping_adjacent"
     provider = _current_grouping_provider(db)
     if provider in ("deepseek", "glm", *_OPENAI_GROUPING_MODELS, "gemini-2.5-flash-lite", *_OPENROUTER_MODELS):
         return f"{provider}_grouping_{stage}"
@@ -10420,6 +10451,12 @@ def _reexamine_carry_item_signal_with_probe_frames(
     }
 
 
+def _carry_factor_hit(result: Mapping[str, Any], low_purchase: bool) -> bool:
+    if result.get("source") == "openrouter_jev_carry":
+        return result.get("status") == "suspicious" and _as_boolish(result.get("hit"))
+    return _as_boolish(result.get("hit")) or (_as_boolish(result.get("insufficient_evidence")) and low_purchase)
+
+
 def _evaluate_carry_item_signal_with_ai(
     db: Session,
     *,
@@ -10432,6 +10469,11 @@ def _evaluate_carry_item_signal_with_ai(
     total_quantity: int,
     total_value: float,
 ) -> dict[str, Any]:
+    if _current_jev_stage_provider(db, "carry") == "jev":
+        return jev_pipeline.evaluate_carry(
+            db, batch_id=batch_id, group_key=group_key, location_id=location_id,
+            group=group, transactions=transactions,
+        )
     carry_evidence = _group_carry_evidence(group)
     legacy_hit = (
         carry_evidence["legacy_carry_score"] >= settings.filter_carry_score_threshold
@@ -11291,16 +11333,9 @@ def _run_theft_confidence_for_grouping_batch_locked(
             factor_details=factor_details,
             factors=factor_settings,
             factor_code="carry_item_signal",
-            # Insufficient evidence alone used to always count as a hit,
-            # which fired on almost every weak-angle/partial-occlusion case
-            # regardless of how much the customer actually bought - too
-            # noisy in practice. Now only escalates it when the customer
-            # also barely bought anything: "couldn't confirm what they left
-            # with, AND they paid for almost nothing" is worth a second
-            # look; "couldn't quite see the bag, but they bought a full
-            # basket" usually isn't.
-            hit=_as_boolish(carry_ai_result.get("hit"))
-            or (_as_boolish(carry_ai_result.get("insufficient_evidence")) and low_purchase),
+            # Jev only flags suspicious. The legacy provider keeps its
+            # insufficient-evidence + low-purchase escalation on rollback.
+            hit=_carry_factor_hit(carry_ai_result, low_purchase),
             reason="carry_item_signal",
             evidence=carry_ai_result,
         ):
@@ -11705,11 +11740,8 @@ def score_confidence_for_single_group(
         factor_details=factor_details,
         factors=factor_settings,
         factor_code="carry_item_signal",
-        # See the matching comment in _run_theft_confidence_for_grouping_batch_locked -
-        # insufficient_evidence alone only escalates to a hit when the
-        # customer also barely bought anything.
-        hit=_as_boolish(carry_ai_result.get("hit"))
-        or (_as_boolish(carry_ai_result.get("insufficient_evidence")) and low_purchase),
+        # Same Jev/legacy policy as scheduled confidence analysis.
+        hit=_carry_factor_hit(carry_ai_result, low_purchase),
         reason="carry_item_signal",
         evidence=carry_ai_result,
     ):

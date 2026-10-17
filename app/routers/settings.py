@@ -1,4 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
+from typing import Literal
+import os
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -17,6 +19,28 @@ class FramesPerTriggerRequest(BaseModel):
 
 class KioskAnalysisDisabledRequest(BaseModel):
     disabled: bool
+
+
+class JevStageProviderRequest(BaseModel):
+    provider: Literal["jev", "inherit"]
+
+
+@router.get("/jev-stage-providers")
+def get_jev_stage_providers(db: Session = Depends(get_transaction_db)) -> dict:
+    return {
+        "adjacent": workflow_service._current_jev_stage_provider(db, "adjacent"),
+        "carry": workflow_service._current_jev_stage_provider(db, "carry"),
+        "openrouter_key_configured": bool(str(settings.openrouter_api_key or os.environ.get("OPENROUTER_API_KEY") or "").strip()),
+        "model": "typesafe/jev-1.14",
+        "minimum_choice_confidence": workflow_service.jev_pipeline.MIN_CHOICE_CONFIDENCE,
+    }
+
+
+@router.put("/jev-stage-providers/{stage}")
+def update_jev_stage_provider(stage: Literal["adjacent", "carry"], payload: JevStageProviderRequest,
+                              db: Session = Depends(get_transaction_db)) -> dict:
+    repositories.set_app_setting(db, f"{stage}_provider", payload.provider)
+    return {"ok": True, "stage": stage, "provider": payload.provider}
 
 
 @router.get("/grouping-frames-per-trigger")
