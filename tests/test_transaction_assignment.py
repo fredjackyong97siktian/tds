@@ -37,9 +37,9 @@ class AssignmentTests(unittest.TestCase):
                 for minute in (3, 4, 5):
                     self.assertEqual([value["entry_trigger_id"] for value in assignment.active_groups(groups, time(10, minute))], expected)
 
-    def test_one_receipt_can_be_ambiguous_and_open_visits_are_active(self):
+    def test_open_identity_without_a_completed_group_is_not_active(self):
         groups = [group(1, time(10), time(10, 5)), group(3, time(9, 57), None), group(5, time(10, 4), time(10, 6))]
-        self.assertEqual([value["entry_trigger_id"] for value in assignment.active_groups(groups, time(10, 3))], [1, 3])
+        self.assertEqual([value["entry_trigger_id"] for value in assignment.active_groups(groups, time(10, 3))], [1])
 
     def test_stale_unresolved_entries_do_not_count_as_active_forever(self):
         paid_at = time(10, 3)
@@ -52,12 +52,12 @@ class AssignmentTests(unittest.TestCase):
         self.assertEqual(len(report["decisions"][0]["active_groups"]), 1)
         self.calls["decide_with_jev"].assert_not_called()
 
-    def test_open_entry_limit_is_relative_to_each_payment_not_now_or_expand_duration(self):
+    def test_recent_open_identities_are_excluded_too(self):
         paid_at = time(10, 3)
         groups = [group(1, paid_at - timedelta(minutes=60), None),
                   group(3, paid_at - timedelta(minutes=60, seconds=1), None),
                   group(5, paid_at - timedelta(minutes=30), None)]
-        self.assertEqual([row["entry_trigger_id"] for row in assignment.active_groups(groups, paid_at)], [1, 5])
+        self.assertEqual(assignment.active_groups(groups, paid_at), [])
 
     def test_completed_long_visit_uses_its_real_exit_not_open_entry_age_limit(self):
         groups = [group(1, time(8), time(10, 5)), group(3, time(8), time(10, 2))]
@@ -103,18 +103,16 @@ class AssignmentTests(unittest.TestCase):
                 row["raw_payload"]["machineName"] = name
                 self.assertEqual(assignment.machine_side("Edumetro, Subang", row)["image_side"], expected)
 
-    def test_overlapping_group_query_bounds_open_history_and_requires_completed_exit(self):
+    def test_overlapping_group_query_only_reads_completed_memberships(self):
         db = Mock()
         with patch.object(workflow.repositories, "_fetch_all_dicts", side_effect=[[], []]):
             store.list_overlapping_groups(db, location_id=2, start=time(10, 3), end=time(10, 5))
         closed_sql, closed_params = db.execute.call_args_list[0].args
-        open_sql, open_params = db.execute.call_args_list[1].args
         self.assertIn("exit_time >= :start_time", str(closed_sql))
         self.assertNotIn("or exit_time is null", str(closed_sql))
         self.assertEqual(closed_params["location_id"], 2)
-        self.assertIn("te.trigger_time >= :open_since", str(open_sql))
-        self.assertEqual(open_params["open_since"], time(9, 3))
-        self.assertEqual(open_params["end_time"], time(10, 5))
+        self.assertEqual(db.execute.call_count, 1)
+        self.assertIn("gi.status='grouped'", str(closed_sql))
 
     def assign(self, rows, groups, *, previous=None, decision=None, recovered=None, save_side_effect=None):
         self.calls = {}
@@ -176,7 +174,7 @@ class AssignmentTests(unittest.TestCase):
     def test_none_uncertain_and_api_errors_never_assign_window_receipts(self):
         for status in ("none", "uncertain", "error"):
             with self.subTest(status=status):
-                assigned, report = self.assign([receipt(1, time(10, 3))], [group(1, time(10), time(10, 5)), group(3, time(9, 30), None)],
+                assigned, report = self.assign([receipt(1, time(10, 3))], [group(1, time(10), time(10, 5)), group(3, time(9, 30), time(10, 6))],
                                                decision={"status": status, "entry_trigger_id": None, "method": "jev"})
                 self.assertEqual(assigned, [])
                 self.assertEqual(report["unresolved_count"], 0 if status == "none" else 1)
@@ -290,7 +288,7 @@ class AssignmentTests(unittest.TestCase):
     def test_failed_receipt_is_not_automatically_resent_even_if_context_changes(self):
         previous = {"1": {"context_hash": "older", "status": "error", "evidence": {
             "status": "error", "entry_trigger_id": None, "method": "jev", "reason": "Provider failed"}}}
-        assigned, report = self.assign([receipt(1, time(10, 3))], [group(1, time(10), time(10, 5)), group(3, time(9, 30), None)], previous=previous)
+        assigned, report = self.assign([receipt(1, time(10, 3))], [group(1, time(10), time(10, 5)), group(3, time(9, 30), time(10, 6))], previous=previous)
         self.assertEqual(assigned, [])
         self.assertEqual(report["status"], "needs_review")
         self.assertTrue(report["decisions"][0]["cached"])
@@ -360,20 +358,53 @@ class AssignmentTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "receipt identity"):
             self.assign([row], [group(1, time(10), time(10, 5))])
 
-    def test_current_batch_open_entries_block_false_sole_owner(self):
+    def test_current_batch_open_entries_do_not_create_extra_transaction_candidates(self):
         with patch.object(store, "list_overlapping_groups", return_value=([], [])), \
-             patch.object(workflow.repositories, "get_grouping_batch", return_value={"result_payload": {"groups": [], "open_entries": [3]}}), \
+             patch.object(workflow.repositories, "get_grouping_batch", return_value={"status": "success", "location_id": 2, "result_payload": {"groups": [{"entry": [1], "exit": [2]}], "open_entries": [3]}}), \
              patch.object(workflow.repositories, "get_trigger", side_effect=lambda db, tid: {"trigger_time": {1: time(10), 2: time(10, 5), 3: time(9, 30)}[tid]}):
             groups = assignment.collect_groups(Mock(), location_id=2, start=time(10), end=time(10, 5), batch_id=1, current_group={"entry": [1], "exit": [2]})
-        self.assertEqual(len(assignment.active_groups(groups, time(10, 3))), 2)
+        self.assertEqual([row["entry_trigger_id"] for row in assignment.active_groups(groups, time(10, 3))], [1])
 
     def test_old_open_entries_in_current_batch_snapshot_are_also_excluded(self):
         with patch.object(store, "list_overlapping_groups", return_value=([], [])), \
-             patch.object(workflow.repositories, "get_grouping_batch", return_value={"result_payload": {"groups": [], "open_entries": [3]}}), \
+             patch.object(workflow.repositories, "get_grouping_batch", return_value={"status": "success", "location_id": 2, "result_payload": {"groups": [{"entry": [1], "exit": [2]}], "open_entries": [3]}}), \
              patch.object(workflow.repositories, "get_trigger", side_effect=lambda db, tid: {"trigger_time": {1: time(10), 2: time(10, 5), 3: time(8)}[tid]}):
             groups = assignment.collect_groups(Mock(), location_id=2, start=time(10, 3), end=time(10, 5), batch_id=1,
                                                current_group={"entry": [1], "exit": [2]})
         self.assertEqual([row["entry_trigger_id"] for row in groups], [1])
+
+    def test_standalone_trigger_cannot_be_invented_as_a_current_group(self):
+        with patch.object(store, "list_overlapping_groups", return_value=([], [])), \
+             patch.object(workflow.repositories, "get_grouping_batch", return_value={"status": "success", "location_id": 2, "result_payload": {"groups": [], "open_entries": [1]}}):
+            with self.assertRaisesRegex(ValueError, "existing group"):
+                assignment.collect_groups(Mock(), location_id=2, start=time(10), end=time(10, 5),
+                                          batch_id=1, current_group={"entry": [1], "exit": [2]})
+
+    def test_entry_only_group_is_never_sent_for_assignment(self):
+        with self.assertRaisesRegex(ValueError, "at least one exit"):
+            assignment.assign(Mock(), batch_id=1, location_id=2, group={"entry": [1], "exit": []},
+                              start_time=time(10), end_time=time(10, 5))
+
+    def test_recent_ungrouped_identity_does_not_force_a_paid_request(self):
+        assigned, report = self.assign([receipt(1, time(10, 3))],
+            [group(1, time(10), time(10, 5)), group(3, time(10, 1), None)])
+        self.assertEqual(len(assigned), 1)
+        self.assertEqual(report["decisions"][0]["method"], "time")
+        self.calls["decide_with_jev"].assert_not_called()
+
+    def test_group_membership_in_another_batch_does_not_validate_current_group(self):
+        existing = {"batch_id": 9, "group_key": "g", "entry_ids": "1", "exit_ids": "2",
+                    "entry_time": time(10), "exit_time": time(10, 5)}
+        with patch.object(store, "list_overlapping_groups", return_value=([existing], [])), \
+             patch.object(workflow.repositories, "get_grouping_batch", return_value={"status": "success", "location_id": 2, "result_payload": {"groups": []}}):
+            with self.assertRaisesRegex(ValueError, "existing group"):
+                assignment.collect_groups(Mock(), location_id=2, start=time(10), end=time(10, 5),
+                                          batch_id=1, current_group={"entry": [1], "exit": [2]})
+
+    def test_active_candidate_requires_exit_membership_not_just_exit_timestamp(self):
+        value = group(1, time(10), time(10, 5))
+        value["exit_trigger_ids"] = []
+        self.assertEqual(assignment.active_groups([value], time(10, 3)), [])
 
     def test_session_retry_never_reintroduces_rejected_paid_receipts(self):
         with patch.object(workflow, "_is_kiosk_analysis_disabled", return_value=False), \

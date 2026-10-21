@@ -62,24 +62,29 @@ required: ambiguous receipts use the existing OpenRouter key and Jev 1.14.
   `Formatted Timestamp` when payment time is null. Never use `createdAt`.
 - A completed group is active at payment when entry <= payment <= its last
   exit. Groups whose actual exit precedes the payment are never candidates.
-  The completed-group query requires an exit, so a corrupt/legacy entry-only
-  membership cannot bypass the unresolved-entry limit.
-- Known open entries may also be considered, but ONLY during the first 60
-  minutes after their entry. This implements the earlier one-hour maximum-stay
-  assumption, separately from Expand's 20-minute search setting. The limit is
-  relative to each receipt's payment timestamp, never the current clock.
-  `OPEN_ENTRY_LOOKBACK_MINUTES` in `transaction_assignment_store.py` is its
-  single source. Historical open entries do not remain active forever.
-- The SQL open-entry lookup starts one hour before the earliest relevant
-  payment, and the same check is applied per receipt and to current-batch
-  snapshots. Queries use actual payment bounds rather than the whole batch
-  period. A visit with no paid receipts skips candidate lookup entirely.
+  Both an entry and at least one exit must exist in the group.
+- Open entries, unknowns and standalone identities are excluded, even if they
+  occurred recently. They become eligible only after a group is formed.
+  The current group must exist in its successful batch's saved grouping output
+  or committed memberships; the assignment code cannot invent a group from
+  a supplied trigger ID. This does not change grouping carry-forward rules.
+- Queries use actual payment bounds rather than the whole batch period.
+  A visit with no paid receipts skips candidate lookup entirely.
 - Exactly one active group: assign automatically. More than one: compare
   each receipt independently with Jev. A group may receive multiple receipts,
   but a receipt may have only one owner per location.
 - For each ambiguous receipt, capture ten kiosk frames in a single FFmpeg
   playback, at one-second intervals from payment - 5s through payment + 4s.
   Apply the kiosk camera's own configured NVR delay; do not entrance-crop.
+- Before starting kiosk capture, wait for the same NVR/FFmpeg slot used by
+  video and trigger-frame retrieval jobs. Lock checks use non-blocking
+  `GET_LOCK(..., 0)` calls separated by short Python sleeps, never a long
+  query exceeding PyMySQL's 30-second read timeout. Receipt captures wait
+  up to `transaction_assignment_retrieval_wait_seconds` (default 900 seconds).
+  A busy-slot deadline stops before capture or Jev and records a retryable
+  error rather than assuming no purchase. Retrieval logs record actual wait
+  duration. Restart the API, retrieval and confidence workers after deployment;
+  all must use the shared lock implementation. No database migration needed.
 - Include each candidate's existing entry and exit images. In Edumetro,
   machine Left means image-right, and machine Right means image-left.
   Machine names such as `Edumetro-right-1`, `Edumetro-left-2`, and `RIGHT_1`

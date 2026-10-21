@@ -4114,15 +4114,29 @@ def _acquire_retrieval_ffmpeg_lock(*, wait_seconds: int) -> Connection | None:
     # _try_acquire_theft_confidence_lock below - GET_LOCK/RELEASE_LOCK must
     # run on the exact same physical connection, which an ORM Session's own
     # transaction lifecycle doesn't guarantee.
+    deadline = time.monotonic() + max(0, wait_seconds)
     conn = transactional_engine.connect()
-    acquired_row = conn.execute(
-        text("select get_lock(:lock_name, :wait_seconds) as acquired"),
-        {"lock_name": _RETRIEVAL_FFMPEG_LOCK_NAME, "wait_seconds": wait_seconds},
-    ).mappings().first()
-    if int((acquired_row or {}).get("acquired") or 0) != 1:
+    try:
+        while True:
+            # GET_LOCK(180) exceeds PyMySQL's 30-second read timeout when
+            # another retrieval owns the slot. Wait in Python, not in SQL.
+            acquired_row = conn.execute(
+                text("select get_lock(:lock_name, :wait_seconds) as acquired"),
+                {"lock_name": _RETRIEVAL_FFMPEG_LOCK_NAME, "wait_seconds": 0},
+            ).mappings().first()
+            acquired = (acquired_row or {}).get("acquired")
+            if acquired is None:
+                raise RuntimeError("MySQL could not check the shared NVR/FFmpeg lock.")
+            if int(acquired) == 1:
+                return conn
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                conn.close()
+                return None
+            time.sleep(min(1.0, remaining))
+    except BaseException:
         conn.close()
-        return None
-    return conn
+        raise
 
 
 def _release_retrieval_ffmpeg_lock(conn: Connection) -> None:
@@ -15063,6 +15077,18 @@ def _run_video_retrieval_job(
 
 
 def start_trigger_frame_asset_retrieval_job(job: TriggerFrameAssetRetrievalQueued) -> None:
+    lock_conn = _acquire_retrieval_ffmpeg_lock(wait_seconds=settings.retrieval_ffmpeg_lock_wait_seconds)
+    if lock_conn is None:
+        raise RuntimeError(
+            f"Could not get exclusive ffmpeg/NVR access within {settings.retrieval_ffmpeg_lock_wait_seconds}s."
+        )
+    try:
+        _run_trigger_frame_asset_retrieval_job(job)
+    finally:
+        _release_retrieval_ffmpeg_lock(lock_conn)
+
+
+def _run_trigger_frame_asset_retrieval_job(job: TriggerFrameAssetRetrievalQueued) -> None:
     db = TransactionalSessionLocal()
     # Diagnostic-only: how late this retrieval is actually running compared to
     # its own requested window, and compared to the trigger that caused it -

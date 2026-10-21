@@ -47,7 +47,7 @@ class IdentifierCaptureTests(unittest.TestCase):
         self.assertEqual(command[command.index("-ss") + 1], "0.500")
         self.assertEqual(command[command.index("-frames:v") + 1], "12")
 
-    def run_capture(self, *, frames=12, timeout=False, direction="left", section="identifier"):
+    def run_capture(self, *, frames=12, timeout=False, direction="left", section="identifier", busy=False):
         self.calls = {}
         with TemporaryDirectory() as directory, ExitStack() as stack:
             stack.enter_context(patch.object(capture, "tmp_trigger_root", return_value=Path(directory)))
@@ -64,7 +64,7 @@ class IdentifierCaptureTests(unittest.TestCase):
             stack.enter_context(patch.object(workflow, "decrypt_secret", return_value="camera-secret"))
             self.calls["delay"] = stack.enter_context(patch.object(workflow, "_current_delayed_seconds", return_value=425))
             self.calls["url"] = stack.enter_context(patch.object(workflow, "_build_dahua_rtsp_playback_url", return_value="rtsp://camera-user:camera-secret@example.test"))
-            self.calls["lock"] = stack.enter_context(patch.object(workflow, "_acquire_retrieval_ffmpeg_lock", return_value=Mock()))
+            self.calls["lock"] = stack.enter_context(patch.object(workflow, "_acquire_retrieval_ffmpeg_lock", return_value=None if busy else Mock()))
             self.calls["release"] = stack.enter_context(patch.object(workflow, "_release_retrieval_ffmpeg_lock"))
             self.calls["upload"] = stack.enter_context(patch.object(workflow, "upload_private_file", side_effect=lambda path, key, **kw: {"public_url": f"https://example.test/{key}"}))
 
@@ -131,6 +131,18 @@ class IdentifierCaptureTests(unittest.TestCase):
         self.assertEqual(result["frames"][0]["camera_sample_time"], "2026-10-21T10:52:50")
         self.assertEqual(result["frames"][-1]["sample_time"], "2026-10-21T11:00:04")
         self.assertEqual(self.calls["create_script_run_started"].call_args.kwargs["model_name"], "dahua_rtsp_playback:kiosk_payment_frames")
+
+    def test_payment_capture_waits_for_shared_retrieval_slot_before_ffmpeg(self):
+        self.run_capture(frames=10, section="kiosk")
+        self.calls["lock"].assert_called_once_with(wait_seconds=workflow.settings.transaction_assignment_retrieval_wait_seconds)
+
+    def test_busy_retrieval_never_starts_payment_capture_or_upload(self):
+        with self.assertRaisesRegex(RuntimeError, "another retrieval is still busy"):
+            self.run_capture(frames=10, section="kiosk", busy=True)
+        self.calls["run"].assert_not_called()
+        self.calls["upload"].assert_not_called()
+        self.calls["release"].assert_not_called()
+        self.assertEqual(self.calls["finish_script_run"].call_args.kwargs["status"], "failed")
 
 
 if __name__ == "__main__":

@@ -1,15 +1,11 @@
 """Durable paid-receipt ownership, independent of session creation."""
 
 from contextlib import contextmanager
-from datetime import timedelta
 import json
 
 from sqlalchemy import bindparam, text
 
 from .. import repositories
-
-OPEN_ENTRY_LOOKBACK_MINUTES = 60
-
 
 @contextmanager
 def location_lock(db, location_id, *, wait_seconds=30):
@@ -128,20 +124,5 @@ def list_overlapping_groups(db, *, location_id, start, end):
         group by gi.batch_id, gi.group_key
         having entry_time <= :end_time and exit_time >= :start_time
     """), {"location_id": location_id, "start_time": start, "end_time": end}))
-    # A missing exit is not evidence that a customer remained inside forever.
-    # Bound unresolved entries by the payment window, never wall-clock now.
-    opens = repositories._fetch_all_dicts(db.execute(text(f"""
-        select gi.batch_id, gi.trigger_id, te.trigger_time as entry_time
-        from {table('filter_grouping_item')} gi
-        join {table('filter_grouping_batch')} b on b.id=gi.batch_id
-        join {table('trigger_event')} te on te.id=gi.trigger_id
-        where te.location_id=:location_id and b.status='success' and gi.role='unknown'
-          and json_unquote(json_extract(gi.result_payload, '$.reason'))='open_entry_waiting_for_exit'
-          and te.trigger_time >= :open_since and te.trigger_time <= :end_time
-          and not exists (
-              select 1 from {table('filter_grouping_item')} used
-              join {table('filter_grouping_batch')} ub on ub.id=used.batch_id
-              where used.trigger_id=gi.trigger_id and used.role='entry'
-                and used.status='grouped' and ub.status='success')
-    """), {"location_id": location_id, "open_since": start - timedelta(minutes=OPEN_ENTRY_LOOKBACK_MINUTES), "end_time": end}))
-    return rows, opens
+    # Open/unknown identities are not groups and cannot own paid receipts.
+    return rows, []

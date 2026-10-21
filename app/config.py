@@ -69,9 +69,12 @@ class Settings(BaseSettings):
     # How long an ad-hoc direct capture (kiosk transaction probe frames,
     # carry-evidence re-check probes) waits for VideoRetrievalWorker's
     # currently-running job to release the NVR before giving up - see
-    # _acquire_retrieval_ffmpeg_lock. Generous on purpose: only a truly stuck
-    # job (caught by retrieval_stale_seconds) should ever make this time out.
+    # _acquire_retrieval_ffmpeg_lock polls non-blocking GET_LOCK calls so the
+    # overall wait never becomes one query exceeding the DB read timeout.
     retrieval_ffmpeg_lock_wait_seconds: int = 180
+    # Receipt ownership waits for the retrieval slot before fetching kiosk
+    # frames. Bound the wait so an unavailable NVR cannot stall scoring forever.
+    transaction_assignment_retrieval_wait_seconds: int = 900
     trigger_frame_interval_seconds: float = 1.0
     trigger_frame_gap: int = 12
     trigger_frame_fps: int = 25

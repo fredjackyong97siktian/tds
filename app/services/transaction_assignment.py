@@ -36,10 +36,9 @@ def payment_time(row):
 
 
 def active_groups(groups, paid_at):
-    return [group for group in groups if group["entry_time"] <= paid_at
-            and ((group.get("exit_time") is not None and paid_at <= group["exit_time"])
-                 or (group.get("exit_time") is None
-                     and paid_at - group["entry_time"] <= timedelta(minutes=store.OPEN_ENTRY_LOOKBACK_MINUTES)))]
+    return [group for group in groups if group.get("exit_trigger_ids")
+            and group.get("exit_time") is not None
+            and group["entry_time"] <= paid_at <= group["exit_time"]]
 
 
 def machine_side(location_name, row):
@@ -64,7 +63,7 @@ def _ids(value):
 def collect_groups(db, *, location_id, start, end, batch_id, current_group):
     from . import workflow_service as workflow
 
-    rows, opens = store.list_overlapping_groups(db, location_id=location_id, start=start, end=end)
+    rows, _ = store.list_overlapping_groups(db, location_id=location_id, start=start, end=end)
     by_entry = {}
     for row in sorted(rows, key=lambda item: int(item["batch_id"])):
         entries = _ids(row["entry_ids"])
@@ -73,21 +72,28 @@ def collect_groups(db, *, location_id, start, end, batch_id, current_group):
         by_entry[entries[0]] = {"entry_trigger_id": entries[0], "exit_trigger_ids": _ids(row["exit_ids"]),
                               "entry_time": row["entry_time"], "exit_time": row["exit_time"],
                               "batch_id": row["batch_id"], "group_key": row["group_key"]}
-    for row in opens:
-        entry_id = int(row["trigger_id"])
-        by_entry.setdefault(entry_id, {"entry_trigger_id": entry_id, "exit_trigger_ids": [],
-                                      "entry_time": row["entry_time"], "exit_time": None,
-                                      "batch_id": row["batch_id"], "group_key": None})
     batch = repositories.get_grouping_batch(db, batch_id)
+    if batch.get("status") != "success" or int(batch.get("location_id") or 0) != location_id:
+        raise ValueError("Transaction assignment requires a successful grouping batch at this location.")
     payload = batch.get("result_payload") or {}
     if isinstance(payload, str):
         payload = json.loads(payload)
-    # Include all newly formed groups even before their item rows are committed.
-    pending_entries = [{"entry": [value], "exit": []} for value in workflow._group_trigger_id_list(payload.get("open_entries"))
-                       if value not in by_entry]
-    for group in [*pending_entries, *(payload.get("groups") or []), current_group]:
+    # Current-batch groups can be scored before their membership rows commit,
+    # but the saved grouping output must actually contain the group.
+    def membership(group):
+        return (tuple(sorted(workflow._group_trigger_id_list(group.get("entry")))),
+                tuple(sorted(workflow._group_trigger_id_list(group.get("exit")))))
+
+    recorded = {membership(group) for group in payload.get("groups") or []}
+    recorded.update((tuple(_ids(row["entry_ids"])), tuple(_ids(row["exit_ids"])))
+                    for row in rows if int(row["batch_id"]) == batch_id)
+    if membership(current_group) not in recorded or not membership(current_group)[1]:
+        raise ValueError("Transaction assignment requires an existing group with an entry and an exit.")
+    for group in [*(payload.get("groups") or []), current_group]:
         entry_ids = workflow._group_trigger_id_list(group.get("entry"))
         exit_ids = workflow._group_trigger_id_list(group.get("exit"))
+        if not exit_ids:
+            continue
         if len(entry_ids) != 1:
             raise ValueError("Transaction assignment requires one entry trigger per group.")
         entry_time = workflow._coerce_datetime_value(repositories.get_trigger(db, entry_ids[0])["trigger_time"])
@@ -97,12 +103,9 @@ def collect_groups(db, *, location_id, start, end, batch_id, current_group):
         by_entry[entry_ids[0]] = {"entry_trigger_id": entry_ids[0], "exit_trigger_ids": exit_ids,
                                 "entry_time": entry_time, "exit_time": max(exit_times) if exit_times else None,
                                 "batch_id": batch_id, "group_key": str(group.get("group_id") or group.get("id") or "")}
-    # Apply the same bounds to current-batch open entries, which may not yet
-    # exist in the stored item query, and to older/cached batch snapshots.
-    eligible = [value for value in by_entry.values() if value["entry_time"] <= end
-                and ((value["exit_time"] is not None and value["exit_time"] >= start)
-                     or (value["exit_time"] is None
-                         and value["entry_time"] >= start - timedelta(minutes=store.OPEN_ENTRY_LOOKBACK_MINUTES)))]
+    eligible = [value for value in by_entry.values() if value["exit_trigger_ids"]
+                and value["exit_time"] is not None and value["entry_time"] <= end
+                and value["exit_time"] >= start]
     return sorted(eligible, key=lambda value: value["entry_trigger_id"])
 
 
@@ -180,8 +183,8 @@ def assign(db, *, batch_id, location_id, group, start_time, end_time):
 
     require_enabled(db)
     entries = workflow._group_trigger_id_list(group.get("entry"))
-    if len(entries) != 1:
-        raise ValueError("Transaction assignment requires exactly one entry trigger.")
+    if len(entries) != 1 or not workflow._group_trigger_id_list(group.get("exit")):
+        raise ValueError("Transaction assignment requires exactly one entry trigger and at least one exit in a group.")
     owner = entries[0]
     # A failed query or missing migration must stop scoring, not masquerade as no purchase.
     with store.location_lock(db, location_id):
@@ -301,7 +304,7 @@ def _commit_decision(db, *, location_id, receipt, payment_time_utc, context_hash
 def _report(owner, rows, assigned, decisions):
     unresolved = sum(value["status"] in {"uncertain", "error"} or value.get("context_changed", False) for value in decisions)
     return {"version": POLICY_VERSION, "entry_trigger_id": owner,
-            "open_entry_lookback_minutes": store.OPEN_ENTRY_LOOKBACK_MINUTES,
+            "candidate_policy": "completed_groups_only",
             "status": "needs_review" if unresolved else "complete", "candidate_count": len(rows),
             "assigned_count": len(assigned), "unresolved_count": unresolved,
             "selection": "none" if not assigned else "all" if len(assigned) == len(rows) else "some",

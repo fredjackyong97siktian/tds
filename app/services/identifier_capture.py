@@ -5,6 +5,8 @@ from pathlib import Path
 import subprocess
 from tempfile import TemporaryDirectory
 from typing import Any
+from time import monotonic
+import logging
 
 from .. import repositories
 from ..storage import tmp_trigger_root
@@ -12,6 +14,7 @@ from ..storage import tmp_trigger_root
 FRAME_COUNT = 12
 FRAME_INTERVAL_SECONDS = 0.5
 LAST_FRAME_BEFORE_EXIT_SECONDS = 3
+logger = logging.getLogger(__name__)
 
 
 def sample_times(exit_time: datetime) -> list[datetime]:
@@ -83,9 +86,16 @@ def capture_sequence(db: Any, *, location_id: int, trigger: dict[str, Any],
                 rtsp_url, start_offset_seconds=offset, gap_seconds=interval,
                 frame_count=frame_count, output_pattern=pattern, apply_entrance_crop=False,
             )
-            lock = workflow._acquire_retrieval_ffmpeg_lock(wait_seconds=workflow.settings.retrieval_ffmpeg_lock_wait_seconds)
+            wait_seconds = (workflow.settings.transaction_assignment_retrieval_wait_seconds if section == "kiosk"
+                            else workflow.settings.retrieval_ffmpeg_lock_wait_seconds)
+            waiting_since = monotonic()
+            logger.info("Waiting for NVR retrieval slot: section=%s trigger_id=%s script_run_id=%s timeout=%ss",
+                        section, trigger_id, run_id, wait_seconds)
+            lock = workflow._acquire_retrieval_ffmpeg_lock(wait_seconds=wait_seconds)
             if lock is None:
-                raise RuntimeError(f"{section} retrieval could not acquire the NVR/FFmpeg lock.")
+                raise RuntimeError(f"{section} retrieval waited {wait_seconds}s for the shared NVR/FFmpeg slot; "
+                                   "another retrieval is still busy. No capture or AI request was started.")
+            waited_seconds = round(monotonic() - waiting_since, 3)
             try:
                 completed = subprocess.run(command, capture_output=True, text=True,
                                            timeout=max(1, int(workflow.settings.retrieval_ffmpeg_timeout_seconds)))
@@ -108,7 +118,8 @@ def capture_sequence(db: Any, *, location_id: int, trigger: dict[str, Any],
                                "image_url": str(uploaded.get("public_url") or workflow._spaces_download_url_for_object_key(key))})
         result = {"trigger_id": trigger_id, "trigger_time": exit_time.isoformat(),
                   "section": section, "recorder_channel": channel, "exit_direction": direction,
-                  "delayed_seconds": delay, "frames": frames, "script_run_id": run_id}
+                  "delayed_seconds": delay, "frames": frames, "script_run_id": run_id,
+                  "retrieval_wait_seconds": waited_seconds}
         repositories.finish_script_run(db, run_id, status="success", stderr_log="",
             stdout_log=repositories.merge_script_run_stdout_fields(db, run_id, result))
         return result
