@@ -21,6 +21,24 @@ class GroupingExpandDurationRequest(BaseModel):
     duration_minutes: int = Field(ge=1, le=120, strict=True)
 
 
+class TransactionAssignmentControlRequest(BaseModel):
+    enabled: bool
+
+
+@router.get("/transaction-assignment-control")
+def get_transaction_assignment_control(db: Session = Depends(get_transaction_db)) -> dict:
+    from ..services import transaction_assignment
+    return {"enabled": transaction_assignment.is_enabled(db)}
+
+
+@router.put("/transaction-assignment-control")
+def update_transaction_assignment_control(payload: TransactionAssignmentControlRequest,
+                                          db: Session = Depends(get_transaction_db)) -> dict:
+    from ..services import transaction_assignment
+    repositories.set_app_setting(db, transaction_assignment.ENABLED_SETTING_KEY, "true" if payload.enabled else "false")
+    return {"ok": True, "enabled": payload.enabled}
+
+
 @router.get("/grouping-expand-duration")
 def get_grouping_expand_duration(db: Session = Depends(get_transaction_db)) -> dict:
     from ..services import grouping_expand

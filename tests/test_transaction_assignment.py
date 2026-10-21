@@ -24,6 +24,11 @@ def receipt(number, paid_at):
 
 
 class AssignmentTests(unittest.TestCase):
+    def setUp(self):
+        enabled = patch.object(assignment, "is_enabled", return_value=True)
+        enabled.start()
+        self.addCleanup(enabled.stop)
+
     def test_user_scenarios_are_decided_per_payment_not_receipt_count(self):
         a = group(1, time(10), time(10, 5))
         for b_exit, expected in [(time(10, 2), [1]), (time(10, 6), [1, 3]), (time(9, 58), [1])]:
@@ -104,6 +109,16 @@ class AssignmentTests(unittest.TestCase):
         self.assign(rows, groups)
         saved = self.calls["save"].call_args.kwargs
         self.assign(rows, groups, previous={"1": {"context_hash": saved["context_hash"], "status": "assigned", "evidence": saved["decision"]}})
+        self.calls["decide_with_jev"].assert_not_called()
+        self.calls["save"].assert_not_called()
+
+    def test_failed_receipt_is_not_automatically_resent_even_if_context_changes(self):
+        previous = {"1": {"context_hash": "older", "status": "error", "evidence": {
+            "status": "error", "entry_trigger_id": None, "method": "jev", "reason": "Provider failed"}}}
+        assigned, report = self.assign([receipt(1, time(10, 3))], [group(1, time(10), time(10, 5)), group(3, time(9), None)], previous=previous)
+        self.assertEqual(assigned, [])
+        self.assertEqual(report["status"], "needs_review")
+        self.assertTrue(report["decisions"][0]["cached"])
         self.calls["decide_with_jev"].assert_not_called()
         self.calls["save"].assert_not_called()
 
@@ -205,6 +220,59 @@ class AssignmentTests(unittest.TestCase):
         self.assertEqual(times[-1], time(10) + timedelta(seconds=4))
         self.assertEqual(set(call.call_args.args[2]["questions"]["receipt_owner"]["criteria"]), options)
         self.assertEqual(finish.call_args.kwargs["status"], "success")
+
+
+class AssignmentPauseTests(unittest.TestCase):
+    def test_default_is_paused_and_only_explicit_true_resumes(self):
+        for value, expected in [(None, False), ("false", False), ("true", True), ("unexpected", False)]:
+            with self.subTest(value=value), patch.object(assignment.repositories, "get_app_setting", return_value=value):
+                self.assertEqual(assignment.is_enabled(Mock()), expected)
+
+    def test_paused_assignment_does_not_query_receipts_or_send_api(self):
+        with patch.object(assignment, "is_enabled", return_value=False), \
+             patch.object(workflow.repositories, "list_paid_transactions_for_assignment") as query, \
+             patch.object(assignment, "decide_with_jev") as call:
+            with self.assertRaises(assignment.AssignmentPaused):
+                assignment.assign(Mock(), batch_id=1, location_id=2, group={"entry": [1]}, start_time=time(10), end_time=time(11))
+        query.assert_not_called()
+        call.assert_not_called()
+
+    def test_paused_confidence_batch_stays_queued_without_scoring_or_error_record(self):
+        with patch.object(assignment, "is_enabled", return_value=False), \
+             patch.object(workflow, "_try_acquire_theft_confidence_lock") as lock, \
+             patch.object(workflow, "_run_theft_confidence_for_grouping_batch_locked") as score:
+            result = workflow.run_theft_confidence_for_grouping_batch(Mock(), batch_id=1)
+        self.assertEqual(result["reason"], "transaction_assignment_paused")
+        score.assert_not_called()
+        lock.assert_not_called()
+
+    def test_direct_assignment_call_is_blocked_before_capture_or_script_creation(self):
+        with patch.object(assignment, "is_enabled", return_value=False), \
+             patch.object(workflow.repositories, "create_script_run_started") as create, \
+             patch.object(identifier_capture, "capture_sequence") as capture:
+            with self.assertRaises(assignment.AssignmentPaused):
+                assignment.decide_with_jev(Mock(), location_id=2, batch_id=1, receipt="a", row={},
+                    paid_at=time(10), candidates=[group(1, time(9), time(11))], mapping={})
+        create.assert_not_called()
+        capture.assert_not_called()
+
+    def test_worker_does_not_spawn_or_requeue_while_paused(self):
+        from app.workers.theft_confidence_worker import TheftConfidenceWorker, RunningJob
+        from app.workers import theft_confidence_worker as module
+        worker = TheftConfidenceWorker()
+        process = Mock()
+        process.poll.return_value = None
+        worker._running[1] = RunningJob(process=process, batch_id=1, location_id=2)
+        with patch.object(module, "TransactionalSessionLocal", return_value=Mock()), \
+             patch.object(assignment, "is_enabled", return_value=False), \
+             patch.object(module.repositories, "list_pending_theft_confidence_batches") as query, \
+             patch.object(module.subprocess, "Popen") as spawn, self.assertLogs(module.logger, level="WARNING"):
+            worker._fill_available_slots()
+        process.terminate.assert_called_once()
+        process.wait.assert_called_once_with(timeout=10)
+        self.assertEqual(worker._running, {})
+        query.assert_not_called()
+        spawn.assert_not_called()
 
 
 if __name__ == "__main__":

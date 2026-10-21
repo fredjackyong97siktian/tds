@@ -8,6 +8,21 @@ from .. import repositories
 from . import transaction_assignment_store as store
 
 POLICY_VERSION = 1
+ENABLED_SETTING_KEY = "paid_transaction_assignment_enabled"
+
+
+class AssignmentPaused(RuntimeError):
+    pass
+
+
+def is_enabled(db):
+    # Explicit opt-in: keep work queued while the assignment issue is investigated.
+    return str(repositories.get_app_setting(db, ENABLED_SETTING_KEY) or "false").strip().lower() == "true"
+
+
+def require_enabled(db):
+    if not is_enabled(db):
+        raise AssignmentPaused("Transaction Assignment is paused. Confidence analysis remains queued; no purchase decision was made.")
 
 
 def payment_time(row):
@@ -94,6 +109,8 @@ def _references(db, group):
 def decide_with_jev(db, *, location_id, batch_id, receipt, row, paid_at, candidates, mapping):
     from . import identifier_capture, jev_pipeline, workflow_service as workflow
 
+    require_enabled(db)
+
     run_id = repositories.create_script_run_started(
         db, session_id=None, trigger_id=candidates[0]["entry_trigger_id"], script_name="grouping",
         model_name="openrouter-jev-1.14_transaction_assignment", command=workflow.SCRIPT_RUN_COMMAND_REDACTED,
@@ -129,6 +146,7 @@ def decide_with_jev(db, *, location_id, batch_id, receipt, row, paid_at, candida
                     "A bystander near the kiosk is not necessarily the payer. Do not assign by timing alone: every candidate was active at payment. "
                     "Do not invent hidden faces or items. Choose exactly one owner, none if clearly another customer, "
                     "or uncertain when identity/visibility/machine association is unclear. Other receipts may belong to the same group.")}}}
+        require_enabled(db)
         response, _meta = jev_pipeline.logged_call(db, run_id, body, list(dict.fromkeys(all_urls)), description="Paid transaction assignment")
         answer = jev_pipeline.read_choice(response, "receipt_owner", set(options))
         choice = answer["choice"] if answer["confidence"] >= jev_pipeline.MIN_CHOICE_CONFIDENCE else "uncertain"
@@ -141,12 +159,15 @@ def decide_with_jev(db, *, location_id, batch_id, receipt, row, paid_at, candida
         evidence.update(status="error", entry_trigger_id=None, reason=str(exc))
         repositories.finish_script_run(db, run_id, status="failed", stderr_log=str(exc),
             stdout_log=repositories.merge_script_run_stdout_fields(db, run_id, evidence))
+        if isinstance(exc, AssignmentPaused):
+            raise
     return evidence
 
 
 def assign(db, *, batch_id, location_id, group, start_time, end_time):
     from . import workflow_service as workflow
 
+    require_enabled(db)
     entries = workflow._group_trigger_id_list(group.get("entry"))
     if len(entries) != 1:
         raise ValueError("Transaction assignment requires exactly one entry trigger.")
@@ -164,6 +185,7 @@ def assign(db, *, batch_id, location_id, group, start_time, end_time):
         location = repositories.get_location_endpoint(db, location_id)
         decisions, assigned = [], []
         for receipt, row in zip(receipts, rows):
+            require_enabled(db)
             paid_at, source = payment_time(row)
             if paid_at is None:
                 raise ValueError(f"Paid receipt {receipt} has no usable payment timestamp.")
@@ -174,7 +196,7 @@ def assign(db, *, batch_id, location_id, group, start_time, end_time):
                                   for value in eligible], "mapping": mapping}
             context_hash = hashlib.sha256(json.dumps(context, default=str, sort_keys=True).encode()).hexdigest()
             previous = cached.get(receipt)
-            if previous and previous["context_hash"] == context_hash and previous["status"] != "error":
+            if previous and (previous["context_hash"] == context_hash or previous["status"] == "error"):
                 decision = {**previous["evidence"], "cached": True}
             elif previous and previous["status"] == "assigned":
                 # Never silently move a receipt after another confidence result used it.

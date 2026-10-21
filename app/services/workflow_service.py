@@ -11010,6 +11010,10 @@ def run_theft_confidence_for_grouping_batch(
     *,
     batch_id: int,
 ) -> dict[str, Any]:
+    from . import transaction_assignment
+    if not transaction_assignment.is_enabled(db):
+        return {"ok": True, "batch_id": batch_id, "analyzed_count": 0, "promoted_count": 0,
+                "skipped": True, "reason": "transaction_assignment_paused"}
     lock_conn = _try_acquire_theft_confidence_lock(batch_id, wait_seconds=0)
     if lock_conn is None:
         return {
@@ -11529,6 +11533,8 @@ def score_confidence_for_single_group(
     created_session_ids: set[int],
     queued_video_asset_ids: set[int],
 ) -> dict[str, int]:
+    from . import transaction_assignment
+    transaction_assignment.require_enabled(db)
     # Scores exactly one group and writes its filter_confidence_result -
     # duplicated from the per-group body of
     # _run_theft_confidence_for_grouping_batch_locked() (rather than shared)

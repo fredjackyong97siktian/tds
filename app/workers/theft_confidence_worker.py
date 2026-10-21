@@ -10,6 +10,7 @@ from threading import Lock
 from .. import repositories
 from ..config import settings
 from ..db import TransactionalSessionLocal
+from ..services import transaction_assignment
 
 
 logger = logging.getLogger("tds.theft_confidence_worker")
@@ -102,11 +103,13 @@ class TheftConfidenceWorker:
         with self._lock:
             running_jobs = list(self._running.values())
         available_slots = max(0, self._max_workers - len(running_jobs))
-        if available_slots <= 0:
-            return
-
         db = TransactionalSessionLocal()
         try:
+            if not transaction_assignment.is_enabled(db):
+                self._stop_assignment_jobs()
+                return
+            if available_slots <= 0:
+                return
             if repositories.is_worker_paused(db, "theft_confidence_analysis"):
                 return
             candidates = repositories.list_pending_theft_confidence_batches(
@@ -133,6 +136,21 @@ class TheftConfidenceWorker:
                 logger.info("Claimed theft confidence batch_id=%s location_id=%s pid=%s", batch_id, location_id, process.pid)
         finally:
             db.close()
+
+    def _stop_assignment_jobs(self) -> None:
+        with self._lock:
+            items = list(self._running.items())
+        for batch_id, job in items:
+            if job.process.poll() is None:
+                logger.warning("Stopping confidence batch_id=%s because Transaction Assignment is paused", batch_id)
+                job.process.terminate()
+                try:
+                    job.process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    job.process.kill()
+                    job.process.wait()
+            with self._lock:
+                self._running.pop(batch_id, None)
 
 
 def main() -> None:

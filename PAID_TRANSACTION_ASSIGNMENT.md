@@ -1,5 +1,30 @@
 # Paid Transaction Assignment
 
+## Temporary Pause
+
+Transaction Assignment now defaults to PAUSED. Deploy/restart the API and
+theft-confidence worker for this change to take effect. To stop new jobs on
+an older deployment immediately, pause Theft Confidence Analysis in Workers.
+That older control does not cancel requests already in flight.
+
+Settings -> Pipeline -> Transaction Assignment provides a pause/resume
+control backed by `tds_app_setting.paid_transaction_assignment_enabled`.
+Only the explicit string `true` enables it. No new SQL migration is needed
+for this control. Grouping and existing L1 analysis continue while new
+confidence scoring remains queued before assignment; the pause never treats
+unassigned purchases as zero purchases or reverts to window-only ownership.
+
+The updated confidence worker terminates its own active confidence child
+processes when it sees the pause, including when all worker slots are full.
+An external request already accepted by the provider cannot be unbilled by
+stopping the local process. An old worker must be restarted to adopt this
+behavior. Manual scoring and the assignment API path also check the pause.
+
+Failed receipt decisions are retained and reused rather than automatically
+resent, even if the candidate context changes. Resolving/retrying those
+failed receipts now requires an explicit reset of their ownership record;
+ordinary polling or grouping retries will not trigger another paid attempt.
+
 ## Deployment
 
 Run `migrations/20261021_paid_transaction_assignment.sql` on MySQL before
