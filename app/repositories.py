@@ -278,6 +278,33 @@ def _resolve_trigger_entry_identity(
     return None, None
 
 
+def _attach_cctv_exit_directions(db: Session, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    eligible = {f"cctv_exit_direction:{int(row['id'])}": row for row in rows
+                if str(row.get("section") or "").lower() in {"identifier", "kiosk"}}
+    for row in rows:
+        row["exit_direction"] = None
+    if eligible:
+        statement = text(f"select setting_key, setting_value from {_table('app_setting')} "
+                         "where setting_key in :keys").bindparams(bindparam("keys", expanding=True))
+        for setting in _fetch_all_dicts(db.execute(statement, {"keys": list(eligible)})):
+            eligible[setting["setting_key"]]["exit_direction"] = setting["setting_value"] or None
+    return rows
+
+
+def _save_cctv_exit_direction(db: Session, cctv_id: int, payload: Mapping[str, Any]) -> None:
+    # Store per-camera configuration in existing app settings; no schema migration.
+    eligible = str(payload.get("section") or "").lower() in {"identifier", "kiosk"}
+    if eligible and "exit_direction" not in payload:
+        return
+    key = f"cctv_exit_direction:{cctv_id}"
+    if not eligible or not payload.get("exit_direction"):
+        db.execute(text(f"delete from {_table('app_setting')} where setting_key = :key"), {"key": key})
+        return
+    db.execute(text(f"insert into {_table('app_setting')} (setting_key, setting_value) values (:key, :value) "
+                    "on duplicate key update setting_value = values(setting_value)"),
+               {"key": key, "value": payload["exit_direction"]})
+
+
 def get_cctv(db: Session, cctv_id: int) -> dict[str, Any]:
     cctv_table = _table("cctv")
     location_endpoint_table = _table("location_endpoint")
@@ -300,7 +327,7 @@ def get_cctv(db: Session, cctv_id: int) -> dict[str, Any]:
         ),
         {"cctv_id": cctv_id},
     )
-    return _fetch_one_dict(result)
+    return _attach_cctv_exit_directions(db, [_fetch_one_dict(result)])[0]
 
 
 def get_cctv_by_location_section(db: Session, *, location_id: int, section: str) -> dict[str, Any]:
@@ -327,7 +354,7 @@ def get_cctv_by_location_section(db: Session, *, location_id: int, section: str)
         ),
         {"location_id": location_id, "section": section},
     )
-    return _fetch_one_dict(result)
+    return _attach_cctv_exit_directions(db, [_fetch_one_dict(result)])[0]
 
 
 def update_cctv_delayed_seconds(
@@ -374,7 +401,7 @@ def list_cctv(db: Session, location_id: int | None = None) -> list[dict[str, Any
                 """
             )
         )
-        return _fetch_all_dicts(result)
+        return _attach_cctv_exit_directions(db, _fetch_all_dicts(result))
 
     result = db.execute(
         text(
@@ -396,7 +423,7 @@ def list_cctv(db: Session, location_id: int | None = None) -> list[dict[str, Any
         ),
         {"location_id": location_id},
     )
-    return _fetch_all_dicts(result)
+    return _attach_cctv_exit_directions(db, _fetch_all_dicts(result))
 
 
 def get_dashboard_activity_timeseries(db: Session, *, hours: int = 24) -> list[dict[str, Any]]:
@@ -5823,8 +5850,10 @@ def create_cctv(db: Session, payload: Mapping[str, Any]) -> dict[str, Any]:
             "delayed_seconds": payload.get("delayed_seconds", 0),
         },
     )
+    cctv_id = int(result.lastrowid)
+    _save_cctv_exit_direction(db, cctv_id, payload)
     db.commit()
-    return get_cctv(db, int(result.lastrowid))
+    return get_cctv(db, cctv_id)
 
 
 def update_cctv(db: Session, cctv_id: int, payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -5851,9 +5880,10 @@ def update_cctv(db: Session, cctv_id: int, payload: Mapping[str, Any]) -> dict[s
             "delayed_seconds": payload.get("delayed_seconds", 0),
         },
     )
-    db.commit()
     if result.rowcount == 0:
-        raise ValueError("CCTV record not found.")
+        get_cctv(db, cctv_id)
+    _save_cctv_exit_direction(db, cctv_id, payload)
+    db.commit()
     return get_cctv(db, cctv_id)
 
 
@@ -5868,6 +5898,8 @@ def delete_cctv(db: Session, cctv_id: int) -> bool:
         ),
         {"cctv_id": cctv_id},
     )
+    if result.rowcount:
+        _save_cctv_exit_direction(db, cctv_id, {"section": ""})
     db.commit()
     return bool(result.rowcount)
 

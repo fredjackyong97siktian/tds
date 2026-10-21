@@ -1,7 +1,7 @@
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class HealthResponse(BaseModel):
@@ -16,6 +16,14 @@ class CctvBase(BaseModel):
     stream_name: str | None = None
     recorder_channel: str | None = None
     delayed_seconds: int = 0
+    exit_direction: Literal["left", "right", "up", "down", "upper_left", "upper_right",
+                            "lower_left", "lower_right", "towards_camera", "away_from_camera"] | None = None
+
+    @model_validator(mode="after")
+    def validate_exit_direction_section(self):
+        if self.exit_direction is not None and self.section.strip().lower() not in {"identifier", "kiosk"}:
+            raise ValueError("Exit direction is supported only for identifier and kiosk cameras.")
+        return self
 
 
 class CctvCreate(CctvBase):

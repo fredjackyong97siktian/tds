@@ -33,7 +33,7 @@ def create_cctv(payload: CctvCreate, db: Session = Depends(get_transaction_db)) 
 @router.put("/{cctv_id}", response_model=CctvResponse)
 def update_cctv(cctv_id: int, payload: CctvUpdate, db: Session = Depends(get_transaction_db)) -> CctvResponse:
     try:
-        row = repositories.update_cctv(db, cctv_id, payload.model_dump())
+        row = repositories.update_cctv(db, cctv_id, payload.model_dump(exclude_unset=True))
     except ValueError as exc:
         raise HTTPException(status_code=404, detail="CCTV record not found.") from exc
     return CctvResponse(**row)

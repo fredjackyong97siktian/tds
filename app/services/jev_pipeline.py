@@ -164,9 +164,9 @@ CARRY_REASONS = {"yellow_bag", "bag_enlarged", "unexplained_carry_change", "cons
                  "consistent_with_receipt", "unclear_images", "uncertain_receipt_assignment", "other"}
 
 
-def carry_result(response: Mapping[str, Any]) -> dict[str, Any]:
+def carry_result(response: Mapping[str, Any], *, reason_options: set[str] | None = None) -> dict[str, Any]:
     status = read_choice(response, "carry_status", {"suspicious", "reasonable", "insufficient_evidence"})
-    reason = read_choice(response, "carry_reason", CARRY_REASONS)
+    reason = read_choice(response, "carry_reason", reason_options if reason_options is not None else CARRY_REASONS)
     effective = status["choice"] if status["confidence"] >= MIN_CHOICE_CONFIDENCE else "insufficient_evidence"
     allowed = {
         "suspicious": {"yellow_bag", "bag_enlarged", "unexplained_carry_change"},
@@ -298,19 +298,89 @@ def verify_adjacent(db: Any, script_run_id: int, entry_groups: list[dict[str, An
     return {int(group["group_number"]): result}, {}, {}, meta
 
 
+NO_PURCHASE_REASONS = {"unexplained_carry_change", "bag_enlarged", "consistent_with_entry", "unclear_images", "other"}
+
+
+def no_purchase_request(entries: list[dict[str, Any]], exits: list[dict[str, Any]],
+                        identifier_sequences: list[dict[str, Any]]) -> tuple[dict[str, Any], list[str]]:
+    if not entries or not exits:
+        raise ValueError("No-purchase carry analysis requires both entry and exit reference frames.")
+    expected = {int(item["trigger_id"]) for item in exits}
+    actual = [int(item["trigger_id"]) for item in identifier_sequences]
+    if len(actual) != len(expected) or set(actual) != expected:
+        raise ValueError("Each exit needs its own identifier-camera sequence.")
+    if {int(item["trigger_id"]) for item in entries} & expected:
+        raise ValueError("A no-purchase trigger cannot be both entry and exit.")
+    if any(len(item.get("frames") or []) != 12 or not item.get("exit_direction") for item in identifier_sequences):
+        raise ValueError("Each identifier sequence needs all 12 frames and a configured exit direction.")
+    sequences, urls = encode_sequences([*entries, *exits, *identifier_sequences])
+    first_identifier = len(entries) + len(exits)
+    identifier_payload = []
+    for encoded, original in zip(sequences[first_identifier:], identifier_sequences):
+        identifier_payload.append({**encoded, "camera_section": "identifier",
+            "recorder_channel": original["recorder_channel"], "exit_direction": original["exit_direction"],
+            "exit_trigger_id": original["trigger_id"], "exit_time": original["trigger_time"],
+            "window_relative_to_exit_seconds": [-8.5, -3], "interval_seconds": 0.5})
+    state = {"entry_sequences": sequences[:len(entries)],
+             "exit_sequences": sequences[len(entries):first_identifier],
+             "identifier_sequences": identifier_payload, "paid_transactions_in_visit_window": [],
+             "transaction_scope": "No paid transactions returned by the current visit-window query; not proof of theft."}
+    instructions = (
+        "Assess the grouped customer's carrying change using the original entrance entry and exit frames "
+        "plus the identifier camera sequences from inside the store. The entrance sequences are labeled "
+        "entry/exit references; do not apply an identifier camera direction to the entrance camera. "
+        "Each identifier sequence has its own exit_trigger_id and configured exit_direction, relative to "
+        "THAT camera's image. Use it to locate the route towards the door and follow the matched customer "
+        "leaving. Frames are oldest to newest, 0.5 seconds apart, from 8.5 to 3 seconds before that exit. "
+        "There may be multiple exits for this group: compare all sequences, do not double-count the same item "
+        "or repeated view, and do not attribute another customer's items to this customer. "
+        "Compare clearly visible belongings at entry against what this customer carries towards/out of the exit. "
+        "Example: one orange bottle at entry and one orange plus one pink bottle when leaving means newly "
+        "carried goods, hence suspicious. Only that same orange bottle when leaving, with clear comparison, "
+        "means reasonable. An existing bag or yellow container alone is not suspicious in this no-purchase check. "
+        "A visibly fuller/loaded bag or clearly new carried store goods can be suspicious. Do not infer contents "
+        "inside opaque bags, assume an item was absent just because it was occluded at entry, or invent exact counts. "
+        "No paid transactions alone is not evidence of theft. If the customer, route, carrying state, original "
+        "belongings, or whether newly seen goods are actually taken out cannot be compared clearly, choose "
+        "insufficient_evidence, not an all-clear. Reasonable means no new carried goods observed with adequate "
+        "visibility; it does not prove nothing concealed was taken. Suspicious flags L1, not confirmed theft."
+    )
+    reasons = {
+        "unexplained_carry_change": "Clearly newly carried goods beyond the belongings visible at entry.",
+        "bag_enlarged": "An existing bag visibly becomes fuller or loaded as the customer leaves.",
+        "consistent_with_entry": "Adequate visibility; only original entry belongings are carried out, or nothing is carried out.",
+        "unclear_images": "Identity, direction, entry baseline, or carrying comparison is obscured or unclear.",
+        "other": "The listed visual reasons are not supported clearly enough.",
+    }
+    return {"model": jev.MODEL, "state": state, "questions": {
+        "carry_status": {"type": "choice", "instructions": instructions + " Which carrying status applies?", "criteria": {
+            "suspicious": "Clear new carried goods or a visibly loaded/enlarged bag compared with entry.",
+            "reasonable": "Enough visible evidence; no new carried goods beyond original entry belongings observed.",
+            "insufficient_evidence": "Not enough evidence to establish either outcome without guessing.",
+        }},
+        "carry_reason": {"type": "choice", "instructions": instructions + " Independently select the best-supported reason.",
+                         "criteria": reasons},
+    }}, urls
+
+
 def evaluate_carry(db: Any, *, batch_id: int, group_key: str, location_id: int,
                    group: Mapping[str, Any], transactions: list[dict[str, Any]]) -> dict[str, Any]:
     from .. import repositories
     from . import workflow_service as workflow
+    from . import identifier_capture
 
     entry_ids = [int(value) for value in (workflow._read_group_value(group, "entry") or [])]
     exit_ids = [int(value) for value in (workflow._read_group_value(group, "exit") or [])]
+    no_purchase = not transactions
+    identifier_sequences = []
     run_id = repositories.create_script_run_started(
         db, session_id=None, trigger_id=entry_ids[0] if entry_ids else None,
-        script_name="carry_confidence", model_name="openrouter-jev-1.14_carry_confidence",
+        script_name="carry_confidence",
+        model_name="openrouter-jev-1.14_no_purchase_carry_confidence" if no_purchase else "openrouter-jev-1.14_carry_confidence",
         command=workflow.SCRIPT_RUN_COMMAND_REDACTED,
         runner_payload={"batch_id": batch_id, "group_key": group_key, "location_id": location_id,
-                        "entry_trigger_ids": entry_ids, "exit_trigger_ids": exit_ids, "model": jev.MODEL},
+                        "entry_trigger_ids": entry_ids, "exit_trigger_ids": exit_ids, "model": jev.MODEL,
+                        "no_purchase_identifier_check": no_purchase},
     )
     try:
         triggers = []
@@ -322,16 +392,35 @@ def evaluate_carry(db: Any, *, batch_id: int, group_key: str, location_id: int,
             frames = [frame for frame in ((assets[0].get("frames") or []) if assets else [])
                       if frame.get("status") == "ok" and frame.get("image_url")]
             frames = sorted(frames, key=lambda frame: int(frame.get("frame_index") or 0))[:workflow._grouping_frames_per_trigger(db)]
+            if not frames:
+                raise ValueError(f"Trigger {trigger_id} has no usable reference frames.")
             triggers.append({"trigger_id": trigger_id, "trigger_time": trigger.get("trigger_time"), "frames": frames})
-        body, urls = carry_request(triggers[:len(entry_ids)], triggers[len(entry_ids):], workflow._transaction_summary(transactions))
+        if no_purchase:
+            if not entry_ids or not exit_ids or set(entry_ids) & set(exit_ids):
+                raise ValueError("No-purchase check needs distinct entry and exit triggers.")
+            for exit_trigger in triggers[len(entry_ids):]:
+                identifier_sequences.append(identifier_capture.capture_exit(
+                    db, location_id=location_id, exit_trigger=exit_trigger, parent_script_run_id=run_id))
+            body, urls = no_purchase_request(triggers[:len(entry_ids)], triggers[len(entry_ids):], identifier_sequences)
+        else:
+            body, urls = carry_request(triggers[:len(entry_ids)], triggers[len(entry_ids):], workflow._transaction_summary(transactions))
         response, meta = logged_call(db, run_id, body, urls, description="Jev carry assessment")
-        result = {**carry_result(response), "script_run_id": run_id,
+        result = {**carry_result(response, reason_options=NO_PURCHASE_REASONS if no_purchase else None), "script_run_id": run_id,
                   "image_urls": urls, "image_count": len(urls), "transactions": workflow._transaction_summary(transactions),
-                  "cost_detail": meta.get("usage"), "receipt_attribution": "time_window_only"}
+                  "cost_detail": meta.get("usage"), "receipt_attribution": "time_window_only",
+                  "no_purchase_identifier_check": no_purchase, "identifier_sequences": identifier_sequences}
+        if no_purchase:
+            result["new_items_observed"] = True if result["status"] == "suspicious" else False if result["status"] == "reasonable" else None
+            result["message"] = {
+                "suspicious": "Newly carried goods or a loaded bag were observed beyond entry belongings; L1 analysis is required, not confirmed theft.",
+                "reasonable": "No newly carried goods were observed beyond original entry belongings. This is not proof that nothing concealed was taken.",
+                "insufficient_evidence": "Entry/exit/identifier evidence cannot establish whether new goods were carried out. This is not an all-clear or a confirmed hit.",
+            }[result["status"]]
     except Exception as exc:
         result = {"status": "insufficient_evidence", "hit": False, "insufficient_evidence": True,
                   "reason": "jev_carry_failed", "message": "Carry assessment could not complete; this is not an all-clear or a carry-factor hit.",
-                  "source": "openrouter_jev_carry", "error": str(exc), "script_run_id": run_id}
+                  "source": "openrouter_jev_carry", "error": str(exc), "script_run_id": run_id,
+                  "no_purchase_identifier_check": no_purchase, "identifier_sequences": identifier_sequences}
         repositories.finish_script_run(db, run_id, status="failed",
                                      stdout_log=repositories.merge_script_run_stdout_fields(db, run_id, result), stderr_log=str(exc))
         return result

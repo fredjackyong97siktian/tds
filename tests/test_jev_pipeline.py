@@ -178,7 +178,7 @@ class JevPipelineTests(unittest.TestCase):
         assets = [{"frames": [{"frame_index": 1, "status": "ok", "image_url": "https://example.test/frame.jpg"}]}]
         db = Mock()
         with patch.object(workflow.repositories, "create_script_run_started", return_value=9), patch.object(workflow.repositories, "get_trigger", return_value={"location_id": 2}), patch.object(workflow.repositories, "list_trigger_frame_assets", return_value=assets) as load, patch.object(workflow.repositories, "get_app_setting", return_value="6"), patch.object(workflow.repositories, "merge_script_run_stdout_fields", side_effect=lambda db, run, payload: json.dumps(payload)), patch.object(workflow.repositories, "finish_script_run") as finish, patch.object(pipeline, "carry_request", return_value=({"questions": {}}, ["https://example.test/frame.jpg"])) as request, patch.object(pipeline, "logged_call", return_value=(carry_answer("reasonable", "consistent_with_entry"), {"usage": {"actual_cost_usd": 0.001}})):
-            result = pipeline.evaluate_carry(db, batch_id=1, group_key="1", location_id=2, group={"entry": [1], "exit": [2, 3]}, transactions=[])
+            result = pipeline.evaluate_carry(db, batch_id=1, group_key="1", location_id=2, group={"entry": [1], "exit": [2, 3]}, transactions=[{"total_items": 1}])
         self.assertEqual([call.kwargs["trigger_id"] for call in load.call_args_list], [1, 2, 3])
         self.assertEqual(len(request.call_args.args[1]), 2)
         self.assertEqual(result["status"], "reasonable")

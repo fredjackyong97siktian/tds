@@ -10532,7 +10532,7 @@ def _evaluate_carry_item_signal_with_ai(
     total_quantity: int,
     total_value: float,
 ) -> dict[str, Any]:
-    if _current_jev_stage_provider(db, "carry") == "jev":
+    if not transactions or _current_jev_stage_provider(db, "carry") == "jev":
         return jev_pipeline.evaluate_carry(
             db, batch_id=batch_id, group_key=group_key, location_id=location_id,
             group=group, transactions=transactions,
@@ -14628,8 +14628,9 @@ def _build_frame_batch_capture_command(
     gap_seconds: float,
     frame_count: int,
     output_pattern: Path,
+    apply_entrance_crop: bool = True,
 ) -> list[str]:
-    crop_filter = _trigger_frame_crop_filter()
+    crop_filter = _trigger_frame_crop_filter() if apply_entrance_crop else None
     fps_filter = f"fps={1 / max(0.04, gap_seconds):.6f}"
     vf_filter = f"{crop_filter},{fps_filter}" if crop_filter else fps_filter
     return [
