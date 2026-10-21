@@ -51,6 +51,44 @@ def save(db, *, location_id, receipt, payment_time_utc, context_hash, decision):
     db.commit()
 
 
+def checkpoint_run(db, run_id, decision):
+    stdout = repositories.merge_script_run_stdout_fields(db, run_id, decision)
+    db.execute(text(f"update {repositories._table('script_run')} set stdout_log=:stdout where id=:id"),
+               {"id": run_id, "stdout": stdout})
+    db.commit()
+
+
+def recover_decision(db, *, location_id, receipt):
+    """Recover a paid answer whose receipt commit was interrupted or failed."""
+    rows = repositories._fetch_all_dicts(db.execute(text(f"""
+        select id, status, runner_payload, stdout_log from {repositories._table('script_run')}
+        where script_name='grouping' and model_name='openrouter-jev-1.14_transaction_assignment'
+          and status in ('success', 'running', 'failed')
+          and cast(json_unquote(json_extract(runner_payload, '$.location_id')) as unsigned)=:location_id
+          and json_unquote(json_extract(runner_payload, '$.receipt_number'))=:receipt
+        order by id desc limit 20
+    """), {"location_id": location_id, "receipt": receipt}))
+    fields = ("status", "entry_trigger_id", "jev_decision", "reason", "kiosk_evidence", "media_owner_trigger_id")
+    for row in rows:
+        try:
+            payload = row.get("runner_payload") or {}
+            payload = json.loads(payload) if isinstance(payload, str) else payload
+            result = row.get("stdout_log") or {}
+            result = json.loads(result) if isinstance(result, str) else result
+            if result.get("status") not in {"assigned", "none", "uncertain"}:
+                continue
+            if row["status"] != "success" and result.get("api_succeeded") is not True:
+                continue
+            if result["status"] == "assigned" and result.get("entry_trigger_id") not in payload.get("candidate_entry_trigger_ids", []):
+                continue
+            return {**{key: result[key] for key in fields if key in result}, "method": "jev",
+                    "script_run_id": int(row["id"]), "recovered_from_script_run": True,
+                    "recorded_candidate_entry_ids": payload.get("candidate_entry_trigger_ids") or []}
+        except (ValueError, TypeError, AttributeError):
+            continue
+    return None
+
+
 def list_overlapping_groups(db, *, location_id, start, end):
     table = repositories._table
     # Group across every successful batch, not only the batch currently being scored.

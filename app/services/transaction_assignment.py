@@ -163,9 +163,9 @@ def decide_with_jev(db, *, location_id, batch_id, receipt, row, paid_at, candida
         choice = answer["choice"] if answer["confidence"] >= jev_pipeline.MIN_CHOICE_CONFIDENCE else "uncertain"
         evidence.update(status="assigned" if choice.startswith("entry_") else choice,
                         entry_trigger_id=int(choice[6:]) if choice.startswith("entry_") else None,
-                        jev_decision=answer, reason=f"Jev selected {choice} for this paid receipt.")
-        repositories.finish_script_run(db, run_id, status="success", stderr_log="",
-            stdout_log=repositories.merge_script_run_stdout_fields(db, run_id, evidence))
+                        jev_decision=answer, reason=f"Jev selected {choice} for this paid receipt.",
+                        api_succeeded=True, persistence_status="awaiting_receipt_commit")
+        store.checkpoint_run(db, run_id, evidence)
     except Exception as exc:
         evidence.update(status="error", entry_trigger_id=None, reason=str(exc))
         repositories.finish_script_run(db, run_id, status="failed", stderr_log=str(exc),
@@ -185,6 +185,9 @@ def assign(db, *, batch_id, location_id, group, start_time, end_time):
     owner = entries[0]
     # A failed query or missing migration must stop scoring, not masquerade as no purchase.
     with store.location_lock(db, location_id):
+        # Config reads may have opened a repeatable-read snapshot BEFORE the
+        # location lock was acquired. Refresh it to see the prior owner's commit.
+        db.commit()
         rows = repositories.list_paid_transactions_for_assignment(
             db, location_id=location_id, start_time=start_time, end_time=end_time)
         rows = list({str(row.get("receipt_number") or row.get("transaction_id")): row for row in rows}.values())
@@ -213,6 +216,17 @@ def assign(db, *, batch_id, location_id, group, start_time, end_time):
                                   for value in eligible], "mapping": mapping}
             context_hash = hashlib.sha256(json.dumps(context, default=str, sort_keys=True).encode()).hexdigest()
             previous = cached.get(receipt)
+            if previous and previous["evidence"].get("attempt_reserved"):
+                recovered = store.recover_decision(db, location_id=location_id, receipt=receipt)
+                if recovered is not None:
+                    recovered.update(receipt_number=receipt, transaction_id=row.get("transaction_id"),
+                                     payment_time=paid_at.isoformat(), payment_time_source=source,
+                                     active_groups=eligible, **mapping)
+                    if set(recovered["recorded_candidate_entry_ids"]) != {item["entry_trigger_id"] for item in eligible}:
+                        recovered["context_changed"] = True
+                    _commit_decision(db, location_id=location_id, receipt=receipt,
+                        payment_time_utc=workflow._local_naive_to_utc(paid_at), context_hash=context_hash, decision=recovered)
+                    previous = {"status": recovered["status"], "context_hash": context_hash, "evidence": recovered}
             failed_run_id = None
             if previous and previous["status"] == "error" and len(eligible) <= 1:
                 # Re-evaluate a failed visual attempt deterministically when the
@@ -221,10 +235,11 @@ def assign(db, *, batch_id, location_id, group, start_time, end_time):
                 previous = None
             if previous and (previous["context_hash"] == context_hash or previous["status"] == "error"):
                 decision = {**previous["evidence"], "cached": True}
-            elif previous and previous["status"] == "assigned":
-                # Never silently move a receipt after another confidence result used it.
+            elif previous:
+                # A successful none/uncertain answer must not be bought again
+                # merely because another grouping batch changed the candidates.
                 decision = {**previous["evidence"], "cached": True, "context_changed": True,
-                            "reason": "Existing receipt owner retained; candidate context changed. Review before reassigning."}
+                            "reason": "Recorded receipt decision retained; candidate context changed. Review before reassigning."}
             else:
                 if len(eligible) == 1:
                     decision = {"status": "assigned", "method": "time", "entry_trigger_id": eligible[0]["entry_trigger_id"],
@@ -233,18 +248,50 @@ def assign(db, *, batch_id, location_id, group, start_time, end_time):
                     decision = {"status": "none", "method": "time", "entry_trigger_id": None,
                                 "reason": "No group was active at payment time."}
                 else:
-                    decision = decide_with_jev(db, location_id=location_id, batch_id=batch_id, receipt=receipt,
-                                               row=row, paid_at=paid_at, candidates=eligible, mapping=mapping)
+                    decision = store.recover_decision(db, location_id=location_id, receipt=receipt)
+                    if decision is None:
+                        # Commit a durable attempt barrier BEFORE any NVR/API
+                        # work. A killed child or failed final write cannot resend.
+                        store.save(db, location_id=location_id, receipt=receipt,
+                            payment_time_utc=workflow._local_naive_to_utc(paid_at), context_hash=context_hash,
+                            decision={"status": "error", "method": "jev", "entry_trigger_id": None,
+                                      "attempt_reserved": True,
+                                      "reason": "Assignment attempt reserved; outcome not committed. Automatic resend blocked."})
+                        decision = decide_with_jev(db, location_id=location_id, batch_id=batch_id, receipt=receipt,
+                                                   row=row, paid_at=paid_at, candidates=eligible, mapping=mapping)
+                    elif set(decision["recorded_candidate_entry_ids"]) != {item["entry_trigger_id"] for item in eligible}:
+                        decision["context_changed"] = True
                 decision.update(receipt_number=receipt, transaction_id=row.get("transaction_id"), payment_time=paid_at.isoformat(),
                                 payment_time_source=source, active_groups=eligible, **mapping)
                 if failed_run_id is not None:
                     decision["supersedes_failed_script_run_id"] = failed_run_id
-                store.save(db, location_id=location_id, receipt=receipt, payment_time_utc=workflow._local_naive_to_utc(paid_at),
-                           context_hash=context_hash, decision=decision)
+                _commit_decision(db, location_id=location_id, receipt=receipt,
+                    payment_time_utc=workflow._local_naive_to_utc(paid_at), context_hash=context_hash, decision=decision)
             decisions.append(decision)
             if decision["status"] == "assigned" and decision.get("entry_trigger_id") == owner and not decision.get("context_changed"):
                 assigned.append({**row, "receipt_attribution": "confirmed_group_ownership"})
     return assigned, _report(owner, rows, assigned, decisions)
+
+
+def _commit_decision(db, *, location_id, receipt, payment_time_utc, context_hash, decision):
+    run_id = decision.get("script_run_id")
+    try:
+        store.save(db, location_id=location_id, receipt=receipt, payment_time_utc=payment_time_utc,
+                   context_hash=context_hash, decision={**decision, "persistence_status": "committed"})
+    except Exception as exc:
+        db.rollback()
+        if run_id:
+            repositories.finish_script_run(db, run_id, status="failed", stderr_log=f"Receipt decision persistence failed: {exc}",
+                stdout_log=repositories.merge_script_run_stdout_fields(db, run_id,
+                    {**decision, "api_succeeded": decision.get("status") != "error", "persistence_status": "failed",
+                     "persistence_error": str(exc)}))
+        raise
+    decision["persistence_status"] = "committed"
+    if run_id:
+        repositories.finish_script_run(db, run_id, status="failed" if decision["status"] == "error" else "success",
+            stderr_log=str(decision.get("reason") or "") if decision["status"] == "error" else "",
+            stdout_log=repositories.merge_script_run_stdout_fields(db, run_id,
+                {**decision, "persistence_status": "committed"}))
 
 
 def _report(owner, rows, assigned, decisions):

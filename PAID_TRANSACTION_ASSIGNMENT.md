@@ -79,6 +79,24 @@ required: ambiguous receipts use the existing OpenRouter key and Jev 1.14.
   candidate context changes, retain the original ownership record, flag the
   new audit for review, and do not count that receipt in the new score. Do
   not silently steal a receipt from an already-scored visit.
+- The location-lock holder refreshes its DB read transaction before loading
+  cached ownership, so a snapshot opened before waiting on the lock cannot
+  hide another worker's just-committed result.
+- Before any paid visual request, commit an error-state attempt reservation
+  in the existing ownership table. This is an incomplete-attempt barrier,
+  not a theft or no-purchase finding. If that write fails, no API call starts.
+  If the child dies mid-request, automatic resending is blocked rather than
+  risking another charge for a request whose outcome is unknown.
+- After a valid API answer, checkpoint its decision on the Script Run while
+  it is still running. Only mark the run successful AFTER ownership commits.
+  A failed ownership write is shown as a persistence failure, not success.
+  Subsequent work can recover this checkpoint or a legacy successful run by
+  location and receipt without sending the images again. Existing failed API
+  responses are not mistaken for recoverable successful answers.
+- Successful `none` and `uncertain` decisions also remain cached if another
+  batch changes the candidate set; flag the changed context for review instead
+  of automatically paying for a new answer. A trigger ID is not the receipt's
+  idempotency key: separate receipts may legitimately share the same trigger.
 - Missing SQL migration or failed transaction queries stop scoring instead of
   pretending there were no purchases. Image/API failures are visible as
   unresolved assignment decisions.

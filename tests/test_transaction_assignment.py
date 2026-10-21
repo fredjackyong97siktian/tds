@@ -116,16 +116,20 @@ class AssignmentTests(unittest.TestCase):
         self.assertEqual(open_params["open_since"], time(9, 3))
         self.assertEqual(open_params["end_time"], time(10, 5))
 
-    def assign(self, rows, groups, *, previous=None, decision=None):
+    def assign(self, rows, groups, *, previous=None, decision=None, recovered=None, save_side_effect=None):
         self.calls = {}
         with ExitStack() as stack:
             for target, name, value in [
                 (store, "location_lock", nullcontext()), (store, "load", previous or {}), (store, "save", None),
+                (store, "recover_decision", recovered),
                 (assignment, "collect_groups", groups), (workflow.repositories, "get_location_endpoint", {"name": "Edumetro"}),
                 (workflow.repositories, "list_paid_transactions_for_assignment", rows),
+                (workflow.repositories, "finish_script_run", None),
+                (workflow.repositories, "merge_script_run_stdout_fields", "{}"),
                 (assignment, "decide_with_jev", decision or {"status": "assigned", "entry_trigger_id": 1, "method": "jev"}),
             ]:
                 self.calls[name] = stack.enter_context(patch.object(target, name, return_value=value))
+            self.calls["save"].side_effect = save_side_effect
             return assignment.assign(Mock(), batch_id=1, location_id=2, group={"entry": [1], "exit": [2]},
                                      start_time=time(10), end_time=time(10, 5))
 
@@ -170,6 +174,95 @@ class AssignmentTests(unittest.TestCase):
         self.assign(rows, groups, previous={"1": {"context_hash": saved["context_hash"], "status": "assigned", "evidence": saved["decision"]}})
         self.calls["decide_with_jev"].assert_not_called()
         self.calls["save"].assert_not_called()
+
+    def test_paid_attempt_is_reserved_before_visual_work_and_finalized_after_receipt_save(self):
+        events = []
+        groups = [group(1, time(10), time(10, 5)), group(3, time(9, 57), time(10, 6))]
+        def saved(db, **kwargs):
+            events.append("reserve" if kwargs["decision"].get("attempt_reserved") else "receipt_committed")
+        self.assign([receipt(1, time(10, 3))], groups, save_side_effect=saved,
+                    decision={"status": "assigned", "entry_trigger_id": 1, "method": "jev", "script_run_id": 77})
+        self.assertEqual(events, ["reserve", "receipt_committed"])
+        self.assertEqual(self.calls["finish_script_run"].call_args.kwargs["status"], "success")
+        self.assertTrue(self.calls["save"].call_args_list[0].kwargs["decision"]["attempt_reserved"])
+
+    def test_failed_final_write_is_not_reported_success_and_retry_does_not_resend(self):
+        groups = [group(1, time(10), time(10, 5)), group(3, time(9, 57), time(10, 6))]
+        with self.assertRaisesRegex(RuntimeError, "write denied"):
+            self.assign([receipt(1, time(10, 3))], groups,
+                save_side_effect=[None, RuntimeError("write denied")],
+                decision={"status": "assigned", "entry_trigger_id": 1, "method": "jev", "script_run_id": 77})
+        self.assertEqual(self.calls["finish_script_run"].call_args.kwargs["status"], "failed")
+        self.assertIn("persistence failed", self.calls["finish_script_run"].call_args.kwargs["stderr_log"])
+        barrier = self.calls["save"].call_args_list[0].kwargs["decision"]
+        self.assign([receipt(1, time(10, 3))], groups,
+                    previous={"1": {"status": "error", "context_hash": "old", "evidence": barrier}})
+        self.calls["decide_with_jev"].assert_not_called()
+        self.calls["save"].assert_not_called()
+
+    def test_reservation_write_failure_prevents_even_the_first_paid_call(self):
+        with self.assertRaisesRegex(RuntimeError, "INSERT denied"):
+            self.assign([receipt(1, time(10, 3))], [group(1, time(10), time(10, 5)), group(3, time(9, 57), None)],
+                        save_side_effect=RuntimeError("INSERT denied"))
+        self.calls["decide_with_jev"].assert_not_called()
+
+    def test_prior_success_is_recovered_without_another_api_call(self):
+        groups = [group(1, time(10), time(10, 5)), group(3, time(9, 57), time(10, 6))]
+        for status in ("assigned", "none", "uncertain"):
+            with self.subTest(status=status):
+                recovered = {"status": status, "entry_trigger_id": 1 if status == "assigned" else None,
+                             "method": "jev", "script_run_id": 77, "recovered_from_script_run": True,
+                             "recorded_candidate_entry_ids": [1, 3]}
+                assigned, report = self.assign([receipt(1, time(10, 3))], groups, recovered=recovered)
+                self.assertEqual(len(assigned), 1 if status == "assigned" else 0)
+                self.assertTrue(report["decisions"][0]["recovered_from_script_run"])
+                self.calls["decide_with_jev"].assert_not_called()
+                self.assertEqual(self.calls["save"].call_count, 1)
+
+    def test_interrupted_attempt_with_checkpoint_recovers_instead_of_remaining_stuck(self):
+        previous = {"1": {"status": "error", "context_hash": "old", "evidence": {"attempt_reserved": True, "status": "error"}}}
+        recovered = {"status": "assigned", "entry_trigger_id": 1, "method": "jev", "script_run_id": 77,
+                     "recovered_from_script_run": True, "recorded_candidate_entry_ids": [1, 3]}
+        assigned, _report = self.assign([receipt(1, time(10, 3))],
+            [group(1, time(10), time(10, 5)), group(3, time(9, 57), time(10, 6))], previous=previous, recovered=recovered)
+        self.assertEqual(len(assigned), 1)
+        self.calls["decide_with_jev"].assert_not_called()
+        self.calls["save"].assert_called_once()
+
+    def test_successful_none_and_uncertain_are_not_rebought_when_candidates_change(self):
+        for status in ("none", "uncertain"):
+            with self.subTest(status=status):
+                previous = {"1": {"status": status, "context_hash": "old", "evidence": {
+                    "status": status, "entry_trigger_id": None, "method": "jev"}}}
+                assigned, report = self.assign([receipt(1, time(10, 3))],
+                    [group(1, time(10), time(10, 5)), group(3, time(9, 57), None)], previous=previous)
+                self.assertEqual(assigned, [])
+                self.assertEqual(report["status"], "needs_review")
+                self.calls["decide_with_jev"].assert_not_called()
+
+    def test_recovery_only_accepts_valid_completed_answers_for_the_scoped_receipt(self):
+        payload = {"candidate_entry_trigger_ids": [1, 3]}
+        rows = [{"id": 77, "status": "success", "runner_payload": payload,
+                 "stdout_log": '{"status":"assigned","entry_trigger_id":1}'}]
+        db = Mock()
+        with patch.object(workflow.repositories, "_fetch_all_dicts", return_value=rows):
+            result = store.recover_decision(db, location_id=2, receipt="receipt-a")
+        self.assertEqual(result["entry_trigger_id"], 1)
+        self.assertEqual(result["script_run_id"], 77)
+        self.assertEqual(db.execute.call_args.args[1], {"location_id": 2, "receipt": "receipt-a"})
+        for result in ('{"status":"error"}', '{"status":"assigned","entry_trigger_id":99}', 'not json'):
+            rows[0]["stdout_log"] = result
+            with patch.object(workflow.repositories, "_fetch_all_dicts", return_value=rows):
+                self.assertIsNone(store.recover_decision(db, location_id=2, receipt="receipt-a"))
+
+    def test_api_succeeded_checkpoint_can_be_recovered_after_database_failure(self):
+        row = {"id": 77, "status": "failed", "runner_payload": {"candidate_entry_trigger_ids": [1, 3]},
+               "stdout_log": {"status": "assigned", "entry_trigger_id": 1, "api_succeeded": True}}
+        with patch.object(workflow.repositories, "_fetch_all_dicts", return_value=[row]):
+            self.assertIsNotNone(store.recover_decision(Mock(), location_id=2, receipt="a"))
+        row["stdout_log"].pop("api_succeeded")
+        with patch.object(workflow.repositories, "_fetch_all_dicts", return_value=[row]):
+            self.assertIsNone(store.recover_decision(Mock(), location_id=2, receipt="a"))
 
     def test_failed_receipt_is_not_automatically_resent_even_if_context_changes(self):
         previous = {"1": {"context_hash": "older", "status": "error", "evidence": {
@@ -285,6 +378,7 @@ class AssignmentTests(unittest.TestCase):
             stack.enter_context(patch.object(workflow.repositories, "create_script_run_started", return_value=8))
             finish = stack.enter_context(patch.object(workflow.repositories, "finish_script_run"))
             stack.enter_context(patch.object(workflow.repositories, "merge_script_run_stdout_fields", return_value="{}"))
+            checkpoint = stack.enter_context(patch.object(store, "checkpoint_run"))
             capture = stack.enter_context(patch.object(identifier_capture, "capture_sequence", return_value={"frames": []}))
             stack.enter_context(patch.object(assignment, "_references", return_value=[]))
             stack.enter_context(patch.object(jev_pipeline, "encode_sequences", return_value=([{}, {}], ["https://example.test/image.jpg"])))
@@ -298,7 +392,8 @@ class AssignmentTests(unittest.TestCase):
         self.assertEqual(times[0], time(10) - timedelta(seconds=5))
         self.assertEqual(times[-1], time(10) + timedelta(seconds=4))
         self.assertEqual(set(call.call_args.args[2]["questions"]["receipt_owner"]["criteria"]), options)
-        self.assertEqual(finish.call_args.kwargs["status"], "success")
+        finish.assert_not_called()
+        self.assertEqual(checkpoint.call_args.args[2]["persistence_status"], "awaiting_receipt_commit")
 
 
 class AssignmentPauseTests(unittest.TestCase):
