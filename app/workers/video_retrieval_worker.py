@@ -30,9 +30,8 @@ class VideoRetrievalWorker:
     # Exactly one ffmpeg process runs at a time, full stop - frame retrieval
     # (quick per-trigger snapshots feeding grouping) and video retrieval (full
     # clips for L1 entrance/kiosk analysis) share this single slot rather than
-    # each getting their own budget. Video candidates are checked first each
-    # cycle (see _fill_available_slots) so an entrance/kiosk analysis waiting
-    # on its video doesn't sit behind a pile of new-trigger frame jobs.
+    # each getting their own budget. Trigger frames are checked first each
+    # cycle so a video backlog cannot starve grouping of its required frames.
     #
     # This used to submit jobs to a ThreadPoolExecutor - a stalled ffmpeg/RTSP
     # call (exactly the kind of thing an NVR under load can produce) occupied
@@ -165,9 +164,44 @@ class VideoRetrievalWorker:
                     1,
                 )
 
-            # Video candidates (entrance/kiosk L1 analysis) are claimed before frame
-            # candidates so an already-queued analysis video doesn't wait behind a
-            # burst of new-trigger frame jobs for the one available slot.
+            # Frames unblock scheduled grouping. Priority applies to the next
+            # free slot; never interrupt a video that is already running.
+            priority_candidates = repositories.list_pending_trigger_frame_asset_retrievals(
+                db,
+                limit=max(self._max_workers * 10, 20),
+            )
+            for candidate in priority_candidates:
+                if available_slots <= 0:
+                    break
+                location_id = candidate.get("location_id")
+                if location_id is None:
+                    continue
+                location_id = int(location_id)
+                if running_by_location.get(location_id, 0) >= max(1, settings.retrieval_max_per_location):
+                    continue
+                frame_asset_id = int(candidate["id"])
+                running_key = f"frame:{frame_asset_id}"
+                if running_key in self._running:
+                    continue
+                claimed = repositories.claim_trigger_frame_asset_for_retrieval(db, frame_asset_id)
+                if not claimed:
+                    continue
+
+                process = subprocess.Popen(
+                    [sys.executable, "-m", "app.workers.run_retrieval_job", "frame", str(frame_asset_id)]
+                )
+                with self._lock:
+                    self._running[running_key] = RunningJob(
+                        process=process,
+                        location_id=location_id,
+                        asset_id=frame_asset_id,
+                        asset_kind="frame_asset",
+                    )
+                running_by_location[location_id] = running_by_location.get(location_id, 0) + 1
+                available_slots -= 1
+                logger.info("Claimed frame retrieval job frame_asset_id=%s location_id=%s pid=%s", frame_asset_id, location_id, process.pid)
+
+            # Videos use the remaining eligible slots after frame jobs.
             video_candidates = repositories.list_pending_video_asset_retrievals(
                 db,
                 limit=max(self._max_workers * 10, 20),
@@ -202,41 +236,6 @@ class VideoRetrievalWorker:
                 running_by_location[location_id] = running_by_location.get(location_id, 0) + 1
                 available_slots -= 1
                 logger.info("Claimed retrieval job video_asset_id=%s location_id=%s pid=%s", video_asset_id, location_id, process.pid)
-
-            frame_candidates = repositories.list_pending_trigger_frame_asset_retrievals(
-                db,
-                limit=max(self._max_workers * 10, 20),
-            )
-            for candidate in frame_candidates:
-                if available_slots <= 0:
-                    break
-                location_id = candidate.get("location_id")
-                if location_id is None:
-                    continue
-                location_id = int(location_id)
-                if running_by_location.get(location_id, 0) >= max(1, settings.retrieval_max_per_location):
-                    continue
-                frame_asset_id = int(candidate["id"])
-                running_key = f"frame:{frame_asset_id}"
-                if running_key in self._running:
-                    continue
-                claimed = repositories.claim_trigger_frame_asset_for_retrieval(db, frame_asset_id)
-                if not claimed:
-                    continue
-
-                process = subprocess.Popen(
-                    [sys.executable, "-m", "app.workers.run_retrieval_job", "frame", str(frame_asset_id)]
-                )
-                with self._lock:
-                    self._running[running_key] = RunningJob(
-                        process=process,
-                        location_id=location_id,
-                        asset_id=frame_asset_id,
-                        asset_kind="frame_asset",
-                    )
-                running_by_location[location_id] = running_by_location.get(location_id, 0) + 1
-                available_slots -= 1
-                logger.info("Claimed frame retrieval job frame_asset_id=%s location_id=%s pid=%s", frame_asset_id, location_id, process.pid)
         finally:
             db.close()
 
