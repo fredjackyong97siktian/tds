@@ -441,7 +441,8 @@ CREATE TABLE IF NOT EXISTS sesamedb.tds_filter_grouping_item (
     result_payload JSON,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    UNIQUE KEY uq_filter_grouping_item_batch_trigger (batch_id, trigger_id),
+    membership_key VARCHAR(100) GENERATED ALWAYS AS (COALESCE(group_key, '')) STORED,
+    UNIQUE KEY uq_filter_grouping_item_membership (batch_id, trigger_id, role, membership_key),
     KEY idx_filter_grouping_item_trigger_id (trigger_id),
     KEY idx_filter_grouping_item_video_asset_id (video_asset_id),
     CONSTRAINT fk_filter_grouping_item_batch

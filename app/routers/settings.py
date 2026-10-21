@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from typing import Literal
 import os
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from ..config import settings
@@ -15,6 +15,24 @@ router = APIRouter(prefix="/api/v1/settings", tags=["settings"])
 
 class FramesPerTriggerRequest(BaseModel):
     frames_per_trigger: int
+
+
+class GroupingExpandDurationRequest(BaseModel):
+    duration_minutes: int = Field(ge=1, le=120, strict=True)
+
+
+@router.get("/grouping-expand-duration")
+def get_grouping_expand_duration(db: Session = Depends(get_transaction_db)) -> dict:
+    from ..services import grouping_expand
+    return {"duration_minutes": grouping_expand.duration_minutes(db), "default": grouping_expand.DEFAULT_MINUTES}
+
+
+@router.put("/grouping-expand-duration")
+def update_grouping_expand_duration(payload: GroupingExpandDurationRequest,
+                                   db: Session = Depends(get_transaction_db)) -> dict:
+    from ..services import grouping_expand
+    repositories.set_app_setting(db, grouping_expand.SETTING_KEY, str(payload.duration_minutes))
+    return {"ok": True, "duration_minutes": payload.duration_minutes}
 
 
 class KioskAnalysisDisabledRequest(BaseModel):

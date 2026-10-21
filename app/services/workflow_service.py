@@ -3652,6 +3652,11 @@ def _persist_grouping_items_from_summary(
     batch_id: int,
     grouping_summary: Mapping[str, Any],
 ) -> None:
+    # A trigger can be shared by multiple groups. Rebuild the memberships from
+    # the authoritative summary, retaining each trigger's retrieved frame data.
+    frame_payloads = {int(item["trigger_id"]): item.get("frame_payload")
+                      for item in repositories.list_grouping_items(db, batch_id) if item.get("frame_payload")}
+    db.execute(text(f"delete from {repositories._table('filter_grouping_item')} where batch_id=:batch_id"), {"batch_id": batch_id})
     groups = grouping_summary.get("groups") or grouping_summary.get("Groups") or []
     grouped_trigger_ids: set[int] = set()
     if isinstance(groups, list):
@@ -3675,11 +3680,15 @@ def _persist_grouping_items_from_summary(
                             group_key=group_key,
                             role=role,
                             status="grouped",
+                            frame_payload=frame_payloads.get(normalized_trigger_id),
                             score=float(group.get("score")) if group.get("score") is not None else None,
                             result_payload=dict(group),
+                            commit=False,
                         )
                     except Exception:
                         logger.exception("Could not persist grouping item batch_id=%s trigger_id=%s", batch_id, trigger_id)
+                        db.rollback()
+                        raise
     open_entries = grouping_summary.get("open_entries") or []
     if isinstance(open_entries, list):
         for trigger_id in open_entries:
@@ -3695,10 +3704,14 @@ def _persist_grouping_items_from_summary(
                     group_key=None,
                     role="unknown",
                     status="unknown",
+                    frame_payload=frame_payloads.get(normalized_trigger_id),
                     result_payload={"reason": "open_entry_waiting_for_exit"},
+                    commit=False,
                 )
             except Exception:
                 logger.exception("Could not persist open grouping item batch_id=%s trigger_id=%s", batch_id, trigger_id)
+                db.rollback()
+                raise
     unknown = grouping_summary.get("unknown") or []
     if isinstance(unknown, list):
         for trigger_id in unknown:
@@ -3714,10 +3727,14 @@ def _persist_grouping_items_from_summary(
                     group_key=None,
                     role="unknown",
                     status="unknown",
+                    frame_payload=frame_payloads.get(normalized_trigger_id),
                     result_payload={"reason": "runner_or_repair_returned_unknown"},
+                    commit=False,
                 )
             except Exception:
                 logger.exception("Could not persist unknown grouping item batch_id=%s trigger_id=%s", batch_id, trigger_id)
+                db.rollback()
+                raise
     issues = grouping_summary.get("issues") or []
     frame_retrieval_issue_trigger_ids = {
         int(trigger_id) for trigger_id in (grouping_summary.get("frame_retrieval_issue_trigger_ids") or [])
@@ -3741,10 +3758,15 @@ def _persist_grouping_items_from_summary(
                     group_key=None,
                     role="unknown",
                     status="issue",
+                    frame_payload=frame_payloads.get(normalized_trigger_id),
                     result_payload={"reason": reason},
+                    commit=False,
                 )
             except Exception:
                 logger.exception("Could not persist issue grouping item batch_id=%s trigger_id=%s", batch_id, trigger_id)
+                db.rollback()
+                raise
+    db.commit()
 
 
 def _invoke_remote_runner(
@@ -6036,6 +6058,9 @@ def delete_confidence_result_and_ungroup(db: Session, confidence_result_id: int)
                 remaining_groups.append(group)
             if ungrouped_trigger_ids:
                 grouping_summary["groups"] = remaining_groups
+                still_used = {value for remaining in remaining_groups if isinstance(remaining, Mapping)
+                              for role in ("entry", "exit") for value in _group_trigger_id_list(remaining.get(role))}
+                ungrouped_trigger_ids = [value for value in ungrouped_trigger_ids if value not in still_used]
                 unknown = _group_trigger_id_list(grouping_summary.get("unknown"))
                 for trigger_id in ungrouped_trigger_ids:
                     if trigger_id not in unknown:
@@ -6058,6 +6083,7 @@ def delete_confidence_result_and_ungroup(db: Session, confidence_result_id: int)
 def build_grouping_analysis_job_from_batch(db: Session, batch_id: int) -> GroupingAnalysisQueued:
     batch = repositories.get_grouping_batch(db, batch_id)
     items = repositories.list_grouping_items(db, batch_id)
+    items = list({int(item["trigger_id"]): item for item in items}.values())
     triggers_payload: list[dict[str, Any]] = []
     for item in items:
         trigger = repositories.get_trigger(db, int(item["trigger_id"]))
@@ -7977,6 +8003,7 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
     # retrieval's actual current outcome, not a stale snapshot taken too early.
     _refresh_grouping_item_frame_payloads(db, batch=batch)
     items = repositories.list_grouping_items(db, batch_id)
+    items = list({int(item["trigger_id"]): item for item in items}.values())
     trigger_inputs: list[dict[str, Any]] = []
     for item in items:
         trigger = repositories.get_trigger(db, int(item["trigger_id"]))
@@ -7989,6 +8016,7 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
                 "phone_entry_id": trigger.get("phone_entry_id"),
                 "credit_card_entry_id": trigger.get("credit_card_entry_id"),
                 "entry_source_type": trigger.get("entry_source_type"),
+                "motion_person_present": trigger.get("motion_person_present"),
                 "frames": frames,
             }
         )
@@ -8057,6 +8085,9 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
         )
         raise RuntimeError("No trigger frame images are available for Gemini grouping.")
 
+    # Adjacent consumes triggers from its output; Expand needs the original
+    # evidence pool, including identity-bearing and already-matched triggers.
+    expand_trigger_inputs = [dict(row) for row in trigger_inputs]
     model_name = str(settings.grouping_gemini_model or "gemini-3.5-flash-lite").strip()
     resize_scale = _grouping_gemini_resize_scale()
     normalized_groups: list[dict[str, Any]] = []
@@ -8774,6 +8805,19 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
                 f"{len(pending_triggers)} trigger(s) left by adjacent were passed straight to repair."
             )
 
+        from . import grouping_expand
+        expand_groups, expand_diagnostics, expand_notes = grouping_expand.run(
+            db, batch_id=batch_id, location_id=int(batch["location_id"]),
+            triggers=expand_trigger_inputs, groups=normalized_groups,
+            window_end=batch["window_end"], excluded_ids=issue_trigger_ids)
+        normalized_groups.extend(expand_groups)
+        notes.extend(expand_notes)
+        for expanded in expand_groups:
+            matched_ids = set(expanded["entry"] + expanded["exit"])
+            grouped_trigger_ids.update(matched_ids)
+            normalized_open_entries.difference_update(matched_ids)
+            normalized_unknown.difference_update(matched_ids)
+
         all_trigger_ids = [int(item["trigger_id"]) for item in items if item.get("trigger_id") is not None]
         normalized_unknown = {
             trigger_id
@@ -8812,6 +8856,7 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
                 "verification_cost_details": verification_cost_details,
                 "issue_trigger_ids": sorted(issue_trigger_ids),
                 "adjacent_matched_groups": len(adjacent_groups),
+                "expand": expand_diagnostics,
             },
         }
         return grouping_summary, {

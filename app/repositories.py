@@ -1870,6 +1870,17 @@ def set_trigger_appearance(
     db.commit()
 
 
+def list_confirmed_non_customer_trigger_ids(db: Session, trigger_ids: list[int]) -> set[int]:
+    if not trigger_ids:
+        return set()
+    statement = text(f"""
+        select id from {_table('trigger_event')}
+        where id in :trigger_ids and motion_person_present = 0
+    """).bindparams(bindparam("trigger_ids", expanding=True))
+    rows = _fetch_all_dicts(db.execute(statement, {"trigger_ids": sorted(set(trigger_ids))}))
+    return {int(row["id"]) for row in rows}
+
+
 def set_trigger_motion_person_present(
     db: Session,
     trigger_id: int,
@@ -3366,6 +3377,7 @@ def upsert_grouping_item(
     score: float | None = None,
     frame_payload: Mapping[str, Any] | None = None,
     result_payload: Mapping[str, Any] | None = None,
+    commit: bool = True,
 ) -> None:
     table_name = _table("filter_grouping_item")
     db.execute(
@@ -3399,7 +3411,8 @@ def upsert_grouping_item(
             "result_payload": _json_dumps(result_payload) if result_payload is not None else None,
         },
     )
-    db.commit()
+    if commit:
+        db.commit()
 
 
 def list_pending_grouping_batches(db: Session, limit: int = 50) -> list[dict[str, Any]]:
@@ -3497,7 +3510,7 @@ def count_recent_grouping_batches(db: Session) -> int:
 def count_grouping_items(db: Session, batch_id: int) -> int:
     table_name = _table("filter_grouping_item")
     result = db.execute(
-        text(f"select count(*) as total from {table_name} where batch_id = :batch_id"),
+        text(f"select count(distinct trigger_id) as total from {table_name} where batch_id = :batch_id"),
         {"batch_id": batch_id},
     )
     row = result.mappings().first()
@@ -3737,7 +3750,7 @@ def _script_run_list_filters(
 ) -> tuple[list[str], dict[str, Any]]:
     filters: list[str] = []
     params: dict[str, Any] = {}
-    if script_name in {"person_presence", "transaction_assignment"}:
+    if script_name in {"person_presence", "transaction_assignment", "grouping_expand"}:
         # Presence checks reuse the allowed grouping script name in older databases.
         filters.append("script_name = :script_name")
         params["script_name"] = "grouping"
