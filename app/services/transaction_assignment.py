@@ -3,11 +3,12 @@
 from datetime import datetime, timedelta
 import hashlib
 import json
+import re
 
 from .. import repositories
 from . import transaction_assignment_store as store
 
-POLICY_VERSION = 1
+POLICY_VERSION = 2
 ENABLED_SETTING_KEY = "paid_transaction_assignment_enabled"
 
 
@@ -36,7 +37,9 @@ def payment_time(row):
 
 def active_groups(groups, paid_at):
     return [group for group in groups if group["entry_time"] <= paid_at
-            and (group.get("exit_time") is None or paid_at <= group["exit_time"])]
+            and ((group.get("exit_time") is not None and paid_at <= group["exit_time"])
+                 or (group.get("exit_time") is None
+                     and paid_at - group["entry_time"] <= timedelta(minutes=store.OPEN_ENTRY_LOOKBACK_MINUTES)))]
 
 
 def machine_side(location_name, row):
@@ -46,7 +49,9 @@ def machine_side(location_name, row):
     name = str(row.get("machine_name") or raw.get("machineName") or raw.get("machine_name") or "").strip()
     side = None
     if "edumetro" in str(location_name).lower():
-        side = {"left": "right", "right": "left"}.get(name.lower())
+        tokens = set(re.findall(r"(?<![a-z])(left|right)(?![a-z])", name.lower()))
+        if len(tokens) == 1:
+            side = {"left": "right", "right": "left"}[tokens.pop()]
     return {"machine_name": name, "image_side": side,
             "mapping": "Edumetro: Left machine = image-right; Right machine = image-left."
             if "edumetro" in str(location_name).lower() else "Machine-to-image mapping not configured; do not assume a side."}
@@ -92,7 +97,13 @@ def collect_groups(db, *, location_id, start, end, batch_id, current_group):
         by_entry[entry_ids[0]] = {"entry_trigger_id": entry_ids[0], "exit_trigger_ids": exit_ids,
                                 "entry_time": entry_time, "exit_time": max(exit_times) if exit_times else None,
                                 "batch_id": batch_id, "group_key": str(group.get("group_id") or group.get("id") or "")}
-    return sorted(by_entry.values(), key=lambda value: value["entry_trigger_id"])
+    # Apply the same bounds to current-batch open entries, which may not yet
+    # exist in the stored item query, and to older/cached batch snapshots.
+    eligible = [value for value in by_entry.values() if value["entry_time"] <= end
+                and ((value["exit_time"] is not None and value["exit_time"] >= start)
+                     or (value["exit_time"] is None
+                         and value["entry_time"] >= start - timedelta(minutes=store.OPEN_ENTRY_LOOKBACK_MINUTES)))]
+    return sorted(eligible, key=lambda value: value["entry_trigger_id"])
 
 
 def _references(db, group):
@@ -177,7 +188,13 @@ def assign(db, *, batch_id, location_id, group, start_time, end_time):
         rows = repositories.list_paid_transactions_for_assignment(
             db, location_id=location_id, start_time=start_time, end_time=end_time)
         rows = list({str(row.get("receipt_number") or row.get("transaction_id")): row for row in rows}.values())
-        groups = collect_groups(db, location_id=location_id, start=start_time, end=end_time, batch_id=batch_id, current_group=group)
+        if not rows:
+            return [], _report(owner, [], [], [])
+        payment_times = [payment_time(row)[0] for row in rows]
+        if any(value is None for value in payment_times):
+            raise ValueError("Paid receipt has no usable payment timestamp.")
+        groups = collect_groups(db, location_id=location_id, start=min(payment_times), end=max(payment_times),
+                                batch_id=batch_id, current_group=group)
         receipts = [str(row.get("receipt_number") or row.get("transaction_id") or "") for row in rows]
         if any(not value or value == "None" for value in receipts):
             raise ValueError("Paid transaction is missing its receipt identity.")
@@ -196,6 +213,12 @@ def assign(db, *, batch_id, location_id, group, start_time, end_time):
                                   for value in eligible], "mapping": mapping}
             context_hash = hashlib.sha256(json.dumps(context, default=str, sort_keys=True).encode()).hexdigest()
             previous = cached.get(receipt)
+            failed_run_id = None
+            if previous and previous["status"] == "error" and len(eligible) <= 1:
+                # Re-evaluate a failed visual attempt deterministically when the
+                # corrected time window proves there is no ambiguity. No resend.
+                failed_run_id = previous["evidence"].get("script_run_id")
+                previous = None
             if previous and (previous["context_hash"] == context_hash or previous["status"] == "error"):
                 decision = {**previous["evidence"], "cached": True}
             elif previous and previous["status"] == "assigned":
@@ -214,18 +237,25 @@ def assign(db, *, batch_id, location_id, group, start_time, end_time):
                                                row=row, paid_at=paid_at, candidates=eligible, mapping=mapping)
                 decision.update(receipt_number=receipt, transaction_id=row.get("transaction_id"), payment_time=paid_at.isoformat(),
                                 payment_time_source=source, active_groups=eligible, **mapping)
+                if failed_run_id is not None:
+                    decision["supersedes_failed_script_run_id"] = failed_run_id
                 store.save(db, location_id=location_id, receipt=receipt, payment_time_utc=workflow._local_naive_to_utc(paid_at),
                            context_hash=context_hash, decision=decision)
             decisions.append(decision)
             if decision["status"] == "assigned" and decision.get("entry_trigger_id") == owner and not decision.get("context_changed"):
                 assigned.append({**row, "receipt_attribution": "confirmed_group_ownership"})
+    return assigned, _report(owner, rows, assigned, decisions)
+
+
+def _report(owner, rows, assigned, decisions):
     unresolved = sum(value["status"] in {"uncertain", "error"} or value.get("context_changed", False) for value in decisions)
-    return assigned, {"version": POLICY_VERSION, "entry_trigger_id": owner,
-                      "status": "needs_review" if unresolved else "complete", "candidate_count": len(rows),
-                      "assigned_count": len(assigned), "unresolved_count": unresolved,
-                      "selection": "none" if not assigned else "all" if len(assigned) == len(rows) else "some",
-                      "assigned_receipts": [str(row.get("receipt_number") or row.get("transaction_id")) for row in assigned],
-                      "decisions": decisions}
+    return {"version": POLICY_VERSION, "entry_trigger_id": owner,
+            "open_entry_lookback_minutes": store.OPEN_ENTRY_LOOKBACK_MINUTES,
+            "status": "needs_review" if unresolved else "complete", "candidate_count": len(rows),
+            "assigned_count": len(assigned), "unresolved_count": unresolved,
+            "selection": "none" if not assigned else "all" if len(assigned) == len(rows) else "some",
+            "assigned_receipts": [str(row.get("receipt_number") or row.get("transaction_id")) for row in assigned],
+            "decisions": decisions}
 
 
 def for_session(db, session_id):

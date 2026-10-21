@@ -20,9 +20,11 @@ An external request already accepted by the provider cannot be unbilled by
 stopping the local process. An old worker must be restarted to adopt this
 behavior. Manual scoring and the assignment API path also check the pause.
 
-Failed receipt decisions are retained and reused rather than automatically
-resent, even if the candidate context changes. Resolving/retrying those
-failed receipts now requires an explicit reset of their ownership record;
+Failed receipt decisions are retained rather than automatically resent, even
+if the candidate context changes. If corrected timing proves there are zero
+or one active groups, the failure can be resolved deterministically without
+another API request (the prior Script Run ID remains in the audit). Still-
+ambiguous failures require an explicit ownership-record reset before retrying;
 ordinary polling or grouping retries will not trigger another paid attempt.
 
 ## Deployment
@@ -40,8 +42,20 @@ required: ambiguous receipts use the existing OpenRouter key and Jev 1.14.
 - Prefer `paymentAttemptAt` (UTC), converted to store-local time for comparison
   with existing trigger timestamps. Fall back explicitly to the POS
   `Formatted Timestamp` when payment time is null. Never use `createdAt`.
-- A group is active at payment when entry <= payment <= its last exit.
-  Known open entries are included, even from earlier successful batches.
+- A completed group is active at payment when entry <= payment <= its last
+  exit. Groups whose actual exit precedes the payment are never candidates.
+  The completed-group query requires an exit, so a corrupt/legacy entry-only
+  membership cannot bypass the unresolved-entry limit.
+- Known open entries may also be considered, but ONLY during the first 60
+  minutes after their entry. This implements the earlier one-hour maximum-stay
+  assumption, separately from Expand's 20-minute search setting. The limit is
+  relative to each receipt's payment timestamp, never the current clock.
+  `OPEN_ENTRY_LOOKBACK_MINUTES` in `transaction_assignment_store.py` is its
+  single source. Historical open entries do not remain active forever.
+- The SQL open-entry lookup starts one hour before the earliest relevant
+  payment, and the same check is applied per receipt and to current-batch
+  snapshots. Queries use actual payment bounds rather than the whole batch
+  period. A visit with no paid receipts skips candidate lookup entirely.
 - Exactly one active group: assign automatically. More than one: compare
   each receipt independently with Jev. A group may receive multiple receipts,
   but a receipt may have only one owner per location.
@@ -50,6 +64,9 @@ required: ambiguous receipts use the existing OpenRouter key and Jev 1.14.
   Apply the kiosk camera's own configured NVR delay; do not entrance-crop.
 - Include each candidate's existing entry and exit images. In Edumetro,
   machine Left means image-right, and machine Right means image-left.
+  Machine names such as `Edumetro-right-1`, `Edumetro-left-2`, and `RIGHT_1`
+  are recognized by their left/right token. Ambiguous names containing both
+  directions are not guessed.
   This reversed mapping is enabled by location name containing Edumetro;
   no camera-side assumption is applied to other locations.
 - Jev can select one candidate, none, or uncertain. Invalid answers, missing
@@ -93,5 +110,8 @@ protects shared probe aliases when their assigned owner becomes a theft case.
 Unit tests cover the three timing scenarios, one-receipt ambiguity, multiple
 receipts, open visits, UTC conversion, Edumetro mapping, decision caching,
 ownership conflicts, session retry guards and ten-frame kiosk capture.
+Regression coverage also includes 531 stale open entries, per-payment age
+limits, current-batch stale snapshots, real long completed visits, automatic
+assignment without Jev, and full kiosk machine names.
 No live database migration, production NVR capture or paid Jev request was
 performed as part of local verification.

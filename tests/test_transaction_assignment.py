@@ -41,6 +41,43 @@ class AssignmentTests(unittest.TestCase):
         groups = [group(1, time(10), time(10, 5)), group(3, time(9, 57), None), group(5, time(10, 4), time(10, 6))]
         self.assertEqual([value["entry_trigger_id"] for value in assignment.active_groups(groups, time(10, 3))], [1, 3])
 
+    def test_stale_unresolved_entries_do_not_count_as_active_forever(self):
+        paid_at = time(10, 3)
+        groups = [group(1, time(10), time(10, 5)),
+                  *[group(100 + n, paid_at - timedelta(days=n + 1), None) for n in range(531)]]
+        self.assertEqual([row["entry_trigger_id"] for row in assignment.active_groups(groups, paid_at)], [1])
+        assigned, report = self.assign([receipt(1, paid_at)], groups)
+        self.assertEqual(len(assigned), 1)
+        self.assertEqual(report["decisions"][0]["method"], "time")
+        self.assertEqual(len(report["decisions"][0]["active_groups"]), 1)
+        self.calls["decide_with_jev"].assert_not_called()
+
+    def test_open_entry_limit_is_relative_to_each_payment_not_now_or_expand_duration(self):
+        paid_at = time(10, 3)
+        groups = [group(1, paid_at - timedelta(minutes=60), None),
+                  group(3, paid_at - timedelta(minutes=60, seconds=1), None),
+                  group(5, paid_at - timedelta(minutes=30), None)]
+        self.assertEqual([row["entry_trigger_id"] for row in assignment.active_groups(groups, paid_at)], [1, 5])
+
+    def test_completed_long_visit_uses_its_real_exit_not_open_entry_age_limit(self):
+        groups = [group(1, time(8), time(10, 5)), group(3, time(8), time(10, 2))]
+        self.assertEqual([row["entry_trigger_id"] for row in assignment.active_groups(groups, time(10, 3))], [1])
+
+    def test_all_three_scenarios_only_send_jev_for_actual_overlap(self):
+        for exit_time, needs_jev in [(time(10, 2), False), (time(10, 6), True), (time(9, 58), False)]:
+            with self.subTest(exit_time=exit_time):
+                groups = [group(1, time(10), time(10, 5)), group(3, time(9, 57), exit_time)]
+                assigned, report = self.assign([receipt(n, time(10, n)) for n in (3, 4, 5)], groups)
+                self.assertEqual(len(assigned), 3)
+                self.assertEqual(self.calls["decide_with_jev"].call_count, 3 if needs_jev else 0)
+                self.assertTrue(all(row["method"] == ("jev" if needs_jev else "time") for row in report["decisions"]))
+
+    def test_one_group_receipts_use_payment_bounds_for_collecting_candidates(self):
+        self.assign([receipt(1, time(10, 3)), receipt(2, time(10, 4))], [group(1, time(10), time(10, 5))])
+        kwargs = self.calls["collect_groups"].call_args.kwargs
+        self.assertEqual(kwargs["start"], time(10, 3))
+        self.assertEqual(kwargs["end"], time(10, 4))
+
     def test_payment_attempt_is_utc_and_preferred_over_created_or_formatted_time(self):
         row = receipt(1, time(10, 3))
         row.update(created_at=time(2), transaction_time=time(9))
@@ -56,6 +93,28 @@ class AssignmentTests(unittest.TestCase):
         row["raw_payload"]["machineName"] = "Right"
         self.assertEqual(assignment.machine_side("Edumetro", row)["image_side"], "left")
         self.assertIsNone(assignment.machine_side("Another store", row)["image_side"])
+
+    def test_full_machine_names_are_mapped_without_matching_unrelated_words(self):
+        for name, expected in [("Edumetro-right-1", "left"), ("Edumetro-left-2", "right"),
+                               ("EDUMETRO_RIGHT_1", "left"), ("Right1", "left"),
+                               ("bright-1", None), ("left-right-1", None), ("", None)]:
+            with self.subTest(name=name):
+                row = receipt(1, time(10))
+                row["raw_payload"]["machineName"] = name
+                self.assertEqual(assignment.machine_side("Edumetro, Subang", row)["image_side"], expected)
+
+    def test_overlapping_group_query_bounds_open_history_and_requires_completed_exit(self):
+        db = Mock()
+        with patch.object(workflow.repositories, "_fetch_all_dicts", side_effect=[[], []]):
+            store.list_overlapping_groups(db, location_id=2, start=time(10, 3), end=time(10, 5))
+        closed_sql, closed_params = db.execute.call_args_list[0].args
+        open_sql, open_params = db.execute.call_args_list[1].args
+        self.assertIn("exit_time >= :start_time", str(closed_sql))
+        self.assertNotIn("or exit_time is null", str(closed_sql))
+        self.assertEqual(closed_params["location_id"], 2)
+        self.assertIn("te.trigger_time >= :open_since", str(open_sql))
+        self.assertEqual(open_params["open_since"], time(9, 3))
+        self.assertEqual(open_params["end_time"], time(10, 5))
 
     def assign(self, rows, groups, *, previous=None, decision=None):
         self.calls = {}
@@ -90,7 +149,7 @@ class AssignmentTests(unittest.TestCase):
     def test_none_uncertain_and_api_errors_never_assign_window_receipts(self):
         for status in ("none", "uncertain", "error"):
             with self.subTest(status=status):
-                assigned, report = self.assign([receipt(1, time(10, 3))], [group(1, time(10), time(10, 5)), group(3, time(9), None)],
+                assigned, report = self.assign([receipt(1, time(10, 3))], [group(1, time(10), time(10, 5)), group(3, time(9, 30), None)],
                                                decision={"status": status, "entry_trigger_id": None, "method": "jev"})
                 self.assertEqual(assigned, [])
                 self.assertEqual(report["unresolved_count"], 0 if status == "none" else 1)
@@ -105,7 +164,7 @@ class AssignmentTests(unittest.TestCase):
         self.calls["decide_with_jev"].assert_not_called()
 
     def test_repeated_identical_context_reuses_decision_without_api_cost(self):
-        rows, groups = [receipt(1, time(10, 3))], [group(1, time(10), time(10, 5)), group(3, time(9), None)]
+        rows, groups = [receipt(1, time(10, 3))], [group(1, time(10), time(10, 5)), group(3, time(9, 30), None)]
         self.assign(rows, groups)
         saved = self.calls["save"].call_args.kwargs
         self.assign(rows, groups, previous={"1": {"context_hash": saved["context_hash"], "status": "assigned", "evidence": saved["decision"]}})
@@ -115,12 +174,22 @@ class AssignmentTests(unittest.TestCase):
     def test_failed_receipt_is_not_automatically_resent_even_if_context_changes(self):
         previous = {"1": {"context_hash": "older", "status": "error", "evidence": {
             "status": "error", "entry_trigger_id": None, "method": "jev", "reason": "Provider failed"}}}
-        assigned, report = self.assign([receipt(1, time(10, 3))], [group(1, time(10), time(10, 5)), group(3, time(9), None)], previous=previous)
+        assigned, report = self.assign([receipt(1, time(10, 3))], [group(1, time(10), time(10, 5)), group(3, time(9, 30), None)], previous=previous)
         self.assertEqual(assigned, [])
         self.assertEqual(report["status"], "needs_review")
         self.assertTrue(report["decisions"][0]["cached"])
         self.calls["decide_with_jev"].assert_not_called()
         self.calls["save"].assert_not_called()
+
+    def test_failed_visual_receipt_can_be_resolved_by_time_without_resending(self):
+        previous = {"1": {"context_hash": "old_531_candidates", "status": "error", "evidence": {
+            "status": "error", "entry_trigger_id": None, "script_run_id": 90}}}
+        assigned, report = self.assign([receipt(1, time(10, 3))], [group(1, time(10), time(10, 5))], previous=previous)
+        self.assertEqual(len(assigned), 1)
+        self.assertEqual(report["decisions"][0]["method"], "time")
+        self.assertEqual(report["decisions"][0]["supersedes_failed_script_run_id"], 90)
+        self.calls["decide_with_jev"].assert_not_called()
+        self.calls["save"].assert_called_once()
 
     def test_same_visit_in_another_batch_does_not_invalidate_receipt_cache(self):
         rows, groups = [receipt(1, time(10, 3))], [group(1, time(10), time(10, 5))]
@@ -148,6 +217,8 @@ class AssignmentTests(unittest.TestCase):
         self.assertEqual(report["candidate_count"], 0)
         self.assertEqual(report["selection"], "none")
         self.calls["decide_with_jev"].assert_not_called()
+        self.calls["collect_groups"].assert_not_called()
+        self.calls["get_location_endpoint"].assert_not_called()
 
     def test_paid_query_uses_payment_utc_bounds_and_paid_filter(self):
         db = Mock()
@@ -176,9 +247,17 @@ class AssignmentTests(unittest.TestCase):
     def test_current_batch_open_entries_block_false_sole_owner(self):
         with patch.object(store, "list_overlapping_groups", return_value=([], [])), \
              patch.object(workflow.repositories, "get_grouping_batch", return_value={"result_payload": {"groups": [], "open_entries": [3]}}), \
-             patch.object(workflow.repositories, "get_trigger", side_effect=lambda db, tid: {"trigger_time": {1: time(10), 2: time(10, 5), 3: time(9)}[tid]}):
+             patch.object(workflow.repositories, "get_trigger", side_effect=lambda db, tid: {"trigger_time": {1: time(10), 2: time(10, 5), 3: time(9, 30)}[tid]}):
             groups = assignment.collect_groups(Mock(), location_id=2, start=time(10), end=time(10, 5), batch_id=1, current_group={"entry": [1], "exit": [2]})
         self.assertEqual(len(assignment.active_groups(groups, time(10, 3))), 2)
+
+    def test_old_open_entries_in_current_batch_snapshot_are_also_excluded(self):
+        with patch.object(store, "list_overlapping_groups", return_value=([], [])), \
+             patch.object(workflow.repositories, "get_grouping_batch", return_value={"result_payload": {"groups": [], "open_entries": [3]}}), \
+             patch.object(workflow.repositories, "get_trigger", side_effect=lambda db, tid: {"trigger_time": {1: time(10), 2: time(10, 5), 3: time(8)}[tid]}):
+            groups = assignment.collect_groups(Mock(), location_id=2, start=time(10, 3), end=time(10, 5), batch_id=1,
+                                               current_group={"entry": [1], "exit": [2]})
+        self.assertEqual([row["entry_trigger_id"] for row in groups], [1])
 
     def test_session_retry_never_reintroduces_rejected_paid_receipts(self):
         with patch.object(workflow, "_is_kiosk_analysis_disabled", return_value=False), \
