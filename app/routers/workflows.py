@@ -126,6 +126,17 @@ def stop_script_run(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.post("/script-runs/{script_run_id}/retry-transaction-assignment")
+def retry_transaction_assignment(script_run_id: int, db: Session = Depends(get_transaction_db)) -> dict[str, Any]:
+    from ..services import transaction_assignment
+    try:
+        return transaction_assignment.retry_from_script_run(db, script_run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @router.get("/script-runs/by-runner-job/{runner_job_id}", response_model=ScriptRunDetailResponse)
 def get_script_run_by_runner_job_id(
     runner_job_id: str,

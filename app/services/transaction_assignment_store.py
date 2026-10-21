@@ -12,10 +12,10 @@ OPEN_ENTRY_LOOKBACK_MINUTES = 60
 
 
 @contextmanager
-def location_lock(db, location_id):
+def location_lock(db, location_id, *, wait_seconds=30):
     with db.get_bind().connect() as connection:
         name = f"tds_paid_assignment_{int(location_id)}"
-        acquired = connection.execute(text("select get_lock(:name, 30)"), {"name": name}).scalar() == 1
+        acquired = connection.execute(text("select get_lock(:name, :wait)"), {"name": name, "wait": wait_seconds}).scalar() == 1
         if not acquired:
             raise RuntimeError("Paid transaction assignment is busy for this location. Retry the confidence result.")
         try:

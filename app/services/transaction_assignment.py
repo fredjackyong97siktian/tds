@@ -216,6 +216,10 @@ def assign(db, *, batch_id, location_id, group, start_time, end_time):
                                   for value in eligible], "mapping": mapping}
             context_hash = hashlib.sha256(json.dumps(context, default=str, sort_keys=True).encode()).hexdigest()
             previous = cached.get(receipt)
+            if previous and previous["evidence"].get("retry_authorized"):
+                # One explicit user retry. The new attempt barrier replaces this
+                # authorization before a paid request, so polling cannot loop it.
+                previous = None
             if previous and previous["evidence"].get("attempt_reserved"):
                 recovered = store.recover_decision(db, location_id=location_id, receipt=receipt)
                 if recovered is not None:
@@ -303,6 +307,60 @@ def _report(owner, rows, assigned, decisions):
             "selection": "none" if not assigned else "all" if len(assigned) == len(rows) else "some",
             "assigned_receipts": [str(row.get("receipt_number") or row.get("transaction_id")) for row in assigned],
             "decisions": decisions}
+
+
+def retry_from_script_run(db, script_run_id):
+    from sqlalchemy import text
+    from . import workflow_service as workflow
+
+    require_enabled(db)
+    run = repositories.get_script_run(db, script_run_id)
+    if run.get("model_name") != "openrouter-jev-1.14_transaction_assignment":
+        raise ValueError("This Script Run is not Transaction Assignment.")
+    payload = run.get("runner_payload") or {}
+    batch_id, location_id = int(payload.get("batch_id") or 0), int(payload.get("location_id") or 0)
+    receipt = str(payload.get("receipt_number") or "").strip()
+    paid_at = workflow._coerce_datetime_value(payload.get("payment_time"))
+    if not batch_id or not location_id or not receipt or paid_at is None:
+        raise ValueError("This Script Run is missing its batch, location, receipt or payment time.")
+    batch = repositories.get_grouping_batch(db, batch_id)
+    if int(batch["location_id"]) != location_id or batch["status"] != "success":
+        raise ValueError("The original grouping batch must be successful before retrying its assignment.")
+    lock = workflow._try_acquire_theft_confidence_lock(batch_id, wait_seconds=0)
+    if lock is None:
+        raise RuntimeError("This confidence batch is already running. Wait for it to finish before retrying.")
+    try:
+        with store.location_lock(db, location_id, wait_seconds=0):
+            db.commit()
+            previous = store.load(db, location_id, [receipt]).get(receipt)
+            table = repositories._table("filter_confidence_result")
+            # Keep existing result IDs and group memberships. Only affected
+            # scores become eligible again; the worker does the expensive work.
+            db.execute(text(f"""
+                update {table}
+                set factor_payload=json_set(coalesce(factor_payload, json_object()), '$.assignment_retry_requested', true)
+                where batch_id=:batch_id and json_search(factor_payload, 'one', :receipt, null,
+                    '$.transaction_assignment.decisions[*].receipt_number') is not null
+            """), {"batch_id": batch_id, "receipt": receipt})
+            db.execute(text(f"delete from {table} where batch_id=:batch_id and group_key='__error__'"), {"batch_id": batch_id})
+            if not previous or previous["status"] != "assigned":
+                store.save(db, location_id=location_id, receipt=receipt,
+                    payment_time_utc=workflow._local_naive_to_utc(paid_at),
+                    context_hash=(previous or {}).get("context_hash") or hashlib.sha256(receipt.encode()).hexdigest(),
+                    decision={"status": "error", "method": "jev", "entry_trigger_id": None,
+                              "retry_authorized": True, "requested_from_script_run_id": script_run_id,
+                              "reason": "User queued one retry. Recover a saved answer first; otherwise allow one new attempt."})
+            else:
+                db.commit()
+            paused = repositories.is_worker_paused(db, "theft_confidence_analysis")
+            return {"ok": True, "batch_id": batch_id, "receipt_number": receipt, "queued": True,
+                    "message": "Retry queued. Turn on Theft Confidence Analysis in Workers." if paused else
+                               "Retry queued. Saved answers will be reused before any new paid request."}
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        workflow._release_theft_confidence_lock(lock, batch_id)
 
 
 def for_session(db, session_id):

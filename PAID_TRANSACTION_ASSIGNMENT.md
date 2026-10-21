@@ -24,8 +24,17 @@ Failed receipt decisions are retained rather than automatically resent, even
 if the candidate context changes. If corrected timing proves there are zero
 or one active groups, the failure can be resolved deterministically without
 another API request (the prior Script Run ID remains in the audit). Still-
-ambiguous failures require an explicit ownership-record reset before retrying;
-ordinary polling or grouping retries will not trigger another paid attempt.
+ambiguous failures require an explicit retry; ordinary polling or grouping
+retries will not trigger another paid attempt.
+
+To resume, enable Transaction Assignment in Settings -> Pipeline. This also
+resumes the Theft Confidence Analysis worker. Open the affected Transaction
+Assignment Script Run and click Retry Transaction Assignment. This queues only
+that receipt's affected confidence scores in its original batch, preserving
+result IDs, grouping memberships and script history. The worker reuses a saved
+Jev answer first. If none exists, the click authorizes one new paid attempt;
+the durable attempt barrier is restored before making that request. No new
+database migration is required for this retry control.
 
 ## Deployment
 

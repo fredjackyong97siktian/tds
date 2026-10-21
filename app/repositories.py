@@ -3857,6 +3857,8 @@ def list_pending_theft_confidence_batches(db: Session, limit: int = 50) -> list[
               and b.result_payload is not null
               and (
                   select count(*) from {confidence_table} c where c.batch_id = b.id
+                    and c.group_key <> '__error__'
+                    and coalesce(json_unquote(json_extract(c.factor_payload, '$.assignment_retry_requested')), 'false') <> 'true'
               ) < greatest(
                   1,
                   coalesce(
@@ -4009,7 +4011,9 @@ def list_scored_group_keys_for_batch(db: Session, batch_id: int) -> set[str]:
     # kiosk pipeline kickoff) work all over again.
     confidence_table = _table("filter_confidence_result")
     result = db.execute(
-        text(f"select group_key from {confidence_table} where batch_id = :batch_id"),
+        text(f"""select group_key from {confidence_table} where batch_id = :batch_id
+            and group_key <> '__error__'
+            and coalesce(json_unquote(json_extract(factor_payload, '$.assignment_retry_requested')), 'false') <> 'true'"""),
         {"batch_id": batch_id},
     )
     return {str(row[0]) for row in result.all()}

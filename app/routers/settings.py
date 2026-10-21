@@ -36,6 +36,8 @@ def update_transaction_assignment_control(payload: TransactionAssignmentControlR
                                           db: Session = Depends(get_transaction_db)) -> dict:
     from ..services import transaction_assignment
     repositories.set_app_setting(db, transaction_assignment.ENABLED_SETTING_KEY, "true" if payload.enabled else "false")
+    if payload.enabled:
+        repositories.set_worker_paused(db, "theft_confidence_analysis", False)
     return {"ok": True, "enabled": payload.enabled}
 
 
