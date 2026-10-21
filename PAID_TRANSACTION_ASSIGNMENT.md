@@ -36,6 +36,15 @@ Jev answer first. If none exists, the click authorizes one new paid attempt;
 the durable attempt barrier is restored before making that request. No new
 database migration is required for this retry control.
 
+The Grouping page also has a Transaction Assignments panel showing the latest
+20 unresolved receipts directly from the ownership ledger. Refresh checks the
+latest state without loading Script Run logs. Retry is available in that panel
+when processing is enabled; queued receipts are labeled to avoid repeated
+clicks. Retry API failures return a JSON diagnostic (including database error
+codes when available), and the browser also handles plain-text proxy errors.
+Retry queue flags use JSON booleans; the worker accepts both boolean `true`
+and legacy numeric `1` so older queued retries are not silently skipped.
+
 ## Deployment
 
 Run `migrations/20261021_paid_transaction_assignment.sql` on MySQL before

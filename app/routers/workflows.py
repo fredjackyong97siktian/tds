@@ -1,7 +1,9 @@
 from datetime import datetime, timedelta
 from typing import Any
+import logging
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from .. import repositories
@@ -21,6 +23,26 @@ from ..services import workflow_service
 
 
 router = APIRouter(prefix="/api/v1/workflows", tags=["workflows"])
+logger = logging.getLogger(__name__)
+
+
+def _assignment_database_error(exc: SQLAlchemyError) -> str:
+    args = getattr(getattr(exc, "orig", None), "args", ())
+    code = args[0] if args else "unknown"
+    # Include the driver diagnostic, not SQL statements or bound parameters.
+    diagnostic = str(args[1])[:600] if len(args) > 1 else "Check the API server logs."
+    return f"Transaction Assignment database error ({code}): {diagnostic}"
+
+
+@router.get("/transaction-assignments/stuck")
+def list_stuck_transaction_assignments(limit: int = Query(20, ge=1, le=50),
+                                       db: Session = Depends(get_transaction_db)) -> dict[str, Any]:
+    from ..services import transaction_assignment
+    try:
+        return transaction_assignment.list_stuck_assignments(db, limit=limit)
+    except SQLAlchemyError as exc:
+        logger.exception("Could not list unresolved transaction assignments")
+        raise HTTPException(status_code=500, detail=_assignment_database_error(exc)) from exc
 
 
 @router.post("/triggers/{trigger_id}/run-entry", response_model=ScriptRunResponse)
@@ -135,6 +157,14 @@ def retry_transaction_assignment(script_run_id: int, db: Session = Depends(get_t
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.exception("Transaction assignment retry failed for Script Run %s", script_run_id)
+        raise HTTPException(status_code=500, detail=_assignment_database_error(exc)) from exc
+    except Exception as exc:
+        db.rollback()
+        logger.exception("Transaction assignment retry failed for Script Run %s", script_run_id)
+        raise HTTPException(status_code=500, detail="Could not queue transaction assignment retry. Check the API server logs.") from exc
 
 
 @router.get("/script-runs/by-runner-job/{runner_job_id}", response_model=ScriptRunDetailResponse)

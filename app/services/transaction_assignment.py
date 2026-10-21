@@ -318,6 +318,13 @@ def retry_from_script_run(db, script_run_id):
     if run.get("model_name") != "openrouter-jev-1.14_transaction_assignment":
         raise ValueError("This Script Run is not Transaction Assignment.")
     payload = run.get("runner_payload") or {}
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError as exc:
+            raise ValueError("This Script Run has an invalid assignment payload.") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("This Script Run has an invalid assignment payload.")
     batch_id, location_id = int(payload.get("batch_id") or 0), int(payload.get("location_id") or 0)
     receipt = str(payload.get("receipt_number") or "").strip()
     paid_at = workflow._coerce_datetime_value(payload.get("payment_time"))
@@ -338,7 +345,7 @@ def retry_from_script_run(db, script_run_id):
             # scores become eligible again; the worker does the expensive work.
             db.execute(text(f"""
                 update {table}
-                set factor_payload=json_set(coalesce(factor_payload, json_object()), '$.assignment_retry_requested', true)
+                set factor_payload=json_set(coalesce(factor_payload, json_object()), '$.assignment_retry_requested', json_extract('true', '$'))
                 where batch_id=:batch_id and json_search(factor_payload, 'one', :receipt, null,
                     '$.transaction_assignment.decisions[*].receipt_number') is not null
             """), {"batch_id": batch_id, "receipt": receipt})
@@ -349,6 +356,7 @@ def retry_from_script_run(db, script_run_id):
                     context_hash=(previous or {}).get("context_hash") or hashlib.sha256(receipt.encode()).hexdigest(),
                     decision={"status": "error", "method": "jev", "entry_trigger_id": None,
                               "retry_authorized": True, "requested_from_script_run_id": script_run_id,
+                              "script_run_id": script_run_id, "batch_id": batch_id,
                               "reason": "User queued one retry. Recover a saved answer first; otherwise allow one new attempt."})
             else:
                 db.commit()
@@ -361,6 +369,35 @@ def retry_from_script_run(db, script_run_id):
         raise
     finally:
         workflow._release_theft_confidence_lock(lock, batch_id)
+
+
+def list_stuck_assignments(db, *, limit=20):
+    rows = store.list_unresolved(db, limit=limit)
+    items = []
+    for row in rows:
+        evidence = row.get("evidence") or {}
+        payload = row.get("runner_payload") or {}
+        for name, value in (("evidence", evidence), ("payload", payload)):
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except ValueError:
+                    value = {}
+            if not isinstance(value, dict):
+                value = {}
+            if name == "evidence":
+                evidence = value
+            else:
+                payload = value
+        items.append({"location_id": row["location_id"], "receipt_number": row["receipt_number"],
+                      "status": "queued" if evidence.get("retry_authorized") else row["status"],
+                      "batch_id": payload.get("batch_id") or evidence.get("batch_id"),
+                      "script_run_id": row.get("latest_script_run_id") or row.get("script_run_id"),
+                      "payment_time_utc": row.get("payment_time_utc"), "updated_at": row.get("updated_at"),
+                      "last_error": row.get("last_error") or None,
+                      "reason": str(evidence.get("reason") or "Assignment requires review or recovery.")[:1000]})
+    return {"items": items, "limit": limit, "enabled": is_enabled(db),
+            "worker_paused": repositories.is_worker_paused(db, "theft_confidence_analysis")}
 
 
 def for_session(db, session_id):

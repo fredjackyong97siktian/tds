@@ -36,6 +36,28 @@ def load(db, location_id, receipts):
     return {str(row["receipt_number"]): row for row in rows}
 
 
+def list_unresolved(db, *, limit=20):
+    # Bound the ledger first; never transfer full Script Run logs to this panel.
+    return repositories._fetch_all_dicts(db.execute(text(f"""
+        select a.*, s.id as latest_script_run_id, s.runner_payload,
+               left(s.stderr_log, 1000) as last_error
+        from (
+            select * from {repositories._table('paid_transaction_assignment')}
+            where status in ('error', 'uncertain')
+            order by updated_at desc, location_id, receipt_number limit :limit
+        ) a
+        left join {repositories._table('script_run')} s on s.id = coalesce(
+          a.script_run_id,
+          cast(json_unquote(json_extract(a.evidence, '$.requested_from_script_run_id')) as unsigned), (
+            select max(r.id) from {repositories._table('script_run')} r
+            where r.script_name='grouping' and r.model_name='openrouter-jev-1.14_transaction_assignment'
+              and json_unquote(json_extract(r.runner_payload, '$.receipt_number'))=a.receipt_number
+              and cast(json_unquote(json_extract(r.runner_payload, '$.location_id')) as unsigned)=a.location_id
+        ))
+        order by a.updated_at desc, a.location_id, a.receipt_number
+    """), {"limit": max(1, min(int(limit), 50))}))
+
+
 def save(db, *, location_id, receipt, payment_time_utc, context_hash, decision):
     db.execute(text(f"""
         insert into {repositories._table('paid_transaction_assignment')}
