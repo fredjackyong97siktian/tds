@@ -47,7 +47,7 @@ class IdentifierCaptureTests(unittest.TestCase):
         self.assertEqual(command[command.index("-ss") + 1], "0.500")
         self.assertEqual(command[command.index("-frames:v") + 1], "12")
 
-    def run_capture(self, *, frames=12, timeout=False, direction="left"):
+    def run_capture(self, *, frames=12, timeout=False, direction="left", section="identifier"):
         self.calls = {}
         with TemporaryDirectory() as directory, ExitStack() as stack:
             stack.enter_context(patch.object(capture, "tmp_trigger_root", return_value=Path(directory)))
@@ -76,6 +76,11 @@ class IdentifierCaptureTests(unittest.TestCase):
                 return Mock(returncode=0, stderr="")
 
             self.calls["run"] = stack.enter_context(patch.object(capture.subprocess, "run", side_effect=fake_run))
+            if section == "kiosk":
+                anchor = datetime(2026, 10, 21, 11)
+                from datetime import timedelta
+                return capture.capture_sequence(Mock(), location_id=2, trigger={"trigger_id": 58, "trigger_time": anchor},
+                    parent_script_run_id=99, section="kiosk", times=[anchor + timedelta(seconds=index - 5) for index in range(10)])
             return capture.capture_exit(Mock(), location_id=2, exit_trigger={"trigger_id": 58,
                                         "trigger_time": datetime(2026, 10, 21, 11)}, parent_script_run_id=99)
 
@@ -114,6 +119,18 @@ class IdentifierCaptureTests(unittest.TestCase):
             self.run_capture(direction=None)
         self.calls["run"].assert_not_called()
         self.assertEqual(self.calls["finish_script_run"].call_args.kwargs["status"], "failed")
+
+    def test_payment_sequence_captures_ten_frames_in_one_command_with_kiosk_delay(self):
+        result = self.run_capture(frames=10, section="kiosk", direction=None)
+        self.assertEqual(len(result["frames"]), 10)
+        self.assertEqual(self.calls["delay"].call_args.kwargs["section"], "kiosk")
+        self.assertEqual(self.calls["get_cctv_by_location_section"].call_args.kwargs["section"], "kiosk")
+        self.assertEqual(self.calls["run"].call_count, 1)
+        command = self.calls["run"].call_args.args[0]
+        self.assertEqual(command[command.index("-vf") + 1], "fps=1.000000")
+        self.assertEqual(result["frames"][0]["camera_sample_time"], "2026-10-21T10:52:50")
+        self.assertEqual(result["frames"][-1]["sample_time"], "2026-10-21T11:00:04")
+        self.assertEqual(self.calls["create_script_run_started"].call_args.kwargs["model_name"], "dahua_rtsp_playback:kiosk_payment_frames")
 
 
 if __name__ == "__main__":

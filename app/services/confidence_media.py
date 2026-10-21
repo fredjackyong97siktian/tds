@@ -169,6 +169,11 @@ def _finish(db, row):
         return
     session_id = int(session["id"])
     repositories.update_session_grouping_link(db, session_id=session_id, grouping_id=int(row["batch_id"]))
+    if "transaction_assignment" in payload:
+        from . import transaction_assignment
+        owned = transaction_assignment.for_session(db, session_id)
+        if owned is not None:
+            transaction_assignment.sync_session(db, session_id, owned)
     for link, asset in zip(links, assets):
         repositories.create_session_video_asset_link(db, session_id, asset["id"], {
             "section": link["section"], "sequence_no": None, "clip_start_time": _time(link["start"]),

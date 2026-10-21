@@ -3737,12 +3737,12 @@ def _script_run_list_filters(
 ) -> tuple[list[str], dict[str, Any]]:
     filters: list[str] = []
     params: dict[str, Any] = {}
-    if script_name == "person_presence":
+    if script_name in {"person_presence", "transaction_assignment"}:
         # Presence checks reuse the allowed grouping script name in older databases.
         filters.append("script_name = :script_name")
         params["script_name"] = "grouping"
         filters.append("right(model_name, length(:presence_suffix)) = :presence_suffix")
-        params["presence_suffix"] = "_person_presence"
+        params["presence_suffix"] = f"_{script_name}"
     elif script_name:
         filters.append("script_name = :script_name")
         params["script_name"] = script_name
@@ -5546,6 +5546,34 @@ def list_session_customers(db: Session, session_id: int) -> list[dict[str, Any]]
         {"session_id": session_id},
     )
     return _fetch_all_dicts(result)
+
+
+def list_paid_transactions_for_assignment(db: Session, *, location_id: int, start_time, end_time) -> list[dict[str, Any]]:
+    from .services import workflow_service
+
+    transaction_table = _qualified_paid_table(settings.paid_transaction_table_name)
+    location = _quote_identifier(settings.paid_transaction_location_id_column)
+    status = _quote_identifier(settings.paid_transaction_status_column)
+    formatted = _quote_identifier(PAID_TRANSACTION_TIME_COLUMN)
+    payment_column = next((name for name in ("paymentAttemptAt", "payment_attempt_at")
+                           if _column_exists(db, transaction_table, name)), None)
+    params = {"location_id": location_id, "paid": settings.paid_transaction_status_value,
+              "start": start_time, "end": end_time}
+    if payment_column:
+        payment = _quote_identifier(payment_column)
+        condition = f"((t.{payment} is not null and t.{payment} between :start_utc and :end_utc) "
+        condition += f"or (t.{payment} is null and t.{formatted} between :start and :end))"
+        params.update(start_utc=workflow_service._local_naive_to_utc(start_time), end_utc=workflow_service._local_naive_to_utc(end_time))
+    else:
+        condition = f"t.{formatted} between :start and :end"
+    rows = _fetch_all_dicts(db.execute(text(f"select t.* from {transaction_table} t "
+        f"where t.{location}=:location_id and t.{status}=:paid and {condition} order by t.{formatted}"), params))
+    if not rows:
+        return []
+    return _transactions_with_item_details_by_receipt(db, rows,
+        detail_table=_qualified_paid_table(settings.paid_transaction_detail_table_name),
+        detail_transaction_id_column=_quote_identifier(settings.paid_transaction_detail_transaction_id_column),
+        detail_transaction_id_name=settings.paid_transaction_detail_transaction_id_column)
 
 
 def list_paid_transactions_for_session_window(

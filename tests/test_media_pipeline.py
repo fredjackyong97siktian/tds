@@ -28,7 +28,7 @@ class RetentionPolicyTests(unittest.TestCase):
             if "where b.status" in sql:
                 return [{"trigger_id": 4}]
             return []
-        with patch.object(retention, "_rows", side_effect=rows):
+        with patch.object(retention, "_rows", side_effect=rows), patch.object(retention.repositories, "_column_exists", return_value=False):
             sessions, triggers, videos = retention.protected_owners(Mock(), datetime(2026, 9, 17))
         self.assertEqual(sessions, {7})
         self.assertEqual(triggers, {1, 2, 3, 4})

@@ -120,7 +120,7 @@ def carry_request(entries: list[Mapping[str, Any]], exits: list[Mapping[str, Any
     state = {
         "entry_sequences": sequences[:len(entries)], "exit_sequences": sequences[len(entries):],
         "paid_transactions_in_visit_window": transactions,
-        "receipt_attribution": "time_window_only_not_confirmed_customer_ownership",
+        "receipt_attribution": "confirmed_group_ownership" if transactions and all(row.get("receipt_attribution") == "confirmed_group_ownership" for row in transactions) else "time_window_only_not_confirmed_customer_ownership",
         "receipt_query_complete": True,
     }
     instructions = (
@@ -133,7 +133,7 @@ def carry_request(entries: list[Mapping[str, Any]], exits: list[Mapping[str, Any
         "A pre-existing bag alone, a large bag alone or no paid receipt alone is not sufficient evidence of theft. "
         "No paid receipts plus clearly acquired store goods can be suspicious; delivery of a pre-existing box into the store is not. "
         "Use item names, quantities, likely sizes and paid values; monetary values are in the source table's units, not necessarily RM. "
-        "Do not guess concealed contents or exact item counts from opaque bags. Receipts are window candidates, not confirmed customer ownership. "
+        "Do not guess concealed contents or exact item counts from opaque bags. Use receipt_attribution: confirmed_group_ownership receipts were assigned to this group; otherwise they are only window candidates. "
         "If receipt ownership is needed to distinguish suspicious from reasonable but unclear, choose insufficient_evidence. "
         "Reasonable requires clear evidence consistent with the customer's existing belongings or attributable purchases. "
         "If visibility, customer identity, entry/exit comparison or required transaction attribution is insufficient, choose insufficient_evidence. "
@@ -407,7 +407,7 @@ def evaluate_carry(db: Any, *, batch_id: int, group_key: str, location_id: int,
         response, meta = logged_call(db, run_id, body, urls, description="Jev carry assessment")
         result = {**carry_result(response, reason_options=NO_PURCHASE_REASONS if no_purchase else None), "script_run_id": run_id,
                   "image_urls": urls, "image_count": len(urls), "transactions": workflow._transaction_summary(transactions),
-                  "cost_detail": meta.get("usage"), "receipt_attribution": "time_window_only",
+                  "cost_detail": meta.get("usage"), "receipt_attribution": "confirmed_group_ownership" if transactions and all(row.get("receipt_attribution") == "confirmed_group_ownership" for row in transactions) else "time_window_only",
                   "no_purchase_identifier_check": no_purchase, "identifier_sequences": identifier_sequences}
         if no_purchase:
             result["new_items_observed"] = True if result["status"] == "suspicious" else False if result["status"] == "reasonable" else None

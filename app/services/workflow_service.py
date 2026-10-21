@@ -10229,6 +10229,9 @@ def _transaction_summary(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         payload.append(
             {
                 "receipt_number": row.get("receipt_number"),
+                "transaction_id": row.get("transaction_id"),
+                "machine_name": row.get("machine_name") or _kiosk_transaction_machine_name(row),
+                "receipt_attribution": row.get("receipt_attribution"),
                 "status": row.get("status"),
                 "created_at": row.get("created_at"),
                 "transaction_time": row.get("transaction_time"),
@@ -11118,12 +11121,10 @@ def _run_theft_confidence_for_grouping_batch_locked(
             continue
         start_time = min(trigger_times)
         end_time = max(trigger_times)
-        transactions = repositories.list_paid_transactions_for_session_window(
-            db,
-            location_id=location_id,
-            start_time=start_time,
-            end_time=end_time,
-        )
+        from . import transaction_assignment
+        transactions, assignment_report = transaction_assignment.assign(
+            db, batch_id=batch_id, location_id=location_id, group=group,
+            start_time=start_time, end_time=end_time)
         issue_transactions = repositories.list_non_paid_transactions_for_session_window(
             db,
             location_id=location_id,
@@ -11431,6 +11432,7 @@ def _run_theft_confidence_for_grouping_batch_locked(
                 "country_code_result": country_code_result,
                 "unusual_group_size_result": unusual_group_size_result,
                 "total_customer": total_customer,
+                "transaction_assignment": assignment_report,
                 "transactions": _transaction_summary(transactions),
                 "issue_transactions": _transaction_summary(issue_transactions),
                 "minus_alerts": [
@@ -11533,12 +11535,10 @@ def score_confidence_for_single_group(
         return {"analyzed_count": 1, "promoted_count": 0}
     start_time = min(trigger_times)
     end_time = max(trigger_times)
-    transactions = repositories.list_paid_transactions_for_session_window(
-        db,
-        location_id=location_id,
-        start_time=start_time,
-        end_time=end_time,
-    )
+    from . import transaction_assignment
+    transactions, assignment_report = transaction_assignment.assign(
+        db, batch_id=batch_id, location_id=location_id, group=group,
+        start_time=start_time, end_time=end_time)
     issue_transactions = repositories.list_non_paid_transactions_for_session_window(
         db,
         location_id=location_id,
@@ -11837,6 +11837,7 @@ def score_confidence_for_single_group(
             "country_code_result": country_code_result,
             "unusual_group_size_result": unusual_group_size_result,
             "total_customer": total_customer,
+            "transaction_assignment": assignment_report,
             "transactions": _transaction_summary(transactions),
             "issue_transactions": _transaction_summary(issue_transactions),
             "minus_alerts": [
@@ -11913,7 +11914,9 @@ def _prepare_session_kiosk_pipeline(
     session_end_time: datetime,
     exit_trigger_time: datetime | None = None,
 ) -> tuple[int, dict[str, Any], list[tuple[datetime, datetime]]]:
-    paid_transactions = repositories.list_paid_transactions_for_session_window(
+    from . import transaction_assignment
+    authoritative = transaction_assignment.for_session(db, session_id)
+    paid_transactions = authoritative if authoritative is not None else repositories.list_paid_transactions_for_session_window(
         db,
         location_id=location_id,
         start_time=session_start_time,
@@ -11972,7 +11975,7 @@ def _prepare_session_kiosk_pipeline(
             },
         )
         selected["session_transaction_id"] = selected_transaction_id
-    elif len(transaction_summaries) > 1:
+    elif len(transaction_summaries) > 1 and authoritative is None:
         candidates = [dict(item.get("raw_payload") or {}) for item in transaction_summaries]
         matched_transactions, identification_summary = _identify_kiosk_transactions_for_session(
             db,
@@ -12005,6 +12008,10 @@ def _prepare_session_kiosk_pipeline(
                 },
             )
             selected["session_transaction_id"] = selected_transaction_id
+
+    if authoritative is not None:
+        transaction_assignment.sync_session(db, session_id, authoritative)
+        identification_summary = {"source": "confidence_transaction_assignment", "status": "confirmed"}
 
     session_close_summary = {
         "session_close_pipeline": {
@@ -12724,6 +12731,17 @@ def _kickoff_kiosk_pipeline_for_session(
         # Nothing is queued while disabled; re-enabling does not backfill it.
         return {"status": "skipped", "reason": "kiosk_analysis_disabled", "video_asset_ids": []}
 
+    from . import transaction_assignment
+    authoritative = transaction_assignment.for_session(db, session_id)
+    if authoritative is not None:
+        if not authoritative:
+            repositories.delete_session_transactions(db, session_id)
+            return {"status": "skipped", "reason": "no_assigned_paid_transactions", "video_asset_ids": []}
+        return _finalize_kiosk_transaction_match(
+            db, session_id=session_id, location_id=location_id, matched_transactions=authoritative,
+            identification_summary={"status": "confirmed", "source": "confidence_transaction_assignment"},
+            exit_trigger_time=exit_trigger_time)
+
     all_candidates: list[Mapping[str, Any]] = list(transactions or []) + list(issue_transactions or [])
     if not all_candidates:
         repositories.update_session_fields(
@@ -12989,6 +13007,11 @@ def _gather_kiosk_transaction_candidate_groups_for_session(
     if entry_time is None or exit_time is None:
         return session, location_id, exit_time, []
     start_time, end_time = (entry_time, exit_time) if entry_time <= exit_time else (exit_time, entry_time)
+    from . import transaction_assignment
+    authoritative = transaction_assignment.for_session(db, session_id)
+    if authoritative is not None:
+        groups = _group_transactions_by_machine_and_initiated_at(authoritative)
+        return session, location_id, exit_time, groups
     transactions = repositories.list_paid_transactions_for_session_window(
         db, location_id=location_id, start_time=start_time, end_time=end_time
     )

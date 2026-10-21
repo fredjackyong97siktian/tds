@@ -140,6 +140,18 @@ def protected_owners(db, cutoff):
         where b.status in ('pending','dispatching','running')
     """)
     trigger_ids.update(int(row["trigger_id"]) for row in grouping)
+    # A shared kiosk probe may have been stored under a different candidate's
+    # trigger prefix before its payer was identified. Protect that alias too.
+    if repositories._column_exists(db, table("paid_transaction_assignment"), "evidence"):
+        aliases = _rows(db, f"""
+            select json_extract(pa.evidence, '$.media_owner_trigger_id') as owner
+            from {table('paid_transaction_assignment')} pa
+            join {table('session')} s on s.entry_trigger_id=pa.entry_trigger_id
+            where pa.status='assigned' and (s.status='detected' or exists (
+                select 1 from {table('thief_alert')} a
+                where a.method='TDS System' and a.detail=concat('Session ', s.id)))
+        """)
+        trigger_ids.update(int(row["owner"]) for row in aliases if row.get("owner") is not None)
     return session_ids, trigger_ids, video_ids
 
 
