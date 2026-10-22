@@ -250,6 +250,15 @@ def retry_confidence_result(confidence_result_id: int, db: Session = Depends(get
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.get("/confidence-results/{confidence_result_id}/script-runs")
+def confidence_script_runs(confidence_result_id: int, db: Session = Depends(get_transaction_db)) -> list[dict[str, Any]]:
+    from ..services import confidence_timeline
+    runs = confidence_timeline.list_successful_runs(db, confidence_result_id)
+    if runs is None:
+        raise HTTPException(status_code=404, detail="Confidence result was not found.")
+    return runs
+
+
 @router.post("/confidence-results/{confidence_result_id}/force-deep-analysis")
 def force_deep_analysis(confidence_result_id: int, db: Session = Depends(get_transaction_db)) -> dict[str, Any]:
     try:
