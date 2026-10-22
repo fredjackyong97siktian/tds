@@ -36,9 +36,23 @@ Jev answer first. If none exists, the click authorizes one new paid attempt;
 the durable attempt barrier is restored before making that request. No new
 database migration is required for this retry control.
 
-The Grouping page also has a Transaction Assignments panel showing the latest
-20 unresolved receipts directly from the ownership ledger. Refresh checks the
-latest state without loading Script Run logs. Retry is available in that panel
+Action -> Issues has a Transaction Assignments panel showing the latest
+20 unresolved or retried receipts directly from the ownership ledger. Completed
+retries stay visible, with source (saved answer, timing, new attempt or manual),
+requested/finished timestamps and a link to the relevant Script Run.
+The dedicated Script Run column also links the original run if a new attempt
+created a different run. The panel no longer appears on Grouping. The Issues
+page additionally lists failed Script Runs of all types, paginated with bounded
+error summaries instead of full logs. Historical failures remain visible even
+if a later attempt succeeded, so the list is an audit rather than an automatic
+claim that each old failure is still blocking the pipeline. Active
+retries refresh every 15 seconds while the page is visible. States distinguish
+queued, checking saved answers, retrieving frames, calling Jev, completed,
+needs manual review, failed and interrupted (no batch worker lock remains).
+Retry progress is saved in the existing ledger's evidence JSON; no migration.
+Explicit confidence retry flags also independently qualify the batch for the
+worker queue, even when old result rows outnumber the current grouping count.
+Refresh checks the latest state without loading full Script Run logs. Retry is available in that panel
 when processing is enabled; queued receipts are labeled to avoid repeated
 clicks. Retry API failures return a JSON diagnostic (including database error
 codes when available), and the browser also handles plain-text proxy errors.
@@ -88,9 +102,13 @@ required: ambiguous receipts use the existing OpenRouter key and Jev 1.14.
   AI). A paused pipeline stays paused until explicitly resumed. Existing
   confirmed ownership cannot be stolen by a stale manual form, and affected
   scoring batches must be idle during the update. No migration is required.
-- For each ambiguous receipt, capture ten kiosk frames in a single FFmpeg
-  playback, at one-second intervals from payment - 5s through payment + 4s.
-  Apply the kiosk camera's own configured NVR delay; do not entrance-crop.
+- For each ambiguous receipt, capture five kiosk frames in a single FFmpeg
+  playback at payment -4s, -2s, 0s, +2s and +4s. Resize width and height to 50%
+  before upload and before sending to Jev. Apply the kiosk camera's own
+  configured NVR delay; do not entrance-crop. This affects only transaction
+  assignment payment frames, not identifier captures, entrance/exit references,
+  grouping frames or kiosk video analysis. Offsets and scale are defined once
+  in `transaction_assignment.py`; no environment setting or migration needed.
 - Before starting kiosk capture, wait for the same NVR/FFmpeg slot used by
   video and trigger-frame retrieval jobs. Lock checks use non-blocking
   `GET_LOCK(..., 0)` calls separated by short Python sleeps, never a long
@@ -165,7 +183,7 @@ protects shared probe aliases when their assigned owner becomes a theft case.
 
 Unit tests cover the three timing scenarios, one-receipt ambiguity, multiple
 receipts, open visits, UTC conversion, Edumetro mapping, decision caching,
-ownership conflicts, session retry guards and ten-frame kiosk capture.
+ownership conflicts, session retry guards and five-frame half-size kiosk capture.
 Regression coverage also includes 531 stale open entries, per-payment age
 limits, current-batch stale snapshots, real long completed visits, automatic
 assignment without Jev, and full kiosk machine names.

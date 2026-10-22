@@ -14717,10 +14717,15 @@ def _build_frame_batch_capture_command(
     frame_count: int,
     output_pattern: Path,
     apply_entrance_crop: bool = True,
+    image_scale: float = 1.0,
 ) -> list[str]:
+    if not 0 < image_scale <= 1:
+        raise ValueError("Image scale must be greater than 0 and at most 1.")
     crop_filter = _trigger_frame_crop_filter() if apply_entrance_crop else None
     fps_filter = f"fps={1 / max(0.04, gap_seconds):.6f}"
     vf_filter = f"{crop_filter},{fps_filter}" if crop_filter else fps_filter
+    if image_scale < 1:
+        vf_filter += f",scale=iw*{image_scale:.6f}:ih*{image_scale:.6f}"
     return [
         settings.ffmpeg_bin,
         "-y",

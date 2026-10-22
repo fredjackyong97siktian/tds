@@ -6,12 +6,43 @@ import shutil
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import Mock, patch
+from PIL import Image
 
 from app.services import identifier_capture as capture
 from app.services import workflow_service as workflow
+from app.services import transaction_assignment as assignment
 
 
 class IdentifierCaptureTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("ffmpeg"), "FFmpeg is not installed")
+    def test_real_ffmpeg_payment_capture_produces_five_half_size_images(self):
+        with TemporaryDirectory() as directory:
+            source = Path(directory) / "source.mp4"
+            subprocess.run([shutil.which("ffmpeg"), "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+                            "testsrc=duration=10:size=96x64:rate=10", "-c:v", "mpeg4", str(source)],
+                           capture_output=True, check=True, timeout=15)
+            with patch.object(workflow.settings, "ffmpeg_bin", shutil.which("ffmpeg")):
+                command = workflow._build_frame_batch_capture_command(
+                    str(source), start_offset_seconds=0, gap_seconds=2, frame_count=5,
+                    output_pattern=Path(directory) / "frame_%02d.jpg", apply_entrance_crop=False, image_scale=0.5)
+            transport = command.index("-rtsp_transport")
+            del command[transport:transport + 2]
+            subprocess.run(command, capture_output=True, check=True, timeout=15)
+            frames = sorted(Path(directory).glob("frame_*.jpg"))
+            self.assertEqual(len(frames), 5)
+            for path in frames:
+                with Image.open(path) as image:
+                    self.assertEqual(image.size, (48, 32))
+
+    def test_invalid_scale_cannot_start_capture(self):
+        for scale in (0, -0.5, 1.1):
+            with self.subTest(scale=scale), patch.object(capture.repositories, "create_script_run_started") as create:
+                with self.assertRaisesRegex(ValueError, "Image scale"):
+                    capture.capture_sequence(Mock(), location_id=2, trigger={"trigger_id": 58},
+                        parent_script_run_id=99, section="kiosk", image_scale=scale,
+                        times=capture.sample_times(datetime(2026, 10, 21, 11)))
+                create.assert_not_called()
+
     @unittest.skipUnless(shutil.which("ffmpeg"), "FFmpeg is not installed")
     def test_real_ffmpeg_produces_twelve_frames_from_a_local_fixture(self):
         with TemporaryDirectory() as directory:
@@ -80,13 +111,16 @@ class IdentifierCaptureTests(unittest.TestCase):
                 anchor = datetime(2026, 10, 21, 11)
                 from datetime import timedelta
                 return capture.capture_sequence(Mock(), location_id=2, trigger={"trigger_id": 58, "trigger_time": anchor},
-                    parent_script_run_id=99, section="kiosk", times=[anchor + timedelta(seconds=index - 5) for index in range(10)])
+                    parent_script_run_id=99, section="kiosk",
+                    times=[anchor + timedelta(seconds=offset) for offset in assignment.PAYMENT_FRAME_OFFSETS_SECONDS],
+                    image_scale=assignment.PAYMENT_FRAME_IMAGE_SCALE)
             return capture.capture_exit(Mock(), location_id=2, exit_trigger={"trigger_id": 58,
                                         "trigger_time": datetime(2026, 10, 21, 11)}, parent_script_run_id=99)
 
     def test_capture_uses_identifier_channel_and_offset_and_logs_all_frames(self):
         result = self.run_capture()
         self.assertEqual(len(result["frames"]), 12)
+        self.assertEqual(result["image_scale"], 1.0)
         self.calls["get_cctv_by_location_section"].assert_called_once()
         self.assertEqual(self.calls["get_cctv_by_location_section"].call_args.kwargs["section"], "identifier")
         url = self.calls["url"].call_args.kwargs
@@ -120,25 +154,29 @@ class IdentifierCaptureTests(unittest.TestCase):
         self.calls["run"].assert_not_called()
         self.assertEqual(self.calls["finish_script_run"].call_args.kwargs["status"], "failed")
 
-    def test_payment_sequence_captures_ten_frames_in_one_command_with_kiosk_delay(self):
-        result = self.run_capture(frames=10, section="kiosk", direction=None)
-        self.assertEqual(len(result["frames"]), 10)
+    def test_payment_sequence_captures_five_half_size_frames_in_one_command_with_kiosk_delay(self):
+        result = self.run_capture(frames=5, section="kiosk", direction=None)
+        self.assertEqual(len(result["frames"]), 5)
         self.assertEqual(self.calls["delay"].call_args.kwargs["section"], "kiosk")
         self.assertEqual(self.calls["get_cctv_by_location_section"].call_args.kwargs["section"], "kiosk")
         self.assertEqual(self.calls["run"].call_count, 1)
         command = self.calls["run"].call_args.args[0]
-        self.assertEqual(command[command.index("-vf") + 1], "fps=1.000000")
-        self.assertEqual(result["frames"][0]["camera_sample_time"], "2026-10-21T10:52:50")
+        self.assertEqual(command[command.index("-vf") + 1], "fps=0.500000,scale=iw*0.500000:ih*0.500000")
+        self.assertEqual(result["image_scale"], 0.5)
+        self.assertEqual(self.calls["create_script_run_started"].call_args.kwargs["runner_payload"]["image_scale"], 0.5)
+        self.assertEqual(self.calls["create_script_run_started"].call_args.kwargs["runner_payload"]["frame_count"], 5)
+        self.assertEqual(command[command.index("-frames:v") + 1], "5")
+        self.assertEqual(result["frames"][0]["camera_sample_time"], "2026-10-21T10:52:51")
         self.assertEqual(result["frames"][-1]["sample_time"], "2026-10-21T11:00:04")
         self.assertEqual(self.calls["create_script_run_started"].call_args.kwargs["model_name"], "dahua_rtsp_playback:kiosk_payment_frames")
 
     def test_payment_capture_waits_for_shared_retrieval_slot_before_ffmpeg(self):
-        self.run_capture(frames=10, section="kiosk")
+        self.run_capture(frames=5, section="kiosk")
         self.calls["lock"].assert_called_once_with(wait_seconds=workflow.settings.transaction_assignment_retrieval_wait_seconds)
 
     def test_busy_retrieval_never_starts_payment_capture_or_upload(self):
         with self.assertRaisesRegex(RuntimeError, "another retrieval is still busy"):
-            self.run_capture(frames=10, section="kiosk", busy=True)
+            self.run_capture(frames=5, section="kiosk", busy=True)
         self.calls["run"].assert_not_called()
         self.calls["upload"].assert_not_called()
         self.calls["release"].assert_not_called()

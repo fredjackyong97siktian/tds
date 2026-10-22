@@ -135,13 +135,18 @@ class AssignmentTests(unittest.TestCase):
         previous = {"1": {"status": "error", "context_hash": "old",
                           "evidence": {"retry_authorized": True}}}
         recovered = {"status": "assigned", "entry_trigger_id": 1, "method": "jev",
-                     "recorded_candidate_entry_ids": [1, 3], "script_run_id": 20804}
+                     "recorded_candidate_entry_ids": [1, 3], "script_run_id": 20804,
+                     "recovered_from_script_run": True}
         assigned, _ = self.assign([receipt(1, time(10, 3))],
             [group(1, time(10), time(10, 5)), group(3, time(10), time(10, 6))],
             previous=previous, recovered=recovered)
         self.assertEqual(len(assigned), 1)
         self.calls["decide_with_jev"].assert_not_called()
-        self.assertEqual(self.calls["save"].call_count, 1)
+        self.assertEqual(self.calls["save"].call_count, 2)
+        retry = self.calls["save"].call_args.kwargs["decision"]["retry"]
+        self.assertEqual(retry["state"], "completed")
+        self.assertEqual(retry["source"], "saved_answer")
+        self.assertIn("finished_at", retry)
 
     def test_explicit_retry_without_saved_answer_reserves_before_one_api_call(self):
         previous = {"1": {"status": "error", "context_hash": "old",
@@ -459,7 +464,7 @@ class AssignmentTests(unittest.TestCase):
         manual = {**decision, "method": "manual"}
         self.assertEqual(store.honor_recorded_choice(manual, [9769]), manual)
 
-    def test_jev_receipt_choice_includes_all_candidates_none_uncertain_and_ten_payment_samples(self):
+    def test_jev_receipt_choice_includes_all_candidates_and_five_half_size_payment_samples(self):
         options = {"entry_1", "entry_3", "none", "uncertain"}
         answer = {"answers": {"receipt_owner": {"type": "choice", "choice": "entry_3", "confidence": 0.9,
                   "probabilities": {key: 0.94 if key == "entry_3" else 0.02 for key in options}}}}
@@ -477,9 +482,12 @@ class AssignmentTests(unittest.TestCase):
                                                 mapping={"machine_name": "Left", "image_side": "right"})
         self.assertEqual(result["entry_trigger_id"], 3)
         times = capture.call_args.kwargs["times"]
-        self.assertEqual(len(times), 10)
-        self.assertEqual(times[0], time(10) - timedelta(seconds=5))
+        self.assertEqual(len(times), 5)
+        self.assertEqual(times[0], time(10) - timedelta(seconds=4))
         self.assertEqual(times[-1], time(10) + timedelta(seconds=4))
+        self.assertEqual(times[2], time(10))
+        self.assertTrue(all((right - left).total_seconds() == 2 for left, right in zip(times, times[1:])))
+        self.assertEqual(capture.call_args.kwargs["image_scale"], 0.5)
         self.assertEqual(set(call.call_args.args[2]["questions"]["receipt_owner"]["criteria"]), options)
         finish.assert_not_called()
         self.assertEqual(checkpoint.call_args.args[2]["persistence_status"], "awaiting_receipt_commit")

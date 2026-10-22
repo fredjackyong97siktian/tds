@@ -31,11 +31,14 @@ def capture_exit(db: Any, *, location_id: int, exit_trigger: dict[str, Any],
 
 
 def capture_sequence(db: Any, *, location_id: int, trigger: dict[str, Any],
-                     parent_script_run_id: int, section: str, times: list[datetime]) -> dict[str, Any]:
+                     parent_script_run_id: int, section: str, times: list[datetime],
+                     image_scale: float = 1.0) -> dict[str, Any]:
     """Capture one evenly sampled NVR sequence, without the entrance crop."""
     from . import workflow_service as workflow
 
     trigger_id = int(trigger["trigger_id"])
+    if not 0 < image_scale <= 1:
+        raise ValueError("Image scale must be greater than 0 and at most 1.")
     frame_count = len(times)
     if frame_count < 2:
         raise ValueError("At least two camera sample times are required.")
@@ -47,7 +50,8 @@ def capture_sequence(db: Any, *, location_id: int, trigger: dict[str, Any],
         model_name=f"dahua_rtsp_playback:{'identifier_frames' if section == 'identifier' else 'kiosk_payment_frames'}", command=workflow.SCRIPT_RUN_COMMAND_REDACTED,
         runner_payload={"parent_script_run_id": parent_script_run_id, "location_id": location_id,
                         "section": section, "trigger_id": trigger_id, "frame_count": frame_count,
-                        "interval_seconds": interval, "sample_times": [value.isoformat() for value in times]},
+                        "interval_seconds": interval, "image_scale": image_scale,
+                        "sample_times": [value.isoformat() for value in times]},
     )
     frames: list[dict[str, Any]] = []
     rtsp_url = ""
@@ -85,6 +89,7 @@ def capture_sequence(db: Any, *, location_id: int, trigger: dict[str, Any],
             command = workflow._build_frame_batch_capture_command(
                 rtsp_url, start_offset_seconds=offset, gap_seconds=interval,
                 frame_count=frame_count, output_pattern=pattern, apply_entrance_crop=False,
+                image_scale=image_scale,
             )
             wait_seconds = (workflow.settings.transaction_assignment_retrieval_wait_seconds if section == "kiosk"
                             else workflow.settings.retrieval_ffmpeg_lock_wait_seconds)
@@ -119,7 +124,7 @@ def capture_sequence(db: Any, *, location_id: int, trigger: dict[str, Any],
         result = {"trigger_id": trigger_id, "trigger_time": exit_time.isoformat(),
                   "section": section, "recorder_channel": channel, "exit_direction": direction,
                   "delayed_seconds": delay, "frames": frames, "script_run_id": run_id,
-                  "retrieval_wait_seconds": waited_seconds}
+                  "retrieval_wait_seconds": waited_seconds, "image_scale": image_scale}
         repositories.finish_script_run(db, run_id, status="success", stderr_log="",
             stdout_log=repositories.merge_script_run_stdout_fields(db, run_id, result))
         return result

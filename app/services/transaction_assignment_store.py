@@ -35,11 +35,15 @@ def load(db, location_id, receipts):
 def list_unresolved(db, *, limit=20):
     # Bound the ledger first; never transfer full Script Run logs to this panel.
     return repositories._fetch_all_dicts(db.execute(text(f"""
-        select a.*, s.id as latest_script_run_id, s.runner_payload,
-               left(s.stderr_log, 1000) as last_error
+        select a.*, s.id as latest_script_run_id, s.runner_payload, s.status as script_run_status,
+               left(s.stderr_log, 1000) as last_error,
+               is_used_lock(concat('tds_theft_confidence_batch_', coalesce(
+                   json_unquote(json_extract(a.evidence, '$.retry.batch_id')),
+                   json_unquote(json_extract(s.runner_payload, '$.batch_id'))))) is not null as confidence_running
         from (
             select * from {repositories._table('paid_transaction_assignment')}
             where status in ('error', 'uncertain')
+               or json_extract(evidence, '$.retry.requested_at') is not null
             order by updated_at desc, location_id, receipt_number limit :limit
         ) a
         left join {repositories._table('script_run')} s on s.id = coalesce(
@@ -52,6 +56,17 @@ def list_unresolved(db, *, limit=20):
         ))
         order by a.updated_at desc, a.location_id, a.receipt_number
     """), {"limit": max(1, min(int(limit), 50))}))
+
+
+def update_retry_progress(db, *, location_id, receipt, state, script_run_id):
+    db.execute(text(f"""
+        update {repositories._table('paid_transaction_assignment')}
+        set evidence=json_set(evidence, '$.retry.state', :state, '$.retry.script_run_id', :run),
+            script_run_id=:run
+        where location_id=:location_id and receipt_number=:receipt
+          and json_extract(evidence, '$.retry.requested_at') is not null
+    """), {"location_id": location_id, "receipt": receipt, "state": state, "run": script_run_id})
+    db.commit()
 
 
 def save(db, *, location_id, receipt, payment_time_utc, context_hash, decision):

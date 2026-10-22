@@ -10,6 +10,8 @@ from . import transaction_assignment_store as store
 
 POLICY_VERSION = 2
 ENABLED_SETTING_KEY = "paid_transaction_assignment_enabled"
+PAYMENT_FRAME_OFFSETS_SECONDS = (-4, -2, 0, 2, 4)
+PAYMENT_FRAME_IMAGE_SCALE = 0.5
 
 
 class AssignmentPaused(RuntimeError):
@@ -130,13 +132,17 @@ def decide_with_jev(db, *, location_id, batch_id, receipt, row, paid_at, candida
         model_name="openrouter-jev-1.14_transaction_assignment", command=workflow.SCRIPT_RUN_COMMAND_REDACTED,
         runner_payload={"batch_id": batch_id, "location_id": location_id, "receipt_number": receipt,
                         "candidate_entry_trigger_ids": [value["entry_trigger_id"] for value in candidates],
-                        "payment_time": paid_at.isoformat(), **mapping})
+                        "payment_time": paid_at.isoformat(), "payment_frame_count": len(PAYMENT_FRAME_OFFSETS_SECONDS),
+                        "payment_frame_offsets_seconds": list(PAYMENT_FRAME_OFFSETS_SECONDS),
+                        "payment_image_scale": PAYMENT_FRAME_IMAGE_SCALE, **mapping})
     evidence = {"script_run_id": run_id, "method": "jev", "media_owner_trigger_id": candidates[0]["entry_trigger_id"]}
     try:
+        store.update_retry_progress(db, location_id=location_id, receipt=receipt, state="retrieving_frames", script_run_id=run_id)
         probe = identifier_capture.capture_sequence(
             db, location_id=location_id, trigger={"trigger_id": candidates[0]["entry_trigger_id"], "trigger_time": paid_at},
             parent_script_run_id=run_id, section="kiosk",
-            times=[paid_at + timedelta(seconds=index - 5) for index in range(10)])
+            times=[paid_at + timedelta(seconds=offset) for offset in PAYMENT_FRAME_OFFSETS_SECONDS],
+            image_scale=PAYMENT_FRAME_IMAGE_SCALE)
         evidence["kiosk_evidence"] = probe
         group_states, all_urls = [], []
         for group in candidates:
@@ -161,6 +167,7 @@ def decide_with_jev(db, *, location_id, batch_id, receipt, row, paid_at, candida
                     "Do not invent hidden faces or items. Choose exactly one owner, none if clearly another customer, "
                     "or uncertain when identity/visibility/machine association is unclear. Other receipts may belong to the same group.")}}}
         require_enabled(db)
+        store.update_retry_progress(db, location_id=location_id, receipt=receipt, state="calling_jev", script_run_id=run_id)
         response, _meta = jev_pipeline.logged_call(db, run_id, body, list(dict.fromkeys(all_urls)), description="Paid transaction assignment")
         answer = jev_pipeline.read_choice(response, "receipt_owner", set(options))
         choice = answer["choice"]
@@ -219,6 +226,9 @@ def assign(db, *, batch_id, location_id, group, start_time, end_time):
                                   for value in eligible], "mapping": mapping}
             context_hash = hashlib.sha256(json.dumps(context, default=str, sort_keys=True).encode()).hexdigest()
             previous = cached.get(receipt)
+            retry = (previous or {}).get("evidence", {}).get("retry")
+            if retry and retry.get("finished_at"):
+                retry = None
             if previous and previous["context_hash"] == context_hash:
                 updated = store.honor_recorded_choice(previous["evidence"], {item["entry_trigger_id"] for item in eligible})
                 if updated != previous["evidence"]:
@@ -228,6 +238,18 @@ def assign(db, *, batch_id, location_id, group, start_time, end_time):
             if previous and previous["evidence"].get("retry_authorized"):
                 # One explicit user retry. The new attempt barrier replaces this
                 # authorization before a paid request, so polling cannot loop it.
+                from datetime import timezone
+                retry = {**(retry or {}), "state": "processing", "batch_id": batch_id,
+                         "started_at": datetime.now(timezone.utc).isoformat()}
+                retry.setdefault("requested_at", retry["started_at"])
+                retry.setdefault("source_script_run_id", previous["evidence"].get("script_run_id"))
+                # Consume authorization durably before recovery/capture. A
+                # killed retry cannot silently authorize another paid call.
+                store.save(db, location_id=location_id, receipt=receipt,
+                    payment_time_utc=workflow._local_naive_to_utc(paid_at), context_hash=context_hash,
+                    decision={"status": "error", "method": "jev", "entry_trigger_id": None,
+                              "attempt_reserved": True, "retry": retry,
+                              "reason": "Retry processing: checking saved answers before a new request."})
                 previous = None
             if previous and previous["evidence"].get("attempt_reserved"):
                 recovered = store.recover_decision(db, location_id=location_id, receipt=receipt)
@@ -237,6 +259,8 @@ def assign(db, *, batch_id, location_id, group, start_time, end_time):
                                      active_groups=eligible, **mapping)
                     if set(recovered["recorded_candidate_entry_ids"]) != {item["entry_trigger_id"] for item in eligible}:
                         recovered["context_changed"] = True
+                    if retry:
+                        recovered["retry"] = retry
                     _commit_decision(db, location_id=location_id, receipt=receipt,
                         payment_time_utc=workflow._local_naive_to_utc(paid_at), context_hash=context_hash, decision=recovered)
                     previous = {"status": recovered["status"], "context_hash": context_hash, "evidence": recovered}
@@ -269,6 +293,7 @@ def assign(db, *, batch_id, location_id, group, start_time, end_time):
                             payment_time_utc=workflow._local_naive_to_utc(paid_at), context_hash=context_hash,
                             decision={"status": "error", "method": "jev", "entry_trigger_id": None,
                                       "attempt_reserved": True,
+                                      **({"retry": retry} if retry else {}),
                                       "reason": "Assignment attempt reserved; outcome not committed. Automatic resend blocked."})
                         decision = decide_with_jev(db, location_id=location_id, batch_id=batch_id, receipt=receipt,
                                                    row=row, paid_at=paid_at, candidates=eligible, mapping=mapping)
@@ -278,6 +303,12 @@ def assign(db, *, batch_id, location_id, group, start_time, end_time):
                                 payment_time_source=source, active_groups=eligible, **mapping)
                 if failed_run_id is not None:
                     decision["supersedes_failed_script_run_id"] = failed_run_id
+                if retry:
+                    decision["retry"] = retry
+                _commit_decision(db, location_id=location_id, receipt=receipt,
+                    payment_time_utc=workflow._local_naive_to_utc(paid_at), context_hash=context_hash, decision=decision)
+            if retry and not (decision.get("retry") or {}).get("finished_at"):
+                decision["retry"] = retry
                 _commit_decision(db, location_id=location_id, receipt=receipt,
                     payment_time_utc=workflow._local_naive_to_utc(paid_at), context_hash=context_hash, decision=decision)
             decisions.append(decision)
@@ -287,6 +318,15 @@ def assign(db, *, batch_id, location_id, group, start_time, end_time):
 
 
 def _commit_decision(db, *, location_id, receipt, payment_time_utc, context_hash, decision):
+    from datetime import timezone
+    if decision.get("retry"):
+        state = ("failed" if decision["status"] == "error" else "needs_review"
+                 if decision["status"] == "uncertain" or decision.get("context_changed") else "completed")
+        source = ("saved_answer" if decision.get("recovered_from_script_run") or decision.get("cached")
+                  else "timing" if decision.get("method") == "time" else "new_request")
+        decision["retry"] = {**decision["retry"], "state": state, "source": source,
+                             "finished_at": datetime.now(timezone.utc).isoformat(),
+                             "script_run_id": decision.get("script_run_id")}
     run_id = decision.get("script_run_id")
     try:
         store.save(db, location_id=location_id, receipt=receipt, payment_time_utc=payment_time_utc,
@@ -349,6 +389,9 @@ def retry_from_script_run(db, script_run_id):
         with store.location_lock(db, location_id, wait_seconds=0):
             db.commit()
             previous = store.load(db, location_id, [receipt]).get(receipt)
+            from datetime import timezone
+            retry = {"state": "queued", "requested_at": datetime.now(timezone.utc).isoformat(),
+                     "batch_id": batch_id, "source_script_run_id": script_run_id}
             table = repositories._table("filter_confidence_result")
             # Keep existing result IDs and group memberships. Only affected
             # scores become eligible again; the worker does the expensive work.
@@ -366,11 +409,15 @@ def retry_from_script_run(db, script_run_id):
                     decision={"status": "error", "method": "jev", "entry_trigger_id": None,
                               "retry_authorized": True, "requested_from_script_run_id": script_run_id,
                               "script_run_id": script_run_id, "batch_id": batch_id,
+                              "retry": retry,
                               "reason": "User queued one retry. Recover a saved answer first; otherwise allow one new attempt."})
             else:
-                db.commit()
+                store.save(db, location_id=location_id, receipt=receipt,
+                    payment_time_utc=previous["payment_time_utc"], context_hash=previous["context_hash"],
+                    decision={**previous["evidence"], "retry": retry})
             paused = repositories.is_worker_paused(db, "theft_confidence_analysis")
             return {"ok": True, "batch_id": batch_id, "receipt_number": receipt, "queued": True,
+                    "retry": retry,
                     "message": "Retry queued. Turn on Theft Confidence Analysis in Workers." if paused else
                                "Retry queued. Saved answers will be reused before any new paid request."}
     except Exception:
@@ -398,12 +445,17 @@ def list_stuck_assignments(db, *, limit=20):
                 evidence = value
             else:
                 payload = value
+        retry = evidence.get("retry") or {}
+        if retry.get("state") in {"processing", "retrieving_frames", "calling_jev"} and not row.get("confidence_running"):
+            retry = {**retry, "state": "interrupted"}
         items.append({"location_id": row["location_id"], "receipt_number": row["receipt_number"],
                       "status": "queued" if evidence.get("retry_authorized") else row["status"],
                       "batch_id": payload.get("batch_id") or evidence.get("batch_id"),
                       "script_run_id": row.get("latest_script_run_id") or row.get("script_run_id"),
                       "payment_time_utc": row.get("payment_time_utc"), "updated_at": row.get("updated_at"),
-                      "last_error": row.get("last_error") or None,
+                      "last_error": (row.get("last_error") or None) if row["status"] == "error" else None,
+                      "retry": retry or None, "confidence_running": bool(row.get("confidence_running")),
+                      "entry_trigger_id": row.get("entry_trigger_id"),
                       "reason": str(evidence.get("reason") or "Assignment requires review or recovery.")[:1000]})
     return {"items": items, "limit": limit, "enabled": is_enabled(db),
             "worker_paused": repositories.is_worker_paused(db, "theft_confidence_analysis")}
@@ -485,6 +537,9 @@ def resolve_manually(db, *, confidence_result_id, receipt, entry_trigger_id):
                             "resolved_at": datetime.now(timezone.utc).isoformat(),
                             "previous_status": previous["status"], "previous_reason": evidence.get("reason")},
                         "persistence_status": "committed"}
+            if decision.get("retry"):
+                decision["retry"] = {**decision["retry"], "state": "completed", "source": "manual",
+                                     "finished_at": datetime.now(timezone.utc).isoformat()}
             for key in ("attempt_reserved", "retry_authorized", "requested_from_script_run_id"):
                 decision.pop(key, None)
             # Queue every existing group that saw this receipt, not just the

@@ -3790,6 +3790,20 @@ def _script_run_list_filters(
     return filters, params
 
 
+def list_script_run_issues(db: Session, *, limit: int = 20, offset: int = 0) -> dict[str, Any]:
+    table = _table("script_run")
+    rows = _fetch_all_dicts(db.execute(text(f"""
+        select id as script_run_id, session_id, trigger_id, script_name, model_name,
+               status, started_at, finished_at, left(stderr_log, 1000) as issue_message
+        from {table}
+        where status='failed'
+        order by started_at desc, id desc
+        limit :limit offset :offset
+    """), {"limit": max(1, min(limit, 100)), "offset": max(0, offset)}))
+    total = db.execute(text(f"select count(*) from {table} where status='failed'")).scalar()
+    return {"items": rows, "total": int(total or 0)}
+
+
 def list_script_runs(
     db: Session,
     limit: int = 100,
@@ -3873,7 +3887,11 @@ def list_pending_theft_confidence_batches(db: Session, limit: int = 50) -> list[
             from {batch_table} b
             where b.status = 'success'
               and b.result_payload is not null
-              and (
+              and (exists (
+                  select 1 from {confidence_table} retry_result
+                  where retry_result.batch_id=b.id and coalesce(json_unquote(json_extract(
+                      retry_result.factor_payload, '$.assignment_retry_requested')), 'false') in ('true', '1')
+              ) or (
                   select count(*) from {confidence_table} c where c.batch_id = b.id
                     and c.group_key <> '__error__'
                     and coalesce(json_unquote(json_extract(c.factor_payload, '$.assignment_retry_requested')), 'false') not in ('true', '1')
@@ -3884,7 +3902,7 @@ def list_pending_theft_confidence_batches(db: Session, limit: int = 50) -> list[
                       json_length(b.result_payload, '$.Groups'),
                       0
                   )
-              )
+              ))
             order by b.finished_at asc, b.id asc
             limit :limit
             """

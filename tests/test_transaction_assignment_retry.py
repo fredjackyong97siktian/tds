@@ -40,6 +40,8 @@ class AssignmentRetryTests(unittest.TestCase):
         self.api.assert_not_called()
         decision = self.save.call_args.kwargs["decision"]
         self.assertTrue(decision["retry_authorized"])
+        self.assertEqual(decision["retry"]["state"], "queued")
+        self.assertIn("requested_at", decision["retry"])
         self.assertEqual(self.save.call_args.kwargs["receipt"], "receipt-test")
         update, cleanup = self.db.execute.call_args_list
         self.assertIn("assignment_retry_requested", str(update.args[0]))
@@ -49,9 +51,14 @@ class AssignmentRetryTests(unittest.TestCase):
         self.release.assert_called_once()
 
     def test_already_assigned_receipt_preserves_ownership(self):
-        self.load.return_value = {"receipt-test": {"status": "assigned", "entry_trigger_id": 9546}}
+        self.load.return_value = {"receipt-test": {"status": "assigned", "entry_trigger_id": 9546,
+            "payment_time_utc": datetime(2026, 10, 20, 14, 19, 59), "context_hash": "old",
+            "evidence": {"status": "assigned", "method": "jev", "entry_trigger_id": 9546}}}
         assignment.retry_from_script_run(self.db, 20804)
-        self.save.assert_not_called()
+        decision = self.save.call_args.kwargs["decision"]
+        self.assertEqual(decision["entry_trigger_id"], 9546)
+        self.assertEqual(decision["status"], "assigned")
+        self.assertEqual(decision["retry"]["state"], "queued")
         self.api.assert_not_called()
 
     def test_running_batch_rejects_retry_without_resetting_receipt(self):
@@ -139,6 +146,54 @@ class AssignmentRetryTests(unittest.TestCase):
         sql = str(self.db.execute.call_args.args[0])
         self.assertIn("not in ('true', '1')", sql)
         self.assertIn("group_key <> '__error__'", sql)
+
+    def test_explicit_retry_flag_queues_batch_independent_of_previous_result_count(self):
+        with patch.object(assignment.repositories, "_fetch_all_dicts", return_value=[]):
+            assignment.repositories.list_pending_theft_confidence_batches(self.db)
+        sql = str(self.db.execute.call_args.args[0])
+        self.assertIn("and (exists (", sql)
+        self.assertIn("retry_result.batch_id=b.id", sql)
+        self.assertIn("in ('true', '1')", sql)
+        self.assertIn(") or (", sql)
+
+    def test_completed_retry_stays_in_list_and_reports_saved_answer_reuse(self):
+        row = {"location_id": 2, "receipt_number": "receipt-test", "status": "assigned", "entry_trigger_id": 9546,
+               "evidence": {"reason": "Saved answer reused", "retry": {"state": "completed", "source": "saved_answer",
+                   "requested_at": "2026-10-22T07:00:00+00:00", "finished_at": "2026-10-22T07:00:10+00:00"}},
+               "last_error": "old error", "latest_script_run_id": 20804}
+        with patch.object(store, "list_unresolved", return_value=[row]):
+            result = assignment.list_stuck_assignments(self.db)
+        item = result["items"][0]
+        self.assertEqual(item["retry"]["source"], "saved_answer")
+        self.assertEqual(item["entry_trigger_id"], 9546)
+        self.assertIsNone(item["last_error"])
+
+    def test_processing_retry_with_no_worker_lock_is_shown_as_interrupted(self):
+        row = {"location_id": 2, "receipt_number": "receipt-test", "status": "error",
+               "evidence": {"retry": {"state": "retrieving_frames"}}, "confidence_running": False}
+        with patch.object(store, "list_unresolved", return_value=[row]):
+            result = assignment.list_stuck_assignments(self.db)
+        self.assertEqual(result["items"][0]["retry"]["state"], "interrupted")
+        row["confidence_running"] = True
+        with patch.object(store, "list_unresolved", return_value=[row]):
+            result = assignment.list_stuck_assignments(self.db)
+        self.assertEqual(result["items"][0]["retry"]["state"], "retrieving_frames")
+
+    def test_progress_update_only_touches_receipts_with_retry_metadata(self):
+        store.update_retry_progress(self.db, location_id=2, receipt="receipt-test", state="calling_jev", script_run_id=20804)
+        sql, params = self.db.execute.call_args.args
+        self.assertIn("$.retry.requested_at", str(sql))
+        self.assertEqual(params["state"], "calling_jev")
+        self.assertEqual(params["receipt"], "receipt-test")
+
+    def test_final_retry_status_distinguishes_failure_from_uncertain_answer(self):
+        for status, expected in [("error", "failed"), ("uncertain", "needs_review"), ("assigned", "completed"), ("none", "completed")]:
+            with self.subTest(status=status):
+                decision = {"status": status, "method": "jev", "retry": {"requested_at": "2026-10-22T07:00:00+00:00"}}
+                assignment._commit_decision(self.db, location_id=2, receipt="receipt-test",
+                    payment_time_utc=datetime(2026, 10, 22, 7), context_hash="hash", decision=decision)
+                self.assertEqual(decision["retry"]["state"], expected)
+                self.assertIn("finished_at", decision["retry"])
 
 
 if __name__ == "__main__":

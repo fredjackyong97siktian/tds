@@ -105,6 +105,12 @@ def run_kiosk(
     return ScriptRunResponse(**result.__dict__)
 
 
+@router.get("/script-run-issues")
+def list_script_run_issues(limit: int = Query(20, ge=1, le=100), offset: int = Query(0, ge=0),
+                          db: Session = Depends(get_transaction_db)) -> dict[str, Any]:
+    return repositories.list_script_run_issues(db, limit=limit, offset=offset)
+
+
 @router.get("/script-runs", response_model=list[ScriptRunDetailResponse])
 def list_script_runs(
     limit: int = 100,
