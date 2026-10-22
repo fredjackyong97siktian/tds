@@ -3750,7 +3750,25 @@ def _script_run_list_filters(
 ) -> tuple[list[str], dict[str, Any]]:
     filters: list[str] = []
     params: dict[str, Any] = {}
-    if script_name in {"person_presence", "transaction_assignment", "grouping_expand"}:
+    if script_name in {"retrieve_frame", "retrieve_video"}:
+        # Existing databases record frame captures under retrieve_video.
+        # Separate them by their explicit model tags without a schema change.
+        frame_models = (
+            "dahua_rtsp_playback:trigger_frames", "dahua_rtsp_playback:trigger_frame_asset",
+            "dahua_rtsp_playback:identifier_frames", "dahua_rtsp_playback:kiosk_payment_frames",
+            "worker_build_frame_job",
+        )
+        placeholders = []
+        for index, value in enumerate(frame_models):
+            key = f"frame_model_{index}"
+            placeholders.append(f":{key}")
+            params[key] = value
+        frame_model_clause = f"lower(coalesce(model_name, '')) in ({', '.join(placeholders)})"
+        if script_name == "retrieve_frame":
+            filters.append(f"(script_name = 'retrieve_frame' or (script_name = 'retrieve_video' and {frame_model_clause}))")
+        else:
+            filters.extend(["script_name = 'retrieve_video'", f"not ({frame_model_clause})"])
+    elif script_name in {"person_presence", "transaction_assignment", "grouping_expand"}:
         # Presence checks reuse the allowed grouping script name in older databases.
         filters.append("script_name = :script_name")
         params["script_name"] = "grouping"

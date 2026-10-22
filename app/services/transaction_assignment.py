@@ -163,7 +163,7 @@ def decide_with_jev(db, *, location_id, batch_id, receipt, row, paid_at, candida
         require_enabled(db)
         response, _meta = jev_pipeline.logged_call(db, run_id, body, list(dict.fromkeys(all_urls)), description="Paid transaction assignment")
         answer = jev_pipeline.read_choice(response, "receipt_owner", set(options))
-        choice = answer["choice"] if answer["confidence"] >= jev_pipeline.MIN_CHOICE_CONFIDENCE else "uncertain"
+        choice = answer["choice"]
         evidence.update(status="assigned" if choice.startswith("entry_") else choice,
                         entry_trigger_id=int(choice[6:]) if choice.startswith("entry_") else None,
                         jev_decision=answer, reason=f"Jev selected {choice} for this paid receipt.",
@@ -219,6 +219,12 @@ def assign(db, *, batch_id, location_id, group, start_time, end_time):
                                   for value in eligible], "mapping": mapping}
             context_hash = hashlib.sha256(json.dumps(context, default=str, sort_keys=True).encode()).hexdigest()
             previous = cached.get(receipt)
+            if previous and previous["context_hash"] == context_hash:
+                updated = store.honor_recorded_choice(previous["evidence"], {item["entry_trigger_id"] for item in eligible})
+                if updated != previous["evidence"]:
+                    _commit_decision(db, location_id=location_id, receipt=receipt,
+                        payment_time_utc=workflow._local_naive_to_utc(paid_at), context_hash=context_hash, decision=updated)
+                    previous = {**previous, "status": updated["status"], "evidence": updated}
             if previous and previous["evidence"].get("retry_authorized"):
                 # One explicit user retry. The new attempt barrier replaces this
                 # authorization before a paid request, so polling cannot loop it.
@@ -401,6 +407,106 @@ def list_stuck_assignments(db, *, limit=20):
                       "reason": str(evidence.get("reason") or "Assignment requires review or recovery.")[:1000]})
     return {"items": items, "limit": limit, "enabled": is_enabled(db),
             "worker_paused": repositories.is_worker_paused(db, "theft_confidence_analysis")}
+
+
+def resolve_manually(db, *, confidence_result_id, receipt, entry_trigger_id):
+    """Record a human ownership decision; never capture frames or call AI."""
+    from contextlib import ExitStack
+    from datetime import timezone
+    from sqlalchemy import text
+    from . import workflow_service as workflow
+
+    result = repositories.get_filter_confidence_result(db, confidence_result_id)
+    if not result:
+        raise ValueError("Confidence result was not found.")
+    batch_id, location_id = int(result["batch_id"]), int(result["location_id"])
+    lock = workflow._try_acquire_theft_confidence_lock(batch_id, wait_seconds=0)
+    if lock is None:
+        raise RuntimeError("This confidence batch is running. Wait for it to finish before assigning manually.")
+    locks = ExitStack()
+    locks.callback(workflow._release_theft_confidence_lock, lock, batch_id)
+    try:
+        with store.location_lock(db, location_id, wait_seconds=0):
+            db.commit()
+            result = repositories.get_filter_confidence_result(db, confidence_result_id)
+            if not result:
+                raise ValueError("Confidence result was removed. Refresh the page.")
+            payload = result.get("factor_payload") or {}
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            report = payload.get("transaction_assignment") or {}
+            snapshot = next((decision for decision in report.get("decisions", [])
+                             if str(decision.get("receipt_number")) == receipt), None)
+            if snapshot is None:
+                raise ValueError("This receipt does not belong to this confidence result's assignment audit.")
+            previous = store.load(db, location_id, [receipt]).get(receipt)
+            if not previous:
+                raise ValueError("No saved receipt assignment exists. Retry confidence analysis first.")
+            evidence = previous.get("evidence") or {}
+            if isinstance(evidence, str):
+                evidence = json.loads(evidence)
+            if previous["status"] == "assigned" and previous.get("entry_trigger_id") != entry_trigger_id:
+                raise RuntimeError("This receipt already has a confirmed owner. Refresh before making another change.")
+            if previous["status"] not in {"error", "uncertain", "assigned"}:
+                raise ValueError("This receipt is already resolved. Refresh its confidence result.")
+            paid_at = workflow._utc_naive_to_local(previous["payment_time_utc"])
+            if paid_at is None:
+                raise ValueError("The receipt has no valid payment timestamp.")
+            current_group = {"entry": payload.get("entry_trigger_ids") or [report.get("entry_trigger_id")],
+                             "exit": payload.get("exit_trigger_ids") or []}
+            groups = collect_groups(db, location_id=location_id, start=paid_at, end=paid_at,
+                                    batch_id=batch_id, current_group=current_group)
+            eligible = active_groups(groups, paid_at)
+            if entry_trigger_id is not None and not any(group["entry_trigger_id"] == entry_trigger_id for group in eligible):
+                raise ValueError("Select an existing completed group that was active when this receipt was paid.")
+            related = repositories._fetch_all_dicts(db.execute(text(f"""
+                select distinct batch_id from {repositories._table('filter_confidence_result')}
+                where location_id=:location_id and json_search(factor_payload, 'one', :receipt, null,
+                    '$.transaction_assignment.decisions[*].receipt_number') is not null
+            """), {"location_id": location_id, "receipt": receipt}))
+            affected_batches = {int(row["batch_id"]) for row in related}
+            affected_batches.update(int(group["batch_id"]) for group in eligible)
+            for related_batch in sorted(affected_batches - {batch_id}):
+                related_lock = workflow._try_acquire_theft_confidence_lock(related_batch, wait_seconds=0)
+                if related_lock is None:
+                    raise RuntimeError("Another affected confidence batch is running. Wait for it to finish before assigning manually.")
+                locks.callback(workflow._release_theft_confidence_lock, related_lock, related_batch)
+            context = {"version": POLICY_VERSION, "paid_at": paid_at,
+                       "groups": [{key: group[key] for key in ("entry_trigger_id", "exit_trigger_ids", "entry_time", "exit_time")}
+                                  for group in eligible],
+                       "mapping": {key: snapshot.get(key) for key in ("machine_name", "image_side", "mapping")}}
+            context_hash = hashlib.sha256(json.dumps(context, default=str, sort_keys=True).encode()).hexdigest()
+            decision = {**evidence, **context["mapping"], "status": "assigned" if entry_trigger_id is not None else "none",
+                        "method": "manual", "entry_trigger_id": entry_trigger_id, "context_changed": False,
+                        "receipt_number": receipt, "payment_time": paid_at.isoformat(), "active_groups": eligible,
+                        "reason": f"Manually assigned to the group with entry #{entry_trigger_id}." if entry_trigger_id is not None
+                                  else "Manually confirmed that none of the candidate groups owns this paid receipt.",
+                        "manual_resolution": {"confidence_result_id": confidence_result_id,
+                            "resolved_at": datetime.now(timezone.utc).isoformat(),
+                            "previous_status": previous["status"], "previous_reason": evidence.get("reason")},
+                        "persistence_status": "committed"}
+            for key in ("attempt_reserved", "retry_authorized", "requested_from_script_run_id"):
+                decision.pop(key, None)
+            # Queue every existing group that saw this receipt, not just the
+            # chosen group. Their totals and carry checks must agree on ownership.
+            db.execute(text(f"""
+                update {repositories._table('filter_confidence_result')}
+                set factor_payload=json_set(coalesce(factor_payload, json_object()),
+                    '$.assignment_retry_requested', json_extract('true', '$'))
+                where location_id=:location_id and json_search(factor_payload, 'one', :receipt, null,
+                    '$.transaction_assignment.decisions[*].receipt_number') is not null
+            """), {"location_id": location_id, "receipt": receipt})
+            store.save(db, location_id=location_id, receipt=receipt, payment_time_utc=previous["payment_time_utc"],
+                       context_hash=context_hash, decision=decision)
+            held = not is_enabled(db) or repositories.is_worker_paused(db, "theft_confidence_analysis")
+            return {"ok": True, "status": decision["status"], "entry_trigger_id": entry_trigger_id,
+                    "message": "Manual ownership saved without an AI request. Confidence checks are queued."
+                    + (" Resume Transaction Assignment and the confidence worker to process them." if held else "")}
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        locks.close()
 
 
 def for_session(db, session_id):

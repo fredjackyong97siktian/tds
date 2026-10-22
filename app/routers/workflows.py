@@ -4,6 +4,7 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.exc import SQLAlchemyError
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from .. import repositories
@@ -32,6 +33,29 @@ def _assignment_database_error(exc: SQLAlchemyError) -> str:
     # Include the driver diagnostic, not SQL statements or bound parameters.
     diagnostic = str(args[1])[:600] if len(args) > 1 else "Check the API server logs."
     return f"Transaction Assignment database error ({code}): {diagnostic}"
+
+
+class ManualTransactionAssignmentRequest(BaseModel):
+    confidence_result_id: int = Field(gt=0)
+    receipt_number: str = Field(min_length=1, max_length=255)
+    entry_trigger_id: int | None = Field(..., gt=0)
+
+
+@router.post("/transaction-assignments/manual")
+def resolve_transaction_assignment(payload: ManualTransactionAssignmentRequest,
+                                   db: Session = Depends(get_transaction_db)) -> dict[str, Any]:
+    from ..services import transaction_assignment
+    try:
+        return transaction_assignment.resolve_manually(db, confidence_result_id=payload.confidence_result_id,
+            receipt=payload.receipt_number.strip(), entry_trigger_id=payload.entry_trigger_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.exception("Manual transaction assignment failed")
+        raise HTTPException(status_code=500, detail=_assignment_database_error(exc)) from exc
 
 
 @router.get("/transaction-assignments/stuck")

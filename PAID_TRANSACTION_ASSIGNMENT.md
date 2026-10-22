@@ -73,6 +73,21 @@ required: ambiguous receipts use the existing OpenRouter key and Jev 1.14.
 - Exactly one active group: assign automatically. More than one: compare
   each receipt independently with Jev. A group may receive multiple receipts,
   but a receipt may have only one owner per location.
+- Jev's selected option is used directly, without a confidence cutoff. An
+  entry choice assigns that group's receipt; `none` means no candidate owns
+  it; an explicit `uncertain` remains available for manual resolution.
+  Confidence and probabilities are retained for audit only. Retrying an old
+  confidence-gated decision reuses the recorded choice rather than buying a
+  new answer, subject to the existing valid-group and context checks.
+- In Confidence Result Detail -> Transaction Assignment, unresolved receipts
+  offer Choose Receipt Owner Manually. Select a completed group active at the
+  payment time or None of these groups. The backend validates membership and
+  timing again, preserves the Jev response, and saves method `manual` in the
+  ownership ledger. No new capture or ownership AI call is made. All affected
+  confidence scores are queued for recalculation (their factor checks may use
+  AI). A paused pipeline stays paused until explicitly resumed. Existing
+  confirmed ownership cannot be stolen by a stale manual form, and affected
+  scoring batches must be idle during the update. No migration is required.
 - For each ambiguous receipt, capture ten kiosk frames in a single FFmpeg
   playback, at one-second intervals from payment - 5s through payment + 4s.
   Apply the kiosk camera's own configured NVR delay; do not entrance-crop.

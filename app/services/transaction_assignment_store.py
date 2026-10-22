@@ -76,6 +76,19 @@ def checkpoint_run(db, run_id, decision):
     db.commit()
 
 
+def honor_recorded_choice(decision, candidate_ids):
+    """Remove the old confidence-only override without buying the answer again."""
+    if decision.get("status") != "uncertain" or decision.get("method") == "manual" or decision.get("context_changed"):
+        return decision
+    choice = (decision.get("jev_decision") or {}).get("choice")
+    owners = {f"entry_{value}": value for value in candidate_ids}
+    if choice not in owners and choice != "none":
+        return decision
+    return {**decision, "status": "assigned" if choice in owners else "none",
+            "entry_trigger_id": owners.get(choice), "confidence_cutoff_removed": True,
+            "reason": f"Jev selected {choice}; its recorded choice is used without a confidence cutoff."}
+
+
 def recover_decision(db, *, location_id, receipt):
     """Recover a paid answer whose receipt commit was interrupted or failed."""
     rows = repositories._fetch_all_dicts(db.execute(text(f"""
@@ -97,6 +110,7 @@ def recover_decision(db, *, location_id, receipt):
                 continue
             if row["status"] != "success" and result.get("api_succeeded") is not True:
                 continue
+            result = honor_recorded_choice(result, payload.get("candidate_entry_trigger_ids") or [])
             if result["status"] == "assigned" and result.get("entry_trigger_id") not in payload.get("candidate_entry_trigger_ids", []):
                 continue
             return {**{key: result[key] for key in fields if key in result}, "method": "jev",

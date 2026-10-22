@@ -424,6 +424,41 @@ class AssignmentTests(unittest.TestCase):
              patch.object(store, "load", return_value={"a": {"entry_trigger_id": 1}, "b": {"entry_trigger_id": 3}}):
             self.assertEqual(assignment.for_session(Mock(), 7), [{"receipt_number": "a"}])
 
+    def test_low_confidence_owner_choice_is_used_without_a_cutoff(self):
+        response = {"answers": {"receipt_owner": {"type": "choice", "choice": "entry_1", "confidence": 0.25,
+                    "probabilities": {"entry_1": 0.44, "entry_3": 0.32, "uncertain": 0.22, "none": 0.02}}}}
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(workflow.repositories, "create_script_run_started", return_value=8))
+            stack.enter_context(patch.object(store, "checkpoint_run"))
+            stack.enter_context(patch.object(identifier_capture, "capture_sequence", return_value={"frames": []}))
+            stack.enter_context(patch.object(assignment, "_references", return_value=[]))
+            stack.enter_context(patch.object(jev_pipeline, "encode_sequences", return_value=([{}, {}], [])))
+            stack.enter_context(patch.object(jev_pipeline, "logged_call", return_value=(response, {})))
+            result = assignment.decide_with_jev(Mock(), location_id=2, batch_id=1, receipt="a", row=receipt("a", time(10)),
+                paid_at=time(10), candidates=[group(1, time(9), time(11)), group(3, time(9), time(11))], mapping={})
+        self.assertEqual(result["status"], "assigned")
+        self.assertEqual(result["entry_trigger_id"], 1)
+        self.assertEqual(result["jev_decision"]["choice"], "entry_1")
+        self.assertEqual(result["jev_decision"]["confidence"], 0.25)
+        self.assertNotIn("minimum_confidence", result)
+
+    def test_old_confidence_override_reuses_original_selected_owner(self):
+        decision = {"status": "uncertain", "method": "jev", "jev_decision": {"choice": "entry_9769", "confidence": 0.25}}
+        result = store.honor_recorded_choice(decision, [9769, 9770])
+        self.assertEqual(result["status"], "assigned")
+        self.assertEqual(result["entry_trigger_id"], 9769)
+        self.assertEqual(result["jev_decision"]["confidence"], 0.25)
+
+    def test_explicit_uncertain_choice_stays_available_for_manual_selection(self):
+        decision = {"status": "uncertain", "method": "jev", "jev_decision": {"choice": "uncertain", "confidence": 0.25}}
+        self.assertEqual(store.honor_recorded_choice(decision, [9769]), decision)
+
+    def test_legacy_recovery_cannot_assign_an_ungrouped_candidate_or_override_a_human(self):
+        decision = {"status": "uncertain", "method": "jev", "jev_decision": {"choice": "entry_9769", "confidence": 0.25}}
+        self.assertEqual(store.honor_recorded_choice(decision, [9770]), decision)
+        manual = {**decision, "method": "manual"}
+        self.assertEqual(store.honor_recorded_choice(manual, [9769]), manual)
+
     def test_jev_receipt_choice_includes_all_candidates_none_uncertain_and_ten_payment_samples(self):
         options = {"entry_1", "entry_3", "none", "uncertain"}
         answer = {"answers": {"receipt_owner": {"type": "choice", "choice": "entry_3", "confidence": 0.9,
