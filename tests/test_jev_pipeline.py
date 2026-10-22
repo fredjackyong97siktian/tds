@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 
 from app.services import jev_pipeline as pipeline
 from app.services import workflow_service as workflow
+from app.services import session_analysis
 
 
 def trigger(number, minutes=0, identity=False):
@@ -155,7 +156,7 @@ class JevPipelineTests(unittest.TestCase):
             self.assertEqual(workflow._grouping_stage_label(Mock(), "direct"), "openrouter-mimo-v2.6-flash_grouping_direct")
 
     def test_jev_carry_failure_is_unclear_and_script_run_is_failed(self):
-        with patch.object(workflow.repositories, "create_script_run_started", return_value=9), patch.object(workflow.repositories, "get_trigger", return_value={"location_id": 2}), patch.object(workflow.repositories, "list_trigger_frame_assets", return_value=[]), patch.object(workflow.repositories, "get_app_setting", return_value="6"), patch.object(workflow.repositories, "merge_script_run_stdout_fields", return_value="{}"), patch.object(workflow.repositories, "finish_script_run") as finish:
+        with patch.object(session_analysis, "PAUSED", False), patch.object(workflow.repositories, "create_script_run_started", return_value=9), patch.object(workflow.repositories, "get_trigger", return_value={"location_id": 2}), patch.object(workflow.repositories, "list_trigger_frame_assets", return_value=[]), patch.object(workflow.repositories, "get_app_setting", return_value="6"), patch.object(workflow.repositories, "merge_script_run_stdout_fields", return_value="{}"), patch.object(workflow.repositories, "finish_script_run") as finish:
             result = pipeline.evaluate_carry(Mock(), batch_id=1, group_key="1", location_id=2, group={"entry": [1], "exit": [2]}, transactions=[])
         self.assertEqual(result["status"], "insufficient_evidence")
         self.assertFalse(workflow._carry_factor_hit(result, True))
@@ -163,7 +164,7 @@ class JevPipelineTests(unittest.TestCase):
 
     def test_carry_router_bypasses_text_only_provider(self):
         with patch.object(workflow, "_current_jev_stage_provider", return_value="jev"), patch.object(pipeline, "evaluate_carry", return_value={"status": "reasonable"}) as evaluate, patch.object(workflow, "_call_grouping_vision") as generic:
-            workflow._evaluate_carry_item_signal_with_ai(Mock(), batch_id=1, group_key="1", location_id=2, trigger_ids=[1, 2], group={"entry": [1], "exit": [2]}, transactions=[], total_quantity=0, total_value=0)
+            workflow._evaluate_carry_item_signal_with_ai(Mock(), batch_id=1, group_key="1", location_id=2, trigger_ids=[1, 2], group={"entry": [1], "exit": [2]}, transactions=[{"total_items": 1}], total_quantity=1, total_value=100)
         evaluate.assert_called_once()
         generic.assert_not_called()
 

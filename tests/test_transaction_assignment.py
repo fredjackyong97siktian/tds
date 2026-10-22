@@ -412,7 +412,9 @@ class AssignmentTests(unittest.TestCase):
         self.assertEqual(assignment.active_groups([value], time(10, 3)), [])
 
     def test_session_retry_never_reintroduces_rejected_paid_receipts(self):
-        with patch.object(workflow, "_is_kiosk_analysis_disabled", return_value=False), \
+        from app.services import session_analysis
+        with patch.object(session_analysis, "PAUSED", False), \
+             patch.object(workflow, "_is_kiosk_analysis_disabled", return_value=False), \
              patch.object(assignment, "for_session", return_value=[]), \
              patch.object(workflow.repositories, "delete_session_transactions") as delete, \
              patch.object(workflow, "_identify_kiosk_transaction_groups_for_session") as identify:

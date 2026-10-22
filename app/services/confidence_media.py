@@ -126,18 +126,21 @@ def _queue(db, row):
 
 
 def finish_pending(db, limit=50):
+    from . import session_analysis
     rows = db.execute(text(f"""
         select * from {repositories._table('filter_confidence_result')}
         where json_unquote(json_extract(factor_payload, '$.media_retrieval.status'))
               in ('preparing', 'planning_error', 'pending', 'waiting')
+           or (:resume and json_unquote(json_extract(factor_payload, '$.media_retrieval.session_analysis_status')) = 'paused')
         order by updated_at asc, id asc limit :limit
-    """), {"limit": limit}).mappings().all()
+    """), {"limit": limit, "resume": not session_analysis.PAUSED}).mappings().all()
     for row in rows:
         try:
             with group_lock(db, row["id"]) as acquired:
                 if acquired:
                     current = repositories.get_filter_confidence_result(db, row["id"])
-                    if current and _payload(current).get("media_retrieval", {}).get("status") != "complete":
+                    plan = _payload(current).get("media_retrieval", {}) if current else {}
+                    if current and (plan.get("status") != "complete" or (not session_analysis.PAUSED and plan.get("session_analysis_status") == "paused")):
                         _finish(db, current)
         except Exception:
             db.rollback()
@@ -145,7 +148,7 @@ def finish_pending(db, limit=50):
 
 
 def _finish(db, row):
-    from . import workflow_service
+    from . import workflow_service, session_analysis
 
     payload = _payload(row)
     plan = payload["media_retrieval"]
@@ -161,6 +164,14 @@ def _finish(db, row):
         plan.update(status="waiting" if errors else "pending", issue_video_asset_ids=errors)
         _save(db, row["id"], plan)
         return
+    if session_analysis.PAUSED:
+        plan.update(status="complete", session_analysis_status="paused")
+        _save(db, row["id"], plan)
+        return
+    if not row.get("need_deep_analysis"):
+        plan.update(status="complete", session_analysis_status="not_required")
+        _save(db, row["id"], plan)
+        return
     session = workflow_service._ensure_session_for_confidence_group(
         db, location_id=int(row["location_id"]), entry_trigger_ids=payload["entry_trigger_ids"],
         exit_trigger_ids=payload["exit_trigger_ids"], entry_has_identity=payload.get("entry_has_identity", True))
@@ -168,6 +179,14 @@ def _finish(db, row):
         _save(db, row["id"], plan)
         return
     session_id = int(session["id"])
+    no_transaction = session_analysis.no_transaction_check(db, row=row, payload=payload, session_id=session_id)
+    if no_transaction:
+        db.execute(text(f"""
+            update {repositories._table('filter_confidence_result')}
+            set factor_payload=json_set(coalesce(factor_payload,json_object()), '$.no_transaction_group', json_extract(:value,'$'))
+            where id=:id
+        """), {"id": row["id"], "value": json.dumps(no_transaction, default=str)})
+        db.commit()
     repositories.update_session_grouping_link(db, session_id=session_id, grouping_id=int(row["batch_id"]))
     if "transaction_assignment" in payload:
         from . import transaction_assignment
@@ -185,5 +204,5 @@ def _finish(db, row):
         if metadata.get("retrieval_source") == "confidence_evidence":
             metadata["analysis_eligible"] = bool(metadata.get("analysis_eligible")) or bool(row["need_deep_analysis"])
             repositories.update_video_asset_status(db, asset["id"], asset["status"], metadata=metadata)
-    plan.update(status="complete", session_id=session_id, completed_at=datetime.now(timezone.utc).isoformat())
+    plan.update(status="complete", session_analysis_status="ready", session_id=session_id, completed_at=datetime.now(timezone.utc).isoformat())
     _save(db, row["id"], plan)

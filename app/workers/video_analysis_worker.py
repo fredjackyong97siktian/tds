@@ -73,6 +73,9 @@ class VideoAnalysisWorker:
             self._next_dispatch_after = time.time() + cooldown_seconds
 
     def _fill_available_slots(self) -> None:
+        from ..services import session_analysis
+        if session_analysis.PAUSED:
+            return
         now = time.time()
         with self._lock:
             running_jobs = list(self._running.values())

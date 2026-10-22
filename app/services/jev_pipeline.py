@@ -364,7 +364,8 @@ def no_purchase_request(entries: list[dict[str, Any]], exits: list[dict[str, Any
 
 
 def evaluate_carry(db: Any, *, batch_id: int, group_key: str, location_id: int,
-                   group: Mapping[str, Any], transactions: list[dict[str, Any]]) -> dict[str, Any]:
+                   group: Mapping[str, Any], transactions: list[dict[str, Any]],
+                   session_id: int | None = None) -> dict[str, Any]:
     from .. import repositories
     from . import workflow_service as workflow
     from . import identifier_capture
@@ -372,9 +373,12 @@ def evaluate_carry(db: Any, *, batch_id: int, group_key: str, location_id: int,
     entry_ids = [int(value) for value in (workflow._read_group_value(group, "entry") or [])]
     exit_ids = [int(value) for value in (workflow._read_group_value(group, "exit") or [])]
     no_purchase = not transactions
+    if no_purchase:
+        from . import session_analysis
+        session_analysis.require_active()
     identifier_sequences = []
     run_id = repositories.create_script_run_started(
-        db, session_id=None, trigger_id=entry_ids[0] if entry_ids else None,
+        db, session_id=session_id, trigger_id=entry_ids[0] if entry_ids else None,
         script_name="carry_confidence",
         model_name="openrouter-jev-1.14_no_purchase_carry_confidence" if no_purchase else "openrouter-jev-1.14_carry_confidence",
         command=workflow.SCRIPT_RUN_COMMAND_REDACTED,

@@ -10594,7 +10594,13 @@ def _evaluate_carry_item_signal_with_ai(
     total_quantity: int,
     total_value: float,
 ) -> dict[str, Any]:
-    if not transactions or _current_jev_stage_provider(db, "carry") == "jev":
+    if not transactions:
+        from . import session_analysis
+        return {"hit": False, "status": "deferred", "reason": "deferred_to_session_analysis",
+                "message": "No-transaction checks run only in session analysis after a factor hits."
+                           + (" Session analysis is currently paused." if session_analysis.PAUSED else ""),
+                "no_purchase_identifier_check": False}
+    if _current_jev_stage_provider(db, "carry") == "jev":
         return jev_pipeline.evaluate_carry(
             db, batch_id=batch_id, group_key=group_key, location_id=location_id,
             group=group, transactions=transactions,
@@ -11303,7 +11309,7 @@ def _run_theft_confidence_for_grouping_batch_locked(
             factor_details=factor_details,
             factors=factor_settings,
             factor_code="long_stay_low_purchase",
-            hit=long_stay and low_purchase,
+            hit=long_stay and low_purchase and total_value > 0,
             reason="long_stay_low_purchase",
             evidence={
                 "duration_seconds": duration_seconds,
@@ -11711,7 +11717,7 @@ def score_confidence_for_single_group(
         factor_details=factor_details,
         factors=factor_settings,
         factor_code="long_stay_low_purchase",
-        hit=long_stay and low_purchase,
+        hit=long_stay and low_purchase and total_value > 0,
         reason="long_stay_low_purchase",
         evidence={
             "duration_seconds": duration_seconds,
@@ -12792,6 +12798,9 @@ def _kickoff_kiosk_pipeline_for_session(
     transaction is this session's" action) instead of only ever waiting on a
     fallible AI call.
     """
+    from . import session_analysis
+    if session_analysis.PAUSED:
+        return {"status": "skipped", "reason": "session_analysis_paused", "video_asset_ids": []}
     if _is_kiosk_analysis_disabled(db):
         # Nothing is queued while disabled; re-enabling does not backfill it.
         return {"status": "skipped", "reason": "kiosk_analysis_disabled", "video_asset_ids": []}
@@ -14640,6 +14649,8 @@ def build_retrieval_job_from_trigger_frame_asset(db: Session, frame_asset_id: in
 
 
 def build_entrance_analysis_job_from_video_asset(db: Session, video_asset_id: int) -> EntranceAnalysisQueued:
+    from . import session_analysis
+    session_analysis.require_active()
     video_asset = repositories.get_video_asset(db, video_asset_id)
     trigger_id = video_asset.get("trigger_id")
     if trigger_id is None:
@@ -15495,6 +15506,8 @@ def run_entry_for_trigger(
     output_dir: str | None = None,
     gallery_state_path: str | None = None,
 ) -> ScriptExecutionResult:
+    from . import session_analysis
+    session_analysis.require_active()
     trigger = repositories.get_trigger(db, trigger_id)
     location_id = int(trigger["location_id"])
     if session_id is None:
@@ -15629,6 +15642,8 @@ def run_kiosk_for_session(
     output_dir: str | None = None,
     gallery_state_path: str | None = None,
 ) -> ScriptExecutionResult:
+    from . import session_analysis
+    session_analysis.require_active()
     # Dispatches every video passed in as ONE RunPod job (see KioskRunnerRequest
     # in tds_runner) instead of one job per video - a session can have more
     # than one kiosk video (one per non-overlapping paid-transaction window,

@@ -173,7 +173,8 @@ class ConfidenceMediaTests(unittest.TestCase):
                                        {"video_asset_id": key, "section": role, "start": self.start.isoformat(), "end": (self.start + timedelta(minutes=5)).isoformat()}
                                        for key, role in ((10, "entry"), (11, "exit"), (12, "kiosk"))]}}}
 
-    def finish(self, *, failed=False, deep=False):
+    def finish(self, *, failed=False, deep=False, paused=False):
+        from app.services import session_analysis
         row = self.sample_row(deep)
         assets = [{"id": key, "status": "issue" if failed and key == 12 else "ready",
                    "retrieved_at": None if failed and key == 12 else self.start,
@@ -182,13 +183,20 @@ class ConfidenceMediaTests(unittest.TestCase):
         workflow._ensure_session_for_confidence_group = Mock(return_value={"id": 7})
         saved = []
         import app.services
-        with patch.dict("sys.modules", {"app.services.workflow_service": workflow}), patch.object(app.services, "workflow_service", workflow, create=True), patch.object(media.repositories, "get_video_asset", side_effect=assets), patch.object(media.repositories, "create_session_video_asset_link") as link, patch.object(media.repositories, "update_session_grouping_link"), patch.object(media.repositories, "update_video_asset_status") as update, patch.object(media, "_save", side_effect=lambda db, result_id, plan: saved.append(copy.deepcopy(plan))):
+        with patch.object(session_analysis, "PAUSED", paused), patch.object(session_analysis, "no_transaction_check", return_value=None) as no_purchase, patch.dict("sys.modules", {"app.services.workflow_service": workflow}), patch.object(app.services, "workflow_service", workflow, create=True), patch.object(media.repositories, "get_video_asset", side_effect=assets), patch.object(media.repositories, "create_session_video_asset_link") as link, patch.object(media.repositories, "update_session_grouping_link"), patch.object(media.repositories, "update_video_asset_status") as update, patch.object(media, "_save", side_effect=lambda db, result_id, plan: saved.append(copy.deepcopy(plan))):
             media._finish(self.db, row)
             if failed:
                 workflow._ensure_session_for_confidence_group.assert_not_called()
                 link.assert_not_called()
                 self.assertEqual(saved[-1]["status"], "waiting")
                 self.assertEqual(saved[-1]["issue_video_asset_ids"], [12])
+            elif paused or not deep:
+                workflow._ensure_session_for_confidence_group.assert_not_called()
+                no_purchase.assert_not_called()
+                link.assert_not_called()
+                update.assert_not_called()
+                self.assertEqual(saved[-1]["status"], "complete")
+                self.assertEqual(saved[-1]["session_analysis_status"], "paused" if paused else "not_required")
             else:
                 workflow._ensure_session_for_confidence_group.assert_called_once()
                 self.assertEqual(link.call_count, 3)
@@ -199,8 +207,11 @@ class ConfidenceMediaTests(unittest.TestCase):
     def test_failed_kiosk_blocks_session_creation(self):
         self.finish(failed=True)
 
-    def test_safe_group_gets_session_only_after_all_videos_ready(self):
+    def test_safe_group_keeps_videos_without_creating_session(self):
         self.finish(deep=False)
+
+    def test_paused_flagged_group_keeps_videos_without_session_or_analysis(self):
+        self.finish(deep=True, paused=True)
 
     def test_flagged_group_enables_analysis_after_retrieval(self):
         self.finish(deep=True)

@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 from app.services import identifier_capture
 from app.services import jev_pipeline as pipeline
 from app.services import workflow_service as workflow
+from app.services import session_analysis
 
 
 def trigger(number):
@@ -31,6 +32,11 @@ def answer(status, reason):
 
 
 class NoPurchaseCarryTests(unittest.TestCase):
+    def setUp(self):
+        pause = patch.object(session_analysis, "PAUSED", False)
+        pause.start()
+        self.addCleanup(pause.stop)
+
     def test_one_combined_request_includes_all_reference_and_identifier_frames(self):
         with patch.object(pipeline.jev, "download_image", return_value="data:image/jpeg;base64,AA=="):
             body, urls = pipeline.no_purchase_request([trigger(1)], [trigger(2), trigger(3)], [identifier(2), identifier(3)])
@@ -87,13 +93,15 @@ class NoPurchaseCarryTests(unittest.TestCase):
                 self.assertEqual(result["cost_detail"]["actual_cost_usd"], 0.001)
                 self.assertEqual(finish.call_args.kwargs["status"], "success")
 
-    def test_no_paid_path_uses_jev_even_if_regular_carry_inherits_grouping_model(self):
+    def test_no_paid_path_is_deferred_in_confidence_scoring(self):
         with patch.object(workflow, "_current_jev_stage_provider", return_value="inherit"), \
                 patch.object(pipeline, "evaluate_carry", return_value={"status": "reasonable"}) as evaluate, \
                 patch.object(workflow, "_call_grouping_vision") as inherited:
-            workflow._evaluate_carry_item_signal_with_ai(Mock(), batch_id=10, group_key="1", location_id=2,
+            result = workflow._evaluate_carry_item_signal_with_ai(Mock(), batch_id=10, group_key="1", location_id=2,
                 trigger_ids=[1, 2], group={"entry": [1], "exit": [2]}, transactions=[], total_quantity=0, total_value=0)
-        evaluate.assert_called_once()
+        evaluate.assert_not_called()
+        self.assertEqual(result["status"], "deferred")
+        self.assertFalse(workflow._carry_factor_hit(result, True))
         inherited.assert_not_called()
 
     def test_identifier_failure_never_sends_partial_evidence_to_jev(self):
