@@ -42,8 +42,12 @@ def list_unresolved(db, *, limit=20):
                    json_unquote(json_extract(s.runner_payload, '$.batch_id'))))) is not null as confidence_running
         from (
             select * from {repositories._table('paid_transaction_assignment')}
-            where status in ('error', 'uncertain')
-               or json_extract(evidence, '$.retry.requested_at') is not null
+            where status='uncertain'
+               or (status='error' and (
+                   coalesce(json_unquote(json_extract(evidence, '$.retry_authorized')), 'false') in ('true', '1')
+                   or json_unquote(json_extract(evidence, '$.retry.state'))
+                       in ('queued', 'processing', 'retrieving_frames', 'calling_jev')
+               ))
             order by updated_at desc, location_id, receipt_number limit :limit
         ) a
         left join {repositories._table('script_run')} s on s.id = coalesce(

@@ -448,8 +448,12 @@ def list_stuck_assignments(db, *, limit=20):
         retry = evidence.get("retry") or {}
         if retry.get("state") in {"processing", "retrieving_frames", "calling_jev"} and not row.get("confidence_running"):
             retry = {**retry, "state": "interrupted"}
+        active_retry = retry.get("state") in {"queued", "processing", "retrieving_frames", "calling_jev"}
+        queued = bool(evidence.get("retry_authorized")) or retry.get("state") == "queued"
+        if row["status"] != "uncertain" and not (row["status"] == "error" and (queued or active_retry)):
+            continue
         items.append({"location_id": row["location_id"], "receipt_number": row["receipt_number"],
-                      "status": "queued" if evidence.get("retry_authorized") else row["status"],
+                      "status": "queued" if queued else "processing" if active_retry and row["status"] == "error" else row["status"],
                       "batch_id": payload.get("batch_id") or evidence.get("batch_id"),
                       "script_run_id": row.get("latest_script_run_id") or row.get("script_run_id"),
                       "payment_time_utc": row.get("payment_time_utc"), "updated_at": row.get("updated_at"),

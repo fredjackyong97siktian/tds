@@ -108,7 +108,7 @@ class AssignmentRetryTests(unittest.TestCase):
         self.api.assert_not_called()
 
     def test_stuck_list_handles_missing_or_malformed_legacy_payload(self):
-        row = {"location_id": 2, "receipt_number": "receipt-test", "status": "error",
+        row = {"location_id": 2, "receipt_number": "receipt-test", "status": "uncertain",
                "evidence": "invalid", "runner_payload": [], "script_run_id": None}
         with patch.object(store, "list_unresolved", return_value=[row]):
             result = assignment.list_stuck_assignments(self.db)
@@ -137,7 +137,9 @@ class AssignmentRetryTests(unittest.TestCase):
             store.list_unresolved(self.db, limit=10000)
         sql, params = self.db.execute.call_args.args
         self.assertEqual(params["limit"], 50)
-        self.assertIn("status in ('error', 'uncertain')", str(sql))
+        self.assertIn("status='uncertain'", str(sql))
+        self.assertIn("$.retry_authorized", str(sql))
+        self.assertNotIn("or json_extract(evidence, '$.retry.requested_at') is not null", str(sql))
         self.assertIn("coalesce(\n          a.script_run_id", str(sql))
 
     def test_scored_keys_do_not_skip_legacy_numeric_retry_flags(self):
@@ -156,28 +158,34 @@ class AssignmentRetryTests(unittest.TestCase):
         self.assertIn("in ('true', '1')", sql)
         self.assertIn(") or (", sql)
 
-    def test_completed_retry_stays_in_list_and_reports_saved_answer_reuse(self):
+    def test_completed_retry_is_removed_from_unresolved_list(self):
         row = {"location_id": 2, "receipt_number": "receipt-test", "status": "assigned", "entry_trigger_id": 9546,
                "evidence": {"reason": "Saved answer reused", "retry": {"state": "completed", "source": "saved_answer",
                    "requested_at": "2026-10-22T07:00:00+00:00", "finished_at": "2026-10-22T07:00:10+00:00"}},
                "last_error": "old error", "latest_script_run_id": 20804}
         with patch.object(store, "list_unresolved", return_value=[row]):
             result = assignment.list_stuck_assignments(self.db)
-        item = result["items"][0]
-        self.assertEqual(item["retry"]["source"], "saved_answer")
-        self.assertEqual(item["entry_trigger_id"], 9546)
-        self.assertIsNone(item["last_error"])
+        self.assertEqual(result["items"], [])
 
-    def test_processing_retry_with_no_worker_lock_is_shown_as_interrupted(self):
+    def test_interrupted_failed_attempt_is_not_shown_but_active_retry_is(self):
         row = {"location_id": 2, "receipt_number": "receipt-test", "status": "error",
                "evidence": {"retry": {"state": "retrieving_frames"}}, "confidence_running": False}
         with patch.object(store, "list_unresolved", return_value=[row]):
             result = assignment.list_stuck_assignments(self.db)
-        self.assertEqual(result["items"][0]["retry"]["state"], "interrupted")
+        self.assertEqual(result["items"], [])
         row["confidence_running"] = True
         with patch.object(store, "list_unresolved", return_value=[row]):
             result = assignment.list_stuck_assignments(self.db)
         self.assertEqual(result["items"][0]["retry"]["state"], "retrieving_frames")
+        self.assertEqual(result["items"][0]["status"], "processing")
+
+    def test_only_uncertain_ownership_and_active_retries_are_visible(self):
+        base = {"location_id": 2, "receipt_number": "receipt-test", "evidence": {}}
+        rows = [{**base, "status": status} for status in ("error", "assigned", "none", "uncertain")]
+        rows.append({**base, "status": "error", "evidence": {"retry": {"state": "failed"}}})
+        with patch.object(store, "list_unresolved", return_value=rows):
+            result = assignment.list_stuck_assignments(self.db)
+        self.assertEqual([item["status"] for item in result["items"]], ["uncertain"])
 
     def test_progress_update_only_touches_receipts_with_retry_metadata(self):
         store.update_retry_progress(self.db, location_id=2, receipt="receipt-test", state="calling_jev", script_run_id=20804)

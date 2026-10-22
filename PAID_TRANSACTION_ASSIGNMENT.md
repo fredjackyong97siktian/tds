@@ -37,15 +37,15 @@ the durable attempt barrier is restored before making that request. No new
 database migration is required for this retry control.
 
 Action -> Issues has a Transaction Assignments panel showing the latest
-20 unresolved or retried receipts directly from the ownership ledger. Completed
-retries stay visible, with source (saved answer, timing, new attempt or manual),
-requested/finished timestamps and a link to the relevant Script Run.
+20 uncertain ownership decisions and their active retries directly from the
+ownership ledger. Failed retrieval/API attempts, interrupted failed attempts,
+resolved ownership and completed retries are excluded. Retry source (saved
+answer, timing, new attempt or manual), timestamps and Script Run links remain
+available while ownership is unresolved. Resolved items leave this list;
+their audit remains in the confidence result and original Script Run.
 The dedicated Script Run column also links the original run if a new attempt
-created a different run. The panel no longer appears on Grouping. The Issues
-page additionally lists failed Script Runs of all types, paginated with bounded
-error summaries instead of full logs. Historical failures remain visible even
-if a later attempt succeeded, so the list is an audit rather than an automatic
-claim that each old failure is still blocking the pipeline. Active
+created a different run. The panel no longer appears on Grouping, and Issues
+does not show a general Failed Script Runs section. Active
 retries refresh every 15 seconds while the page is visible. States distinguish
 queued, checking saved answers, retrieving frames, calling Jev, completed,
 needs manual review, failed and interrupted (no batch worker lock remains).
