@@ -3,6 +3,7 @@ from datetime import timedelta
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from ..db import VectorSessionLocal, get_transaction_db
@@ -255,6 +256,27 @@ def retry_detection_analysis(session_id: int, db: Session = Depends(get_transact
         return detection_analysis.retry(db, session_id)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get("/{session_id}/detection-analysis/frames")
+def list_detection_analysis_frames(session_id: int, script_run_id: int | None = Query(None, gt=0),
+                                   db: Session = Depends(get_transaction_db)) -> dict:
+    from ..services import detection_frames
+    try:
+        return detection_frames.list_frames(db, session_id, script_run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/{session_id}/detection-analysis/frames/{script_run_id}/{frame_index}")
+def get_detection_analysis_frame(session_id: int, script_run_id: int, frame_index: int,
+                                 db: Session = Depends(get_transaction_db)) -> FileResponse:
+    from ..services import detection_frames
+    try:
+        path = detection_frames.image_path(db, session_id, script_run_id, frame_index)
+    except (ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return FileResponse(path=path, media_type="image/jpeg", headers={"Cache-Control": "private, no-store"})
 
 
 @router.get("/{session_id}/transactions", response_model=list[SessionTransactionResponse])

@@ -254,7 +254,7 @@ def create_run(db, *, model_name, **kwargs):
 
 
 def run_session(db, session_id):
-    from . import detection_evidence
+    from . import detection_evidence, detection_frames
     with session_lock(db, session_id) as acquired:
         if not acquired:
             return None
@@ -319,15 +319,16 @@ def run_session(db, session_id):
 
             with tempfile.TemporaryDirectory(prefix=f"tds-detection-{session_id}-") as directory:
                 context, frames = detection_evidence.build_evidence(db, session, row, Path(directory))
+                snapshots = detection_frames.preserve(frames, location_id=row["location_id"], session_id=session_id, run_id=run_id)
                 analysis["image_count"] = len(frames)
                 save(db, session_id, analysis)
                 db.execute(text(f"""update {repositories._table('script_run')}
                     set runner_payload=json_set(coalesce(runner_payload,json_object()),
                         '$.image_count', :count, '$.request_context', json_extract(:context,'$'),
-                        '$.frames', json_extract(:frames,'$')) where id=:id"""),
+                        '$.frames', json_extract(:frames,'$'), '$.frame_snapshot_version', 1,
+                        '$.request_started_at', :started) where id=:id"""),
                     {"id": run_id, "count": len(frames), "context": json.dumps(context, default=str),
-                     "frames": json.dumps([{key: value for key, value in frame.items() if key not in {"image_url", "data_url"}}
-                                            for frame in frames], default=str)})
+                     "frames": json.dumps(snapshots, default=str), "started": now()})
                 db.commit()
                 response = detection_evidence.call_mimo(context, frames, on_chunk=capture, model_name=selected_model)
             _persist_response(db, run_id, response, complete=True)

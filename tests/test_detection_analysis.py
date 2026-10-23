@@ -145,7 +145,7 @@ class DetectionAnalysisTests(unittest.TestCase):
 
 class DetectionRunTests(unittest.TestCase):
     def setUp(self):
-        from app.services import detection_evidence
+        from app.services import detection_evidence, detection_frames
         self.db = Mock()
         self.analysis = {"status": "queued", "confidence_result_id": 8, "attempt": 0}
         self.session = {"id": 7, "entry_trigger_id": 1, "result_summary": {"detection_analysis": self.analysis}}
@@ -164,6 +164,7 @@ class DetectionRunTests(unittest.TestCase):
         self.save = stack.enter_context(patch.object(detection, "save"))
         self.persist = stack.enter_context(patch.object(detection, "_persist_response"))
         self.build = stack.enter_context(patch.object(detection_evidence, "build_evidence", return_value=({}, [{"role": "kiosk", "image_url": "data:private"}])))
+        self.snapshots = stack.enter_context(patch.object(detection_frames, "preserve", return_value=[{"index": 1, "role": "kiosk", "sha256": "example", "image_url": "/api/v1/sessions/7/detection-analysis/frames/11/1"}]))
         self.api = stack.enter_context(patch.object(detection_evidence, "call_mimo", return_value=answer()))
 
     def test_one_new_paid_attempt_has_a_new_run_and_saves_answer_before_success(self):
@@ -177,6 +178,15 @@ class DetectionRunTests(unittest.TestCase):
         self.assertEqual(self.finish.call_args.kwargs["status"], "success")
         audit = next(call.args[1] for call in self.db.execute.call_args_list if "request_context" in str(call.args[0]))
         self.assertNotIn("data:private", audit["frames"])
+        self.snapshots.assert_called_once()
+        self.assertEqual(self.api.call_args.args[1][0]["image_url"], "data:private", "API keeps the exact original prepared bytes, not a gallery URL")
+
+    def test_snapshot_failure_never_sends_paid_request(self):
+        self.snapshots.side_effect = OSError("Snapshot storage unavailable")
+        with self.assertLogs(detection.logger, level="ERROR"):
+            result = detection.run_session(self.db, 7)
+        self.assertEqual(result["status"], "failed")
+        self.api.assert_not_called()
 
     def test_dispatch_uses_current_saved_model_for_api_and_audit(self):
         self.model.return_value = "vendor/alternative-vision"

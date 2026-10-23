@@ -78,6 +78,27 @@ goods, clock offsets, sparse footage, and uncertain receipts can leave a case
 inconclusive. The session detail shows the model's reason and limitations.
 No automatic Stripe charge, blacklist, or other theft action is performed.
 
+## Frames Used
+
+The Detection Analysis panel includes a lazy-loaded Frames Used gallery. Each
+new attempt saves the exact encoded JPEG bytes before inference under the
+session's `detection_analysis/run_{script_run_id}` directory on the shared media
+volume. The API and worker must mount the same session storage, as in compose.
+Snapshots are not regenerated from video on viewing, and retries never overwrite
+another run's images. Script Run metadata records input order, phase, available
+source timestamps/playback offsets, and SHA-256 checksums without image base64.
+
+The gallery groups entry, kiosk, and exit inputs and allows enlargement. Kiosk
+playback offsets are labelled as playback, not inferred POS/store timestamps.
+GET `/api/v1/sessions/{id}/detection-analysis/frames?script_run_id={run}` returns
+the manifest, and its image URLs serve saved snapshots with session/run ownership
+checks. Viewing makes no model call. Older runs without saved images explicitly
+show unavailable evidence rather than fabricated reconstructions.
+
+Snapshots follow existing local-media retention: non-theft images older than a
+month can expire, while detected-session evidence remains protected. Expired or
+modified snapshots are not silently replaced with another frame.
+
 ## Issues Page
 
 Unresolved Detection Analysis appears in Action > Issues: completed results with
