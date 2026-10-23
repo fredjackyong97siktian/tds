@@ -15,11 +15,11 @@ class SensorPresenceTests(unittest.TestCase):
         self.assertIn("right(model_name, length(:presence_suffix)) = :presence_suffix", filters)
         self.assertIn("model_name like 'openrouter-jev-%'", filters)
 
-    def test_other_script_filters_are_unchanged(self):
+    def test_carry_filter_preserves_name_and_excludes_detection_compatibility_runs(self):
         filters, params = workflow.repositories._script_run_list_filters(
             script_name="carry_confidence", script_type=None, model_name=None)
         self.assertEqual(params, {"script_name": "carry_confidence"})
-        self.assertEqual(filters, ["script_name = :script_name"])
+        self.assertEqual(filters, ["script_name = :script_name", "coalesce(right(model_name,19),'') <> '_detection_analysis'"])
 
     def setUp(self):
         self.db = Mock()

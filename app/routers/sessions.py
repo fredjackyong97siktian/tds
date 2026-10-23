@@ -2,7 +2,7 @@ from datetime import datetime
 from datetime import timedelta
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from ..db import VectorSessionLocal, get_transaction_db
@@ -225,6 +225,15 @@ def get_dashboard_session_stats(month: str, db: Session = Depends(get_transactio
     return repositories.get_dashboard_session_stats(db, month=month)
 
 
+@router.get("/detection-analysis/issues")
+def get_detection_analysis_issues(
+    limit: int = Query(10, ge=1, le=50), offset: int = Query(0, ge=0),
+    db: Session = Depends(get_transaction_db),
+) -> dict:
+    from ..services import detection_analysis
+    return detection_analysis.list_issues(db, limit=limit, offset=offset)
+
+
 @router.get("/{session_id}", response_model=SessionListItem)
 def get_session_detail(session_id: int, db: Session = Depends(get_transaction_db)) -> SessionListItem:
     rows = _attach_source_video_urls(repositories.list_sessions(db, limit=1, session_id=session_id))
@@ -237,6 +246,15 @@ def get_session_detail(session_id: int, db: Session = Depends(get_transaction_db
 def list_session_customers(session_id: int, db: Session = Depends(get_transaction_db)) -> list[SessionCustomerResponse]:
     rows = repositories.list_session_customers(db, session_id)
     return [SessionCustomerResponse(**row) for row in rows]
+
+
+@router.post("/{session_id}/detection-analysis/retry")
+def retry_detection_analysis(session_id: int, db: Session = Depends(get_transaction_db)) -> dict:
+    from ..services import detection_analysis
+    try:
+        return detection_analysis.retry(db, session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("/{session_id}/transactions", response_model=list[SessionTransactionResponse])

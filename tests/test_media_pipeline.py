@@ -137,6 +137,9 @@ class RetentionPolicyTests(unittest.TestCase):
 
 class ConfidenceMediaTests(unittest.TestCase):
     def setUp(self):
+        self.detection_patch = patch("app.services.detection_analysis.ENABLED", False)
+        self.detection_patch.start()
+        self.addCleanup(self.detection_patch.stop)
         self.db = Mock()
         self.start = datetime(2026, 10, 17, 10)
         self.triggers = {1: {"id": 1, "location_id": 2, "trigger_time": self.start},

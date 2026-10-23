@@ -148,7 +148,7 @@ def finish_pending(db, limit=50):
 
 
 def _finish(db, row):
-    from . import workflow_service, session_analysis
+    from . import workflow_service, session_analysis, detection_analysis
 
     payload = _payload(row)
     plan = payload["media_retrieval"]
@@ -164,12 +164,12 @@ def _finish(db, row):
         plan.update(status="waiting" if errors else "pending", issue_video_asset_ids=errors)
         _save(db, row["id"], plan)
         return
-    if session_analysis.PAUSED:
-        plan.update(status="complete", session_analysis_status="paused")
-        _save(db, row["id"], plan)
-        return
     if not row.get("need_deep_analysis"):
         plan.update(status="complete", session_analysis_status="not_required")
+        _save(db, row["id"], plan)
+        return
+    if session_analysis.PAUSED and not detection_analysis.ENABLED:
+        plan.update(status="complete", session_analysis_status="paused")
         _save(db, row["id"], plan)
         return
     session = workflow_service._ensure_session_for_confidence_group(
@@ -179,7 +179,8 @@ def _finish(db, row):
         _save(db, row["id"], plan)
         return
     session_id = int(session["id"])
-    no_transaction = session_analysis.no_transaction_check(db, row=row, payload=payload, session_id=session_id)
+    no_transaction = (session_analysis.no_transaction_check(db, row=row, payload=payload, session_id=session_id)
+                      if not detection_analysis.ENABLED else None)
     if no_transaction:
         db.execute(text(f"""
             update {repositories._table('filter_confidence_result')}
@@ -202,7 +203,9 @@ def _finish(db, row):
         # Collecting evidence for a safe group must not start paid L1 analysis.
         metadata = dict(asset.get("metadata") or {})
         if metadata.get("retrieval_source") == "confidence_evidence":
-            metadata["analysis_eligible"] = bool(metadata.get("analysis_eligible")) or bool(row["need_deep_analysis"])
+            metadata["analysis_eligible"] = False if detection_analysis.ENABLED else (bool(metadata.get("analysis_eligible")) or bool(row["need_deep_analysis"]))
             repositories.update_video_asset_status(db, asset["id"], asset["status"], metadata=metadata)
-    plan.update(status="complete", session_analysis_status="ready", session_id=session_id, completed_at=datetime.now(timezone.utc).isoformat())
+    if detection_analysis.ENABLED:
+        detection_analysis.queue_for_confidence(db, session_id, row)
+    plan.update(status="complete", session_analysis_status="detection_queued" if detection_analysis.ENABLED else "ready", session_id=session_id, completed_at=datetime.now(timezone.utc).isoformat())
     _save(db, row["id"], plan)

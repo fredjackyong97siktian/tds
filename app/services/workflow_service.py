@@ -8833,10 +8833,14 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
             normalized_unknown.difference_update(matched_ids)
 
         all_trigger_ids = [int(item["trigger_id"]) for item in items if item.get("trigger_id") is not None]
+        non_customer_trigger_ids = repositories.list_confirmed_non_customer_trigger_ids(db, all_trigger_ids)
+        all_trigger_ids = [value for value in all_trigger_ids if value not in non_customer_trigger_ids]
+        normalized_open_entries.difference_update(non_customer_trigger_ids)
         normalized_unknown = {
             trigger_id
             for trigger_id in (list(normalized_unknown) + all_trigger_ids)
             if trigger_id not in grouped_trigger_ids
+            and trigger_id not in non_customer_trigger_ids
             and trigger_id not in normalized_open_entries
             and trigger_id not in issue_trigger_ids
         }
@@ -8852,6 +8856,7 @@ def _run_gemini_grouping_for_batch(db: Session, *, batch_id: int) -> tuple[dict[
             "groups": normalized_groups,
             "open_entries": sorted(normalized_open_entries),
             "unknown": sorted(normalized_unknown),
+            "excluded_non_customer_trigger_ids": sorted(non_customer_trigger_ids),
             "issues": sorted(issue_trigger_ids),
             "frame_retrieval_issue_trigger_ids": sorted(frame_retrieval_issue_trigger_ids),
             "notes": notes,
@@ -10291,6 +10296,7 @@ def _transaction_summary(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "transaction_id": row.get("transaction_id"),
                 "machine_name": row.get("machine_name") or _kiosk_transaction_machine_name(row),
                 "receipt_attribution": row.get("receipt_attribution"),
+                **({"resolved_by_receipt": row["resolved_by_receipt"]} if row.get("resolved_by_receipt") is not None else {}),
                 "status": row.get("status"),
                 "created_at": row.get("created_at"),
                 "transaction_time": row.get("transaction_time"),
@@ -10312,6 +10318,19 @@ def _transaction_summary(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             }
         )
     return payload
+
+
+def _reconcile_pending_payment_retries(issues, transactions):
+    from . import payment_retry_reconciliation
+
+    def event_time(row):
+        # POS event time is store-local; audit timestamps are stored in UTC.
+        return (_coerce_datetime_value(row.get("transaction_time"))
+                or _utc_naive_to_local(_coerce_datetime_value(row.get("created_at") or row.get("createdAt"))))
+
+    return payment_retry_reconciliation.classify(
+        issues, transactions, event_time=event_time,
+        machine_name=lambda row: row.get("machine_name") or _kiosk_transaction_machine_name(row))
 
 
 def _has_short_period_transaction_issues(rows: list[dict[str, Any]], threshold_seconds: int) -> tuple[bool, dict[str, Any]]:
@@ -11200,6 +11219,7 @@ def _run_theft_confidence_for_grouping_batch_locked(
             start_time=start_time,
             end_time=end_time,
         )
+        issue_transactions, normal_payment_retries = _reconcile_pending_payment_retries(issue_transactions, transactions)
         minus_alerts = repositories.list_minus_button_alerts_for_window(
             db,
             location_id=location_id,
@@ -11344,6 +11364,7 @@ def _run_theft_confidence_for_grouping_batch_locked(
             reason="transaction_issue_low_purchase",
             evidence={
                 "issue_transaction_count": issue_transaction_count,
+                "normal_payment_retry_count": len(normal_payment_retries),
                 "paid_transaction_count": paid_transaction_count,
                 "total_quantity": total_quantity,
                 "total_value": total_value,
@@ -11362,6 +11383,7 @@ def _run_theft_confidence_for_grouping_batch_locked(
             reason="multiple_transaction_issues",
             evidence={
                 **multiple_issue_evidence,
+                "normal_payment_retry_count": len(normal_payment_retries),
                 "related_minus_alert_ids": related_minus_alert_ids,
                 "issue_transactions": _transaction_summary(issue_transactions),
             },
@@ -11504,6 +11526,7 @@ def _run_theft_confidence_for_grouping_batch_locked(
                 "transaction_assignment": assignment_report,
                 "transactions": _transaction_summary(transactions),
                 "issue_transactions": _transaction_summary(issue_transactions),
+                "normal_payment_retries": _transaction_summary(normal_payment_retries),
                 "minus_alerts": [
                     {
                         "id": row.get("id"),
@@ -11616,6 +11639,7 @@ def score_confidence_for_single_group(
         start_time=start_time,
         end_time=end_time,
     )
+    issue_transactions, normal_payment_retries = _reconcile_pending_payment_retries(issue_transactions, transactions)
     minus_alerts = repositories.list_minus_button_alerts_for_window(
         db,
         location_id=location_id,
@@ -11752,6 +11776,7 @@ def score_confidence_for_single_group(
         reason="transaction_issue_low_purchase",
         evidence={
             "issue_transaction_count": issue_transaction_count,
+            "normal_payment_retry_count": len(normal_payment_retries),
             "paid_transaction_count": paid_transaction_count,
             "total_quantity": total_quantity,
             "total_value": total_value,
@@ -11770,6 +11795,7 @@ def score_confidence_for_single_group(
         reason="multiple_transaction_issues",
         evidence={
             **multiple_issue_evidence,
+            "normal_payment_retry_count": len(normal_payment_retries),
             "related_minus_alert_ids": related_minus_alert_ids,
             "issue_transactions": _transaction_summary(issue_transactions),
         },
@@ -11911,6 +11937,7 @@ def score_confidence_for_single_group(
             "transaction_assignment": assignment_report,
             "transactions": _transaction_summary(transactions),
             "issue_transactions": _transaction_summary(issue_transactions),
+            "normal_payment_retries": _transaction_summary(normal_payment_retries),
             "minus_alerts": [
                 {
                     "id": row.get("id"),

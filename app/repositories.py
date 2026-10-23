@@ -1605,9 +1605,7 @@ def _issue_video_retry_status(
     return "not_retrieved"
 
 
-def list_trigger_frame_assets(
-    db: Session,
-    limit: int = 100,
+def _trigger_frame_asset_filters(
     *,
     location_id: int | None = None,
     start_time: Any | None = None,
@@ -1616,12 +1614,9 @@ def list_trigger_frame_assets(
     trigger_id: int | None = None,
     trigger_id_min: int | None = None,
     trigger_id_max: int | None = None,
-) -> list[dict[str, Any]]:
-    frame_asset_table = _table("trigger_frame_asset")
-    frame_table = _table("trigger_frame")
-    trigger_table = _table("trigger_event")
+) -> tuple[str, dict[str, Any]]:
     where_clauses = ["fa.status <> 'deleted'"]
-    params: dict[str, Any] = {"limit": limit}
+    params: dict[str, Any] = {}
     if location_id is not None:
         where_clauses.append("fa.location_id = :location_id")
         params["location_id"] = location_id
@@ -1643,7 +1638,32 @@ def list_trigger_frame_assets(
     if trigger_id_max is not None:
         where_clauses.append("fa.trigger_id <= :trigger_id_max")
         params["trigger_id_max"] = trigger_id_max
-    where_sql = " and ".join(where_clauses)
+    return " and ".join(where_clauses), params
+
+
+def count_trigger_frame_assets(db: Session, **filters) -> int:
+    where_sql, params = _trigger_frame_asset_filters(**filters)
+    result = db.execute(text(f"select count(*) as total from {_table('trigger_frame_asset')} fa where {where_sql}"), params)
+    return int((result.mappings().first() or {}).get("total") or 0)
+
+
+def list_trigger_frame_assets(
+    db: Session, limit: int = 100, *, location_id: int | None = None,
+    start_time: Any | None = None, end_time: Any | None = None,
+    status: str | None = None, trigger_id: int | None = None,
+    trigger_id_min: int | None = None, trigger_id_max: int | None = None,
+    offset: int = 0, order: str = "newest",
+) -> list[dict[str, Any]]:
+    orders = {"newest": "fa.created_at desc, fa.id desc",
+              "trigger_asc": "fa.trigger_id asc, fa.id asc",
+              "trigger_desc": "fa.trigger_id desc, fa.id desc"}
+    if order not in orders:
+        raise ValueError("Unsupported frame sort order.")
+    frame_asset_table, frame_table, trigger_table = _table("trigger_frame_asset"), _table("trigger_frame"), _table("trigger_event")
+    where_sql, params = _trigger_frame_asset_filters(
+        location_id=location_id, start_time=start_time, end_time=end_time, status=status,
+        trigger_id=trigger_id, trigger_id_min=trigger_id_min, trigger_id_max=trigger_id_max)
+    params.update(limit=limit, offset=max(0, offset))
     result = db.execute(
         text(
             f"""
@@ -1652,8 +1672,9 @@ def list_trigger_frame_assets(
             from {frame_asset_table} fa
             left join {trigger_table} te on te.id = fa.trigger_id
             where {where_sql}
-            order by fa.created_at desc, fa.id desc
+            order by {orders[order]}
             limit :limit
+            offset :offset
             """
         ),
         params,
@@ -3489,6 +3510,8 @@ def list_recent_grouping_batches(db: Session, limit: int = 50, *, offset: int = 
             except json.JSONDecodeError:
                 pass
         row["confidence_running"] = bool(row.get("confidence_running"))
+    from .services import grouping_result_summary
+    grouping_result_summary.annotate_batches(db, rows)
     return rows
 
 
@@ -3768,6 +3791,11 @@ def _script_run_list_filters(
             filters.append(f"(script_name = 'retrieve_frame' or (script_name = 'retrieve_video' and {frame_model_clause}))")
         else:
             filters.extend(["script_name = 'retrieve_video'", f"not ({frame_model_clause})"])
+    elif script_name == "detection_analysis":
+        filters.append("(script_name = 'detection_analysis' or (script_name = 'carry_confidence' and right(model_name,19) = '_detection_analysis'))")
+    elif script_name == "carry_confidence":
+        filters.extend(["script_name = :script_name", "coalesce(right(model_name,19),'') <> '_detection_analysis'"])
+        params["script_name"] = script_name
     elif script_name in {"person_presence", "transaction_assignment", "grouping_expand"}:
         # Presence checks reuse the allowed grouping script name in older databases.
         filters.append("script_name = :script_name")
@@ -4094,12 +4122,42 @@ def _confidence_customer_clause(identity_type: str) -> str:
     """
 
 
+def _confidence_status_clause(db: Session, status: str | None) -> str | None:
+    if status is None:
+        return None
+    if status not in {"l1", "detected"}:
+        raise ValueError("Unsupported confidence status filter.")
+    sessions = _table("session")
+    detected = "false"
+    if _column_exists(db, sessions, "grouping_id"):
+        detected = f"""exists (
+            select 1 from {sessions} status_session
+            where status_session.grouping_id = c.batch_id and status_session.status = 'detected'
+              and not exists (select 1 from {sessions} newer_session
+                  where newer_session.grouping_id = status_session.grouping_id
+                    and newer_session.entry_trigger_id = status_session.entry_trigger_id
+                    and newer_session.id > status_session.id)
+              and (json_contains(c.factor_payload, cast(status_session.entry_trigger_id as char), '$.entry_trigger_ids')
+                   or (json_extract(c.factor_payload, '$.entry_trigger_ids') is null and exists (
+                       select 1 from {_table('filter_grouping_item')} status_item
+                       where status_item.batch_id = c.batch_id
+                         and cast(status_item.group_key as binary) = cast(c.group_key as binary)
+                         and status_item.trigger_id = status_session.entry_trigger_id
+                         and status_item.role = 'entry' and status_item.status <> 'deleted')))
+        )"""
+    return f"(coalesce(c.need_deep_analysis, 0) = 1 or {detected})" if status == "l1" else detected
+
+
 def count_filter_confidence_results(
-    db: Session, *, batch_id: int | None = None, customer_identity: tuple[str, str] | None = None
+    db: Session, *, batch_id: int | None = None, customer_identity: tuple[str, str] | None = None,
+    status: str | None = None,
 ) -> int:
     confidence_table = _table("filter_confidence_result")
     where_clauses: list[str] = []
     params: dict[str, Any] = {}
+    status_clause = _confidence_status_clause(db, status)
+    if status_clause:
+        where_clauses.append(status_clause)
     if batch_id is not None:
         where_clauses.append("c.batch_id = :batch_id")
         params["batch_id"] = batch_id
@@ -4129,6 +4187,7 @@ def list_filter_confidence_results(
     batch_id: int | None = None,
     confidence_result_id: int | None = None,
     customer_identity: tuple[str, str] | None = None,
+    status: str | None = None,
 ) -> list[dict[str, Any]]:
     confidence_table = _table("filter_confidence_result")
     batch_table = _table("filter_grouping_batch")
@@ -4138,6 +4197,9 @@ def list_filter_confidence_results(
     location_name_column = settings.location_name_column
     where_clauses: list[str] = []
     params: dict[str, Any] = {"limit": limit, "offset": max(0, offset)}
+    status_clause = _confidence_status_clause(db, status)
+    if status_clause:
+        where_clauses.append(status_clause)
     if batch_id is not None:
         where_clauses.append("c.batch_id = :batch_id")
         params["batch_id"] = batch_id

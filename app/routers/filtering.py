@@ -206,6 +206,7 @@ def list_confidence_results(
     batch_id: int | None = None,
     identity_type: Literal["phone", "card"] | None = None,
     customer_value: str | None = None,
+    status: Literal["l1", "detected"] | None = None,
     db: Session = Depends(get_transaction_db),
 ) -> list[dict[str, Any]]:
     if (identity_type is None) != (customer_value is None) or (customer_value is not None and not customer_value.strip()):
@@ -216,6 +217,7 @@ def list_confidence_results(
         offset=max(0, offset),
         batch_id=batch_id,
         customer_identity=(identity_type, customer_value.strip()) if identity_type and customer_value else None,
+        status=status,
     )
 
 
@@ -224,6 +226,7 @@ def count_confidence_results(
     batch_id: int | None = None,
     identity_type: Literal["phone", "card"] | None = None,
     customer_value: str | None = None,
+    status: Literal["l1", "detected"] | None = None,
     db: Session = Depends(get_transaction_db),
 ) -> dict[str, int]:
     if (identity_type is None) != (customer_value is None) or (customer_value is not None and not customer_value.strip()):
@@ -231,6 +234,7 @@ def count_confidence_results(
     return {"total": repositories.count_filter_confidence_results(
         db, batch_id=batch_id,
         customer_identity=(identity_type, customer_value.strip()) if identity_type and customer_value else None,
+        status=status,
     )}
 
 

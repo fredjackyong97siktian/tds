@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
@@ -20,6 +21,8 @@ def list_frame_assets(
     trigger_id: int | None = None,
     trigger_id_min: int | None = None,
     trigger_id_max: int | None = None,
+    offset: int = Query(default=0, ge=0),
+    order: Literal["newest", "trigger_asc", "trigger_desc"] = "newest",
     db: Session = Depends(get_transaction_db),
 ) -> list[TriggerFrameAssetListItem]:
     rows = repositories.list_trigger_frame_assets(
@@ -32,8 +35,22 @@ def list_frame_assets(
         trigger_id=trigger_id,
         trigger_id_min=trigger_id_min,
         trigger_id_max=trigger_id_max,
+        offset=offset,
+        order=order,
     )
     return [TriggerFrameAssetListItem(**row) for row in rows]
+
+
+@router.get("/assets/count")
+def count_frame_assets(
+    location_id: int | None = None, start_time: datetime | None = None, end_time: datetime | None = None,
+    status: str | None = None, trigger_id: int | None = None,
+    trigger_id_min: int | None = None, trigger_id_max: int | None = None,
+    db: Session = Depends(get_transaction_db),
+) -> dict[str, int]:
+    return {"total": repositories.count_trigger_frame_assets(
+        db, location_id=location_id, start_time=start_time, end_time=end_time, status=status,
+        trigger_id=trigger_id, trigger_id_min=trigger_id_min, trigger_id_max=trigger_id_max)}
 
 
 @router.post("/assets/{frame_asset_id}/retry-issue", response_model=TriggerFrameAssetListItem)

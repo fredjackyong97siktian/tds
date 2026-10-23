@@ -108,6 +108,9 @@ def update_retrieval_control(payload: WorkerControlRequest, db: Session = Depend
 
 
 def _build_entrance_analysis_status(db: Session) -> dict:
+    from ..services import detection_analysis
+    if detection_analysis.ENABLED:
+        return detection_analysis.worker_status(db)
     pending_rows = repositories.list_pending_video_asset_analyses(
         db,
         limit=max(settings.analysis_max_global_workers * 50, 500),
@@ -404,4 +407,7 @@ def get_theft_confidence_activity(db: Session = Depends(get_transaction_db)) -> 
 
 @router.get("/analysis-activity")
 def get_analysis_activity(db: Session = Depends(get_transaction_db)) -> dict:
+    from ..services import detection_analysis
+    if detection_analysis.ENABLED:
+        return {"hours": detection_analysis.worker_activity(db)}
     return {"hours": repositories.get_entrance_analysis_worker_activity(db)}

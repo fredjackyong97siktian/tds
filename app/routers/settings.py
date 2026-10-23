@@ -17,6 +17,28 @@ class FramesPerTriggerRequest(BaseModel):
     frames_per_trigger: int
 
 
+class DetectionAnalysisModelRequest(BaseModel):
+    model: str = Field(min_length=3, max_length=200)
+
+
+@router.get("/detection-analysis-model")
+def get_detection_analysis_model(db: Session = Depends(get_transaction_db)) -> dict:
+    from ..services import detection_settings
+    return {"model": detection_settings.current_model(db), "default": detection_settings.DEFAULT_MODEL,
+            "options": detection_settings.MODEL_OPTIONS}
+
+
+@router.put("/detection-analysis-model")
+def update_detection_analysis_model(payload: DetectionAnalysisModelRequest, db: Session = Depends(get_transaction_db)) -> dict:
+    from ..services import detection_settings
+    try:
+        model = detection_settings.validate_model(payload.model)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    repositories.set_app_setting(db, detection_settings.SETTING_KEY, model)
+    return {"ok": True, "model": model}
+
+
 class GroupingExpandDurationRequest(BaseModel):
     duration_minutes: int = Field(ge=1, le=120, strict=True)
 

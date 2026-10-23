@@ -1,6 +1,18 @@
 version: "3.9"
 
 services:
+  theft-detection-analysis-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: theft-detection-detection-analysis-worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    command: python -m app.workers.detection_analysis_worker
+    volumes:
+      - ../session:/app/session
+
   theft-cleaner-worker:
     build:
       context: .
