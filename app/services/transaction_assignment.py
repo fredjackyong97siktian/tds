@@ -53,9 +53,40 @@ def machine_side(location_name, row):
         tokens = set(re.findall(r"(?<![a-z])(left|right)(?![a-z])", name.lower()))
         if len(tokens) == 1:
             side = {"left": "right", "right": "left"}[tokens.pop()]
-    return {"machine_name": name, "image_side": side,
+    mapping = {"machine_name": name, "image_side": side,
             "mapping": "Edumetro: Left machine = image-right; Right machine = image-left."
             if "edumetro" in str(location_name).lower() else "Machine-to-image mapping not configured; do not assume a side."}
+    if "edumetro" in str(location_name).lower():
+        mapping["kiosk_layout"] = (
+            "The checkout kiosks are the TWO BLACK MONITOR ASSEMBLIES along the bottom counter, seen from behind. "
+            "Both monitors are in the LEFT HALF of the full camera image. Left/right refers to their position "
+            "RELATIVE TO EACH OTHER, not two halves of the camera image. "
+            "The Edumetro Left machine (Edumetro-Left-1) is the RIGHTMOST of these two monitors: "
+            "the LARGE BLACK MONITOR near BOTTOM-CENTRE, approximately x=22%-49%, y=48%-80% of the full frame. "
+            "The Edumetro Right machine (Edumetro-right-1) is the LEFTMOST monitor: the BLACK MONITOR partly "
+            "cut off by the LEFT EDGE, approximately x=0%-21%, y=44%-73%. "
+            "The freezer on the right, the shelves, products and customers are NOT kiosks. "
+            "The rear monitor casing can obscure its operator. A visible person near or behind one monitor "
+            "does not automatically operate it; look for their hands, phone and body orientation toward "
+            "that specific terminal across frames. ")
+    return mapping
+
+
+def receipt_owner_instructions(mapping):
+    return (
+        "Identify who made this ONE paid transaction using payment_camera frames in time order and active_groups entry/exit references. "
+        f"The target receipt machine_name is {mapping.get('machine_name') or 'unknown'}. "
+        f"Its configured relative image_side is {mapping.get('image_side') or 'unknown; do not assume a side'}. "
+        + mapping.get("kiosk_layout", "") +
+        "Identify each target kiosk from its physical black monitor first, then match its operator to the entry references. "
+        "Ignore the operator of the OTHER kiosk for this receipt, even if that person matches a candidate. "
+        "Do not assign both receipts to the most prominent person merely because the other operator is obscured. "
+        "Match visible clothing, build, hair and movement to the person actually operating the relevant payment machine. "
+        "Use machine_name, image_side and the supplied mapping when available; never invent an unconfigured machine location. "
+        "A bystander near the kiosk is not necessarily the payer. Do not assign by timing alone: every candidate was active at payment. "
+        "Do not invent hidden faces or items. Choose exactly one owner, none if clearly another customer, "
+        "or uncertain when identity/visibility/machine association is unclear. Other receipts may belong to the same group. "
+        "Do not force different receipts to different groups.")
 
 
 def _ids(value):
@@ -159,13 +190,8 @@ def decide_with_jev(db, *, location_id, batch_id, receipt, row, paid_at, candida
         body = {"model": jev_pipeline.jev.MODEL,
                 "state": {"active_groups": group_states, "payment_camera": kiosk[0],
                           "paid_transaction": workflow._transaction_summary([row])[0], **mapping},
-                "questions": {"receipt_owner": {"type": "choice", "criteria": options, "instructions": (
-                    "Identify who made this ONE paid transaction using payment_camera frames in time order and active_groups entry/exit references. "
-                    "Match visible clothing, build, hair and movement to the person actually operating the relevant payment machine. "
-                    "Use machine_name and image_side when supplied: Edumetro Left machine is on image-right, Right machine on image-left. "
-                    "A bystander near the kiosk is not necessarily the payer. Do not assign by timing alone: every candidate was active at payment. "
-                    "Do not invent hidden faces or items. Choose exactly one owner, none if clearly another customer, "
-                    "or uncertain when identity/visibility/machine association is unclear. Other receipts may belong to the same group.")}}}
+                "questions": {"receipt_owner": {"type": "choice", "criteria": options,
+                    "instructions": receipt_owner_instructions(mapping)}}}
         require_enabled(db)
         store.update_retry_progress(db, location_id=location_id, receipt=receipt, state="calling_jev", script_run_id=run_id)
         response, _meta = jev_pipeline.logged_call(db, run_id, body, list(dict.fromkeys(all_urls)), description="Paid transaction assignment")

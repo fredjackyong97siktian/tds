@@ -103,6 +103,23 @@ class AssignmentTests(unittest.TestCase):
                 row["raw_payload"]["machineName"] = name
                 self.assertEqual(assignment.machine_side("Edumetro, Subang", row)["image_side"], expected)
 
+    def test_kiosk_geometry_and_target_machine_are_explicit_and_location_scoped(self):
+        for name, side in [("Edumetro-Left-1", "right"), ("Edumetro-right-1", "left")]:
+            row = receipt(1, time(10))
+            row["raw_payload"]["machineName"] = name
+            mapping = assignment.machine_side("Edumetro, Subang", row)
+            prompt = assignment.receipt_owner_instructions(mapping)
+            for text in (name, f"relative image_side is {side}", "TWO BLACK MONITOR ASSEMBLIES",
+                         "LEFT HALF", "RELATIVE TO EACH OTHER", "BOTTOM-CENTRE", "LEFT EDGE",
+                         "x=22%-49%", "x=0%-21%", "OTHER kiosk", "Do not force different receipts"):
+                self.assertIn(text, prompt)
+        mapping = assignment.machine_side("Another store", row)
+        self.assertNotIn("kiosk_layout", mapping)
+        prompt = assignment.receipt_owner_instructions(mapping)
+        self.assertNotIn("BOTTOM-CENTRE", prompt)
+        self.assertNotIn("x=22%-49%", prompt)
+        self.assertIn("unknown; do not assume a side", prompt)
+
     def test_overlapping_group_query_only_reads_completed_memberships(self):
         db = Mock()
         with patch.object(workflow.repositories, "_fetch_all_dicts", side_effect=[[], []]):
@@ -491,6 +508,11 @@ class AssignmentTests(unittest.TestCase):
         self.assertTrue(all((right - left).total_seconds() == 2 for left, right in zip(times, times[1:])))
         self.assertEqual(capture.call_args.kwargs["image_scale"], 0.5)
         self.assertEqual(set(call.call_args.args[2]["questions"]["receipt_owner"]["criteria"]), options)
+        body = call.call_args.args[2]
+        self.assertEqual(body["state"]["machine_name"], "Left")
+        self.assertEqual(body["state"]["image_side"], "right")
+        self.assertEqual(body["questions"]["receipt_owner"]["instructions"],
+                         assignment.receipt_owner_instructions({"machine_name": "Left", "image_side": "right"}))
         finish.assert_not_called()
         self.assertEqual(checkpoint.call_args.args[2]["persistence_status"], "awaiting_receipt_commit")
 
