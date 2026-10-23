@@ -76,7 +76,7 @@ class SensorPresenceTests(unittest.TestCase):
             self.assertEqual(workflow._current_jev_stage_provider(self.db, "presence"), "inherit")
 
     def test_jev_receives_images_and_only_confident_absence_excludes(self):
-        for selected, confidence, expected in [("absent", 0.9, False), ("absent", 0.3, True), ("present", 0.9, True), ("unclear", 0.9, True)]:
+        for selected, confidence, expected in [("absent", 0.9, False), ("absent", 0.3, False), ("present", 0.9, True), ("present", 0.0, True), ("unclear", 0.9, True)]:
             with self.subTest(selected=selected, confidence=confidence):
                 options = ["present", "absent", "unclear"]
                 response = {"answers": {"person_presence": {"type": "choice", "choice": selected,

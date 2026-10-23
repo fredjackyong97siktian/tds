@@ -131,12 +131,32 @@ class JevPipelineTests(unittest.TestCase):
             self.assertEqual(workflow._carry_factor_hit(result, low_purchase=True), status == "suspicious")
             self.assertEqual(result["insufficient_evidence"], status == "insufficient_evidence")
 
-    def test_low_confidence_and_conflicting_reason_do_not_invent_hits(self):
+    def test_carry_preserves_selected_status_and_reason_without_overrides(self):
         result = pipeline.carry_result(carry_answer("reasonable", "yellow_bag"))
         self.assertEqual(result["status"], "reasonable")
-        self.assertEqual(result["reason"], "carry_reasonable")
+        self.assertEqual(result["reason"], "yellow_bag")
         result = pipeline.carry_result(carry_answer("suspicious", confidence=0.2))
-        self.assertEqual(result["status"], "insufficient_evidence")
+        self.assertEqual(result["status"], "suspicious")
+        self.assertTrue(result["hit"])
+
+    def test_all_carry_choices_are_honored_even_at_zero_confidence(self):
+        for status, reason in [("suspicious", "bag_enlarged"), ("reasonable", "consistent_with_entry"), ("insufficient_evidence", "unclear_images")]:
+            with self.subTest(status=status):
+                response = carry_answer(status, reason, confidence=0.0)
+                response["answers"]["carry_reason"]["confidence"] = 0.0
+                result = pipeline.carry_result(response)
+                self.assertEqual(result["status"], status)
+                self.assertEqual(result["reason"], reason)
+                self.assertEqual(result["hit"], status == "suspicious")
+                self.assertEqual(result["confidence"], 0.0)
+                self.assertIsNone(result["minimum_confidence"])
+
+    def test_reported_no_purchase_reasonable_at_049_stays_reasonable(self):
+        response = carry_answer("reasonable", "consistent_with_entry", confidence=0.49)
+        response["answers"]["carry_reason"] = choice("consistent_with_entry", pipeline.NO_PURCHASE_REASONS, confidence=0.7)
+        result = pipeline.carry_result(response, reason_options=pipeline.NO_PURCHASE_REASONS)
+        self.assertEqual(result["status"], "reasonable")
+        self.assertFalse(result["insufficient_evidence"])
         self.assertFalse(result["hit"])
 
     def test_rollback_keeps_legacy_carry_low_purchase_policy(self):

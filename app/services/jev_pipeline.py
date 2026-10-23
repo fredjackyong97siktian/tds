@@ -11,7 +11,7 @@ from . import jev_matching as jev
 
 # Separate from MiMo's similarity cutoff. These trial thresholds are not yet
 # calibrated on the store's CCTV; preserve the complete distributions for review.
-MIN_CHOICE_CONFIDENCE = 0.5
+MIN_CHOICE_CONFIDENCE = None
 
 
 def encode_sequences(triggers: list[Mapping[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
@@ -167,13 +167,8 @@ CARRY_REASONS = {"yellow_bag", "bag_enlarged", "unexplained_carry_change", "cons
 def carry_result(response: Mapping[str, Any], *, reason_options: set[str] | None = None) -> dict[str, Any]:
     status = read_choice(response, "carry_status", {"suspicious", "reasonable", "insufficient_evidence"})
     reason = read_choice(response, "carry_reason", reason_options if reason_options is not None else CARRY_REASONS)
-    effective = status["choice"] if status["confidence"] >= MIN_CHOICE_CONFIDENCE else "insufficient_evidence"
-    allowed = {
-        "suspicious": {"yellow_bag", "bag_enlarged", "unexplained_carry_change"},
-        "reasonable": {"consistent_with_entry", "consistent_with_receipt"},
-        "insufficient_evidence": {"unclear_images", "uncertain_receipt_assignment"},
-    }
-    reason_code = reason["choice"] if reason["choice"] in allowed[effective] and reason["confidence"] >= MIN_CHOICE_CONFIDENCE else f"carry_{effective}"
+    effective = status["choice"]
+    reason_code = reason["choice"]
     messages = {
         "suspicious": "Jev found a suspicious carrying state under the configured screening criteria; deeper analysis is required, not confirmed theft.",
         "reasonable": "Jev found enough evidence for a reasonable carrying state under the configured criteria. This clears only the carry factor.",
@@ -282,7 +277,7 @@ def check_person_presence(db: Any, script_run_id: int, urls: list[str]) -> dict[
     }}
     response, _ = logged_call(db, script_run_id, body, urls, description="Jev sensor person presence")
     decision = read_choice(response, "person_presence", set(criteria))
-    uncertain = decision["choice"] == "unclear" or decision["confidence"] < MIN_CHOICE_CONFIDENCE
+    uncertain = decision["choice"] == "unclear"
     return {"person_present": uncertain or decision["choice"] != "absent",
             "confidence": decision["confidence"], "uncertain": uncertain,
             "jev_decision": decision, "source": "openrouter_jev_person_presence"}
